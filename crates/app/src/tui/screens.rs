@@ -1696,17 +1696,38 @@ const fn wsl_capability_tone(capability: &WslCapability) -> Tone {
 }
 
 fn readiness_problem_lines(model: &ScreenModel, skin: &Skin) -> Vec<Line<'static>> {
-    let issues: Vec<_> = model
-        .snapshot
-        .activity
-        .iter()
+    let readiness_rows = || {
+        model
+            .snapshot
+            .activity
+            .iter()
+            .filter(|row| row.id.starts_with("readiness:"))
+    };
+    let issues: Vec<_> = readiness_rows()
         .filter(|row| {
             model.snapshot.readiness != OperationalReadiness::Ready
-                && row.id.starts_with("readiness:")
+                && row.outcome != ActivityOutcome::Info
+        })
+        .collect();
+    // Information, not problems: shown in either state, never numbered or
+    // given a "Fix:", so the count matches the readiness summary's.
+    let notes: Vec<Line<'static>> = readiness_rows()
+        .filter(|row| row.outcome == ActivityOutcome::Info)
+        .flat_map(|row| {
+            [
+                Line::from(vec![
+                    Span::styled("Note: ".to_owned(), skin.style(Tone::Muted)),
+                    Span::styled(copy_safe(&row.summary), skin.style(Tone::Plain)),
+                ]),
+                Line::from(Span::styled(
+                    format!("      {}", copy_safe(&row.remediation)),
+                    skin.style(Tone::Muted),
+                )),
+            ]
         })
         .collect();
     if issues.is_empty() && model.snapshot.readiness == OperationalReadiness::Ready {
-        return vec![
+        let mut lines = vec![
             Line::from(Span::styled(
                 "Problems & fixes: none".to_owned(),
                 skin.style(Tone::Ok).add_modifier(Modifier::BOLD),
@@ -1715,11 +1736,13 @@ fn readiness_problem_lines(model: &ScreenModel, skin: &Skin) -> Vec<Line<'static
                 "The service and managed hosts are ready for the next job.".to_owned(),
                 skin.style(Tone::Plain),
             )),
-            Line::from(Span::styled(
-                model.refresh_label("[F5] Recheck now", skin),
-                skin.style(Tone::Accent),
-            )),
         ];
+        lines.extend(notes);
+        lines.push(Line::from(Span::styled(
+            model.refresh_label("[F5] Recheck now", skin),
+            skin.style(Tone::Accent),
+        )));
+        return lines;
     }
     if issues.is_empty() {
         return vec![
@@ -1756,6 +1779,7 @@ fn readiness_problem_lines(model: &ScreenModel, skin: &Skin) -> Vec<Line<'static
             Span::styled(copy_safe(&row.remediation), skin.style(Tone::Accent)),
         ]));
     }
+    lines.extend(notes);
     lines.push(Line::from(Span::styled(
         format!(
             "[c] Copy fixes   [a] Open details   {}",

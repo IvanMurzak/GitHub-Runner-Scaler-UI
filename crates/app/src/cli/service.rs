@@ -581,9 +581,15 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
             // Every other remedy below acts on this account's directories, and
             // the service is another installation's: reinstalling it from here
             // would re-register it against the wrong data root.
+            // Unread, the next step is to read it; read, it is to act on it as
+            // the installation's own account.
             format!(
                 "runner-manager service status ({})",
-                foreign.where_to_look()
+                if foreign.is_unread() {
+                    foreign.where_to_look()
+                } else {
+                    foreign.act_as()
+                }
             )
         } else if status
             .problems()
@@ -674,7 +680,8 @@ fn service_failure(source: ServiceError) -> CliError {
     let class = match source {
         ServiceError::LockHeld { .. }
         | ServiceError::AlreadyInstalled { .. }
-        | ServiceError::LocalConfigurationInUse { .. } => Failure::Conflict,
+        | ServiceError::LocalConfigurationInUse { .. }
+        | ServiceError::ForeignInstallation { .. } => Failure::Conflict,
         ServiceError::NotInstalled { .. } => Failure::NotFound,
         ServiceError::BinaryPath { .. } | ServiceError::BinaryMissing { .. } => {
             Failure::InvalidArgument

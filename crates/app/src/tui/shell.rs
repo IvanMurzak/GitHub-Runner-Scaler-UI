@@ -916,6 +916,7 @@ fn readiness_from_facts(
             ..
         }) => {
             let look = foreign.where_to_look();
+            let act_as = foreign.act_as();
             let installed_by = foreign.installed_by();
             for (subject, detail) in problems {
                 issue(
@@ -923,7 +924,7 @@ fn readiness_from_facts(
                     OperationalReadiness::Blocked,
                     format!("Machine service (installed from {installed_by}) {subject}: {detail}"),
                     format!(
-                        "Run `runner-manager service status` {look}, and follow its remediation \
+                        "Run `runner-manager service status` {act_as} and follow its remediation \
                          there. Do not reinstall the service or sign in again from this account: \
                          it would act on this account's own configuration, not the service's."
                     ),
@@ -934,10 +935,11 @@ fn readiness_from_facts(
                  service does not run.",
                 foreign.local_root.display()
             );
-            if foreign.is_unread() && running {
+            if foreign.is_unread() {
                 let summary = format!(
                     "This machine's runner-manager service is installed from {installed_by} and \
-                     is running; this account cannot read its health."
+                     is {}; this account cannot read its health.",
+                    if running { "running" } else { "not running" }
                 );
                 issue(
                     "local:service-elsewhere",
@@ -946,12 +948,12 @@ fn readiness_from_facts(
                     format!("Run `runner-manager tui` {look} to see it. {scope}"),
                 );
                 unread_service = Some(summary);
-            } else if !foreign.is_unread() {
+            } else {
                 issue(
                     "local:service-elsewhere",
                     OperationalReadiness::Ready,
                     format!("This machine's runner-manager service is installed from {installed_by}."),
-                    format!("Its health is shown here; act on it {look}. {scope}"),
+                    format!("Its health is shown here; act on it {act_as}. {scope}"),
                 );
             }
             if let Some(gap) = unattended_gap {
@@ -959,7 +961,7 @@ fn readiness_from_facts(
                     "local:login-only",
                     OperationalReadiness::Degraded,
                     gap.reason,
-                    format!("{} Act on it {look}.", gap.remedy),
+                    format!("{} Only {act_as}, never from this account.", gap.remedy),
                 );
             }
             if let Some(note) = foreign.unused_local_note() {
@@ -6000,6 +6002,7 @@ fn foreign_service(unreadable: bool) -> runner_manager_platform::service::Foreig
         },
         root: root.to_path_buf(),
         owner: Some("yuriv".into()),
+        this_account: None,
         local_root: r"C:\Users\ivand\rm".into(),
         local_record: r"C:\Users\ivand\rm\config\service.toml".into(),
         unused_local_record: Some(record),

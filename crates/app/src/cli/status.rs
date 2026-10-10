@@ -146,7 +146,8 @@ pub struct Product {
     /// The package version plus a commit identity for an unreleased source build.
     pub build_version: &'static str,
     /// The version reported by the product-owned binary registered for the
-    /// local service, or `null` when no readable service installation exists.
+    /// local service, or `null` when no readable service installation exists
+    /// or it is another installation's, whose binary this account never runs.
     pub service_binary_version: Option<String>,
     /// Since when GitHub has rejected the local service's credential, as the
     /// daemon last recorded it; `null` while it is accepted.
@@ -184,8 +185,7 @@ impl ServiceView {
     /// is another installation's -- then that installation's, as far as they
     /// can be read. See [`runner_manager_platform::service::ForeignService`].
     fn of(context: &Context) -> Self {
-        let Some((registration, foreign)) = super::service::operations(context).foreign_service()
-        else {
+        let Some(foreign) = super::service::operations(context).foreign_service() else {
             return Self {
                 paths: context.paths().clone(),
                 binary: InstallRecord::read(context.paths())
@@ -195,14 +195,12 @@ impl ServiceView {
                 foreign: None,
             };
         };
-        let paths = foreign.directories.paths();
         Self {
-            binary: InstallRecord::read(&paths)
-                .ok()
-                .flatten()
-                .map(|record| record.binary)
-                .or_else(|| registration.binary()),
-            paths,
+            // Never run: the path comes from another account's record, and
+            // `--version` would execute whatever that account put there, as
+            // this account, every time the TUI refreshes.
+            binary: None,
+            paths: foreign.directories.paths(),
             foreign: Some(foreign),
         }
     }

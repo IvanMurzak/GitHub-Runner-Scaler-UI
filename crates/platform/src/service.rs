@@ -749,6 +749,27 @@ pub enum ServiceError {
         rollback: String,
     },
 
+    /// The machine's registration is another installation's (see
+    /// [`ForeignService`]), and changing it from this account would act on it
+    /// with this account's directories.
+    #[error(
+        "this machine's {name} service was installed from {installed_by}, not from this \
+         account's data root, so this account does not {operation} it: doing so would \
+         re-register or remove that installation's service with this account's directories. \
+         Do it {act_as}. If that account no longer exists, remove the registration with the \
+         service manager itself first."
+    )]
+    ForeignInstallation {
+        /// Which registration.
+        name: String,
+        /// What was refused.
+        operation: &'static str,
+        /// [`ForeignService::installed_by`].
+        installed_by: String,
+        /// [`ForeignService::act_as`].
+        act_as: String,
+    },
+
     /// `host forget-local` found this account's configuration in use, and
     /// moved nothing.
     #[error("this account's local configuration is in use, so nothing was archived: {detail}.")]
@@ -4185,6 +4206,10 @@ impl ServiceOperations {
         // Item 1. The guard lives until the end of this function; dropping it is
         // the release, so an early return releases it too.
         let _guard = self.refuse_while_an_agent_runs()?;
+        // Replacing applies to this account's own registration only: over
+        // another installation's it would re-register that service against
+        // this account's directories.
+        self.refuse_foreign("replace")?;
 
         // --------------------------------------------------------------------
         // AN INSTALL OVER THE SAME START MODE REPLACES; IT DOES NOT REFUSE.
@@ -4371,11 +4396,27 @@ impl ServiceOperations {
         // Both domains, not only the recorded one. A record can be lost while a
         // registration survives, and leaving a registration behind because a
         // TOML file was deleted is exactly the state `uninstall` exists to end.
+        //
+        // Except another installation's: it is skipped, and when it is all
+        // there is, the uninstall is refused and this account's record kept.
+        let mut foreign = None;
         for mode in [StartMode::Boot, StartMode::Login] {
             let control = self.controls.control(mode)?;
+            if let Some(directories) = control
+                .query(&self.identity)
+                .ok()
+                .flatten()
+                .and_then(|registration| self.foreign_directories(&registration))
+            {
+                foreign = Some(directories);
+                continue;
+            }
             if control.uninstall(&self.identity)? {
                 removed_registration = true;
             }
+        }
+        if !removed_registration && let Some(directories) = foreign {
+            return Err(self.foreign_refusal("uninstall", directories));
         }
         let removed_record = InstallRecord::remove(&self.paths)?;
         Ok(Uninstalled {
@@ -4413,6 +4454,7 @@ impl ServiceOperations {
     /// [`ServiceError::NotInstalled`] when there is no record to switch, and
     /// whatever the platform reports.
     pub fn set_start_mode(&self, to: StartMode) -> Result<StartModeChange, ServiceError> {
+        self.refuse_foreign("switch the start mode of")?;
         let Some(record) = InstallRecord::read(&self.paths)? else {
             return Err(ServiceError::NotInstalled {
                 name: self.identity.name().to_string(),
@@ -4535,13 +4577,26 @@ impl ServiceOperations {
     ///
     /// [`ServiceError::NotInstalled`], or whatever the platform reports.
     pub fn start(&self) -> Result<(), ServiceError> {
-        let Some((mode, _)) = self.find_registration()? else {
-            return Err(ServiceError::NotInstalled {
-                name: self.identity.name().to_string(),
-                operation: "start",
-            });
-        };
+        let mode = self.own_registration_mode("start")?;
         self.controls.control(mode)?.start(&self.identity)
+    }
+
+    /// The domain holding this account's own registration, for `operation`.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotInstalled`] when there is none, and
+    /// [`ServiceError::ForeignInstallation`] when the only one is another
+    /// installation's.
+    fn own_registration_mode(&self, operation: &'static str) -> Result<StartMode, ServiceError> {
+        match self.registration_for_status()? {
+            None => Err(ServiceError::NotInstalled {
+                name: self.identity.name().to_string(),
+                operation,
+            }),
+            Some((_, Some(directories))) => Err(self.foreign_refusal(operation, directories)),
+            Some((registration, None)) => Ok(registration.start_mode),
+        }
     }
 
     /// Stops the registration. Returns whether it was running.
@@ -4550,12 +4605,7 @@ impl ServiceOperations {
     ///
     /// As [`ServiceOperations::start`].
     pub fn stop(&self) -> Result<bool, ServiceError> {
-        let Some((mode, _)) = self.find_registration()? else {
-            return Err(ServiceError::NotInstalled {
-                name: self.identity.name().to_string(),
-                operation: "stop",
-            });
-        };
+        let mode = self.own_registration_mode("stop")?;
         self.controls.control(mode)?.stop(&self.identity)
     }
 
@@ -4839,6 +4889,31 @@ impl ServiceOperations {
         }))
     }
 
+    /// Refuses `operation` when the machine's registration is another
+    /// installation's. See [`ServiceError::ForeignInstallation`].
+    fn refuse_foreign(&self, operation: &'static str) -> Result<(), ServiceError> {
+        match self.registration_for_status()? {
+            Some((_, Some(directories))) => Err(self.foreign_refusal(operation, directories)),
+            _ => Ok(()),
+        }
+    }
+
+    /// [`ServiceError::ForeignInstallation`] for the installation at
+    /// `directories`.
+    fn foreign_refusal(
+        &self,
+        operation: &'static str,
+        directories: ServiceDirectories,
+    ) -> ServiceError {
+        let foreign = self.foreign_service_at(directories);
+        ServiceError::ForeignInstallation {
+            name: self.identity.name().to_string(),
+            operation,
+            installed_by: foreign.installed_by(),
+            act_as: foreign.act_as(),
+        }
+    }
+
     /// The directories `registration` runs against, when they are not this
     /// account's. See [`ForeignService`].
     fn foreign_directories(&self, registration: &Registration) -> Option<ServiceDirectories> {
@@ -4851,21 +4926,37 @@ impl ServiceOperations {
     /// beyond its path. `None` when the service is this account's, when there
     /// is none, or when the service manager cannot be asked.
     #[must_use]
-    pub fn foreign_service(&self) -> Option<(Registration, ForeignService)> {
-        match self.registration_for_status().ok()?? {
-            (registration, Some(directories)) => {
-                Some((registration, self.foreign_service_at(directories)))
-            }
-            (_, None) => None,
-        }
+    pub fn foreign_service(&self) -> Option<ForeignService> {
+        let (_, directories) = self.registration_for_status().ok()??;
+        Some(self.foreign_service_at(directories?))
     }
 
     /// The [`ForeignService`] for an installation at `directories`, before
     /// anything of its own is read.
     fn foreign_service_at(&self, directories: ServiceDirectories) -> ForeignService {
         let root = directories.root();
+        let home = host_home();
+        // This account's own installation under other directories, when the
+        // four are exactly a layout a command of this account resolves.
+        let this_account = home
+            .as_deref()
+            .filter(|home| contains_directory(home, &root))
+            .and_then(|_| {
+                if directories == ServiceDirectories::of(&AppPaths::rooted_at(&root)) {
+                    Some(format!(
+                        "with `--data-dir {}`",
+                        quote_argument(&root.to_string_lossy())
+                    ))
+                } else {
+                    AppPaths::discover()
+                        .ok()
+                        .filter(|standard| directories == ServiceDirectories::of(standard))
+                        .map(|_| "without `--data-dir`".to_owned())
+                }
+            });
         ForeignService {
-            owner: data_root_owner(&root, host_home().as_deref()),
+            owner: data_root_owner(&root, home.as_deref()),
+            this_account,
             root,
             directories,
             local_root: ServiceDirectories::of(&self.paths).root(),
@@ -4926,8 +5017,13 @@ impl ServiceOperations {
     /// database with its host row and policies, `runner.env` and the rest -- is
     /// **renamed** into a `forgotten-<timestamp>` directory beside it, never
     /// deleted, so moving it back restores it exactly. The state, runtime and
-    /// log directories and every secret store are left alone, and so is every
-    /// directory a registration names.
+    /// log directories are left alone even where the platform puts them inside
+    /// the configuration directory (macOS does), and so is every secret store
+    /// and every directory a registration names.
+    ///
+    /// Both domains are asked, strictly: a domain that cannot be asked might
+    /// hold this account's own registration, so it refuses rather than reads
+    /// as empty.
     ///
     /// # Errors
     ///
@@ -4935,41 +5031,48 @@ impl ServiceOperations {
     /// machine runs against these directories, when a registration from
     /// another data root names a directory overlapping them, or when an agent
     /// holds this account's single-instance lock. [`ServiceError::Record`] when
-    /// the move fails; whatever had already moved is put back first.
+    /// the move fails; whatever had already moved is put back first, and
+    /// anything that could not be put back is named.
     pub fn forget_local(&self, at: DateTime<Utc>) -> Result<ForgottenLocal, ServiceError> {
         let config = self.paths.config_dir();
-        let service_root = match self.registration_for_status()? {
-            None => None,
-            Some((registration, None)) => {
-                return Err(ServiceError::LocalConfigurationInUse {
-                    detail: format!(
-                        "{} holds a registration that runs against {}, so it is not unused. \
-                         `service status` describes it",
-                        registration.manager,
-                        config.display()
-                    ),
-                });
+        let in_use = |detail: String| ServiceError::LocalConfigurationInUse { detail };
+        let mut service_root = None;
+        for mode in [StartMode::Boot, StartMode::Login] {
+            let registration = self
+                .controls
+                .control(mode)
+                .and_then(|control| control.query(&self.identity))
+                .map_err(|error| {
+                    in_use(format!(
+                        "whether a {mode} registration runs against it could not be read ({error})"
+                    ))
+                })?;
+            let Some(registration) = registration else {
+                continue;
+            };
+            let Some(directories) = self.foreign_directories(&registration) else {
+                return Err(in_use(format!(
+                    "{} holds a registration that runs against {}. `service status` describes it",
+                    registration.manager,
+                    config.display()
+                )));
+            };
+            if let Some(overlap) = directories.all().into_iter().find(|directory| {
+                contains_directory(directory, config) || contains_directory(config, directory)
+            }) {
+                return Err(in_use(format!(
+                    "the machine's service runs against {}, which overlaps {}",
+                    overlap.display(),
+                    config.display()
+                )));
             }
-            Some((_, Some(directories))) => {
-                if let Some(overlap) = directories.all().into_iter().find(|directory| {
-                    contains_directory(directory, config) || contains_directory(config, directory)
-                }) {
-                    return Err(ServiceError::LocalConfigurationInUse {
-                        detail: format!(
-                            "the machine's service runs against {}, which overlaps {}",
-                            overlap.display(),
-                            config.display()
-                        ),
-                    });
-                }
-                Some(directories.root())
-            }
-        };
+            service_root.get_or_insert_with(|| directories.root());
+        }
         let _lock =
             HostLock::try_acquire(&self.paths, LockKind::SingleInstance).map_err(|source| {
-                ServiceError::LocalConfigurationInUse {
-                    detail: format!("an agent may be running against these directories: {source}"),
-                }
+                in_use(format!(
+                    "an agent may be running against these directories: {source}"
+                ))
             })?;
         let failed = |operation: &'static str, path: &Path| {
             let path = path.to_path_buf();
@@ -4979,15 +5082,20 @@ impl ServiceOperations {
                 detail: error.to_string(),
             }
         };
+        // Never the agent's own directories, wherever the platform nests them.
+        let kept = [
+            self.paths.state_dir(),
+            self.paths.runtime_dir(),
+            self.paths.logs_dir(),
+        ];
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(config).map_err(failed("list", config))? {
-            let entry = entry.map_err(failed("list", config))?;
-            if !entry
+            let entry = entry.map_err(failed("list", config))?.path();
+            let archived = entry
                 .file_name()
-                .to_string_lossy()
-                .starts_with(FORGOTTEN_PREFIX)
-            {
-                entries.push(entry.path());
+                .is_some_and(|name| name.to_string_lossy().starts_with(FORGOTTEN_PREFIX));
+            if !archived && !kept.iter().any(|kept| contains_directory(&entry, kept)) {
+                entries.push(entry);
             }
         }
         if entries.is_empty() {
@@ -5003,11 +5111,25 @@ impl ServiceOperations {
         let inside = |entry: &Path| archive.join(entry.file_name().unwrap_or_default());
         for (index, entry) in entries.iter().enumerate() {
             if let Err(error) = std::fs::rename(entry, inside(entry)) {
-                for done in entries[..index].iter().rev() {
-                    let _ = std::fs::rename(inside(done), done);
-                }
+                let stranded: Vec<String> = entries[..index]
+                    .iter()
+                    .rev()
+                    .filter(|done| std::fs::rename(inside(done), done).is_err())
+                    .map(|done| inside(done).display().to_string())
+                    .collect();
                 let _ = std::fs::remove_dir(&archive);
-                return Err(failed("archive", entry)(error));
+                let mut detail = error.to_string();
+                if !stranded.is_empty() {
+                    detail.push_str(&format!(
+                        "; these could not be put back and are still in the archive: {}",
+                        stranded.join(", ")
+                    ));
+                }
+                return Err(ServiceError::Record {
+                    operation: "archive",
+                    path: entry.clone(),
+                    detail,
+                });
             }
         }
         Ok(ForgottenLocal {
@@ -5077,6 +5199,62 @@ fn same_directory(left: &Path, right: &Path) -> bool {
         )
 }
 
+/// Where the remedy starts in a [`StatusProblem`]'s detail: the sentence
+/// openings every builder above uses for it.
+const REMEDY_OPENINGS: [&str; 8] = [
+    ". Run ",
+    ". If nothing is waiting",
+    ". Re-register",
+    ". Switch the start mode",
+    " Sign in again",
+    ". Fix: ",
+    "; to do it now",
+    "; if the service manager denies",
+];
+
+/// A problem's diagnosis without its remedy. See
+/// [`ServiceStatus::with_foreign`].
+///
+/// A detail that still names a command that changes the registration or the
+/// credential after the cut -- a builder this list does not know yet -- is
+/// reduced to the first clause rather than passed on, because the cost of
+/// showing too little is a shorter sentence and the cost of showing too much
+/// is a broken service.
+fn diagnosis_only(detail: &str) -> String {
+    let cut = REMEDY_OPENINGS
+        .iter()
+        .filter_map(|opening| detail.find(opening))
+        .min()
+        .unwrap_or(detail.len());
+    let diagnosis = detail[..cut].trim_end_matches(['.', ' ']);
+    let names_a_change = |text: &str| {
+        [
+            "service install",
+            "service uninstall",
+            "auth login",
+            "launchctl",
+            "systemctl",
+        ]
+        .iter()
+        .any(|command| text.contains(command))
+    };
+    if !names_a_change(diagnosis) {
+        return diagnosis.to_owned();
+    }
+    // Clause ends followed by a space, so a `.` inside a path does not cut.
+    let end = [", ", "; ", ". "]
+        .iter()
+        .filter_map(|separator| diagnosis.find(separator))
+        .min()
+        .unwrap_or(diagnosis.len());
+    let first = &diagnosis[..end];
+    if names_a_change(first) {
+        "the installation's own records report this".to_owned()
+    } else {
+        first.to_owned()
+    }
+}
+
 /// A path's components as this platform compares them: case-insensitively
 /// on Windows.
 fn path_key(path: &Path) -> Vec<String> {
@@ -5123,6 +5301,11 @@ pub fn data_root_owner(root: &Path, home: Option<&Path>) -> Option<String> {
         return Some("root".to_owned());
     }
     let users = path_key(home?.parent()?);
+    // A home directly under the root (`/root` under `sudo`) names no directory
+    // of homes: every path would then "belong" to its first component.
+    if users.len() < 2 {
+        return None;
+    }
     if target.len() > users.len() && target[..users.len()] == users[..] {
         root.components()
             .nth(users.len())
@@ -5153,6 +5336,11 @@ pub struct ForeignService {
     pub root: PathBuf,
     /// The account that data root belongs to, when its path says.
     pub owner: Option<String>,
+    /// How a command run by this account reaches the installation, when it is
+    /// this account's own under other directories -- an install made with
+    /// `--data-dir`, seen from a command run without it, or the other way
+    /// round. `None` for another account's.
+    pub this_account: Option<String>,
     /// This account's own data root, which no registration runs against.
     pub local_root: PathBuf,
     /// Where this account's own install record is, or would be.
@@ -5168,6 +5356,9 @@ impl ForeignService {
     /// How to see the service's own details: as its owner, or elevated.
     #[must_use]
     pub fn where_to_look(&self) -> String {
+        if let Some(reach) = &self.this_account {
+            return reach.clone();
+        }
         let elevated = if cfg!(windows) {
             "from an elevated terminal (Run as administrator)"
         } else {
@@ -5178,6 +5369,26 @@ impl ForeignService {
                 format!("{elevated}, or signed in as {owner}")
             }
             _ => elevated.to_owned(),
+        }
+    }
+
+    /// Where a change to the service has to be made from: the installation's
+    /// own account, because every remedy a command prints acts on the
+    /// directories of whoever runs it. Elevation alone reads the service's
+    /// records but is still this account.
+    #[must_use]
+    pub fn act_as(&self) -> String {
+        if let Some(reach) = &self.this_account {
+            return reach.clone();
+        }
+        match &self.owner {
+            Some(owner) if owner != "LocalSystem" && owner != "root" => {
+                format!("signed in as {owner}")
+            }
+            _ => format!(
+                "from the account whose data root {} is",
+                self.root.display()
+            ),
         }
     }
 
@@ -5606,7 +5817,23 @@ impl ServiceStatus {
 
     /// Marks a status read from another installation's directories as that
     /// installation's. See [`ForeignService`].
+    ///
+    /// Its problems were written for its owner, and their remedies -- `service
+    /// install`, `auth login`, re-registering a drifted definition -- act on
+    /// the directories of whoever runs them. Printed to this account, which
+    /// reaches here precisely by following "run it elevated", they would
+    /// re-register the machine's service against this account's data root.
+    /// So each keeps its diagnosis and loses its remedy, and says where the
+    /// remedy has to be run instead.
     fn with_foreign(mut self, foreign: ForeignService) -> Self {
+        let act_as = foreign.act_as();
+        for problem in &mut self.problems {
+            problem.detail = format!(
+                "{}. Act on it {act_as}: a remedy run from this account acts on this account's \
+                 own directories, not the service's.",
+                diagnosis_only(&problem.detail)
+            );
+        }
         if let Some(note) = foreign.unused_local_note() {
             self.notes.push(note);
         }
@@ -11288,5 +11515,137 @@ logs = \"/d\"
             "{refused:?}"
         );
         assert!(InstallRecord::read(&earlier.paths).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_readable_foreign_service_keeps_its_diagnoses_and_loses_its_remedies() {
+        let (owner, earlier) = a_machine_with_a_stale_second_account();
+        // The owner's service has every problem whose remedy acts on the
+        // directories of whoever runs it.
+        owner.operations().stop().expect("stopped");
+        record_github_credential_rejected(&owner.paths, Utc::now()).expect("rejected");
+        record_credential_unreadable(&owner.paths, Utc::now()).expect("unreadable");
+
+        let status = second_account(&earlier, &owner).status().expect("a status");
+        assert!(status.foreign().is_some_and(|foreign| !foreign.is_unread()));
+        let subjects: Vec<_> = status.problems().iter().map(|p| p.subject).collect();
+        for subject in [
+            "runtime",
+            "github credential",
+            CREDENTIAL_UNREADABLE_SUBJECT,
+        ] {
+            assert!(subjects.contains(&subject), "{subject}: {status}");
+        }
+        let rendered = status.to_string();
+        for advice in DESTRUCTIVE_ADVICE {
+            assert!(!rendered.contains(advice), "{advice}: {rendered}");
+        }
+        for problem in status.problems() {
+            assert!(problem.detail.contains("Act on it"), "{problem}");
+        }
+    }
+
+    #[test]
+    fn no_command_of_this_account_changes_another_installations_service() {
+        let (owner, earlier) = a_machine_with_a_stale_second_account();
+        let operations = second_account(&earlier, &owner);
+        let foreign = |result: Result<(), ServiceError>| {
+            assert!(
+                matches!(result, Err(ServiceError::ForeignInstallation { .. })),
+                "{result:?}"
+            );
+        };
+        foreign(
+            operations
+                .install(&request_with_directories(&earlier, StartMode::Boot))
+                .map(drop),
+        );
+        foreign(operations.uninstall().map(drop));
+        foreign(operations.set_start_mode(StartMode::Boot).map(drop));
+        foreign(operations.start());
+        foreign(operations.stop().map(drop));
+
+        let registration = owner
+            .controls
+            .control(StartMode::Boot)
+            .unwrap()
+            .query(&ServiceIdentity::product())
+            .unwrap()
+            .expect("the owner's registration is still there");
+        assert_eq!(
+            ServiceDirectories::from_command_line(&registration.command_line),
+            Some(ServiceDirectories::of(&owner.paths)),
+            "and still runs against the owner's directories"
+        );
+        assert!(registration.running, "and was never stopped");
+        assert!(
+            InstallRecord::read(&earlier.paths).unwrap().is_some(),
+            "the refused uninstall kept this account's record"
+        );
+    }
+
+    #[test]
+    fn forget_local_leaves_agent_directories_nested_in_the_configuration_alone() {
+        // macOS puts state, runtime and logs inside the configuration
+        // directory: `config_local_dir` and `data_local_dir` are one folder.
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("Application Support");
+        let paths = AppPaths::from_directories(
+            &config,
+            config.join("state"),
+            config.join("runtime"),
+            config.join("logs"),
+        );
+        paths.create_all().unwrap();
+        std::fs::write(config.join(RECORD_FILE), b"an earlier install").unwrap();
+        std::fs::write(paths.logs_dir().join("runner-manager.log"), b"log").unwrap();
+        let operations = ServiceOperations::with_controls(
+            paths.clone(),
+            ServiceIdentity::product(),
+            std::sync::Arc::new(RecordingControls::new()),
+        );
+
+        let forgotten = operations.forget_local(Utc::now()).expect("archived");
+
+        assert_eq!(forgotten.moved, vec![config.join(RECORD_FILE)]);
+        for kept in [paths.state_dir(), paths.runtime_dir(), paths.logs_dir()] {
+            assert!(kept.is_dir(), "{} was moved", kept.display());
+        }
+        assert!(paths.logs_dir().join("runner-manager.log").is_file());
+    }
+
+    #[test]
+    fn a_remedy_is_cut_from_every_detail_a_builder_writes() {
+        for (detail, diagnosis) in [
+            (
+                "x holds an automatic registration, but the daemon is stopped. Run `runner-manager \
+                 service install --start-at boot`; if the service manager denies replacement",
+                "x holds an automatic registration, but the daemon is stopped",
+            ),
+            (
+                "store -- MISMATCH. Run `auth login` again so the token is stored",
+                "store -- MISMATCH",
+            ),
+            (
+                "unit differs, so the daemon runs under outdated settings. Re-register it with \
+                 `sudo runner-manager service install --start-at boot`",
+                "unit differs, so the daemon runs under outdated settings",
+            ),
+            (
+                "it starts no runner; the log has it. Sign in again: `runner-manager auth login`",
+                "it starts no runner; the log has it",
+            ),
+            (
+                "C:\\a\\runner-manager.exe -- STALE: moved. Run `service uninstall` and `service \
+                 install`",
+                "C:\\a\\runner-manager.exe -- STALE: moved",
+            ),
+            (
+                "a new builder: run `runner-manager service install` here, or not",
+                "the installation's own records report this",
+            ),
+        ] {
+            assert_eq!(diagnosis_only(detail), diagnosis, "{detail}");
+        }
     }
 }
