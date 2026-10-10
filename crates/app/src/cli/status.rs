@@ -496,9 +496,13 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
     let budget = HostBudget::of(interval, &targets);
     // Tolerant on purpose: `status` must answer when something is broken, and
     // an unreadable `polling.toml` is reported by `host show`, which refuses.
-    let intervals = super::polling::configured(context, &store)
-        .unwrap_or_else(|_| super::polling::Intervals::with_default_idle(interval));
-    let polling = super::polling::snapshot(context, intervals, &targets);
+    let configured = super::polling::configured(context, &store).unwrap_or_else(|error| {
+        (
+            super::polling::Intervals::with_default_idle(interval),
+            Some(error.to_string()),
+        )
+    });
+    let polling = super::polling::snapshot(context, configured, &targets);
 
     let runner_root = workspace::host_root(context.paths(), host.as_ref());
     let ephemeral = workspace::host_affected_attempts(&store)?;
@@ -871,6 +875,8 @@ mod tests {
             },
             polling: super::super::polling::PollingSnapshot {
                 idle_interval_secs: 10,
+                effective_idle_interval_secs: 10,
+                idle_interval_unreadable: None,
                 active_interval_secs: 60,
                 idle_requests_per_minute: 12,
                 secondary_limit_points_per_minute: 900,
@@ -879,6 +885,9 @@ mod tests {
                         .expect("a valid instant"),
                     stale: false,
                     observed_minutes: 60,
+                    full_responses: 40,
+                    not_modified_responses: 680,
+                    failed_responses: 0,
                     full_responses_per_hour: 40,
                     not_modified_responses_per_hour: 680,
                     failed_responses_per_hour: 0,
@@ -1005,7 +1014,9 @@ mod tests {
             keys(&emitted, "/polling"),
             [
                 "active_interval_secs",
+                "effective_idle_interval_secs",
                 "idle_interval_secs",
+                "idle_interval_unreadable",
                 "idle_requests_per_minute",
                 "measured",
                 "secondary_limit_points_per_minute",
@@ -1018,9 +1029,12 @@ mod tests {
                 "demand_shared_reads",
                 "demand_suppressed",
                 "demand_unchanged_reads",
+                "failed_responses",
                 "failed_responses_per_hour",
+                "full_responses",
                 "full_responses_per_hour",
                 "not_modified_percent",
+                "not_modified_responses",
                 "not_modified_responses_per_hour",
                 "observed_minutes",
                 "pace",

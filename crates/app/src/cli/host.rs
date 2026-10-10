@@ -1042,9 +1042,12 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     // requests the projection is the cost *if nothing were answered 304*, and
     // an operator deciding whether to lengthen an interval needs the measured
     // number in front of them. See `super::polling`.
-    let intervals = super::polling::configured(context, &store)?;
-    super::polling::write_section(out, &super::polling::snapshot(context, intervals, &targets))
-        .map_err(failed)?;
+    let configured = super::polling::configured(context, &store)?;
+    super::polling::write_section(
+        out,
+        &super::polling::snapshot(context, configured, &targets),
+    )
+    .map_err(failed)?;
     writeln!(out).map_err(failed)?;
     HostBudget::of(interval, &targets)
         .write(out)

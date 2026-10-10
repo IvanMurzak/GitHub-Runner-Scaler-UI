@@ -150,19 +150,26 @@ impl Intervals {
 /// The intervals configured for this host: the active one from its row (or
 /// the default before it has one), the idle one from `config/polling.toml`.
 ///
+/// An unreadable or below-floor `polling.toml` does not fail this: the
+/// default idle interval stands in, which is also what the daemon polls at,
+/// and the second half of the answer says why. Refusing instead would make
+/// `host set-poll-interval`, the command that repairs the file, fail on the
+/// file it is about to replace.
+///
 /// # Errors
-/// The local-state failures, and an unreadable or below-floor
-/// `polling.toml`.
-pub fn configured(context: &Context, store: &dyn Store) -> Result<Intervals, CliError> {
+/// The local-state failures reading the host row.
+pub fn configured(
+    context: &Context,
+    store: &dyn Store,
+) -> Result<(Intervals, Option<String>), CliError> {
     let active = local_host(store)?.map_or_else(RefreshInterval::default, |h| h.refresh_interval);
-    let idle = settings::idle_interval(context.paths()).map_err(|source| {
-        CliError::with_remedy(
-            Failure::LocalState,
-            format!("cannot read this host's idle poll interval: {source}"),
-            "runner-manager host set-poll-interval --idle 10s",
-        )
-    })?;
-    Ok(Intervals { active, idle })
+    Ok(match settings::idle_interval(context.paths()) {
+        Ok(idle) => (Intervals { active, idle }, None),
+        Err(error) => (
+            Intervals::with_default_idle(active),
+            Some(error.to_string()),
+        ),
+    })
 }
 
 /// Repository targets, and organization targets, among `targets`. An
@@ -195,7 +202,11 @@ pub fn set_poll_interval(
 ) -> Result<(), CliError> {
     let failed = write_failed("this host's poll intervals");
     let store = context.store()?;
-    let before = configured(context, &store)?;
+    let (before, unreadable) = configured(context, &store)?;
+    let targets: Vec<ScaleTarget> = store
+        .policies()
+        .map(|policies| policies.into_iter().map(|policy| policy.target).collect())
+        .unwrap_or_default();
 
     let invalid = |message: String| {
         CliError::with_remedy(
@@ -208,8 +219,8 @@ pub fn set_poll_interval(
         Some(secs) => RefreshInterval::from_secs(secs).map_err(|error| {
             invalid(format!(
                 "the active poll interval cannot be {secs}s: {error}. Active polls are full, \
-                 charged responses, and the 30-second floor keeps one host from spending a \
-                 tenth of the account's hourly quota on its own"
+                 charged responses: at the 30-second floor ten busy repositories already \
+                 project about 4,800 an hour, nearly the account's whole hourly quota"
             ))
         })?,
         None => before.active,
@@ -230,39 +241,72 @@ pub fn set_poll_interval(
              would make a target with nothing happening slower to notice new work than a busy one"
         )));
     }
-
-    if active != before.active {
-        let mut host = local_host_or_create(context, &store)?;
-        host.refresh_interval = active;
-        store.put_host(&host).map_err(|source| {
-            CliError::new(
-                Failure::LocalState,
-                format!("cannot store the active poll interval: {source}"),
-            )
-        })?;
+    // The same gate the dashboard applies to the refresh interval, and only
+    // for a shorter one: lengthening never adds load. Active polls are
+    // charged, so the projection is the right yardstick for them.
+    if active < before.active {
+        let budget = super::host::HostBudget::of(active, &targets);
+        if budget.exceeds_allowance() {
+            return Err(CliError::with_remedy(
+                Failure::BudgetRefused,
+                format!(
+                    "a {}-second active interval projects {} requests/hour for the configured \
+                     targets, over the {} this host may plan to spend. Nothing was changed.",
+                    active.as_secs(),
+                    budget.requests_per_hour(),
+                    budget.allowance()
+                ),
+                "choose a longer active interval or remove a target",
+            ));
+        }
     }
-    if idle != before.idle {
+
+    // An unreadable file is rewritten even when the value is unchanged: that
+    // is how this command repairs it.
+    let idle_written = idle != before.idle || unreadable.is_some();
+    if idle_written {
         settings::set_idle_interval(context.paths(), idle).map_err(|source| {
             CliError::new(
                 Failure::LocalState,
-                format!("cannot store the idle poll interval: {source}"),
+                format!("cannot store the idle poll interval: {source}. Nothing was changed."),
             )
         })?;
+    }
+    if active != before.active {
+        let stored = local_host_or_create(context, &store).and_then(|mut host| {
+            host.refresh_interval = active;
+            store
+                .put_host(&host)
+                .map_err(|source| CliError::new(Failure::LocalState, source.to_string()))
+        });
+        if let Err(error) = stored {
+            return Err(CliError::new(
+                Failure::LocalState,
+                format!(
+                    "cannot store the active poll interval: {error}{}",
+                    if idle_written {
+                        format!("; the idle interval was already stored as {idle}")
+                    } else {
+                        String::new()
+                    }
+                ),
+            ));
+        }
+    }
+    if let Some(reason) = &unreadable {
+        writeln!(out, "replaced an unreadable config/polling.toml ({reason})").map_err(failed)?;
     }
 
     writeln!(out, "idle poll interval:   {} -> {idle}", before.idle).map_err(failed)?;
     writeln!(out, "active poll interval: {} -> {active}", before.active).map_err(failed)?;
     let after = Intervals { active, idle };
-    let targets: Vec<ScaleTarget> = store
-        .policies()
-        .map(|policies| policies.into_iter().map(|policy| policy.target).collect())
-        .unwrap_or_default();
     let (repositories, organizations) = count_targets(&targets);
     writeln!(out).map_err(failed)?;
     write_idle_load(out, after, repositories, organizations).map_err(failed)?;
     writeln!(
         out,
-        "A running service picks the new intervals up within {} seconds; nothing restarts.",
+        "A running service reads the intervals again every {} seconds and each target adopts \
+         them at its next poll; nothing restarts.",
         RELOAD_EVERY.as_secs()
     )
     .map_err(failed)?;
@@ -300,10 +344,23 @@ fn write_idle_load(
     )
 }
 
-/// Whether a measurement written at `written_at` is older than the daemon
-/// lets it get while it runs.
+/// Whether a measurement written at `written_at` should be read as left
+/// behind by a daemon that is no longer running.
+///
+/// The daemon's own heartbeat decides first. A loop asleep through a long
+/// wait (a primary rate limit until its reset, an offline back-off, a
+/// stretched active interval) writes no measurement meanwhile, and calling
+/// that "not running" would hide the throttling the record exists to show,
+/// at the moment it matters. Only without a beating daemon does the record's
+/// age decide.
 #[must_use]
-pub fn is_stale(written_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+pub fn is_stale(paths: &AppPaths, written_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    if matches!(
+        runner_manager_platform::daemon_heartbeat::liveness(paths, now),
+        runner_manager_platform::daemon_heartbeat::Liveness::Beating { .. }
+    ) {
+        return false;
+    }
     now.signed_duration_since(written_at)
         .to_std()
         .is_ok_and(|age| age > STALE_AFTER)
@@ -316,7 +373,14 @@ pub fn is_stale(written_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 /// The polling section of `status --json`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PollingSnapshot {
+    /// The configured idle interval.
     pub idle_interval_secs: u16,
+    /// The idle interval the daemon uses: the configured one, capped at the
+    /// active interval.
+    pub effective_idle_interval_secs: u16,
+    /// Why `config/polling.toml` could not be read, when it could not; the
+    /// default idle interval stands in.
+    pub idle_interval_unreadable: Option<String>,
     pub active_interval_secs: u16,
     /// Requests a minute idle polling of this host's repository targets costs,
     /// at the idle interval.
@@ -336,6 +400,12 @@ pub struct MeasuredPolling {
     /// is probably not running.
     pub stale: bool,
     pub observed_minutes: u32,
+    /// The raw counts the per-hour figures are scaled from. Under ten
+    /// minutes of observation the scaled figures overstate: a new daemon's
+    /// first poll of every listing is a full `200`.
+    pub full_responses: u32,
+    pub not_modified_responses: u32,
+    pub failed_responses: u32,
     pub full_responses_per_hour: u32,
     pub not_modified_responses_per_hour: u32,
     pub failed_responses_per_hour: u32,
@@ -364,11 +434,14 @@ pub struct MeasuredPolling {
 
 impl MeasuredPolling {
     #[must_use]
-    pub fn of(traffic: &PollTraffic, now: DateTime<Utc>) -> Self {
+    pub fn of(paths: &AppPaths, traffic: &PollTraffic, now: DateTime<Utc>) -> Self {
         Self {
             written_at: traffic.written_at,
-            stale: is_stale(traffic.written_at, now),
+            stale: is_stale(paths, traffic.written_at, now),
             observed_minutes: traffic.observed_minutes,
+            full_responses: traffic.full,
+            not_modified_responses: traffic.not_modified,
+            failed_responses: traffic.failed,
             full_responses_per_hour: traffic.per_hour(traffic.full),
             not_modified_responses_per_hour: traffic.per_hour(traffic.not_modified),
             failed_responses_per_hour: traffic.per_hour(traffic.failed),
@@ -396,13 +469,16 @@ impl MeasuredPolling {
 #[must_use]
 pub fn snapshot(
     context: &Context,
-    intervals: Intervals,
+    (intervals, unreadable): (Intervals, Option<String>),
     targets: &[ScaleTarget],
 ) -> PollingSnapshot {
     let (repositories, _) = count_targets(targets);
     let now = context.clock().now();
     PollingSnapshot {
         idle_interval_secs: intervals.idle.as_secs(),
+        effective_idle_interval_secs: u16::try_from(intervals.effective_idle().as_secs())
+            .unwrap_or(u16::MAX),
+        idle_interval_unreadable: unreadable,
         active_interval_secs: intervals.active.as_secs(),
         idle_requests_per_minute: intervals.idle_requests_per_minute(repositories),
         secondary_limit_points_per_minute: SECONDARY_POINTS_PER_MINUTE,
@@ -411,7 +487,7 @@ pub fn snapshot(
         measured: settings::last_traffic(context.paths())
             .ok()
             .flatten()
-            .map(|traffic| MeasuredPolling::of(&traffic, now)),
+            .map(|traffic| MeasuredPolling::of(context.paths(), &traffic, now)),
     }
 }
 
@@ -424,9 +500,24 @@ pub fn write_section(out: &mut dyn Write, polling: &PollingSnapshot) -> io::Resu
     writeln!(out, "GitHub polling")?;
     writeln!(
         out,
-        "  idle interval             {}s   (a target with nothing happening; conditional, 304s)",
-        polling.idle_interval_secs
+        "  idle interval             {}s   (a target with nothing happening; conditional, 304s){}",
+        polling.effective_idle_interval_secs,
+        if polling.effective_idle_interval_secs == polling.idle_interval_secs {
+            String::new()
+        } else {
+            format!(
+                "; {}s configured, capped at the active interval",
+                polling.idle_interval_secs
+            )
+        }
     )?;
+    if let Some(reason) = &polling.idle_interval_unreadable {
+        writeln!(
+            out,
+            "  UNREADABLE                config/polling.toml ({reason}); the default stands in. \
+             `runner-manager host set-poll-interval --idle 10s` rewrites it"
+        )?;
+    }
     writeln!(
         out,
         "  active interval           {}s   (a target with runners up or runs changing)",
@@ -450,13 +541,23 @@ pub fn write_section(out: &mut dyn Write, polling: &PollingSnapshot) -> io::Resu
             ""
         }
     )?;
-    writeln!(
-        out,
-        "  responses per hour        {} full (200, charged) / {} not modified (304, free) / {} failed",
-        measured.full_responses_per_hour,
-        measured.not_modified_responses_per_hour,
-        measured.failed_responses_per_hour
-    )?;
+    if measured.observed_minutes < 10 {
+        writeln!(
+            out,
+            "  responses so far          {} full (200, charged) / {} not modified (304, free) / {} \
+             failed; too early for an hourly rate",
+            measured.full_responses, measured.not_modified_responses, measured.failed_responses
+        )?;
+    } else {
+        writeln!(
+            out,
+            "  responses per hour        {} full (200, charged) / {} not modified (304, free) / {} \
+             failed",
+            measured.full_responses_per_hour,
+            measured.not_modified_responses_per_hour,
+            measured.failed_responses_per_hour
+        )?;
+    }
     if let Some(percent) = measured.not_modified_percent {
         writeln!(out, "  share answered 304        {percent}%")?;
     }
@@ -568,23 +669,28 @@ impl PollingMonitor {
     /// [`RELOAD_EVERY`]. A read that fails keeps the last good pair: a loop
     /// must not stop because a settings file is mid-write.
     pub fn intervals(&self) -> Intervals {
-        let mut state = self.lock();
-        if state.read_at.elapsed() < RELOAD_EVERY {
-            return state.intervals;
-        }
-        state.read_at = Instant::now();
+        let current = {
+            let mut state = self.lock();
+            if state.read_at.elapsed() < RELOAD_EVERY {
+                return state.intervals;
+            }
+            // Claimed before the reads, so the other loops keep the current
+            // pair instead of all reading at once.
+            state.read_at = Instant::now();
+            state.intervals
+        };
+        // No lock across the database and the file: every loop would block
+        // behind a busy database otherwise.
         let active = match self.store.host(self.host_id) {
             Ok(Some(host)) => host.refresh_interval,
-            _ => state.intervals.active,
+            _ => current.active,
         };
-        let idle = match settings::idle_interval(&self.paths) {
-            Ok(idle) => idle,
-            Err(error) => {
-                tracing::warn!(%error, "the idle poll interval could not be read; keeping the last one");
-                state.intervals.idle
-            }
-        };
+        let idle = settings::idle_interval(&self.paths).unwrap_or_else(|error| {
+            tracing::warn!(%error, "the idle poll interval could not be read; keeping the last one");
+            current.idle
+        });
         let next = Intervals { active, idle };
+        let mut state = self.lock();
         if next != state.intervals {
             tracing::info!(
                 idle_secs = idle.as_secs(),
@@ -721,11 +827,13 @@ fn throttled_because(
             Some("GitHub's temporary authentication lockout; polls wait it out".to_string())
         }
         PollPace::Offline { consecutive } => Some(format!(
-            "GitHub is unreachable ({consecutive} poll(s) in a row); polls back off"
+            "GitHub is unreachable ({consecutive} poll(s) in a row); polls back off. Check this \
+             machine's network"
         )),
         PollPace::Blocked => Some(
-            "a target cannot be read (credential or permission); it is polled at the active \
-             interval so a fix is noticed"
+            "a target cannot be read: GitHub rejected the credential or a permission is missing. \
+             It is polled at the active interval so a fix is noticed; `runner-manager status` \
+             and `runner-manager auth status` say which"
                 .to_string(),
         ),
     }
@@ -766,6 +874,117 @@ mod tests {
             idle: IdlePollInterval::from_secs(60).expect("valid"),
         };
         assert_eq!(clamped.effective_idle(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn every_throttling_reason_reads_without_a_run_of_spaces() {
+        let now = Utc::now();
+        let quota = RateLimitSnapshot {
+            limit: 5_000,
+            remaining: 100,
+            used: Some(4_900),
+            reset_unix_secs: u64::try_from(now.timestamp() + 600).expect("positive"),
+            observed_at: now,
+        };
+        for pace in [
+            PollPace::Stretched {
+                pressure: PrimaryPressure::Low,
+            },
+            PollPace::Stretched {
+                pressure: PrimaryPressure::Critical,
+            },
+            PollPace::RateLimited {
+                kind: RateLimitKind::Primary,
+            },
+            PollPace::RateLimited {
+                kind: RateLimitKind::Secondary,
+            },
+            PollPace::LockedOut,
+            PollPace::Offline { consecutive: 2 },
+            PollPace::Blocked,
+        ] {
+            for quota in [None, Some(&quota)] {
+                let reason = throttled_because(pace, quota, now).expect("a slowdown says why");
+                assert!(!reason.contains("  "), "{pace}: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_beating_daemon_makes_an_old_measurement_current_and_a_dead_one_stale() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let paths = AppPaths::rooted_at(dir.path());
+        let now = Utc::now();
+        let hour_ago = now - chrono::TimeDelta::hours(1);
+        assert!(
+            is_stale(&paths, hour_ago, now),
+            "no daemon, and an hour old: left behind"
+        );
+        assert!(!is_stale(&paths, now, now), "fresh is never stale");
+        runner_manager_platform::daemon_heartbeat::beat(&paths, now).expect("a heartbeat");
+        assert!(
+            !is_stale(&paths, hour_ago, now),
+            "a daemon asleep through a long rate-limit wait writes nothing, and is not gone"
+        );
+    }
+
+    fn measured(observed_minutes: u32) -> PollingSnapshot {
+        let mut traffic = PollTraffic::new(Utc::now());
+        traffic.observed_minutes = observed_minutes;
+        traffic.full = 20;
+        traffic.not_modified = 0;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        PollingSnapshot {
+            idle_interval_secs: 10,
+            effective_idle_interval_secs: 10,
+            idle_interval_unreadable: None,
+            active_interval_secs: 60,
+            idle_requests_per_minute: 12,
+            secondary_limit_points_per_minute: SECONDARY_POINTS_PER_MINUTE,
+            measured: Some(MeasuredPolling::of(
+                &AppPaths::rooted_at(dir.path()),
+                &traffic,
+                Utc::now(),
+            )),
+        }
+    }
+
+    fn rendered(snapshot: &PollingSnapshot) -> String {
+        let mut out = Vec::new();
+        write_section(&mut out, snapshot).expect("rendered");
+        String::from_utf8(out).expect("UTF-8")
+    }
+
+    #[test]
+    fn a_new_daemons_first_minutes_are_shown_as_counts_not_as_an_hourly_rate() {
+        let early = rendered(&measured(1));
+        assert!(
+            early.contains("responses so far          20 full"),
+            "{early}"
+        );
+        assert!(
+            !early.contains("1200"),
+            "twenty first polls in one minute are not 1,200 an hour: {early}"
+        );
+        let later = rendered(&measured(30));
+        assert!(
+            later.contains("responses per hour        40 full"),
+            "{later}"
+        );
+    }
+
+    #[test]
+    fn the_idle_interval_shown_is_the_one_the_daemon_uses() {
+        let mut snapshot = measured(30);
+        snapshot.idle_interval_secs = 50;
+        snapshot.effective_idle_interval_secs = 30;
+        snapshot.active_interval_secs = 30;
+        let text = rendered(&snapshot);
+        assert!(
+            text.contains("idle interval             30s")
+                && text.contains("50s configured, capped at the active interval"),
+            "{text}"
+        );
     }
 
     #[test]

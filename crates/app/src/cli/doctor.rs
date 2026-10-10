@@ -274,8 +274,9 @@ pub struct HostSetup {
     #[serde(default, skip_serializing)]
     pub daemon_unfit: Option<host_fitness::HostUnfitRecord>,
     /// The poll intervals, and the daemon's last measurement of what polling
-    /// costs. `None` when the intervals could not be read.
-    #[serde(default)]
+    /// costs. `None` when the intervals could not be read. Never sent to
+    /// the elevated copy: no fix reads it.
+    #[serde(default, skip_serializing)]
     pub polling: Option<PollingFacts>,
 }
 
@@ -1289,8 +1290,11 @@ fn probe_pwsh(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
 /// waiting, and the daemon already does.
 fn probe_polling(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
     let Some(polling) = &setup.polling else {
-        return unknown("the poll intervals could not be read from config/polling.toml")
-            .remedy("runner-manager host set-poll-interval --idle 10s");
+        return unknown(
+            "config/polling.toml could not be read, so the service polls at the default idle \
+             interval",
+        )
+        .remedy("runner-manager host set-poll-interval --idle 10s (rewrites the file)");
     };
     let intervals = format!(
         "idle every {}s, active every {}s",
@@ -1332,10 +1336,21 @@ fn probe_polling(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
     );
     match &traffic.throttled_because {
         None => pass(format!("{detail}; not throttled")),
-        Some(reason) => fail(format!("{detail}. Throttled: {reason}")).remedy(
-            "nothing to do here; the service waits and recovers on its own. If the quota is \
-             low, something else signed in as the same GitHub user may be spending it",
-        ),
+        Some(reason) => {
+            let remedy = match traffic.pace.as_str() {
+                "blocked" => {
+                    "runner-manager auth status, then sign in again or grant the missing \
+                              permission"
+                }
+                "offline" => "check this machine's network; the service retries on its own",
+                _ => {
+                    "nothing to do here; the service waits and recovers on its own. If the \
+                      quota is low, something else signed in as the same GitHub user may be \
+                      spending it"
+                }
+            };
+            fail(format!("{detail}. Throttled: {reason}")).remedy(remedy)
+        }
     }
 }
 
@@ -2450,9 +2465,9 @@ fn setup_from_parts(
                         runner_manager_domain::model::RefreshInterval::DEFAULT_SECS,
                         |host| host.refresh_interval.as_secs(),
                     ),
-                    stale: traffic
-                        .as_ref()
-                        .is_some_and(|traffic| super::polling::is_stale(traffic.written_at, now)),
+                    stale: traffic.as_ref().is_some_and(|traffic| {
+                        super::polling::is_stale(context.paths(), traffic.written_at, now)
+                    }),
                     traffic,
                 }
             }),

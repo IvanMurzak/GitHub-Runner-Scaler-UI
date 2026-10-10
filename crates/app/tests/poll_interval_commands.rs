@@ -116,10 +116,59 @@ fn host_set_poll_interval_refuses_what_the_daemon_would_refuse_and_writes_nothin
     let refused = cli(data.path(), &["host", "set-poll-interval", "--idle", "4s"]);
     assert_eq!(refused.code, INVALID_ARGUMENT, "{}", refused.both());
 
+    // The active value is valid; the idle one is not. Nothing may be
+    // written, the host row included.
+    let mixed = cli(
+        data.path(),
+        &[
+            "host",
+            "set-poll-interval",
+            "--active",
+            "45",
+            "--idle",
+            "4s",
+        ],
+    );
+    assert_eq!(mixed.code, INVALID_ARGUMENT, "{}", mixed.both());
+
     let neither = cli(data.path(), &["host", "set-poll-interval"]);
     assert_ne!(neither.code, 0, "one of --idle or --active is required");
 
     let unchanged = polling(data.path());
     assert_eq!(unchanged["idle_interval_secs"], 10);
     assert_eq!(unchanged["active_interval_secs"], 60);
+}
+
+#[test]
+fn an_unreadable_polling_toml_is_reported_and_repaired_by_the_command_that_names_it() {
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(data.path().join("config")).unwrap();
+    std::fs::write(
+        settings_file(data.path()),
+        "schema_version = 1\nidle_interval_secs = 1\n",
+    )
+    .unwrap();
+
+    let reported = polling(data.path());
+    assert_eq!(reported["idle_interval_secs"], 10, "the default stands in");
+    assert!(
+        reported["idle_interval_unreadable"].is_string(),
+        "{reported}"
+    );
+    let shown = cli(data.path(), &["host", "show"]);
+    assert_eq!(shown.code, 0, "host show still answers: {}", shown.both());
+    assert!(shown.stdout.contains("UNREADABLE"), "{}", shown.stdout);
+
+    let repaired = cli(data.path(), &["host", "set-poll-interval", "--idle", "10s"]);
+    assert_eq!(repaired.code, 0, "{}", repaired.both());
+    assert!(
+        repaired
+            .stdout
+            .contains("replaced an unreadable config/polling.toml"),
+        "{}",
+        repaired.stdout
+    );
+    let after = polling(data.path());
+    assert_eq!(after["idle_interval_unreadable"], serde_json::Value::Null);
+    assert_eq!(after["idle_interval_secs"], 10);
 }

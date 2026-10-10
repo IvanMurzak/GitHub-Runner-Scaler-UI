@@ -84,7 +84,10 @@ pub fn set_idle_interval(paths: &AppPaths, idle: IdlePollInterval) -> Result<(),
 /// Every count covers the last hour at most; [`Self::observed_minutes`] says
 /// how much of it. The rate-limit fields are the **account's** quota as GitHub
 /// last reported it, which every host signed in as the same user shares.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `default` on every field: a CLI newer or older than the service's private
+// copy of the binary must still read what the service wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PollTraffic {
     pub schema_version: u32,
     pub written_at: DateTime<Utc>,

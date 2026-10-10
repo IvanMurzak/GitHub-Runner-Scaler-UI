@@ -305,10 +305,17 @@ async fn run_generation(
     // Shared, so a repository covered by two targets is read once per idle
     // interval, every listing's `ETag` is kept in one place, and a rate limit
     // one loop meets silences every loop. See `RestDemand`.
-    let intervals = super::polling::configured(context, store.as_ref()).unwrap_or_else(|error| {
-        tracing::warn!(%error, "the poll intervals could not be read; using the defaults");
-        super::polling::Intervals::with_default_idle(host.refresh_interval)
-    });
+    let intervals = match super::polling::configured(context, store.as_ref()) {
+        Ok((intervals, None)) => intervals,
+        Ok((intervals, Some(reason))) => {
+            tracing::warn!(%reason, "the idle poll interval could not be read; using the default");
+            intervals
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the poll intervals could not be read; using the defaults");
+            super::polling::Intervals::with_default_idle(host.refresh_interval)
+        }
+    };
     let demand_gateway = Arc::new(RestDemand::new(Arc::clone(&client), Arc::clone(&clock)));
     let polling = Arc::new(super::polling::PollingMonitor::new(
         context.paths().clone(),
