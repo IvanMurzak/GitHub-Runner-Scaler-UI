@@ -10909,4 +10909,295 @@ logs = \"/d\"
             );
         }
     }
+
+    // -- another installation's service ---------------------------------------
+
+    /// A request that records `host`'s own four directories on the command
+    /// line, the way `service install` registers one.
+    fn request_with_directories(host: &Host, mode: StartMode) -> InstallRequest {
+        let mut arguments: Vec<OsString> = DAEMON_ARGUMENTS.iter().map(OsString::from).collect();
+        arguments.extend(ServiceDirectories::of(&host.paths).arguments());
+        host.request(mode).with_arguments(arguments)
+    }
+
+    /// The operations a second account on the same machine gets: its own
+    /// directories, and the machine's one service manager.
+    fn second_account(account: &Host, machine: &Host) -> ServiceOperations {
+        ServiceOperations::with_controls(
+            account.paths.clone(),
+            ServiceIdentity::product(),
+            std::sync::Arc::new(machine.controls.clone()),
+        )
+        .with_runner_root(account.runner_root.clone())
+    }
+
+    /// The owner's boot service, and a second account holding the record of
+    /// an earlier login install of its own -- the layout an owner reported on
+    /// a Windows host with two local accounts.
+    fn a_machine_with_a_stale_second_account() -> (Host, Host) {
+        let owner = Host::new();
+        owner
+            .operations()
+            .install(&request_with_directories(&owner, StartMode::Boot))
+            .expect("the owner's boot install");
+        let earlier = Host::new();
+        earlier
+            .operations()
+            .install(&request_with_directories(&earlier, StartMode::Login))
+            .expect("the second account's earlier login install");
+        assert!(
+            InstallRecord::read(&earlier.paths).unwrap().is_some(),
+            "the earlier install left its record behind"
+        );
+        (owner, earlier)
+    }
+
+    /// The advice that, followed from the second account, breaks or replaces
+    /// the owner's healthy service.
+    const DESTRUCTIVE_ADVICE: [&str; 4] = [
+        "service uninstall",
+        "service install`",
+        "service install --",
+        "auth login",
+    ];
+
+    #[test]
+    fn a_service_installed_from_another_data_root_is_reported_as_that_installations() {
+        let (owner, earlier) = a_machine_with_a_stale_second_account();
+
+        let status = second_account(&earlier, &owner).status().expect("a status");
+
+        let foreign = status.foreign().expect("the service is the owner's");
+        assert_eq!(foreign.directories, ServiceDirectories::of(&owner.paths));
+        assert_eq!(foreign.root, ServiceDirectories::of(&owner.paths).root());
+        assert!(foreign.unreadable.is_none(), "{status}");
+        assert!(
+            status.is_healthy(),
+            "the owner's service is healthy, and a stale record elsewhere is not its fault: \
+             {status}"
+        );
+        for subject in [
+            "binary",
+            "start mode",
+            "secret store",
+            "record",
+            "registration",
+        ] {
+            assert!(
+                !status
+                    .problems()
+                    .iter()
+                    .any(|problem| problem.subject == subject),
+                "{subject} compared the second account's record against the owner's \
+                 registration: {status}"
+            );
+        }
+        let rendered = status.to_string();
+        for advice in DESTRUCTIVE_ADVICE {
+            assert!(!rendered.contains(advice), "{advice}: {rendered}");
+        }
+        assert!(rendered.contains("another installation's"), "{rendered}");
+        assert!(
+            status
+                .notes()
+                .iter()
+                .any(|note| note.contains("unused local configuration")
+                    && note.contains("host forget-local")),
+            "{status}"
+        );
+        // What the owner recorded, not what the second account did.
+        assert_eq!(status.start_mode(), Some(StartMode::Boot));
+    }
+
+    #[test]
+    fn a_foreign_service_whose_records_cannot_be_read_reports_only_what_the_manager_says() {
+        let (owner, earlier) = a_machine_with_a_stale_second_account();
+        // Stands in for a profile this account may not open: there is nothing
+        // to read where the registration points.
+        InstallRecord::remove(&owner.paths).expect("the owner's record removed");
+
+        let operations = second_account(&earlier, &owner);
+        let status = operations.status().expect("a status");
+        let foreign = status.foreign().expect("the service is the owner's");
+        assert!(foreign.unreadable.is_some(), "{status}");
+        assert!(
+            status.is_healthy(),
+            "running, and nothing it could judge: {status}"
+        );
+        let rendered = status.to_string();
+        for advice in DESTRUCTIVE_ADVICE {
+            assert!(!rendered.contains(advice), "{advice}: {rendered}");
+        }
+        assert!(rendered.contains("running; installed from"), "{rendered}");
+        assert!(!rendered.contains("last GitHub contact"), "{rendered}");
+
+        // Stopped, it is a problem -- with a place to look, not a reinstall.
+        owner.operations().stop().expect("stopped");
+        let stopped = operations.status().expect("a status");
+        assert!(!stopped.is_healthy(), "{stopped}");
+        let rendered = stopped.to_string();
+        for advice in DESTRUCTIVE_ADVICE {
+            assert!(!rendered.contains(advice), "{advice}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn this_accounts_own_registration_still_reports_every_mismatch() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&request_with_directories(&host, StartMode::Boot))
+            .expect("an install");
+        let other = host.binary.with_file_name("someone-elses");
+        std::fs::write(&other, b"x").expect("writable");
+        // Something edited the registration, keeping its directories.
+        host.controls.edit("runner-manager", |registration| {
+            let mut arguments = split_command_line(&registration.command_line);
+            arguments[0] = other.to_string_lossy().into_owned();
+            registration.command_line = arguments
+                .iter()
+                .map(|argument| quote_argument(argument))
+                .collect::<Vec<_>>()
+                .join(" ");
+            registration.start_mode = StartMode::Login;
+        });
+
+        let status = operations.status().expect("a status");
+        assert!(status.foreign().is_none(), "{status}");
+        assert!(
+            matches!(status.binary(), Some(BinaryPath::Diverged { .. })),
+            "{status}"
+        );
+        assert!(
+            status
+                .problems()
+                .iter()
+                .any(|problem| problem.subject == "start mode"),
+            "{status}"
+        );
+        assert!(status.to_string().contains("service uninstall"), "{status}");
+    }
+
+    #[test]
+    fn directories_read_back_from_a_command_line_with_spaces() {
+        let root = Path::new("/Users/someone/Library/Application Support/runner manager");
+        let directories = ServiceDirectories {
+            config: root.join("config"),
+            state: root.join("data").join("state"),
+            runtime: root.join("data").join("runtime"),
+            logs: root.join("data").join("logs"),
+        };
+        let mut command_line = quote_argument("/usr/local/bin/runner-manager");
+        for argument in ["daemon", "run"]
+            .map(OsString::from)
+            .into_iter()
+            .chain(directories.arguments())
+        {
+            command_line.push(' ');
+            command_line.push_str(&quote_argument(&argument.to_string_lossy()));
+        }
+        assert_eq!(
+            ServiceDirectories::from_command_line(&command_line),
+            Some(directories.clone())
+        );
+        assert_eq!(directories.root(), root);
+        assert_eq!(
+            ServiceDirectories::from_command_line("runner-manager daemon run"),
+            None,
+            "a registration that names no directories cannot be judged foreign"
+        );
+    }
+
+    #[test]
+    fn the_owner_of_a_data_root_is_read_from_its_path() {
+        let users = Path::new(if cfg!(windows) { r"C:\Users" } else { "/home" });
+        let home = users.join("ivand");
+        assert_eq!(
+            data_root_owner(&users.join("yuriv").join("data"), Some(&home)).as_deref(),
+            Some("yuriv")
+        );
+        assert_eq!(
+            data_root_owner(
+                Path::new(if cfg!(windows) { r"D:\rm" } else { "/opt/rm" }),
+                Some(&home)
+            ),
+            None
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                data_root_owner(
+                    Path::new(r"C:\Windows\System32\config\systemprofile\AppData"),
+                    Some(&home)
+                )
+                .as_deref(),
+                Some("LocalSystem")
+            );
+        } else {
+            assert_eq!(
+                data_root_owner(Path::new("/root/.config/runner-manager"), Some(&home)).as_deref(),
+                Some("root")
+            );
+        }
+    }
+
+    #[test]
+    fn forget_local_archives_the_unused_record_and_never_touches_the_service_root() {
+        let (owner, earlier) = a_machine_with_a_stale_second_account();
+        let owner_before = snapshot(&[owner._root.path()]);
+        let config = earlier.paths.config_dir().to_path_buf();
+        let record = std::fs::read(InstallRecord::path(&earlier.paths)).unwrap();
+
+        let forgotten = second_account(&earlier, &owner)
+            .forget_local(Utc::now())
+            .expect("archived");
+
+        assert_eq!(
+            snapshot(&[owner._root.path()]),
+            owner_before,
+            "the owner's directories must not change by one byte"
+        );
+        let archive = forgotten.archive.expect("something was archived");
+        assert!(archive.starts_with(&config), "{}", archive.display());
+        assert_eq!(
+            std::fs::read(archive.join(RECORD_FILE)).unwrap(),
+            record,
+            "moved, not rewritten or deleted"
+        );
+        assert!(InstallRecord::read(&earlier.paths).unwrap().is_none());
+        assert_eq!(
+            forgotten.service_root,
+            Some(ServiceDirectories::of(&owner.paths).root())
+        );
+        // Afterwards the second account's status has no unused record to note.
+        let status = second_account(&earlier, &owner).status().expect("status");
+        assert!(
+            !status
+                .notes()
+                .iter()
+                .any(|note| note.contains("unused local configuration")),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn forget_local_refuses_a_configuration_a_service_runs_against() {
+        let (owner, earlier) = a_machine_with_a_stale_second_account();
+        let before = snapshot(&[owner._root.path()]);
+        let refused = owner.operations().forget_local(Utc::now());
+        assert!(
+            matches!(refused, Err(ServiceError::LocalConfigurationInUse { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(snapshot(&[owner._root.path()]), before);
+
+        // Nor while an agent holds the second account's own lock.
+        let _agent = HostLock::try_acquire(&earlier.paths, LockKind::SingleInstance)
+            .expect("the agent's lock");
+        let refused = second_account(&earlier, &owner).forget_local(Utc::now());
+        assert!(
+            matches!(refused, Err(ServiceError::LocalConfigurationInUse { .. })),
+            "{refused:?}"
+        );
+        assert!(InstallRecord::read(&earlier.paths).unwrap().is_some());
+    }
 }

@@ -5959,6 +5959,140 @@ fn ready_service() -> LocalServiceReadiness {
     }
 }
 
+/// The second account's view on a Windows host whose boot service another
+/// account installed: the service's own directories, and this account's
+/// abandoned login record.
+#[cfg(test)]
+fn foreign_service(unreadable: bool) -> runner_manager_platform::service::ForeignService {
+    use runner_manager_platform::service::{
+        ForeignService, InstallRecord, ServiceAccount, ServiceDirectories,
+    };
+    let root = std::path::Path::new(r"C:\Users\yuriv\AppData\Local\IvanMurzak\runner-manager");
+    let local = std::path::Path::new(r"C:\Users\ivand\rm");
+    let local_directories = ServiceDirectories {
+        config: local.join("config"),
+        state: local.join("data").join("state"),
+        runtime: local.join("data").join("runtime"),
+        logs: local.join("data").join("logs"),
+    };
+    let record = InstallRecord {
+        schema_version: runner_manager_platform::service::RECORD_SCHEMA_VERSION,
+        service_name: "runner-manager".into(),
+        manager: "Windows Task Scheduler".into(),
+        start_mode: StartMode::Login,
+        account: ServiceAccount::InvokingUser,
+        binary: local_directories
+            .state
+            .join("bin")
+            .join("runner-manager-supervisor.exe"),
+        source_binary: None,
+        arguments: vec!["daemon".into(), "run".into()],
+        restart_delay_secs: 15,
+        restart_reset_secs: 600,
+        log_file: local_directories.log_file(),
+        starts_on_demand: false,
+        definition_path: None,
+        installed_at: chrono::DateTime::from_timestamp(1_791_143_815, 0).expect("a time"),
+        installed_by_version: "0.4.30".into(),
+        directories: local_directories,
+    };
+    ForeignService {
+        directories: ServiceDirectories {
+            config: root.join("config"),
+            state: root.join("data").join("state"),
+            runtime: root.join("data").join("runtime"),
+            logs: root.join("data").join("logs"),
+        },
+        root: root.to_path_buf(),
+        owner: Some("yuriv".into()),
+        local_root: r"C:\Users\ivand\rm".into(),
+        local_record: r"C:\Users\ivand\rm\config\service.toml".into(),
+        unused_local_record: Some(record),
+        unreadable: unreadable.then(|| "this account cannot read service.toml".into()),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn another_installations_service_is_not_blocked_by_this_accounts_stale_record() {
+    const DESTRUCTIVE: [&str; 4] = [
+        "service uninstall",
+        "service install",
+        "auth login",
+        "--start-at",
+    ];
+    let unread = readiness_from_facts(
+        Ok(LocalServiceReadiness {
+            start_mode: None,
+            foreign: Some(foreign_service(true)),
+            ..ready_service()
+        }),
+        true,
+        &[],
+        "12:00:00Z".into(),
+    );
+    assert_eq!(
+        unread.state,
+        OperationalReadiness::Unknown,
+        "{:?}",
+        unread.activity
+    );
+    assert!(unread.summary.contains("yuriv"), "{}", unread.summary);
+    assert!(
+        unread
+            .activity
+            .iter()
+            .any(|row| row.id == "readiness:local:service-elsewhere"
+                && row.remediation.contains("elevated")),
+        "{:?}",
+        unread.activity
+    );
+    assert!(
+        unread
+            .activity
+            .iter()
+            .any(|row| row.id == "readiness:local:unused-configuration"
+                && row.outcome == screens::ActivityOutcome::Info
+                && row.remediation.contains("host forget-local")),
+        "{:?}",
+        unread.activity
+    );
+    for row in &unread.activity {
+        for advice in DESTRUCTIVE {
+            assert!(
+                !row.remediation.contains(advice) && !row.summary.contains(advice),
+                "{advice}: {row:?}"
+            );
+        }
+    }
+
+    // A problem the owner's own records show is still reported -- with a
+    // place to look, never a reinstall from this account.
+    let stalled = readiness_from_facts(
+        Ok(LocalServiceReadiness {
+            problems: vec![("daemon stalled".into(), "no progress since 09:00".into())],
+            foreign: Some(foreign_service(false)),
+            ..ready_service()
+        }),
+        true,
+        &[],
+        "12:00:00Z".into(),
+    );
+    assert_eq!(stalled.state, OperationalReadiness::Blocked);
+    let row = stalled
+        .activity
+        .iter()
+        .find(|row| row.id == "readiness:local:daemon-stalled")
+        .expect("the stall is reported");
+    assert!(row.summary.contains("yuriv"), "{row:?}");
+    assert!(
+        row.remediation
+            .starts_with("Run `runner-manager service status` ")
+            && row.remediation.contains("signed in as yuriv"),
+        "{row:?}"
+    );
+}
+
 #[cfg(test)]
 #[test]
 fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {

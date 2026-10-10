@@ -40,6 +40,35 @@ the version being prepared rather than the version in `Cargo.toml`.
   `304`. `status --json` carries the measurement under `polling`. A new `host doctor` check,
   `github.polling`, reports the same and never blocks runners.
 
+### Fixes
+
+- A second account on a machine whose service another account installed is told so, and is
+  no longer told to break it. A Windows host's boot service had been installed by one
+  administrator, and another account that had once run a login-mode install opened
+  `runner-manager tui`: RUNNER READINESS: BLOCKED, a "STALE" service binary, a start mode
+  "mismatch", a secret store "MISMATCH" and a login-only warning, with `service uninstall`,
+  `service install` and `auth login` as the fixes. All of it compared that account's abandoned
+  0.4.30 record against the other installation's registration. Followed from that account,
+  those fixes would have stopped, replaced or broken a service that was running jobs. The
+  service manager's registration names the data directories the service runs against, and when
+  they are not this account's, `service status`, `status`, `host doctor` and the TUI now report
+  the service as the other installation's: its state, its account, the data root it was
+  installed from and whose that is. Where this account can read that installation's records, the
+  report is exactly what its owner would see. Where it cannot, it says that, and to look from an
+  elevated terminal or as that account, instead of guessing. No reinstall or sign-in is ever
+  suggested for it. The TUI shows UNKNOWN rather than BLOCKED and says that its counts are this
+  account's own configuration, which the service does not run. `status --json` carries the other
+  installation's data root as `product.service_installed_from`, and the `host doctor --json`
+  document as `service_installed_from`. The same holds on macOS and Linux for a root-owned boot
+  service seen by a user with a leftover login record. A registration made before the directory
+  options existed names no directories, so it is still judged as this account's own.
+- `runner-manager host forget-local` moves an account's unused configuration (its old install
+  record, database, host row and policies) into a `forgotten-<time>` directory inside its
+  configuration directory. Nothing is deleted, so moving the files back restores it. It refuses
+  while a service on the machine runs against that configuration or an agent holds its lock, and
+  it never touches the service's own directories or any secret store. The service report names it
+  when it finds such a record.
+
 ## 0.4.37
 
 ### Changes

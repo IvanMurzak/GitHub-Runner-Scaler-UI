@@ -64,6 +64,10 @@ const SURFACE: [(&str, &[&str]); 10] = [
             "prepare",
             "required-tools",
             "cache",
+            // Owner decision 2026-10-10: an account whose earlier install was
+            // replaced by another installation's service archives its unused
+            // configuration instead of following remedies meant for the service.
+            "forget-local",
         ],
     ),
     (
