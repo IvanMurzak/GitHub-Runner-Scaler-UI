@@ -69,9 +69,12 @@ use crate::{ApiRequest, ApiResponse, AuthenticatedClient, GithubError, Validator
 
 /// How long an entry nobody asked for is kept.
 ///
-/// Longer than any poll interval this product allows, so a listing polled at
-/// all is never evicted between two of its own polls.
-pub const IDLE_ENTRY_TTL: Duration = Duration::from_secs(15 * 60);
+/// Longer than any wait the schedule produces in practice: the 15-minute
+/// ceilings on the offline and rate-limit back-offs, and the active interval
+/// stretched four times under a critically low quota up to a 30-minute
+/// active interval. An entry evicted by a long wait costs one charged `200`
+/// on the next poll, which is exactly the wrong moment when the quota is low.
+pub const IDLE_ENTRY_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// The most entries kept. A ceiling against a pathological number of runs,
 /// not a size anyone should reach: ten repositories with a handful of active
@@ -80,7 +83,9 @@ pub const MAX_ENTRIES: usize = 1_024;
 
 struct Entry {
     validators: Validators,
-    response: ApiResponse,
+    /// Shared, so answering a `304` hands out a reference rather than a copy
+    /// of a body that may be a hundred workflow runs long.
+    response: Arc<ApiResponse>,
     last_used: Timestamp,
 }
 
@@ -89,7 +94,7 @@ struct Entry {
 pub struct Fetched {
     /// The full response: freshly received, or the cached copy GitHub said is
     /// still current. Never a bodiless `304`.
-    pub response: ApiResponse,
+    pub response: Arc<ApiResponse>,
     /// `true` when GitHub answered `304` and `response` is the cached copy.
     pub not_modified: bool,
 }
@@ -147,7 +152,7 @@ impl ConditionalCache {
     ) -> Result<Fetched, GithubError> {
         let key = request.cache_key();
         let validators = self.lock().get(&key).map(|entry| entry.validators.clone());
-        let sent = match validators {
+        let sent = match validators.clone() {
             Some(validators) => request.clone().conditional(validators),
             None => request.clone(),
         };
@@ -155,20 +160,18 @@ impl ConditionalCache {
         let now = self.clock.now();
 
         if response.is_not_modified() {
-            let cached = self.lock().get_mut(&key).map(|entry| {
-                entry.last_used = now;
-                entry.response.clone()
-            });
+            let cached = self.cached_for(&key, validators.as_ref(), now);
             if let Some(response) = cached {
                 return Ok(Fetched {
                     response,
                     not_modified: true,
                 });
             }
-            // The entry was evicted between the lookup and the answer, so the
-            // body GitHub says is current is gone. Ask again without
-            // validators: one charged request, instead of a bodiless reply.
-            let response = client.send(request).await?;
+            // The entry was evicted or replaced between the lookup and the
+            // answer, so the body GitHub says is current is gone. Ask again
+            // without validators: one charged request, instead of a bodiless
+            // or wrong reply.
+            let response = Arc::new(client.send(request).await?);
             self.store(key, &response, now);
             return Ok(Fetched {
                 response,
@@ -176,6 +179,7 @@ impl ConditionalCache {
             });
         }
 
+        let response = Arc::new(response);
         self.store(key, &response, now);
         Ok(Fetched {
             response,
@@ -183,7 +187,28 @@ impl ConditionalCache {
         })
     }
 
-    fn store(&self, key: String, response: &ApiResponse, now: Timestamp) {
+    /// The cached body a `304` to `sent` vouches for, if it is still the one
+    /// cached.
+    ///
+    /// Only the body the validators we SENT describe. Another request for
+    /// this key may have stored a different answer meanwhile, and a `304`
+    /// vouches for ours, not for whatever is cached now.
+    fn cached_for(
+        &self,
+        key: &str,
+        sent: Option<&Validators>,
+        now: Timestamp,
+    ) -> Option<Arc<ApiResponse>> {
+        self.lock()
+            .get_mut(key)
+            .filter(|entry| Some(&entry.validators) == sent)
+            .map(|entry| {
+                entry.last_used = now;
+                Arc::clone(&entry.response)
+            })
+    }
+
+    fn store(&self, key: String, response: &Arc<ApiResponse>, now: Timestamp) {
         let validators = Validators::of(response);
         let mut entries = self.lock();
         if validators.is_empty() {
@@ -196,7 +221,7 @@ impl ConditionalCache {
             key,
             Entry {
                 validators,
-                response: response.clone(),
+                response: Arc::clone(response),
                 last_used: now,
             },
         );
@@ -465,6 +490,32 @@ mod tests {
             matches!(error, GithubError::Status { status: 304, .. }),
             "{error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_304_vouches_only_for_the_body_its_validators_describe() {
+        let server = MockServer::start().await;
+        mount_unchanged_listing(&server, json!({ "total_count": 0, "workflow_runs": [] })).await;
+        let clock = Arc::new(TestClock::default());
+        let client = client(&server, Arc::clone(&clock));
+        let cache = ConditionalCache::new(Arc::clone(&clock) as Arc<dyn Clock>);
+        let _ = cache.send(&client, &listing()).await.expect("an answer");
+        let key = listing().cache_key();
+        let ours = Validators {
+            etag: Some(ETAG.to_string()),
+            last_modified: None,
+        };
+        let theirs = Validators {
+            etag: Some(r#"W/"stored-by-a-request-that-finished-later""#.to_string()),
+            last_modified: None,
+        };
+
+        assert!(cache.cached_for(&key, Some(&ours), clock.now()).is_some());
+        assert!(
+            cache.cached_for(&key, Some(&theirs), clock.now()).is_none(),
+            "a 304 to other validators must not hand out the body cached now"
+        );
+        assert!(cache.cached_for(&key, None, clock.now()).is_none());
     }
 
     #[tokio::test]

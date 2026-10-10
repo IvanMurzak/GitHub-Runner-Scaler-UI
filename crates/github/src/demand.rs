@@ -452,7 +452,10 @@ impl QueuedDemand {
     /// moment polling is free, because every answer is a `304`.
     #[must_use]
     pub fn is_quiet(&self) -> bool {
-        self.busy.is_empty()
+        // An unavailable repository is not quiet either: its failing listing
+        // is not cached, so every poll of it is a charged request, and an
+        // idle interval would multiply that by six.
+        self.busy.is_empty() && self.unavailable.is_empty()
     }
 
     /// The account's hourly quota as GitHub reported it during this poll.
@@ -731,13 +734,16 @@ struct SharedReadings {
     /// The window, in milliseconds. Atomic so the daemon can change it when
     /// the host's idle interval changes, without stopping a loop.
     window_ms: AtomicU64,
-    /// Never pruned: bounded by the repositories this daemon serves, and a
-    /// daemon that starts serving a different set restarts with a new gateway.
+    /// Pruned of readings older than [`HOLD_MEMORY`] on every insert.
     readings: Mutex<BTreeMap<OwnerRepo, (Timestamp, RepositoryDemand)>>,
     /// One gate per repository, so two loops asking at once make one request
     /// between them.
     gates: Mutex<BTreeMap<OwnerRepo, Arc<tokio::sync::Mutex<()>>>>,
 }
+
+/// How long an ended rate-limit hold is still remembered as part of the same
+/// episode, and how long an unused shared reading is kept.
+const HOLD_MEMORY: Duration = Duration::from_secs(60 * 60);
 
 /// The rate-limit quiet period, host-wide.
 #[derive(Debug, Clone, Copy)]
@@ -852,7 +858,14 @@ impl RestDemand {
             .hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner))?;
-        let left = hold.until.signed_duration_since(now).to_std().ok()?;
+        let left = hold
+            .until
+            .signed_duration_since(now)
+            .to_std()
+            .ok()?
+            // A clock that jumped backwards must not stretch the hold past
+            // the longest one this gateway ever sets.
+            .min(MAX_RATE_LIMIT_BACKOFF);
         if left.is_zero() {
             return None;
         }
@@ -886,12 +899,26 @@ impl RestDemand {
             .hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let consecutive_secondary = match (limit.kind, *hold) {
-            (RateLimitKind::Secondary, Some(previous)) => {
+        // A hold that ended long ago is not part of this episode: a secondary
+        // limit days after the last one starts from one minute again, even if
+        // nothing but errors came back in between.
+        let previous = (*hold).filter(|previous| {
+            now.signed_duration_since(previous.until)
+                < chrono::TimeDelta::from_std(HOLD_MEMORY).unwrap_or(chrono::TimeDelta::MAX)
+        });
+        // The doubling counts EPISODES, not answers. Every target loop shares
+        // this gateway, so one secondary limit can come back on several
+        // requests that were in flight together; each of those is the same
+        // limit, and only an answer arriving after the previous hold ended is
+        // GitHub saying "still limited".
+        let live = previous.filter(|previous| previous.until > now);
+        let consecutive_secondary = match (limit.kind, previous, live) {
+            (RateLimitKind::Primary, _, _) => 0,
+            (RateLimitKind::Secondary, _, Some(live)) => live.consecutive_secondary.max(1),
+            (RateLimitKind::Secondary, Some(previous), None) => {
                 previous.consecutive_secondary.saturating_add(1)
             }
-            (RateLimitKind::Secondary, None) => 1,
-            (RateLimitKind::Primary, _) => 0,
+            (RateLimitKind::Secondary, None, None) => 1,
         };
         let mut wait = limit.delay_from(now);
         if consecutive_secondary > 1 {
@@ -899,11 +926,22 @@ impl RestDemand {
                 .saturating_mul(1_u32 << (consecutive_secondary - 1).min(10));
             wait = wait.max(doubled).min(MAX_RATE_LIMIT_BACKOFF);
         }
-        let until = now + chrono::TimeDelta::from_std(wait).unwrap_or(chrono::TimeDelta::MAX);
+        let mut until = now
+            .checked_add_signed(chrono::TimeDelta::from_std(wait).unwrap_or(chrono::TimeDelta::MAX))
+            .unwrap_or(now);
+        // A later answer never SHORTENS a hold in force: a primary limit with
+        // a near reset must not reopen traffic a secondary limit closed.
+        if let Some(live) = live
+            && live.until > until
+        {
+            until = live.until;
+            wait = until.signed_duration_since(now).to_std().unwrap_or(wait);
+        }
         *hold = Some(RateLimitHold {
             until,
             limit,
-            consecutive_secondary,
+            consecutive_secondary: consecutive_secondary
+                .max(live.map_or(0, |live| live.consecutive_secondary)),
         });
         RateLimited {
             retry_after: Some(wait),
@@ -1090,7 +1128,7 @@ impl RestDemand {
         );
         // Held across the fetch, so a second loop asking for this repository
         // meanwhile waits for this reading instead of making its own request.
-        let _gate = gate.lock().await;
+        let _gate = cancel.run(async { Ok(gate.lock().await) }).await?;
         let now = self.clock.now();
         let fresh = self
             .shared
@@ -1109,11 +1147,19 @@ impl RestDemand {
             return Ok(reading);
         }
         let reading = self.repository_queued(repository, cancel).await?;
-        self.shared
+        let mut readings = self
+            .shared
             .readings
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(repository.clone(), (now, reading.clone()));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        readings.insert(repository.clone(), (now, reading.clone()));
+        // A repository that left an organization's list stops being asked
+        // for; its reading goes once nobody could use it.
+        readings.retain(|_, (at, _)| {
+            now.signed_duration_since(*at)
+                .to_std()
+                .is_ok_and(|age| age < HOLD_MEMORY)
+        });
         Ok(reading)
     }
 
@@ -2922,6 +2968,110 @@ mod tests {
             clock.advance_secs(i64::try_from(wait.as_secs()).expect("fits"));
         }
         assert_eq!(waits, [60, 120, 240, 480]);
+    }
+
+    fn secondary(retry_after: Option<u64>) -> RateLimited {
+        RateLimited {
+            kind: RateLimitKind::Secondary,
+            retry_after: retry_after.map(Duration::from_secs),
+            remaining: Some(4_000),
+            reset_unix_secs: None,
+        }
+    }
+
+    /// Every loop shares the gateway, so one secondary limit can come back on
+    /// several requests that were in flight together. That is one episode.
+    #[tokio::test]
+    async fn answers_to_one_secondary_limit_in_flight_together_are_one_episode() {
+        let server = MockServer::start().await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock);
+        let now = clock.now();
+
+        let waits: Vec<u64> = (0..4)
+            .map(|_| {
+                gateway
+                    .hold_for(secondary(None), now)
+                    .retry_after
+                    .expect("a wait")
+                    .as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [60, 60, 60, 60], "four answers, one limit");
+
+        clock.advance_secs(60);
+        let again = gateway.hold_for(secondary(None), clock.now());
+        assert_eq!(
+            again.retry_after,
+            Some(Duration::from_secs(120)),
+            "an answer after the hold ended is GitHub saying \"still limited\""
+        );
+    }
+
+    /// A primary limit with a near reset must not reopen what a secondary
+    /// limit closed.
+    #[tokio::test]
+    async fn a_later_answer_never_shortens_a_hold_in_force() {
+        let server = MockServer::start().await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock);
+
+        let _ = gateway.hold_for(secondary(Some(600)), clock.now());
+        let primary = RateLimited {
+            kind: RateLimitKind::Primary,
+            retry_after: None,
+            remaining: Some(0),
+            reset_unix_secs: Some(u64::try_from(clock.now().timestamp() + 30).expect("positive")),
+        };
+        let after = gateway.hold_for(primary, clock.now());
+        assert_eq!(after.retry_after, Some(Duration::from_secs(600)));
+        clock.advance_secs(300);
+        assert_eq!(
+            gateway
+                .held(clock.now())
+                .and_then(|limit| limit.retry_after),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn an_unavailable_repository_is_not_quiet() {
+        assert!(QueuedDemand::default().is_quiet());
+        assert!(
+            !QueuedDemand::default()
+                .with_unavailable(repo(), "404")
+                .is_quiet(),
+            "its failing listing is charged on every poll; polling it every few seconds \
+             would multiply that"
+        );
+    }
+
+    /// A draining loop must not wait behind another loop's read.
+    #[tokio::test]
+    async fn a_cancelled_loop_does_not_wait_for_another_loops_read() {
+        let server = MockServer::start().await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock).with_shared_readings(Duration::from_secs(10));
+        let gate = Arc::clone(
+            gateway
+                .shared
+                .gates
+                .lock()
+                .expect("gates")
+                .entry(repo())
+                .or_default(),
+        );
+        let _another_loop = gate.lock().await;
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            gateway.repository_reading(&repo(), &cancel),
+        )
+        .await
+        .expect("a cancelled loop returns at once instead of queueing on the gate");
+        assert!(answer.is_err_and(|error| error.is_cancelled()));
     }
 
     /// A success in between resets the doubling.

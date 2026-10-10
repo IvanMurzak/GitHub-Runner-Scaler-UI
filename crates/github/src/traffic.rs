@@ -223,7 +223,12 @@ impl ApiTraffic {
 
     /// Count one response.
     pub fn record(&self, status: StatusCode, headers: &HeaderMap, now: Timestamp) {
-        let snapshot = RateLimitSnapshot::from_headers(headers, now);
+        // The quota is read only off answers made with the credential: a
+        // `401` carries the unauthenticated 60-an-hour bucket, which is not
+        // the one this host spends.
+        let snapshot = (status.is_success() || status == StatusCode::NOT_MODIFIED)
+            .then(|| RateLimitSnapshot::from_headers(headers, now))
+            .flatten();
         let mut inner = self
             .inner
             .lock()
@@ -437,6 +442,25 @@ mod tests {
         let latest = traffic.latest_rate_limit().expect("a reading");
         assert_eq!(latest.remaining, 4_000);
         assert_eq!(latest.used, Some(1_000));
+    }
+
+    #[test]
+    fn the_quota_is_read_only_off_answers_made_with_the_credential() {
+        let traffic = ApiTraffic::new();
+        traffic.record(StatusCode::OK, &quota(4_000, 5_000), at(10));
+        let mut anonymous = quota(59, 5_000);
+        anonymous.insert("x-ratelimit-limit", HeaderValue::from_static("60"));
+        traffic.record(StatusCode::UNAUTHORIZED, &anonymous, at(11));
+        assert_eq!(
+            traffic.latest_rate_limit().map(|quota| quota.remaining),
+            Some(4_000),
+            "a 401 carries the unauthenticated bucket, not this host's"
+        );
+        traffic.record(StatusCode::NOT_MODIFIED, &quota(3_999, 5_000), at(12));
+        assert_eq!(
+            traffic.latest_rate_limit().map(|quota| quota.remaining),
+            Some(3_999)
+        );
     }
 
     #[test]

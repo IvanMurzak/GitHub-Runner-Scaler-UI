@@ -2209,8 +2209,10 @@ impl AuthenticatedClient {
         let response = builder.send().await.map_err(transport)?;
         let status = response.status();
         let headers = response.headers().clone();
-        let body = response.bytes().await.map_err(transport)?.to_vec();
+        // Counted on the headers, before the body: GitHub charged the request
+        // whether or not the body then arrives whole.
         self.traffic.record(status, &headers, self.clock.now());
+        let body = response.bytes().await.map_err(transport)?.to_vec();
 
         tracing::debug!(
             method = request.method.as_str(),
