@@ -327,7 +327,11 @@ pub const MANIFEST: &[Classification] = &[
         ],
         exclusion: Some(Exclusion {
             boundary: Boundary::HostConfiguration,
-            reason: "The intervals change only how often the daemon polls GitHub, which the                      generated oracle does not model: no policy, attempt, root or credential.                      Dedicated real-process tests drive both flags against polling.toml and the                      host row under --data-dir, read them back through status and host show,                      and pin every refusal and that it writes nothing.",
+            reason: "The intervals change only how often the daemon polls GitHub, which the \
+                     generated oracle does not model: no policy, attempt, root or credential. \
+                     Dedicated real-process tests drive both flags against polling.toml and the \
+                     host row under --data-dir, read them back through status and host show, \
+                     and pin every refusal and that it writes nothing.",
         }),
     },
     generated("host set-runtime-root"),

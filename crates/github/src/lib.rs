@@ -1250,7 +1250,7 @@ pub struct AuthenticatedClient {
     /// Every response this client received, counted. Observation only:
     /// nothing in this client decides anything from it. See
     /// [`crate::traffic`].
-    traffic: Arc<traffic::ApiTraffic>,
+    traffic: traffic::ApiTraffic,
 }
 
 impl fmt::Debug for AuthenticatedClient {
@@ -1410,7 +1410,7 @@ impl AuthenticatedClient {
                 until: None,
                 backoff: DEFAULT_LOCKOUT_BACKOFF,
             }),
-            traffic: Arc::new(traffic::ApiTraffic::new()),
+            traffic: traffic::ApiTraffic::new(),
         }
     }
 
@@ -1422,7 +1422,7 @@ impl AuthenticatedClient {
     /// What this client has received from GitHub, by class, and the newest
     /// reading of the account's hourly quota.
     #[must_use]
-    pub fn traffic(&self) -> &Arc<traffic::ApiTraffic> {
+    pub const fn traffic(&self) -> &traffic::ApiTraffic {
         &self.traffic
     }
 

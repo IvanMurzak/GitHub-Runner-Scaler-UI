@@ -307,10 +307,7 @@ async fn run_generation(
     // one loop meets silences every loop. See `RestDemand`.
     let intervals = super::polling::configured(context, store.as_ref()).unwrap_or_else(|error| {
         tracing::warn!(%error, "the poll intervals could not be read; using the defaults");
-        super::polling::Intervals {
-            active: host.refresh_interval,
-            idle: runner_manager_domain::model::IdlePollInterval::default(),
-        }
+        super::polling::Intervals::with_default_idle(host.refresh_interval)
     });
     let demand_gateway = Arc::new(RestDemand::new(Arc::clone(&client), Arc::clone(&clock)));
     let polling = Arc::new(super::polling::PollingMonitor::new(
@@ -403,8 +400,7 @@ async fn run_generation(
                     jitter: Arc::new(RandomJitter),
                     events: Arc::clone(&events),
                 },
-            )
-            .with_idle_interval(intervals.effective_idle()),
+            ),
             cancel,
             polling: Arc::clone(&polling),
         });
@@ -416,8 +412,7 @@ async fn run_generation(
     let contacts: Arc<dyn ContactRecorder> = Arc::new(FileContactRecorder {
         paths: context.paths().clone(),
         clock: Arc::clone(&clock),
-        write: Mutex::new(()),
-        recorded_at: Mutex::new(None),
+        write: Mutex::new(None),
     });
     // Captured before the targets are moved into their loops: this is the set a
     // restart is measured against.
@@ -2005,42 +2000,38 @@ trait ContactRecorder: Send + Sync + 'static {
 struct FileContactRecorder {
     paths: runner_manager_platform::paths::AppPaths,
     clock: Arc<dyn Clock>,
-    write: Mutex<()>,
-    /// When the record was last written. Every target loop records a contact
-    /// on every pass, and an idle loop passes every few seconds; the record
-    /// answers "is the service reaching GitHub now", which a timestamp a few
-    /// seconds old answers as well as a fresh one, so it is rewritten at most
-    /// every [`CONTACT_RECORD_EVERY`] instead of several times a second.
-    recorded_at: Mutex<Option<std::time::Instant>>,
+    /// Serialises the three records, and holds when the contact record was
+    /// last written. Every target loop records a contact on every pass, and an
+    /// idle loop passes every few seconds; the record answers "is the service
+    /// reaching GitHub now", which a timestamp a few seconds old answers as
+    /// well as a fresh one, so it is rewritten at most every
+    /// [`CONTACT_RECORD_EVERY`] instead of several times a second. Stamped only
+    /// after a write succeeds, so a failed write is retried on the next pass.
+    write: Mutex<Option<std::time::Instant>>,
 }
 
-/// See [`FileContactRecorder::recorded_at`].
+/// See [`FileContactRecorder::write`].
 const CONTACT_RECORD_EVERY: Duration = Duration::from_secs(30);
 
 impl ContactRecorder for FileContactRecorder {
     fn record(&self) -> Result<(), CliError> {
-        {
-            let mut recorded_at = self
-                .recorded_at
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if recorded_at.is_some_and(|at| at.elapsed() < CONTACT_RECORD_EVERY) {
-                return Ok(());
-            }
-            *recorded_at = Some(std::time::Instant::now());
-        }
-        let _write = self.write.lock().map_err(|_| {
+        let mut written_at = self.write.lock().map_err(|_| {
             CliError::new(
                 Failure::LocalState,
                 "cannot lock the last successful GitHub contact record",
             )
         })?;
+        if written_at.is_some_and(|at| at.elapsed() < CONTACT_RECORD_EVERY) {
+            return Ok(());
+        }
         record_github_contact(&self.paths, self.clock.now()).map_err(|source| {
             CliError::new(
                 Failure::LocalState,
                 format!("cannot record the last successful GitHub contact: {source}"),
             )
-        })
+        })?;
+        *written_at = Some(std::time::Instant::now());
+        Ok(())
     }
 
     fn rejected(&self) {

@@ -1303,7 +1303,8 @@ fn probe_polling(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
     };
     if polling.stale {
         return unknown(format!(
-            "{intervals}; the last measurement is from {}, so the service is probably not              running",
+            "{intervals}; the last measurement is from {}, so the service is probably not \
+             running",
             traffic.written_at.to_rfc3339()
         ));
     }
@@ -1311,7 +1312,8 @@ fn probe_polling(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
         || "no responses yet".to_string(),
         |percent| {
             format!(
-                "{percent}% of {} responses over {} minute(s) were 304 (free against the hourly                  quota)",
+                "{percent}% of {} responses over {} minute(s) were 304 (free against the hourly \
+                 quota)",
                 traffic.total(),
                 traffic.observed_minutes
             )
@@ -1331,7 +1333,8 @@ fn probe_polling(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
     match &traffic.throttled_because {
         None => pass(format!("{detail}; not throttled")),
         Some(reason) => fail(format!("{detail}. Throttled: {reason}")).remedy(
-            "nothing to do here; the service waits and recovers on its own. If the quota is              low, something else signed in as the same GitHub user may be spending it",
+            "nothing to do here; the service waits and recovers on its own. If the quota is \
+             low, something else signed in as the same GitHub user may be spending it",
         ),
     }
 }
@@ -2447,11 +2450,9 @@ fn setup_from_parts(
                         runner_manager_domain::model::RefreshInterval::DEFAULT_SECS,
                         |host| host.refresh_interval.as_secs(),
                     ),
-                    stale: traffic.as_ref().is_some_and(|traffic| {
-                        now.signed_duration_since(traffic.written_at)
-                            .to_std()
-                            .is_ok_and(|age| age > super::polling::STALE_AFTER)
-                    }),
+                    stale: traffic
+                        .as_ref()
+                        .is_some_and(|traffic| super::polling::is_stale(traffic.written_at, now)),
                     traffic,
                 }
             }),
@@ -5925,6 +5926,18 @@ mod tests {
 
         let stale = evaluate(&polling_setup(Some(measured(None)), true), &facts);
         assert_eq!(finding(&stale, "github.polling").status, Status::Unknown);
+
+        // Every wording, read in full: a lost line continuation pads a
+        // sentence with a run of spaces that no substring check notices.
+        for report in [&healthy, &throttled, &stale] {
+            let found = finding(report, "github.polling");
+            for text in [Some(&found.detail), found.remedy.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                assert!(!text.contains("  "), "a run of spaces: {text}");
+            }
+        }
 
         let never = evaluate(&polling_setup(None, false), &facts);
         assert_eq!(finding(&never, "github.polling").status, Status::Pass);

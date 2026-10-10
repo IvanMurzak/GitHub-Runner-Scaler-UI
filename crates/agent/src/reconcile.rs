@@ -648,7 +648,7 @@ impl PollSchedule {
     /// make a quiet target *slower* to notice work than a busy one.
     #[must_use]
     pub fn with_idle(mut self, idle: Duration) -> Self {
-        self.idle = idle.min(self.nominal()).max(Self::idle_floor());
+        self.set_intervals(self.interval, idle);
         self
     }
 
@@ -2487,13 +2487,6 @@ impl Reconciler {
     #[must_use]
     pub const fn schedule(&self) -> &PollSchedule {
         &self.schedule
-    }
-
-    /// Poll a quiet target every `idle` rather than every active interval.
-    #[must_use]
-    pub fn with_idle_interval(mut self, idle: Duration) -> Self {
-        self.schedule = self.schedule.with_idle(idle);
-        self
     }
 
     /// Adopt intervals an operator changed while the loop runs.

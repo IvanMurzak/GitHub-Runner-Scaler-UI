@@ -39,7 +39,9 @@ use runner_manager_domain::model::{
 use runner_manager_domain::store::Store;
 use runner_manager_github::demand::RestDemand;
 use runner_manager_github::rest::RateLimitKind;
-use runner_manager_github::traffic::{PrimaryPressure, SECONDARY_POINTS_PER_MINUTE};
+use runner_manager_github::traffic::{
+    PrimaryPressure, RateLimitSnapshot, SECONDARY_POINTS_PER_MINUTE, secondary_share_percent,
+};
 use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::polling::{self as settings, PollTraffic};
 use serde::Serialize;
@@ -114,6 +116,16 @@ pub struct Intervals {
 }
 
 impl Intervals {
+    /// `active`, with the default idle interval: what a reader that could
+    /// not read `polling.toml` falls back to.
+    #[must_use]
+    pub fn with_default_idle(active: RefreshInterval) -> Self {
+        Self {
+            active,
+            idle: IdlePollInterval::default(),
+        }
+    }
+
     /// The idle interval the daemon actually uses: never longer than the
     /// active one.
     #[must_use]
@@ -124,8 +136,9 @@ impl Intervals {
     }
 
     /// Requests a minute `repositories` idle repositories cost this host, at
-    /// the effective idle interval: every one a `304`, so free against the
-    /// hourly quota and not against the secondary limit.
+    /// the effective idle interval. Each is a `304` while nothing changes, so
+    /// free against the hourly quota, but each still counts against the
+    /// secondary limit.
     #[must_use]
     pub fn idle_requests_per_minute(&self, repositories: u32) -> u32 {
         let secs = self.effective_idle().as_secs().max(1);
@@ -211,7 +224,7 @@ pub fn set_poll_interval(
         })?,
         None => before.idle,
     };
-    if u64::from(idle.as_secs()) > u64::from(active.as_secs()) {
+    if idle.as_secs() > active.as_secs() {
         return Err(invalid(format!(
             "an idle interval of {idle} is longer than the active interval of {active}, which \
              would make a target with nothing happening slower to notice new work than a busy one"
@@ -283,8 +296,17 @@ fn write_idle_load(
         "  ({}% of GitHub's {SECONDARY_POINTS_PER_MINUTE}/minute secondary limit, which every host \
          signed in as the same user shares). Each is a conditional request answered `304`, free \
          against the hourly quota while nothing changes.",
-        per_minute.saturating_mul(100) / SECONDARY_POINTS_PER_MINUTE
+        secondary_share_percent(per_minute)
     )
+}
+
+/// Whether a measurement written at `written_at` is older than the daemon
+/// lets it get while it runs.
+#[must_use]
+pub fn is_stale(written_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(written_at)
+        .to_std()
+        .is_ok_and(|age| age > STALE_AFTER)
 }
 
 // ---------------------------------------------------------------------------
@@ -331,26 +353,28 @@ pub struct MeasuredPolling {
     pub rate_limit_remaining: Option<u64>,
     pub rate_limit_used: Option<u64>,
     pub rate_limit_reset: Option<DateTime<Utc>>,
+    /// Since the daemon started: repository readings fetched, how many of
+    /// them were all `304`, readings handed to a second target instead of
+    /// fetched again, and polls withheld inside a rate-limit quiet period.
+    pub demand_reads: u64,
+    pub demand_unchanged_reads: u64,
+    pub demand_shared_reads: u64,
+    pub demand_suppressed: u64,
 }
 
 impl MeasuredPolling {
     #[must_use]
     pub fn of(traffic: &PollTraffic, now: DateTime<Utc>) -> Self {
-        let age = now
-            .signed_duration_since(traffic.written_at)
-            .to_std()
-            .unwrap_or_default();
         Self {
             written_at: traffic.written_at,
-            stale: age > STALE_AFTER,
+            stale: is_stale(traffic.written_at, now),
             observed_minutes: traffic.observed_minutes,
             full_responses_per_hour: traffic.per_hour(traffic.full),
             not_modified_responses_per_hour: traffic.per_hour(traffic.not_modified),
             failed_responses_per_hour: traffic.per_hour(traffic.failed),
             not_modified_percent: traffic.not_modified_percent(),
             peak_requests_per_minute: traffic.peak_requests_per_minute,
-            secondary_limit_percent: traffic.peak_requests_per_minute.saturating_mul(100)
-                / SECONDARY_POINTS_PER_MINUTE,
+            secondary_limit_percent: secondary_share_percent(traffic.peak_requests_per_minute),
             pace: traffic.pace.clone(),
             targets_idle: traffic.targets_idle,
             targets_total: traffic.targets_total,
@@ -360,6 +384,10 @@ impl MeasuredPolling {
             rate_limit_remaining: traffic.rate_limit_remaining,
             rate_limit_used: traffic.rate_limit_used,
             rate_limit_reset: traffic.rate_limit_reset,
+            demand_reads: traffic.demand_reads,
+            demand_unchanged_reads: traffic.demand_unchanged_reads,
+            demand_shared_reads: traffic.demand_shared_reads,
+            demand_suppressed: traffic.demand_suppressed,
         }
     }
 }
@@ -455,6 +483,15 @@ pub fn write_section(out: &mut dyn Write, polling: &PollingSnapshot) -> io::Resu
     }
     writeln!(
         out,
+        "  repository readings       {} fetched ({} all 304), {} shared between targets, {} \
+         withheld while rate limited",
+        measured.demand_reads,
+        measured.demand_unchanged_reads,
+        measured.demand_shared_reads,
+        measured.demand_suppressed
+    )?;
+    writeln!(
+        out,
         "  pace                      {} ({} of {} target(s) idle)",
         measured.pace, measured.targets_idle, measured.targets_total
     )?;
@@ -485,7 +522,7 @@ pub struct PollingMonitor {
 struct MonitorState {
     intervals: Intervals,
     read_at: Instant,
-    paces: BTreeMap<String, PollPace>,
+    paces: BTreeMap<ScaleTarget, PollPace>,
     written_at: Option<Instant>,
 }
 
@@ -564,7 +601,12 @@ impl PollingMonitor {
     /// due.
     pub fn observe(&self, target: &ScaleTarget, next: &NextPoll) {
         let mut state = self.lock();
-        state.paces.insert(target.to_string(), next.pace);
+        match state.paces.get_mut(target) {
+            Some(pace) => *pace = next.pace,
+            None => {
+                state.paces.insert(target.clone(), next.pace);
+            }
+        }
         if state
             .written_at
             .is_some_and(|written| written.elapsed() < WRITE_EVERY)
@@ -640,7 +682,7 @@ const fn pace_severity(pace: &PollPace) -> u8 {
 /// Why polling is slower than configured, in words, or `None` when it is not.
 fn throttled_because(
     pace: PollPace,
-    quota: Option<&runner_manager_github::traffic::RateLimitSnapshot>,
+    quota: Option<&RateLimitSnapshot>,
     now: DateTime<Utc>,
 ) -> Option<String> {
     match pace {

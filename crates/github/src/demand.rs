@@ -455,12 +455,6 @@ impl QueuedDemand {
         self.busy.is_empty()
     }
 
-    /// The repositories that made this reading not quiet.
-    #[must_use]
-    pub const fn busy(&self) -> &BTreeSet<OwnerRepo> {
-        &self.busy
-    }
-
     /// The account's hourly quota as GitHub reported it during this poll.
     ///
     /// Every response carries it, a `304` included, and it describes every
@@ -737,6 +731,8 @@ struct SharedReadings {
     /// The window, in milliseconds. Atomic so the daemon can change it when
     /// the host's idle interval changes, without stopping a loop.
     window_ms: AtomicU64,
+    /// Never pruned: bounded by the repositories this daemon serves, and a
+    /// daemon that starts serving a different set restarts with a new gateway.
     readings: Mutex<BTreeMap<OwnerRepo, (Timestamp, RepositoryDemand)>>,
     /// One gate per repository, so two loops asking at once make one request
     /// between them.
@@ -774,8 +770,6 @@ pub struct DemandStats {
     /// Polls answered "rate limited" without a request, inside the host-wide
     /// quiet period.
     pub suppressed: u64,
-    /// Whether that quiet period is in force now.
-    pub held: bool,
 }
 
 impl fmt::Debug for RestDemand {
@@ -831,8 +825,7 @@ impl RestDemand {
     }
 
     /// The window readings are shared for.
-    #[must_use]
-    pub fn shared_window(&self) -> Duration {
+    fn shared_window(&self) -> Duration {
         Duration::from_millis(self.shared.window_ms.load(Ordering::SeqCst))
     }
 
@@ -844,7 +837,6 @@ impl RestDemand {
             unchanged_reads: self.stats.unchanged_reads.load(Ordering::SeqCst),
             shared_reads: self.stats.shared_reads.load(Ordering::SeqCst),
             suppressed: self.stats.suppressed.load(Ordering::SeqCst),
-            held: self.held(self.clock.now()).is_some(),
         }
     }
 
@@ -2893,7 +2885,6 @@ mod tests {
             "a request inside the quiet period is the one GitHub said not to send"
         );
         assert_eq!(gateway.stats().suppressed, 1);
-        assert!(gateway.stats().held);
 
         // At the end of the window, the next poll asks again.
         clock.advance_secs(22);

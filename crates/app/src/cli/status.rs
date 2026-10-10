@@ -496,11 +496,8 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
     let budget = HostBudget::of(interval, &targets);
     // Tolerant on purpose: `status` must answer when something is broken, and
     // an unreadable `polling.toml` is reported by `host show`, which refuses.
-    let intervals =
-        super::polling::configured(context, &store).unwrap_or(super::polling::Intervals {
-            active: interval,
-            idle: runner_manager_domain::model::IdlePollInterval::default(),
-        });
+    let intervals = super::polling::configured(context, &store)
+        .unwrap_or_else(|_| super::polling::Intervals::with_default_idle(interval));
     let polling = super::polling::snapshot(context, intervals, &targets);
 
     let runner_root = workspace::host_root(context.paths(), host.as_ref());
@@ -797,7 +794,8 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
     writeln!(out)?;
     writeln!(
         out,
-        "Shared REST budget: {} requests/hour projected if no poll were answered 304, of {}          this host may spend",
+        "Shared REST budget: {} requests/hour projected if no poll were answered 304, of {} \
+         this host may spend",
         document.budget.projected_requests_per_hour, document.budget.allowance_requests_per_hour
     )?;
     writeln!(
@@ -896,6 +894,10 @@ mod tests {
                     rate_limit_remaining: Some(4200),
                     rate_limit_used: Some(800),
                     rate_limit_reset: None,
+                    demand_reads: 360,
+                    demand_unchanged_reads: 350,
+                    demand_shared_reads: 0,
+                    demand_suppressed: 0,
                 }),
             },
             policies: vec![PolicySnapshot {
@@ -1012,6 +1014,10 @@ mod tests {
         assert_eq!(
             keys(&emitted, "/polling/measured"),
             [
+                "demand_reads",
+                "demand_shared_reads",
+                "demand_suppressed",
+                "demand_unchanged_reads",
                 "failed_responses_per_hour",
                 "full_responses_per_hour",
                 "not_modified_percent",

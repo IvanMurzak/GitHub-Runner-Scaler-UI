@@ -34,9 +34,15 @@
 //!   `GET …/actions/runs/{id}/jobs?filter=latest&per_page=100` and
 //!   `GET /repos/{o}/{r}/actions/runners?per_page=100` each return a **weak**
 //!   `ETag` (`W/"…"`) and `Cache-Control: private, max-age=60`.
-//! * For an unchanged listing the `ETag` is stable: twelve conditional requests
-//!   ten seconds apart on each of those five listings were answered `304`
-//!   twelve times out of twelve, with one distinct `ETag`.
+//! * For an unchanged listing the `ETag` is stable. Five listings were asked
+//!   twelve times, ten seconds apart: an idle repository's queued and
+//!   in-progress runs, a queued-runs listing holding two stuck runs, one of
+//!   those runs' jobs, and a repository's runners. All sixty answers were
+//!   `304`, one distinct `ETag` per listing.
+//! * A listing that is changing is not: while CI ran, the jobs of an
+//!   in-progress run changed on 11 of 18 polls ten seconds apart, and the
+//!   in-progress runs listing on 1 of 18. That is why an active target keeps
+//!   the longer active interval.
 //! * A `304` carries the account's `x-ratelimit-*` headers, and twenty `304`s
 //!   in a row left `x-ratelimit-used` unchanged apart from other clients'
 //!   traffic on the same account — consistent with the documented exemption.
@@ -72,7 +78,6 @@ pub const IDLE_ENTRY_TTL: Duration = Duration::from_secs(15 * 60);
 /// runs each use a few dozen.
 pub const MAX_ENTRIES: usize = 1_024;
 
-#[derive(Clone)]
 struct Entry {
     validators: Validators,
     response: ApiResponse,
@@ -196,9 +201,7 @@ impl ConditionalCache {
             },
         );
         if entries.len() > MAX_ENTRIES {
-            let idle =
-                chrono::TimeDelta::from_std(IDLE_ENTRY_TTL).unwrap_or(chrono::TimeDelta::MAX);
-            entries.retain(|_, entry| now.signed_duration_since(entry.last_used) < idle);
+            retain_recent(&mut entries, now);
         }
         while entries.len() > MAX_ENTRIES {
             let Some(oldest) = entries
@@ -215,10 +218,14 @@ impl ConditionalCache {
     /// Drop every entry unused for [`IDLE_ENTRY_TTL`].
     pub fn evict_idle(&self) {
         let now = self.clock.now();
-        let idle = chrono::TimeDelta::from_std(IDLE_ENTRY_TTL).unwrap_or(chrono::TimeDelta::MAX);
-        self.lock()
-            .retain(|_, entry| now.signed_duration_since(entry.last_used) < idle);
+        retain_recent(&mut self.lock(), now);
     }
+}
+
+/// Keep only the entries used within [`IDLE_ENTRY_TTL`] of `now`.
+fn retain_recent(entries: &mut HashMap<String, Entry>, now: Timestamp) {
+    let idle = chrono::TimeDelta::from_std(IDLE_ENTRY_TTL).unwrap_or(chrono::TimeDelta::MAX);
+    entries.retain(|_, entry| now.signed_duration_since(entry.last_used) < idle);
 }
 
 #[cfg(test)]

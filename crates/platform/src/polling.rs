@@ -43,8 +43,7 @@ fn settings_path(paths: &AppPaths) -> PathBuf {
 }
 
 /// Where the measurement lives.
-#[must_use]
-pub fn traffic_path(paths: &AppPaths) -> PathBuf {
+fn traffic_path(paths: &AppPaths) -> PathBuf {
     paths.state_dir().join(TRAFFIC_FILE)
 }
 

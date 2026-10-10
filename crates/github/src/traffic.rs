@@ -324,13 +324,6 @@ impl TrafficSummary {
             .saturating_add(self.failed)
     }
 
-    /// The responses that count against the primary limit: everything but a
-    /// `304`.
-    #[must_use]
-    pub const fn charged(&self) -> u32 {
-        self.full.saturating_add(self.failed)
-    }
-
     /// The share of responses that were `304`, in whole percent, or `None`
     /// before any response.
     #[must_use]
@@ -349,13 +342,13 @@ impl TrafficSummary {
         }
         u32::try_from(u64::from(count) * 60 / u64::from(self.observed_minutes)).unwrap_or(u32::MAX)
     }
+}
 
-    /// This host's busiest minute as a share of the secondary limit, in whole
-    /// percent.
-    #[must_use]
-    pub fn secondary_share_percent(&self) -> u32 {
-        self.peak_requests_per_minute.saturating_mul(100) / SECONDARY_POINTS_PER_MINUTE
-    }
+/// `requests_per_minute` as a share of [`SECONDARY_POINTS_PER_MINUTE`], in
+/// whole percent: a `GET` is one point.
+#[must_use]
+pub const fn secondary_share_percent(requests_per_minute: u32) -> u32 {
+    requests_per_minute.saturating_mul(100) / SECONDARY_POINTS_PER_MINUTE
 }
 
 #[cfg(test)]
@@ -402,7 +395,11 @@ mod tests {
             (summary.full, summary.not_modified, summary.failed),
             (1, 2, 1)
         );
-        assert_eq!(summary.charged(), 2, "a 304 is not charged; a 404 is");
+        assert_eq!(
+            summary.full + summary.failed,
+            2,
+            "a 304 is not charged; a 404 is"
+        );
         assert_eq!(summary.not_modified_percent(), Some(50));
         assert_eq!(summary.peak_requests_per_minute, 4);
     }
@@ -467,6 +464,9 @@ mod tests {
             traffic.record(StatusCode::NOT_MODIFIED, &HeaderMap::new(), at(120));
         }
         traffic.record(StatusCode::OK, &HeaderMap::new(), at(180));
-        assert_eq!(traffic.summary(at(180)).secondary_share_percent(), 10);
+        assert_eq!(
+            secondary_share_percent(traffic.summary(at(180)).peak_requests_per_minute),
+            10
+        );
     }
 }

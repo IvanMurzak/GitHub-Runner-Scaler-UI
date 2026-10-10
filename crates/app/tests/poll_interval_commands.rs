@@ -67,6 +67,16 @@ fn host_set_poll_interval_round_trips_through_polling_toml_and_the_host_row() {
         "the idle interval is untouched"
     );
 
+    let prose = cli(data.path(), &["status"]);
+    assert_eq!(prose.code, 0, "{}", prose.both());
+    assert!(
+        prose
+            .stdout
+            .contains("projected if no poll were answered 304, of 2500 this host may spend"),
+        "{}",
+        prose.stdout
+    );
+
     let shown = cli(data.path(), &["host", "show"]);
     assert_eq!(shown.code, 0, "{}", shown.both());
     assert!(
