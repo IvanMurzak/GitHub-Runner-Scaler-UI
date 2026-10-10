@@ -135,6 +135,33 @@
 #   * A NON-FAST-FORWARD ON THE TAP. Somebody pushed to the tap repository
 #     while this ran. Nothing here force-pushes, so the push is refused and the
 #     job fails; a re-run re-clones and succeeds.
+#
+# ----------------------------------------------------------------------------
+# THE SIGNING MATERIAL.
+# ----------------------------------------------------------------------------
+# The macOS binaries are signed with the project's Developer ID Application
+# certificate (not notarized). Its material lives in the `release` ENVIRONMENT,
+# not in repository secrets, and only `preflight` and `build` name that
+# environment:
+#
+#   MAC_CSC_LINK                         secret    base64 of the .p12
+#   MAC_CSC_KEY_PASSWORD                 secret    the .p12's password
+#   MAC_SIGN_IDENTITY                    variable  `Developer ID Application:
+#                                                  <name> (<TEAM ID>)`
+#   RUNNER_MANAGER_REQUIRE_DEVELOPER_ID  variable  `true` refuses the ad-hoc
+#                                                  fallback
+#
+# This workflow has no trigger but `workflow_dispatch`, which needs write
+# access, and no workflow a pull request runs names the environment, so a
+# fork's code never runs where these resolve. The environment's deployment
+# branch rule (main only) is enforced at `preflight`, before anything is
+# written.
+#
+# With none of the material configured the binaries are ad-hoc signed and the
+# run says so in a warning. With PART of it configured, or none while
+# RUNNER_MANAGER_REQUIRE_DEVELOPER_ID is true, the run refuses at `preflight`,
+# which also rehearses the whole signing on a throwaway binary so that a wrong
+# password or certificate is found before the tag rather than after it.
 name: Release
 
 on:
@@ -316,6 +343,10 @@ jobs:
     name: preflight ${{ matrix.target }} (steps 1-2)
     needs: validate
     runs-on: ${{ matrix.os }}
+    # The same environment as `build`, for two refusals that must happen
+    # before the tag rather than after it: the environment's branch rule, and
+    # signing material that is only partly configured.
+    environment: release
     permissions:
       contents: read
     # Bounds a leg that STARTS and then wedges. It does not bound a leg that
@@ -365,6 +396,26 @@ jobs:
         run: |
           bash .github/scripts/release.sh check-native-runner \
             "$TARGET" "$RUNNER_OS" "$RUNNER_ARCH"
+
+      # `build` signs after the tag is pushed, so everything that can make
+      # signing fail is rehearsed here first, on a throwaway copy of a system
+      # binary: material only partly configured, a wrong .p12 password, a .p12
+      # holding another identity or missing its intermediates, an expired
+      # certificate, an unreachable timestamp server. Same subcommands, same
+      # inputs, as `build`.
+      - name: Rehearse signing the macOS binary
+        if: runner.os == 'macOS'
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          MAC_SIGN_IDENTITY: ${{ vars.MAC_SIGN_IDENTITY }}
+          RUNNER_MANAGER_REQUIRE_DEVELOPER_ID: ${{ vars.RUNNER_MANAGER_REQUIRE_DEVELOPER_ID }}
+        run: |
+          bash .github/scripts/release.sh macos-signing-mode
+          probe="${RUNNER_TEMP}/signing-rehearsal"
+          cp /usr/bin/true "$probe"
+          bash .github/scripts/release.sh sign-macos "$probe"
+          bash .github/scripts/release.sh verify-macos-signature "$probe" "$MAC_SIGN_IDENTITY"
 
   # --------------------------------------------------------------------------
   # Step 3. The same matrix as CI, by calling CI rather than copying it.
@@ -495,6 +546,11 @@ jobs:
     name: build ${{ matrix.target }} (steps 5-6)
     needs: [validate, tag]
     runs-on: ${{ matrix.os }}
+    # The macOS signing material lives in this environment and nowhere else.
+    # See "THE SIGNING MATERIAL" in this file's header. Every leg names it --
+    # an environment cannot be chosen per matrix entry without an expression
+    # nothing here can test -- but only the macOS steps read it.
+    environment: release
     permissions:
       contents: read
     # A release build of this workspace is minutes, not hours. Without this the
@@ -574,39 +630,42 @@ jobs:
           # dependency graph that no test leg ever ran.
           cargo build --release --locked --package runner-manager --target "$TARGET"
 
-      # THE LINKER SIGNS arm64 AND ONLY arm64, WHICH IS WHY THIS STEP EXISTS.
+      # ----------------------------------------------------------------------
+      # SIGNED WITH THE PROJECT'S DEVELOPER ID, BEFORE ANYTHING IS PACKAGED.
+      # ----------------------------------------------------------------------
+      # Why a Developer ID, and how the keychain is handled: `release.sh`, above
+      # `sign-macos`. The header of this file lists the signing material.
       #
-      # Apple's linker applies the free ad-hoc signature automatically to arm64
-      # Mach-O, because the kernel refuses to execute unsigned native arm64
-      # code at all. An x86_64 binary has no such requirement, so it comes out
-      # of the same `cargo build` carrying no signature whatsoever -- and the
-      # verification below, which is deliberately uniform across both macOS
-      # legs, then fails the release on the Intel leg every single time. That
-      # is exactly how release 0.1.1 first failed.
-      #
-      # Signing here rather than relaxing the check keeps the stronger property:
-      # every macOS artifact this project publishes carries a signature. `-` is
-      # the ad-hoc identity, which needs no certificate and no keychain, so D12
-      # ("no paid code signing") is untouched. `--force` makes it idempotent on
-      # the arm64 leg, where the linker has already done it.
-      - name: Step 5 - ad-hoc sign the macOS binary
+      # It runs HERE, on the binary straight out of `cargo build`, because every
+      # channel ships these bytes: the archive below, `SHA256SUMS`, the npm
+      # packages unpacked from the archive, the Homebrew formula and the install
+      # scripts. Nothing after this step rewrites the Mach-O -- staging is `cp`,
+      # packaging is `tar` -- so the signature reaches all of them intact.
+      - name: Step 5 - sign the macOS binary
         if: runner.os == 'macOS'
         env:
           TARGET: ${{ matrix.target }}
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          MAC_SIGN_IDENTITY: ${{ vars.MAC_SIGN_IDENTITY }}
+          RUNNER_MANAGER_REQUIRE_DEVELOPER_ID: ${{ vars.RUNNER_MANAGER_REQUIRE_DEVELOPER_ID }}
         run: |
-          codesign --force --sign - "target/${TARGET}/release/runner-manager"
+          bash .github/scripts/release.sh sign-macos \
+            "target/${TARGET}/release/runner-manager"
 
       - name: Step 5 - verify the macOS binary is signed
         if: runner.os == 'macOS'
         env:
           TARGET: ${{ matrix.target }}
+          # The identity alone decides what is expected, not anything the step
+          # above reported, so a signing step that quietly fell back to ad-hoc
+          # is refused here. Empty means no Developer ID is configured, and
+          # then the check is the one every macOS binary has always had: a
+          # signature is present and verifies.
+          MAC_SIGN_IDENTITY: ${{ vars.MAC_SIGN_IDENTITY }}
         run: |
-          # D12 buys no certificate, but the free ad-hoc signature is not
-          # optional: macOS refuses to execute unsigned native arm64 code. The
-          # step above applies it -- which is precisely why this verifies
-          # instead of assuming.
           bash .github/scripts/release.sh verify-macos-signature \
-            "target/${TARGET}/release/runner-manager"
+            "target/${TARGET}/release/runner-manager" "$MAC_SIGN_IDENTITY"
 
       - name: Stage the archive contents
         env:
@@ -921,11 +980,16 @@ jobs:
           A scan that ignores `scope` will report advisories against code these
           artifacts do not contain.
 
-          The macOS binaries carry an ad-hoc signature, which is what lets
-          arm64 builds execute at all; the release workflow verifies it is
-          present before publishing. There is no paid code-signing certificate
-          on any platform, and every documented install path is a terminal
-          command, so no supported install triggers Gatekeeper or SmartScreen.
+          The macOS binaries are code-signed, and the release workflow
+          verifies the signature before publishing. When the project's
+          Developer ID Application certificate is configured, which is the
+          intended state, they are signed with it under the identifier
+          `io.github.IvanMurzak.runner-manager`, so the keychain and privacy
+          grants macOS gives the service carry over to the next release;
+          otherwise they carry an ad-hoc signature and the run warns. Run
+          `codesign -dv` on the binary to see which. The binaries are not
+          notarized, and every documented install path is a terminal command,
+          so no supported install triggers Gatekeeper or SmartScreen.
           NOTES
 
           # `--verify-tag` refuses to invent a tag: the tag must be the one the

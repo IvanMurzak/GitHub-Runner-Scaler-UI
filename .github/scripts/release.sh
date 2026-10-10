@@ -11,7 +11,8 @@
 #   * `1.2`, `v1.2.3` and `abc` are rejected as version inputs;
 #   * a version equal to or below the current one is rejected, and rejected
 #     independently by each of its two sources;
-#   * a macOS binary carrying no signature fails the run;
+#   * a macOS binary carrying no signature fails the run, and one that was
+#     meant to carry the Developer ID signature fails it without that;
 #   * a released artifact set carries a checksum file and an SBOM.
 #
 # A step body written inline in a workflow can only be exercised by dispatching
@@ -82,8 +83,22 @@ Usage: bash .github/scripts/release.sh <subcommand> [args]
       Steps 1-2 and 5. Exit non-zero unless the runner's OS and architecture
       are both native for <target>. Nothing here cross-compiles.
 
-  verify-macos-signature <binary>
-      Step 5. Exit non-zero unless <binary> carries a valid signature.
+  macos-signing-mode
+      Steps 1-2 and 5. Print `developer-id` or `adhoc`, from the PRESENCE of
+      MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD and MAC_SIGN_IDENTITY. Exit non-zero
+      when they are only partly set, or when none is set and
+      RUNNER_MANAGER_REQUIRE_DEVELOPER_ID is `true`. Never prints a value.
+
+  sign-macos <binary>
+      Step 5. Sign <binary> with the Developer ID identity through a keychain
+      that lives for this process, or ad-hoc with a warning when no signing
+      material is configured. One identifier for every build.
+
+  verify-macos-signature <binary> [<identity>]
+      Step 5. Exit non-zero unless <binary> carries a valid signature. Given
+      the Developer ID <identity>, also require that signature, its Team ID,
+      the hardened runtime, a timestamp, and a designated requirement naming
+      the identifier and the Team ID rather than a code hash.
 
   sha256 <file>
       Print "<hash>  <basename>" for <file>.
@@ -754,15 +769,289 @@ cmd_check_native_runner() {
 }
 
 # ----------------------------------------------------------------------------
+# Step 5 — signing the macOS binary with the project's Developer ID.
+# ----------------------------------------------------------------------------
+# WHY A CERTIFICATE AND NOT THE FREE AD-HOC SIGNATURE.
+#
+# macOS remembers two things about this binary that matter to a service: the
+# login-keychain item holding its GitHub credential, and the privacy grant
+# that lets it read a runner root on a removable volume
+# (`kTCCServiceSystemPolicyRemovableVolumes`). Both are tied to the binary's
+# DESIGNATED REQUIREMENT. An ad-hoc signature has no certificate to name, so
+# its requirement is `cdhash H"<hash of this exact build>"` -- and every
+# release is a different build. Every update therefore re-asked the removable-
+# volume question on the Mac's desktop and the daemon started no runner until
+# somebody clicked Allow; the keychain half needed the credential handover in
+# `daemon adopt-credential` to survive at all.
+#
+# Signed with a Developer ID certificate and one constant identifier, the
+# requirement becomes
+#
+#     identifier "io.github.IvanMurzak.runner-manager" and anchor apple generic
+#     and ... and certificate leaf[subject.OU] = <TEAM ID>
+#
+# which every later build satisfies, so the grants carry over. The identifier
+# is the same for both architectures and every version on purpose: it is half
+# of what macOS matches on. NOT notarized: every documented install path is a
+# terminal command, which sets no quarantine flag for Gatekeeper to act on.
+#
+# The fallback is the old ad-hoc signature, and it exists for ONE case: no
+# signing material is configured at all. It says so as a workflow warning, and
+# an operator who wants a release to refuse instead sets
+# `RUNNER_MANAGER_REQUIRE_DEVELOPER_ID=true`. Material that is only PARTLY
+# configured is always a refusal: that is a mistake, not a choice.
+readonly MACOS_SIGNING_IDENTIFIER="io.github.IvanMurzak.runner-manager"
+
+# The name `security find-identity` prints for a Developer ID Application
+# certificate, with the Team ID captured. The Team ID is what the designated
+# requirement pins, so it is read from here rather than configured twice.
+readonly DEVELOPER_ID_PATTERN='^Developer ID Application: .+ \(([A-Z0-9]{10})\)$'
+
+# Prints `developer-id` or `adhoc`. Reads the PRESENCE of the signing
+# material from the environment and never its value: this runs in a step that
+# holds the secrets, and nothing it prints may carry them.
+#
+#   MAC_CSC_LINK               base64 of the .p12 (secret)
+#   MAC_CSC_KEY_PASSWORD       the .p12's password (secret)
+#   MAC_SIGN_IDENTITY          `Developer ID Application: <name> (<TEAM ID>)`
+#   RUNNER_MANAGER_REQUIRE_DEVELOPER_ID  `true` refuses the ad-hoc fallback
+macos_signing_mode() {
+    local required="${RUNNER_MANAGER_REQUIRE_DEVELOPER_ID-}"
+    case "$required" in
+    "" | false | true) ;;
+    *) die "RUNNER_MANAGER_REQUIRE_DEVELOPER_ID must be 'true', 'false' or unset, not '${required}'" ;;
+    esac
+
+    local -a present=() missing=()
+    local name
+    for name in MAC_CSC_LINK MAC_CSC_KEY_PASSWORD MAC_SIGN_IDENTITY; do
+        if [[ -n "${!name-}" ]]; then
+            present+=("$name")
+        else
+            missing+=("$name")
+        fi
+    done
+
+    if ((${#missing[@]} == 0)); then
+        if ! [[ "$MAC_SIGN_IDENTITY" =~ $DEVELOPER_ID_PATTERN ]]; then
+            reject "MAC_SIGN_IDENTITY is not a Developer ID Application identity."
+            printf 'It must read exactly as `security find-identity` prints it:\n' >&2
+            printf '  Developer ID Application: <name> (<10-character Team ID>)\n' >&2
+            exit 1
+        fi
+        printf 'developer-id\n'
+        return 0
+    fi
+
+    if ((${#present[@]} != 0)); then
+        reject "the macOS signing material is only partly configured."
+        printf 'present: %s\n' "${present[*]}" >&2
+        printf 'missing: %s\n' "${missing[*]}" >&2
+        printf 'A release that was meant to be signed must not quietly ship ad-hoc.\n' >&2
+        printf 'Configure all three in the `release` environment, or none of them.\n' >&2
+        exit 1
+    fi
+
+    if [[ "$required" == true ]]; then
+        reject "RUNNER_MANAGER_REQUIRE_DEVELOPER_ID is true and no signing material is configured."
+        printf 'Set MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD and MAC_SIGN_IDENTITY in the\n' >&2
+        printf '`release` environment, or unset RUNNER_MANAGER_REQUIRE_DEVELOPER_ID.\n' >&2
+        exit 1
+    fi
+
+    printf '::warning title=macOS binaries will be ad-hoc signed::No Developer ID signing material is configured (MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, MAC_SIGN_IDENTITY in the release environment). An ad-hoc signature is tied to this exact build, so every update makes macOS ask again for removable-volume access and drops the keychain grant.\n' >&2
+    printf 'adhoc\n'
+}
+
+# The temporary keychain's state, global so the EXIT trap can undo it.
+SIGNING_WORK=""
+SIGNING_KEYCHAIN=""
+SIGNING_SEARCH_LIST=()
+
+# Fills SIGNING_SEARCH_LIST with the user's keychain search list as it is now,
+# minus this run's keychain. Empty when the list cannot be read.
+read_search_list() {
+    SIGNING_SEARCH_LIST=()
+    local listing line quoted='^[[:space:]]*"(.+)"[[:space:]]*$'
+    listing="$(security list-keychains -d user)" || return 0
+    while IFS= read -r line; do
+        if [[ "$line" =~ $quoted ]] && [[ "${BASH_REMATCH[1]}" != "$SIGNING_KEYCHAIN" ]]; then
+            SIGNING_SEARCH_LIST+=("${BASH_REMATCH[1]}")
+        fi
+    done <<<"$listing"
+}
+
+# Undoes everything `sign_with_developer_id` did to the machine, in reverse,
+# whatever stopped it. Keeps the exit status: a cleanup that turned a failed
+# signing into exit 0 would be the silent-unsigned release this file refuses.
+signing_cleanup() {
+    local status=$?
+    set +e
+    # Non-empty only once this run put its keychain on the list. Re-read rather
+    # than restored from the snapshot: on a Mac shared by two signing jobs the
+    # other job's keychain is on the list now, and a snapshot would drop it.
+    if ((${#SIGNING_SEARCH_LIST[@]} != 0)); then
+        read_search_list
+        if ((${#SIGNING_SEARCH_LIST[@]} != 0)); then
+            security list-keychains -d user -s "${SIGNING_SEARCH_LIST[@]}" ||
+                printf 'WARNING: could not restore the keychain search list\n' >&2
+        fi
+    fi
+    if [[ -n "$SIGNING_KEYCHAIN" ]]; then
+        security delete-keychain "$SIGNING_KEYCHAIN" ||
+            printf 'WARNING: could not delete %s\n' "$SIGNING_KEYCHAIN" >&2
+    fi
+    if [[ -n "$SIGNING_WORK" ]]; then
+        rm -rf "$SIGNING_WORK"
+    fi
+    exit "$status"
+}
+
+# ----------------------------------------------------------------------------
+# NO `set-key-partition-list`, AND THAT IS THE DESIGN.
+# ----------------------------------------------------------------------------
+# The usual recipe imports with `-T /usr/bin/codesign` and then runs
+# `security set-key-partition-list` so codesign may use the key without a
+# prompt. macOS 26 stopped authorizing that call from a runner process, and it
+# reports the refusal as "The user name or passphrase you entered is not
+# correct". `security import -A` grants key access at import time instead, so
+# the call is never needed. `-A` is broad -- any process of this user may use
+# the key while the keychain is unlocked -- which is acceptable ONLY because
+# this keychain lives for one process, holds nothing but this certificate, and
+# is deleted by the trap above.
+sign_with_developer_id() {
+    local binary="$1" identity="$MAC_SIGN_IDENTITY"
+
+    trap signing_cleanup EXIT
+    umask 077
+    # macOS's TMPDIR ends in `/`; a doubled one would make the keychain path
+    # differ from the one `security list-keychains` prints back.
+    local base="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+    SIGNING_WORK="$(mktemp -d "${base%/}/runner-manager-signing.XXXXXX")"
+
+    # A per-run password nobody needs to know. `od` rather than the usual
+    # `tr | head`: `head` closing the pipe kills `tr` with SIGPIPE, which
+    # `pipefail` turns into a failed step.
+    local password
+    password="$(od -An -N24 -tx1 /dev/urandom)"
+    password="${password//[[:space:]]/}"
+
+    local keychain="${SIGNING_WORK}/signing.keychain-db"
+    security create-keychain -p "$password" "$keychain"
+    SIGNING_KEYCHAIN="$keychain"
+    # Locks after an hour idle as a backstop; never on sleep, which would lock
+    # it partway through a signing on a Mac that naps.
+    security set-keychain-settings -u -t 3600 "$keychain"
+    security unlock-keychain -p "$password" "$keychain"
+
+    # `security import` takes the .p12 password only in argv or at a prompt,
+    # so it is visible to this user's processes while the import runs. On a
+    # GitHub-hosted runner those are this job's own steps, which already hold
+    # it; a self-hosted Mac shared with other jobs would expose it to them.
+    local p12="${SIGNING_WORK}/identity.p12"
+    printf '%s' "$MAC_CSC_LINK" | base64 --decode >"$p12"
+    security import "$p12" -k "$keychain" -P "$MAC_CSC_KEY_PASSWORD" -A -f pkcs12
+    rm -f "$p12"
+
+    # ON THE SEARCH LIST, IN FRONT, WITH EVERYTHING ELSE KEPT.
+    # `codesign --keychain` restricts where the IDENTITY is looked up, but the
+    # certificate CHAIN is still built from the user's search list, so the
+    # intermediates this .p12 carries are invisible unless the keychain is on
+    # it. `list-keychains -s` replaces the list, so the old one is read first
+    # and restored by the trap; an unreadable list is a refusal, because
+    # setting a one-entry list would be persistent damage to the machine.
+    read_search_list
+    if ((${#SIGNING_SEARCH_LIST[@]} == 0)); then
+        reject "could not read the user keychain search list; refusing to modify it."
+        exit 1
+    fi
+    security list-keychains -d user -s "$keychain" "${SIGNING_SEARCH_LIST[@]}"
+
+    # BY HASH, FROM THIS KEYCHAIN, AND EXACTLY ONE.
+    # A Mac that is also somebody's workstation can hold another certificate
+    # under the same display name; `--keychain` plus the SHA-1 is what makes
+    # the selection unambiguous. The identity is matched by name so that a
+    # .p12 holding the wrong certificate is refused here, by name, rather than
+    # by the Team ID check after it was used.
+    local identities hash
+    local -a hashes=()
+    identities="$(security find-identity -p codesigning "$keychain")"
+    printf '%s\n' "$identities"
+    # `  1) <SHA-1> "<name>"`, followed by ` (<reason>)` when the certificate
+    # does not evaluate as trusted on this machine.
+    local identity_line='^[[:space:]]*[0-9]+\) ([0-9A-F]{40}) "(.*)"( \(.*\))?$'
+    while IFS= read -r line; do
+        if [[ "$line" =~ $identity_line ]] && [[ "${BASH_REMATCH[2]}" == "$identity" ]]; then
+            hash="${BASH_REMATCH[1]}"
+            if [[ " ${hashes[*]-} " != *" ${hash} "* ]]; then
+                hashes+=("$hash")
+            fi
+        fi
+    done <<<"$identities"
+    if ((${#hashes[@]} != 1)); then
+        reject "the .p12 in MAC_CSC_LINK holds ${#hashes[@]} identities named '${identity}', not exactly one."
+        exit 1
+    fi
+    printf 'signing with %s (%s)\n' "$identity" "${hashes[0]}"
+
+    # `--options runtime` is the hardened runtime: this binary loads no
+    # unsigned code, uses no JIT and needs no entitlement. `--timestamp` asks
+    # Apple's server for a secure timestamp, so the signature stays valid after
+    # the certificate expires.
+    codesign --force --options runtime --timestamp \
+        --identifier "$MACOS_SIGNING_IDENTIFIER" \
+        --keychain "$keychain" --sign "${hashes[0]}" "$binary"
+}
+
+cmd_sign_macos() {
+    local binary="${1-}"
+    [[ -n "$binary" ]] || die "sign-macos: no binary given"
+    [[ -f "$binary" ]] || die "sign-macos: no such file: $binary"
+    command -v codesign >/dev/null 2>&1 ||
+        die "sign-macos: codesign not found; this must run on a macOS runner"
+
+    local mode summary
+    mode="$(macos_signing_mode)"
+    case "$mode" in
+    developer-id)
+        command -v security >/dev/null 2>&1 ||
+            die "sign-macos: security not found; this must run on a macOS runner"
+        # In a subshell so the keychain trap and `umask` end with it, before
+        # this process reports anything.
+        (sign_with_developer_id "$binary")
+        summary="signed with \`${MAC_SIGN_IDENTITY}\`, identifier \`${MACOS_SIGNING_IDENTIFIER}\`"
+        ;;
+    adhoc)
+        # `--force`: the linker has already ad-hoc signed an arm64 binary.
+        codesign --force --sign - --identifier "$MACOS_SIGNING_IDENTIFIER" "$binary"
+        summary="AD-HOC signed: no Developer ID signing material is configured"
+        ;;
+    *) die "sign-macos: unexpected signing mode '${mode}'" ;;
+    esac
+
+    printf '%s: %s\n' "$binary" "$summary"
+    if [[ -n "${GITHUB_STEP_SUMMARY-}" ]]; then
+        printf -- '- macOS `%s`: %s\n' "$(basename "$binary")" "$summary" >>"$GITHUB_STEP_SUMMARY"
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # Step 5 — the macOS signature check.
 # ----------------------------------------------------------------------------
 # An arm64 Mach-O carrying no signature does not execute on Apple Silicon at
-# all, so this is a functional gate and not a trust one (D12: no paid signing).
-# The linker normally applies an ad-hoc signature by itself, which is exactly
-# why this VERIFIES rather than assumes: "the linker usually does it" is not a
-# property anyone checked on the artifact that shipped.
+# all, so the first half of this is a functional gate. The linker normally
+# applies an ad-hoc signature by itself, which is exactly why this VERIFIES
+# rather than assumes: "the linker usually does it" is not a property anyone
+# checked on the artifact that shipped.
+#
+# Given the expected identity, the second half checks the property the
+# Developer ID signature exists for: a designated requirement that names the
+# identifier and the Team ID instead of a code hash, so the next build
+# satisfies it too. It is keyed on the identity alone, not on whatever the
+# signing step reported, so that a signing step which quietly fell back to
+# ad-hoc is caught here rather than trusted.
 cmd_verify_macos_signature() {
-    local binary="${1-}"
+    local binary="${1-}" identity="${2-}"
     [[ -n "$binary" ]] || die "verify-macos-signature: no binary given"
     [[ -f "$binary" ]] || die "verify-macos-signature: no such file: $binary"
     command -v codesign >/dev/null 2>&1 ||
@@ -801,7 +1090,68 @@ cmd_verify_macos_signature() {
         exit 1
     fi
 
-    printf 'signature OK: %s\n' "$binary"
+    if [[ -z "$identity" ]]; then
+        printf 'signature OK: %s\n' "$binary"
+        return 0
+    fi
+
+    # ------------------------------------------------------------------------
+    # The Developer ID half.
+    # ------------------------------------------------------------------------
+    [[ "$identity" =~ $DEVELOPER_ID_PATTERN ]] ||
+        die "verify-macos-signature: '${identity}' is not a Developer ID Application identity"
+    local team="${BASH_REMATCH[1]}"
+
+    # Every mismatch is reported, not just the first, so one failed release
+    # names everything that is wrong with the signature.
+    local failed=0
+    mismatch() {
+        reject "$1"
+        failed=1
+    }
+    has_line() { [[ $'\n'"$display"$'\n' == *$'\n'"$1"$'\n'* ]]; }
+
+    has_line "Authority=${identity}" || mismatch "${binary} is not signed by '${identity}'."
+    has_line "Identifier=${MACOS_SIGNING_IDENTIFIER}" ||
+        mismatch "${binary} does not carry the identifier ${MACOS_SIGNING_IDENTIFIER}."
+    has_line "TeamIdentifier=${team}" || mismatch "${binary} does not carry the Team ID ${team}."
+    [[ "$display" == *"(runtime)"* ]] ||
+        mismatch "${binary} was not signed with the hardened runtime (--options runtime)."
+    [[ $'\n'"$display" == *$'\n'Timestamp=* ]] ||
+        mismatch "${binary} carries no secure timestamp (--timestamp)."
+
+    # THE PROPERTY THIS SIGNATURE IS FOR: a requirement the NEXT build meets.
+    local requirement
+    set +e
+    requirement="$(codesign --display -r- "$binary" 2>&1)"
+    status=$?
+    set -e
+    printf '%s\n' "$requirement"
+    ((status == 0)) || mismatch "codesign could not read the designated requirement of ${binary}."
+    [[ "$requirement" != *cdhash* ]] ||
+        mismatch "the designated requirement pins a code hash, so the next build will not satisfy it."
+    [[ "$requirement" == *"designated => identifier \"${MACOS_SIGNING_IDENTIFIER}\" "* ]] ||
+        mismatch "the designated requirement does not name the identifier ${MACOS_SIGNING_IDENTIFIER}."
+    [[ "$requirement" == *"anchor apple generic"* ]] ||
+        mismatch "the designated requirement is not anchored to Apple's certificate authority."
+    # codesign quotes a Team ID that starts with a digit.
+    [[ "$requirement" == *"certificate leaf[subject.OU] = ${team}"* ||
+        "$requirement" == *"certificate leaf[subject.OU] = \"${team}\""* ]] ||
+        mismatch "the designated requirement does not pin the Team ID ${team}."
+
+    # And asked of `codesign` itself, which evaluates the certificate chain up
+    # to Apple's root: the string checks above read what the requirement SAYS,
+    # this checks that the signature MEETS it.
+    codesign --verify --strict \
+        -R="anchor apple generic and identifier \"${MACOS_SIGNING_IDENTIFIER}\" and certificate leaf[subject.OU] = \"${team}\"" \
+        "$binary" ||
+        mismatch "${binary} does not satisfy a Developer ID requirement for Team ID ${team}."
+
+    if ((failed != 0)); then
+        exit 1
+    fi
+    printf 'Developer ID signature OK: %s (%s, Team ID %s)\n' \
+        "$binary" "$MACOS_SIGNING_IDENTIFIER" "$team"
 }
 
 # ----------------------------------------------------------------------------
@@ -1031,6 +1381,8 @@ main() {
     set-version) cmd_set_version "$@" ;;
     verify-version) cmd_verify_version "$@" ;;
     check-native-runner) cmd_check_native_runner "$@" ;;
+    macos-signing-mode) macos_signing_mode ;;
+    sign-macos) cmd_sign_macos "$@" ;;
     verify-macos-signature) cmd_verify_macos_signature "$@" ;;
     sha256) cmd_sha256 "$@" ;;
     sbom) cmd_sbom "$@" ;;

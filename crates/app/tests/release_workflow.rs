@@ -178,11 +178,36 @@ fn run_release_script_with_path(arguments: &[&str], extra_path: Option<&Path>) -
 /// the streams -- which every other assertion here happily does, because it is
 /// reading prose -- would let a progress line pass for a version.
 fn release_script_streams(arguments: &[&str], extra_path: Option<&Path>) -> (bool, String, String) {
+    release_script_with_env(arguments, extra_path, &[])
+}
+
+/// The variables `release.sh` reads to decide how a macOS binary is signed.
+/// Removed from every run unless a test sets them, so that a developer's own
+/// shell, or a runner that happens to carry one, cannot change a verdict.
+const SIGNING_VARIABLES: [&str; 5] = [
+    "MAC_CSC_LINK",
+    "MAC_CSC_KEY_PASSWORD",
+    "MAC_SIGN_IDENTITY",
+    "RUNNER_MANAGER_REQUIRE_DEVELOPER_ID",
+    "GITHUB_STEP_SUMMARY",
+];
+
+fn release_script_with_env(
+    arguments: &[&str],
+    extra_path: Option<&Path>,
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
     let script = release_script();
     let mut command = Command::new(bash_program());
     command.arg(posix(&script));
     command.args(arguments);
     command.current_dir(repository_root());
+    for name in SIGNING_VARIABLES {
+        command.env_remove(name);
+    }
+    for (name, value) in env {
+        command.env(name, value);
+    }
 
     if let Some(directory) = extra_path {
         let existing = std::env::var_os("PATH").unwrap_or_default();
@@ -758,21 +783,31 @@ fn stub_codesign(directory: &Path, display_body: &str, display_exit: i32, verify
     // `$3` is the binary. `codesign --display --verbose=2 <binary>` puts the
     // path third; a stub printing `$2` would be reporting `--verbose=2` as the
     // thing it inspected.
-    let script = format!(
-        "#!/usr/bin/env bash\n\
-         case \"$1\" in\n\
-         --display) {display_body}; exit {display_exit} ;;\n\
-         --verify)  exit {verify_exit} ;;\n\
-         esac\n"
+    write_stub(
+        directory,
+        "codesign",
+        &format!(
+            "case \"$1\" in\n\
+             --display) {display_body}; exit {display_exit} ;;\n\
+             --verify)  exit {verify_exit} ;;\n\
+             esac\n"
+        ),
     );
-    let path = directory.join("codesign");
-    std::fs::write(&path, script).expect("the codesign stub must be writable");
+}
+
+/// Writes `<directory>/<program>`, a bash script with `body` after the shebang.
+fn write_stub(directory: &Path, program: &str, body: &str) {
+    let path = directory.join(program);
+    // `/bin/bash` rather than `/usr/bin/env bash`: one process per stub call
+    // instead of two, which is most of the cost on Windows.
+    std::fs::write(&path, format!("#!/bin/bash\n{body}"))
+        .unwrap_or_else(|err| panic!("the {program} stub must be writable: {err}"));
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("the codesign stub must be executable");
+            .unwrap_or_else(|err| panic!("the {program} stub must be executable: {err}"));
     }
 }
 
@@ -786,7 +821,7 @@ fn the_macos_signature_check_refuses_an_unsigned_binary() {
     let stub_directory = temporary.path().join("stub");
     std::fs::create_dir_all(&stub_directory).expect("the stub directory must be creatable");
 
-    // -- the state D12 requires: an ad-hoc signature, as the linker leaves it --
+    // -- an ad-hoc signature, as the linker leaves it, with no identity asked --
     stub_codesign(
         &stub_directory,
         r#"printf 'Executable=%s\nIdentifier=runner-manager\nSignature=adhoc\n' "$3" >&2"#,
@@ -797,8 +832,19 @@ fn the_macos_signature_check_refuses_an_unsigned_binary() {
         run_release_script_with_path(&["verify-macos-signature", &binary], Some(&stub_directory));
     assert!(
         ok,
-        "an ad-hoc signature is what the linker produces and what D12 requires; \
-         it must pass.\n{output}"
+        "an ad-hoc signature is what the linker produces, and with no Developer \
+         ID identity asked for it is what a release without signing material \
+         ships; it must pass.\n{output}"
+    );
+    // The workflow always passes the identity, as an EMPTY argument when none
+    // is configured; that must mean the same as no argument at all.
+    let (ok, output) = run_release_script_with_path(
+        &["verify-macos-signature", &binary, ""],
+        Some(&stub_directory),
+    );
+    assert!(
+        ok && output.contains("signature OK"),
+        "an empty identity argument must ask for no Developer ID:\n{output}"
     );
 
     // -- the DoD case: a deliberately stripped binary -------------------------
@@ -888,6 +934,648 @@ fn the_macos_signature_check_refuses_an_unsigned_binary() {
         "no `Signature=` or `Authority=` line means nothing established that a \
          signature exists, and absence must not read as success.\n{output}"
     );
+}
+
+// ----------------------------------------------------------------------------
+// Step 5 -- the Developer ID signature.
+// ----------------------------------------------------------------------------
+// The signing itself needs Apple's `security` and `codesign` and the project's
+// certificate, which exist only on a dispatched run. What is pinned here is
+// every DECISION around them: when the release signs, refuses, or falls back;
+// what it asks `security` to do to the machine and that it undoes all of it;
+// what it hands `codesign`; and what the verification accepts. The keychain
+// recipe itself was proved on a real Mac with a throwaway identity (PR body).
+
+const TEST_IDENTITY: &str = "Developer ID Application: Runner Manager Test (ABCDE12345)";
+const TEST_TEAM: &str = "ABCDE12345";
+const TEST_HASH: &str = "0123456789ABCDEF0123456789ABCDEF01234567";
+const SIGNING_IDENTIFIER: &str = "io.github.IvanMurzak.runner-manager";
+// Stand-ins for the two secrets. Distinctive, so that any output carrying
+// either is unmistakable.
+const TEST_P12: &str = "p12-bytes-SENTINEL-3f9c";
+const TEST_PASSWORD: &str = "password-SENTINEL-77ad";
+
+/// `TEST_P12`, base64-encoded the way `MAC_CSC_LINK` carries the .p12.
+const TEST_P12_BASE64: &str = "cDEyLWJ5dGVzLVNFTlRJTkVMLTNmOWM=";
+
+fn developer_id_env() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("MAC_CSC_LINK", TEST_P12_BASE64),
+        ("MAC_CSC_KEY_PASSWORD", TEST_PASSWORD),
+        ("MAC_SIGN_IDENTITY", TEST_IDENTITY),
+    ]
+}
+
+/// Asserts that no secret value reached either stream.
+fn assert_no_secret(out: &str, err: &str) {
+    for secret in [TEST_P12_BASE64, TEST_PASSWORD, TEST_P12] {
+        assert!(
+            !out.contains(secret) && !err.contains(secret),
+            "a secret value reached the output"
+        );
+    }
+}
+
+/// `macos-signing-mode` under `env`; every run is also checked for a leak.
+fn signing_mode(env: &[(&str, &str)]) -> (bool, String, String) {
+    let (ok, out, err) = release_script_with_env(&["macos-signing-mode"], None, env);
+    assert_no_secret(&out, &err);
+    (ok, out, err)
+}
+
+#[test]
+fn the_signing_mode_is_decided_by_what_is_configured() {
+    let full = developer_id_env();
+    const REQUIRE: &str = "RUNNER_MANAGER_REQUIRE_DEVELOPER_ID";
+
+    // -- all three present: Developer ID ------------------------------------
+    let (ok, out, err) = signing_mode(&full);
+    assert!(
+        ok,
+        "complete signing material must be accepted:\n{out}{err}"
+    );
+    assert_eq!(
+        out.trim(),
+        "developer-id",
+        "stdout is the VALUE the workflow captures and must be the mode alone"
+    );
+
+    // -- none present: the ad-hoc fallback, LOUDLY ---------------------------
+    // Both shapes of "none": unset, and set to the EMPTY string -- which is
+    // what the workflow actually hands over for a secret or variable that is
+    // not configured, because `${{ secrets.X }}` always defines the name.
+    let all_empty = [
+        ("MAC_CSC_LINK", ""),
+        ("MAC_CSC_KEY_PASSWORD", ""),
+        ("MAC_SIGN_IDENTITY", ""),
+        (REQUIRE, ""),
+    ];
+    for env in [&[][..], &all_empty[..]] {
+        let (ok, out, err) = signing_mode(env);
+        assert!(
+            ok,
+            "no signing material falls back to ad-hoc ({env:?}):\n{out}{err}"
+        );
+        assert_eq!(out.trim(), "adhoc");
+        assert!(
+            err.contains("::warning"),
+            "the fallback must be a workflow WARNING, visible on the run page, not \
+             a line nobody reads:\n{err}"
+        );
+    }
+
+    // -- none present, but required: refused ---------------------------------
+    let (ok, out, err) = signing_mode(&[(REQUIRE, "true")]);
+    assert!(
+        !ok,
+        "{REQUIRE}=true with no material must refuse the release rather than \
+         ship ad-hoc:\n{out}{err}"
+    );
+
+    // -- required and present: Developer ID ---------------------------------
+    let (ok, out, err) = signing_mode(&[full.as_slice(), &[(REQUIRE, "true")]].concat());
+    assert!(ok && out.trim() == "developer-id", "{out}{err}");
+
+    // -- a typo in the switch is not "false" ---------------------------------
+    let (ok, out, err) = signing_mode(&[(REQUIRE, "yes")]);
+    assert!(
+        !ok,
+        "an unrecognised {REQUIRE} must refuse; read as false it would quietly \
+         allow the fallback it was set to forbid:\n{out}{err}"
+    );
+
+    // -- any ONE missing: refused, and it names what is missing --------------
+    for (index, (missing, _)) in full.iter().enumerate() {
+        let mut partial = full.clone();
+        partial.remove(index);
+        let (ok, out, err) = signing_mode(&partial);
+        assert!(
+            !ok,
+            "signing material without {missing} must refuse: a release that was \
+             meant to be signed must not quietly ship ad-hoc.\n{out}{err}"
+        );
+        assert!(
+            err.contains(&format!("missing: {missing}")),
+            "the refusal must name {missing}:\n{err}"
+        );
+    }
+
+    // -- an identity that is not a Developer ID Application one --------------
+    let (ok, out, err) = signing_mode(&[
+        full[0],
+        full[1],
+        (
+            "MAC_SIGN_IDENTITY",
+            "Apple Development: Runner Manager Test (ABCDE12345)",
+        ),
+    ]);
+    assert!(
+        !ok,
+        "only a Developer ID Application identity produces the requirement that \
+         survives an update:\n{out}{err}"
+    );
+}
+
+/// `security` and `codesign` stubs that append every invocation to a log.
+///
+/// The `security` stub answers the four questions `release.sh` asks of it --
+/// the search list, the identities in a keychain -- and does to the file system
+/// what the real one would: `create-keychain` makes the file, `delete-keychain`
+/// removes it. `import` keeps a copy of the .p12 it was handed, so the test can
+/// check the secret was decoded into the right bytes.
+struct SigningStubs {
+    _root: tempfile::TempDir,
+    directory: PathBuf,
+    log: PathBuf,
+    imported: PathBuf,
+    runner_temp: PathBuf,
+    binary: String,
+}
+
+impl SigningStubs {
+    fn new(identity_in_p12: &str) -> Self {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let directory = root.path().join("stub");
+        let runner_temp = root.path().join("runner-temp");
+        std::fs::create_dir_all(&directory).expect("stub directory");
+        std::fs::create_dir_all(&runner_temp).expect("runner temp directory");
+        let log = root.path().join("calls.log");
+        let imported = root.path().join("imported.p12");
+        let binary = root.path().join("runner-manager");
+        std::fs::write(&binary, b"not really a mach-o").expect("fake binary");
+
+        write_stub(
+            &directory,
+            "security",
+            &format!(
+                "printf '%s\\n' \"security $*\" >>'{log}'\n\
+                 case \"$1\" in\n\
+                 create-keychain) : >\"${{!#}}\" ;;\n\
+                 delete-keychain) rm -f \"$2\" ;;\n\
+                 import) cp \"$2\" '{imported}' ;;\n\
+                 list-keychains) [ \"${{4-}}\" = -s ] || printf '    \"/Users/ci/Library/Keychains/login.keychain-db\"\\n' ;;\n\
+                 find-identity)\n\
+                   printf '\\nPolicy: Code Signing\\n  Matching identities\\n'\n\
+                   printf '  1) {hash} \"{name}\"\\n     1 identities found\\n\\n'\n\
+                   printf '  Valid identities only\\n  1) {hash} \"{name}\"\\n     1 valid identities found\\n' ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log = posix(&log),
+                imported = posix(&imported),
+                hash = TEST_HASH,
+                name = identity_in_p12,
+            ),
+        );
+        write_stub(
+            &directory,
+            "codesign",
+            &format!(
+                "printf '%s\\n' \"codesign $*\" >>'{log}'\n\
+                 exit \"${{STUB_CODESIGN_EXIT:-0}}\"\n",
+                log = posix(&log),
+            ),
+        );
+
+        SigningStubs {
+            _root: root,
+            directory,
+            log,
+            imported,
+            runner_temp,
+            binary: posix(&binary),
+        }
+    }
+
+    fn sign(&self, env: &[(&str, &str)]) -> (bool, String, String) {
+        let runner_temp = posix(&self.runner_temp);
+        let mut all: Vec<(&str, &str)> = vec![("RUNNER_TEMP", runner_temp.as_str())];
+        all.extend_from_slice(env);
+        release_script_with_env(&["sign-macos", &self.binary], Some(&self.directory), &all)
+    }
+
+    fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Index of the first call starting with `prefix`, or a panic naming it.
+    fn position(&self, prefix: &str) -> usize {
+        let calls = self.calls();
+        calls
+            .iter()
+            .position(|call| call.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no `{prefix}` call was made. Calls:\n{}", calls.join("\n")))
+    }
+
+    fn leftovers(&self) -> Vec<String> {
+        std::fs::read_dir(&self.runner_temp)
+            .expect("runner temp is readable")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn developer_id_signing_uses_a_keychain_of_its_own_and_leaves_nothing_behind() {
+    let stubs = SigningStubs::new(TEST_IDENTITY);
+    let (ok, out, err) = stubs.sign(&developer_id_env());
+    let calls = stubs.calls();
+    let transcript = format!("{out}{err}\ncalls:\n{}", calls.join("\n"));
+    assert!(
+        ok,
+        "signing with complete material must succeed:\n{transcript}"
+    );
+
+    // -- the keychain is this run's own, and the .p12 went into it ------------
+    let create = &calls[stubs.position("security create-keychain")];
+    let keychain = create
+        .split_whitespace()
+        .last()
+        .expect("create-keychain names a keychain")
+        .to_string();
+    assert!(
+        keychain.starts_with(&posix(&stubs.runner_temp)),
+        "the keychain must be created under RUNNER_TEMP, not in the user's \
+         Library: {keychain}"
+    );
+    let import = &calls[stubs.position("security import")];
+    for required in [" -A", " -f pkcs12", &format!(" -k {keychain}")] {
+        assert!(
+            import.contains(required),
+            "`security import` must carry `{}`: {import}",
+            required.trim()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&stubs.imported).expect("the stub kept the imported .p12"),
+        TEST_P12,
+        "MAC_CSC_LINK must be base64-DECODED into the file `security import` reads"
+    );
+
+    // -- the macOS 26 trap, by construction ----------------------------------
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.contains("set-key-partition-list")),
+        "`set-key-partition-list` is unauthorizable from a runner on macOS 26; \
+         `import -A` exists so that it is never called:\n{transcript}"
+    );
+
+    // -- the search list: ours in front, the machine's kept, then restored ----
+    let set = stubs.position(&format!("security list-keychains -d user -s {keychain} "));
+    assert!(
+        calls[set].ends_with("/Users/ci/Library/Keychains/login.keychain-db"),
+        "the machine's own keychains must stay on the search list behind ours: \
+         `list-keychains -s` REPLACES the list. {}",
+        calls[set]
+    );
+
+    // -- codesign: by hash, from our keychain, the constant identifier --------
+    let sign = stubs.position("codesign --force");
+    for required in [
+        "--options runtime".to_string(),
+        "--timestamp".to_string(),
+        format!("--identifier {SIGNING_IDENTIFIER}"),
+        format!("--keychain {keychain}"),
+        format!("--sign {TEST_HASH}"),
+    ] {
+        assert!(
+            calls[sign].contains(&required),
+            "codesign must be called with `{required}`: {}",
+            calls[sign]
+        );
+    }
+    assert!(
+        set < sign,
+        "the keychain must be on the search list before codesign runs"
+    );
+
+    // -- and every change undone after it -------------------------------------
+    let restore = stubs.position("security list-keychains -d user -s /Users/ci/");
+    let delete = stubs.position(&format!("security delete-keychain {keychain}"));
+    assert!(
+        sign < restore && sign < delete,
+        "the search list is restored and the keychain deleted AFTER signing:\n{transcript}"
+    );
+    assert!(
+        stubs.leftovers().is_empty(),
+        "nothing may be left in RUNNER_TEMP -- the decoded .p12 least of all: {:?}",
+        stubs.leftovers()
+    );
+    assert_no_secret(&out, &err);
+}
+
+#[test]
+fn a_failed_developer_id_signing_fails_the_release_and_still_cleans_up() {
+    // -- codesign itself fails ------------------------------------------------
+    let stubs = SigningStubs::new(TEST_IDENTITY);
+    let mut env = developer_id_env();
+    env.push(("STUB_CODESIGN_EXIT", "1"));
+    let (ok, out, err) = stubs.sign(&env);
+    let transcript = format!("{out}{err}\ncalls:\n{}", stubs.calls().join("\n"));
+    assert!(
+        !ok,
+        "a failed signing must fail the step; the cleanup trap must not turn \
+         it into exit 0:\n{transcript}"
+    );
+    let sign = stubs.position("codesign --force");
+    assert!(
+        sign < stubs.position("security delete-keychain")
+            && sign < stubs.position("security list-keychains -d user -s /Users/ci/"),
+        "the keychain is deleted and the search list restored even when \
+         signing failed:\n{transcript}"
+    );
+    assert!(stubs.leftovers().is_empty(), "{:?}", stubs.leftovers());
+
+    // -- the .p12 holds some other identity -----------------------------------
+    let stubs = SigningStubs::new("Developer ID Application: Somebody Else (ZZZZZ99999)");
+    let (ok, out, err) = stubs.sign(&developer_id_env());
+    let calls = stubs.calls();
+    assert!(
+        !ok,
+        "a .p12 that does not hold MAC_SIGN_IDENTITY must refuse:\n{out}{err}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.starts_with("codesign")),
+        "nothing may be signed with an identity nobody asked for:\n{}",
+        calls.join("\n")
+    );
+    stubs.position("security delete-keychain");
+    assert!(stubs.leftovers().is_empty(), "{:?}", stubs.leftovers());
+}
+
+#[test]
+fn without_signing_material_the_binary_is_ad_hoc_signed_with_a_warning() {
+    let stubs = SigningStubs::new(TEST_IDENTITY);
+    let (ok, out, err) = stubs.sign(&[]);
+    let calls = stubs.calls();
+    assert!(ok, "the fallback must still sign:\n{out}{err}");
+    assert!(
+        err.contains("::warning"),
+        "the fallback must announce itself:\n{err}"
+    );
+    assert_eq!(
+        calls,
+        vec![format!(
+            "codesign --force --sign - --identifier {SIGNING_IDENTIFIER} {}",
+            stubs.binary
+        )],
+        "the fallback is one ad-hoc codesign and nothing else -- no keychain"
+    );
+
+    // -- and forbidden when the operator said so ------------------------------
+    let stubs = SigningStubs::new(TEST_IDENTITY);
+    let (ok, out, err) = stubs.sign(&[("RUNNER_MANAGER_REQUIRE_DEVELOPER_ID", "true")]);
+    assert!(
+        !ok,
+        "required signing with no material must refuse:\n{out}{err}"
+    );
+    assert!(
+        stubs.calls().is_empty(),
+        "a refused release signs nothing: {:?}",
+        stubs.calls()
+    );
+}
+
+/// A `codesign` that answers each of the verification's questions from a file
+/// the test writes: the `--display` text, the designated requirement, and the
+/// exit status of the `-R` check, whose requirement it records.
+struct VerifyStub {
+    _root: tempfile::TempDir,
+    directory: PathBuf,
+    data: PathBuf,
+    binary: String,
+}
+
+const GOOD_DISPLAY: &str = "Executable=/x/runner-manager
+Identifier=io.github.IvanMurzak.runner-manager
+Format=Mach-O thin (arm64)
+CodeDirectory v=20500 size=36964 flags=0x10000(runtime) hashes=1149+2 location=embedded
+Signature size=9046
+Authority=Developer ID Application: Runner Manager Test (ABCDE12345)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=Oct 7, 2026 at 10:34:23 PM
+TeamIdentifier=ABCDE12345
+";
+
+const GOOD_REQUIREMENT: &str = "designated => identifier \"io.github.IvanMurzak.runner-manager\" \
+and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ \
+and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ \
+and certificate leaf[subject.OU] = ABCDE12345\n";
+
+impl VerifyStub {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let directory = root.path().join("stub");
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&directory).expect("stub directory");
+        std::fs::create_dir_all(&data).expect("data directory");
+        let binary = root.path().join("runner-manager");
+        std::fs::write(&binary, b"not really a mach-o").expect("fake binary");
+        write_stub(
+            &directory,
+            "codesign",
+            &format!(
+                "data='{data}'\n\
+                 # Builtins only: a `cat` per answer is a process start per answer.\n\
+                 slurp() {{ IFS= read -r -d '' text <\"$data/$1\"; printf '%s' \"$text\"; }}\n\
+                 case \"$1 $2\" in\n\
+                 '--display --verbose=2') slurp display >&2; exit 0 ;;\n\
+                 '--display -r-') printf 'Executable=%s\\n' \"$3\" >&2; slurp requirement; exit 0 ;;\n\
+                 '--verify --strict')\n\
+                   case \"$3\" in\n\
+                   -R=*) printf '%s' \"${{3#-R=}}\" >\"$data/tested\"; exit \"$(slurp r_exit)\" ;;\n\
+                   esac\n\
+                   exit 0 ;;\n\
+                 esac\n\
+                 exit 64\n",
+                data = posix(&data),
+            ),
+        );
+        let stub = VerifyStub {
+            _root: root,
+            directory,
+            data,
+            binary: posix(&binary),
+        };
+        stub.answer(GOOD_DISPLAY, GOOD_REQUIREMENT, 0);
+        stub
+    }
+
+    fn answer(&self, display: &str, requirement: &str, r_exit: i32) {
+        std::fs::write(self.data.join("display"), display).expect("display");
+        std::fs::write(self.data.join("requirement"), requirement).expect("requirement");
+        std::fs::write(self.data.join("r_exit"), r_exit.to_string()).expect("r_exit");
+        let _ = std::fs::remove_file(self.data.join("tested"));
+    }
+
+    fn verify(&self) -> (bool, String) {
+        let (ok, out, err) = release_script_with_env(
+            &["verify-macos-signature", &self.binary, TEST_IDENTITY],
+            Some(&self.directory),
+            &[],
+        );
+        (ok, format!("{out}{err}"))
+    }
+}
+
+#[test]
+fn the_developer_id_check_requires_a_requirement_the_next_build_satisfies() {
+    let stub = VerifyStub::new();
+
+    // -- the signature this release is meant to carry ------------------------
+    let (ok, output) = stub.verify();
+    assert!(ok, "a correct Developer ID signature must pass:\n{output}");
+    assert!(!output.contains("REJECTED"), "{output}");
+    let tested = std::fs::read_to_string(stub.data.join("tested"))
+        .expect("the requirement must be TESTED by codesign, not only read");
+    for required in [
+        "anchor apple generic".to_string(),
+        format!("identifier \"{SIGNING_IDENTIFIER}\""),
+        format!("certificate leaf[subject.OU] = \"{TEST_TEAM}\""),
+    ] {
+        assert!(
+            tested.contains(&required),
+            "the requirement handed to `codesign -R` must include `{required}`: {tested}"
+        );
+    }
+    assert!(
+        !tested.starts_with('='),
+        "`codesign -R` takes the requirement text itself; a leading `=` is a \
+         syntax error on a real Mac (measured): {tested}"
+    );
+
+    // codesign quotes a Team ID that starts with a digit.
+    stub.answer(
+        GOOD_DISPLAY,
+        &GOOD_REQUIREMENT.replace("= ABCDE12345", "= \"ABCDE12345\""),
+        0,
+    );
+    let (ok, output) = stub.verify();
+    assert!(
+        ok,
+        "a quoted Team ID in the requirement is the same pin:\n{output}"
+    );
+
+    // -- each way a signature can be the wrong one ----------------------------
+    // Every row changes ONE thing from the passing signature above, and names
+    // the rejection that thing must produce, so each check is shown to be the
+    // one that fires rather than whatever happened to fail first.
+    let adhoc_display = "Executable=/x/runner-manager\n\
+                         Identifier=io.github.IvanMurzak.runner-manager\n\
+                         CodeDirectory v=20400 size=36964 flags=0x2(adhoc) hashes=1149+0 location=embedded\n\
+                         Signature=adhoc\n\
+                         TeamIdentifier=not set\n";
+    let cases: Vec<(&str, String, String, i32, &str)> = vec![
+        (
+            "a signing step that quietly fell back to ad-hoc",
+            adhoc_display.to_string(),
+            "# designated => cdhash H\"8266d400052f411ed937f93a64b7d7d39c2a863c\"\n".to_string(),
+            1,
+            "pins a code hash",
+        ),
+        (
+            "another certificate",
+            GOOD_DISPLAY.replace(
+                "Authority=Developer ID Application: Runner Manager Test (ABCDE12345)",
+                "Authority=Developer ID Application: Somebody Else (ABCDE12345)",
+            ),
+            GOOD_REQUIREMENT.to_string(),
+            0,
+            "is not signed by 'Developer ID Application: Runner Manager Test",
+        ),
+        (
+            "another identifier",
+            GOOD_DISPLAY.replace(
+                "Identifier=io.github.IvanMurzak.runner-manager",
+                "Identifier=runner-manager",
+            ),
+            GOOD_REQUIREMENT.to_string(),
+            0,
+            "does not carry the identifier",
+        ),
+        (
+            "another Team ID in the signature",
+            GOOD_DISPLAY.replace("TeamIdentifier=ABCDE12345", "TeamIdentifier=ZZZZZ99999"),
+            GOOD_REQUIREMENT.to_string(),
+            0,
+            "does not carry the Team ID",
+        ),
+        (
+            "no hardened runtime",
+            GOOD_DISPLAY.replace("flags=0x10000(runtime)", "flags=0x0(none)"),
+            GOOD_REQUIREMENT.to_string(),
+            0,
+            "hardened runtime",
+        ),
+        (
+            "no secure timestamp",
+            GOOD_DISPLAY.replace("Timestamp=", "Signed Time="),
+            GOOD_REQUIREMENT.to_string(),
+            0,
+            "no secure timestamp",
+        ),
+        (
+            "a requirement pinning the code hash",
+            GOOD_DISPLAY.to_string(),
+            GOOD_REQUIREMENT.replace(
+                " and anchor apple generic",
+                " and cdhash H\"00\" and anchor apple generic",
+            ),
+            0,
+            "pins a code hash",
+        ),
+        (
+            "a requirement naming another identifier",
+            GOOD_DISPLAY.to_string(),
+            GOOD_REQUIREMENT.replace(
+                "identifier \"io.github.IvanMurzak.runner-manager\"",
+                "identifier \"runner-manager\"",
+            ),
+            0,
+            "does not name the identifier",
+        ),
+        (
+            "a requirement not anchored to Apple",
+            GOOD_DISPLAY.to_string(),
+            GOOD_REQUIREMENT.replace("anchor apple generic", "certificate root = H\"00\""),
+            0,
+            "not anchored to Apple",
+        ),
+        (
+            "a requirement pinning another Team ID",
+            GOOD_DISPLAY.to_string(),
+            GOOD_REQUIREMENT.replace("= ABCDE12345", "= ZZZZZ99999"),
+            0,
+            "does not pin the Team ID",
+        ),
+        (
+            "a signature codesign says does not meet the requirement",
+            GOOD_DISPLAY.to_string(),
+            GOOD_REQUIREMENT.to_string(),
+            3,
+            "does not satisfy a Developer ID requirement",
+        ),
+    ];
+    for (what, display, requirement, r_exit, rejection) in cases {
+        stub.answer(&display, &requirement, r_exit);
+        let (ok, output) = stub.verify();
+        assert!(!ok, "{what} must fail the release:\n{output}");
+        assert!(
+            output.contains(rejection),
+            "{what} must be refused with `{rejection}`:\n{output}"
+        );
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1392,6 +2080,8 @@ struct WorkflowStep {
     name: String,
     condition: String,
     run: String,
+    /// The step's own `env:` block, `NAME -> value` as written.
+    env: BTreeMap<String, String>,
 }
 
 /// Every step in the file, attributed to its job, with its `if:` and `run:`.
@@ -1476,6 +2166,22 @@ fn workflow_steps(source: &str) -> Vec<WorkflowStep> {
         } else if let Some(rest) = key.strip_prefix("if:") {
             step.condition = rest.trim().to_string();
             index += 1;
+        } else if key == "env:" {
+            index += 1;
+            while index < lines.len() {
+                let Some((line_indent, entry)) = significant(lines[index]) else {
+                    index += 1;
+                    continue;
+                };
+                if line_indent <= key_indent {
+                    break;
+                }
+                if let Some((name, value)) = entry.split_once(':') {
+                    step.env
+                        .insert(name.trim().to_string(), value.trim().to_string());
+                }
+                index += 1;
+            }
         } else if let Some(rest) = key.strip_prefix("run:") {
             let rest = rest.trim();
             index += 1;
@@ -1654,9 +2360,19 @@ fn every_release_sh_decision_is_reached_from_a_step() {
              the wrong platform under the right artifact name",
         ),
         (
+            "release.sh macos-signing-mode",
+            "steps 1-2 -- without it signing material that is only partly \
+             configured is found after the tag is pushed",
+        ),
+        (
+            "release.sh sign-macos",
+            "step 5 -- without it the macOS binaries are not signed with the \
+             Developer ID, and every update loses the service's privacy grants",
+        ),
+        (
             "release.sh verify-macos-signature",
             "step 5 -- without it an unsigned arm64 binary ships, and it does \
-             not execute on Apple Silicon at all (D12)",
+             not execute on Apple Silicon at all",
         ),
         (
             "release.sh sha256",
@@ -1682,15 +2398,19 @@ fn every_release_sh_decision_is_reached_from_a_step() {
     // `codesign` exists only on macOS, so the step must be conditional -- but
     // `runner.os` is then the single value deciding whether the gate runs, and
     // a condition naming the wrong thing disables it silently on the leg that
-    // needs it.
+    // needs it. `preflight` verifies a throwaway rehearsal binary too; what
+    // is asserted here is the check on the binary that SHIPS.
     let signature: Vec<&WorkflowStep> = steps
         .iter()
-        .filter(|step| step.run.contains("release.sh verify-macos-signature"))
+        .filter(|step| {
+            step.run.contains("release.sh verify-macos-signature")
+                && step.run.contains("target/${TARGET}/release/runner-manager")
+        })
         .collect();
     assert_eq!(
         signature.len(),
         1,
-        "expected exactly one step to verify the macOS signature, found {}: {:?}",
+        "expected exactly one step to verify the shipped macOS binary, found {}: {:?}",
         signature.len(),
         signature.iter().map(|step| &step.name).collect::<Vec<_>>()
     );
@@ -1706,6 +2426,210 @@ fn every_release_sh_decision_is_reached_from_a_step() {
         signature.job, "build",
         "the signature check must run in the job that produced the binary, so \
          that what it inspects is this leg's own output"
+    );
+}
+
+#[test]
+fn the_macos_binary_is_signed_before_it_is_packaged_and_only_signing_sees_the_secrets() {
+    let source = read_workflow("release.yml");
+    let steps = workflow_steps(&source);
+    let build: Vec<&WorkflowStep> = steps.iter().filter(|step| step.job == "build").collect();
+    let index_of = |needle: &str| -> usize {
+        let found: Vec<usize> = build
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step.run.contains(needle))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one `build` step running `{needle}`, found {}",
+            found.len()
+        );
+        found[0]
+    };
+
+    // ------------------------------------------------------------------------
+    // ORDER: every channel ships the bytes the archive holds.
+    // ------------------------------------------------------------------------
+    // The archive, SHA256SUMS, the npm packages (unpacked from the archive),
+    // the Homebrew formula and the install scripts all carry what this leg
+    // packaged. A signature applied after packaging would reach none of them.
+    let build_step = index_of("cargo build --release");
+    let sign = index_of("release.sh sign-macos");
+    let verify = index_of("release.sh verify-macos-signature");
+    let stage = index_of("dist/${stem}");
+    let checksum = index_of("release.sh sha256");
+    assert!(
+        build_step < sign && sign < verify && verify < stage && stage < checksum,
+        "the build leg must run cargo build ({build_step}) < sign ({sign}) < \
+         verify ({verify}) < stage the archive ({stage}) < checksum ({checksum})"
+    );
+    for index in [sign, verify] {
+        assert!(
+            build[index].condition.contains("runner.os == 'macOS'"),
+            "`{}` must be gated on `runner.os == 'macOS'`, found `if: {}`",
+            build[index].name,
+            build[index].condition
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // THE VERIFICATION IS KEYED ON THE IDENTITY, NOT ON THE SIGNING STEP.
+    // ------------------------------------------------------------------------
+    // Without the identity argument the check accepts any signature at all,
+    // so a signing step that fell back to ad-hoc would pass it.
+    assert!(
+        build[verify].run.contains("\"$MAC_SIGN_IDENTITY\""),
+        "the verification must be handed the expected identity:\n{}",
+        build[verify].run
+    );
+    assert_eq!(
+        build[verify]
+            .env
+            .get("MAC_SIGN_IDENTITY")
+            .map(String::as_str),
+        Some("${{ vars.MAC_SIGN_IDENTITY }}"),
+        "the expected identity must come from the environment's variable"
+    );
+
+    // ------------------------------------------------------------------------
+    // THE SECRETS REACH THE SIGNING DECISIONS AND NOTHING ELSE.
+    // ------------------------------------------------------------------------
+    let mut holders: Vec<&WorkflowStep> = Vec::new();
+    for step in &steps {
+        let holds = step
+            .env
+            .values()
+            .any(|value| value.contains("secrets.MAC_"));
+        let decides = step.run.contains("release.sh sign-macos")
+            || step.run.contains("release.sh macos-signing-mode");
+        if holds {
+            assert!(
+                decides,
+                "step `{}` in job `{}` is handed the signing secrets but runs \
+                 neither `sign-macos` nor `macos-signing-mode`",
+                step.name, step.job
+            );
+            holders.push(step);
+        }
+        if decides {
+            // The rehearsal in `preflight` is worth something only if it is
+            // handed exactly what `build` is handed: a variable missing from
+            // either would let one pass while the other refuses after the tag.
+            for (name, value) in [
+                ("MAC_CSC_LINK", "${{ secrets.MAC_CSC_LINK }}"),
+                (
+                    "MAC_CSC_KEY_PASSWORD",
+                    "${{ secrets.MAC_CSC_KEY_PASSWORD }}",
+                ),
+                ("MAC_SIGN_IDENTITY", "${{ vars.MAC_SIGN_IDENTITY }}"),
+                (
+                    "RUNNER_MANAGER_REQUIRE_DEVELOPER_ID",
+                    "${{ vars.RUNNER_MANAGER_REQUIRE_DEVELOPER_ID }}",
+                ),
+            ] {
+                assert_eq!(
+                    step.env.get(name).map(String::as_str),
+                    Some(value),
+                    "step `{}` decides how to sign and must read {name} as {value}",
+                    step.name
+                );
+            }
+        }
+    }
+    assert_eq!(
+        holders.len(),
+        2,
+        "exactly two steps hold the signing secrets -- the preflight decision \
+         and the build signing -- found {:?}",
+        holders.iter().map(|step| &step.name).collect::<Vec<_>>()
+    );
+    // Every mention in the FILE is one of those step-level ones, so none sits
+    // in a workflow- or job-level `env:`, where every step would inherit it.
+    let mentions = source.matches("secrets.MAC_").count();
+    let in_steps: usize = holders
+        .iter()
+        .map(|step| {
+            step.env
+                .values()
+                .filter(|value| value.contains("secrets.MAC_"))
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        mentions, in_steps,
+        "release.yml names `secrets.MAC_` {mentions} times but only {in_steps} \
+         are in the two signing steps' own `env:`"
+    );
+    let preflight = holders
+        .iter()
+        .find(|step| step.job == "preflight")
+        .expect("the signing decision must also run in `preflight`, before the tag");
+    assert!(
+        preflight.condition.contains("runner.os == 'macOS'"),
+        "the preflight signing decision belongs on the macOS legs"
+    );
+    for required in [
+        "release.sh macos-signing-mode",
+        "release.sh sign-macos",
+        "release.sh verify-macos-signature \"$probe\" \"$MAC_SIGN_IDENTITY\"",
+    ] {
+        assert!(
+            preflight.run.contains(required),
+            "the preflight rehearsal must run `{required}`, or a wrong password \
+             or certificate is first found after the tag is pushed:\n{}",
+            preflight.run
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // THE ENVIRONMENT: named by the two jobs that need it, and no other.
+    // ------------------------------------------------------------------------
+    let jobs = job_scalars(&source);
+    let with_environment: BTreeSet<&str> = jobs
+        .iter()
+        .filter(|(_, keys)| keys.contains_key("environment"))
+        .map(|(job, _)| job.as_str())
+        .collect();
+    assert_eq!(
+        with_environment,
+        BTreeSet::from(["build", "preflight"]),
+        "only `preflight` and `build` may name an environment"
+    );
+    for job in ["build", "preflight"] {
+        assert_eq!(
+            jobs[job].get("environment").map(String::as_str),
+            Some("release"),
+            "`{job}` must run in the `release` environment, where the signing \
+             material lives"
+        );
+    }
+
+    // No other workflow -- and every pull request runs some of them -- may
+    // name the environment or the secrets.
+    let directory = repository_root().join(".github").join("workflows");
+    let mut others = 0;
+    for entry in std::fs::read_dir(&directory).expect("the workflows directory") {
+        let path = entry.expect("a directory entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name == "release.yml" || !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+            continue;
+        }
+        others += 1;
+        let text = std::fs::read_to_string(&path).expect("a workflow file");
+        for forbidden in ["environment:", "secrets.MAC_", "vars.MAC_SIGN_IDENTITY"] {
+            assert!(
+                !text.contains(forbidden),
+                "{name} contains `{forbidden}`; the signing material belongs to \
+                 the release workflow alone"
+            );
+        }
+    }
+    assert!(
+        others >= 2,
+        "found only {others} other workflows; the scan is not reading the directory"
     );
 }
 
