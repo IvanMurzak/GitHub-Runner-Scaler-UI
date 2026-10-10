@@ -6064,6 +6064,30 @@ fn another_installations_service_is_not_blocked_by_this_accounts_stale_record() 
         }
     }
 
+    // Stopped and unread is still UNKNOWN -- never READY about a service whose
+    // health this account cannot see.
+    let stopped = readiness_from_facts(
+        Ok(LocalServiceReadiness {
+            running: false,
+            foreign: Some(foreign_service(true)),
+            ..ready_service()
+        }),
+        true,
+        &[],
+        "12:00:00Z".into(),
+    );
+    assert_eq!(
+        stopped.state,
+        OperationalReadiness::Unknown,
+        "{:?}",
+        stopped.activity
+    );
+    assert!(
+        stopped.summary.contains("not running"),
+        "{}",
+        stopped.summary
+    );
+
     // A problem the owner's own records show is still reported -- with a
     // place to look, never a reinstall from this account.
     let stalled = readiness_from_facts(

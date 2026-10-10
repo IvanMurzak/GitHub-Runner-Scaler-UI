@@ -54,19 +54,29 @@ the version being prepared rather than the version in `Cargo.toml`.
   they are not this account's, `service status`, `status`, `host doctor` and the TUI now report
   the service as the other installation's: its state, its account, the data root it was
   installed from and whose that is. Where this account can read that installation's records, the
-  report is exactly what its owner would see. Where it cannot, it says that, and to look from an
-  elevated terminal or as that account, instead of guessing. No reinstall or sign-in is ever
-  suggested for it. The TUI shows UNKNOWN rather than BLOCKED and says that its counts are this
-  account's own configuration, which the service does not run. `status --json` carries the other
+  report shows that installation's own problems, each with the account to fix it from, and none
+  of the owner's remedies, since those act on the directories of whoever runs them. Where it
+  cannot, it says that, and to look from an elevated terminal or as that account, instead of
+  guessing. No reinstall or sign-in is suggested for it. The TUI shows UNKNOWN rather than BLOCKED
+  when it cannot read the service, and notes that its counts are this account's own
+  configuration, which the service does not run. `status` never runs the other installation's
+  binary, so its `service_binary_version` is `null`. `status --json` carries the other
   installation's data root as `product.service_installed_from`, and the `host doctor --json`
-  document as `service_installed_from`. The same holds on macOS and Linux for a root-owned boot
-  service seen by a user with a leftover login record. A registration made before the directory
-  options existed names no directories, so it is still judged as this account's own.
+  document carries it as `service_installed_from`. `host doctor` reads that installation's own
+  records for its service checks. The same holds on macOS and Linux for a root-owned boot service
+  seen by a user with a leftover login record. A registration made before the directory options
+  existed names no directories, so it is still judged as this account's own.
+- `service install`, `service uninstall`, the TUI's start-mode switch, and the service start and
+  stop used by updates refuse another installation's registration. They name the account it has
+  to be changed from, where they used to replace, remove or restart it with this account's
+  directories.
 - `runner-manager host forget-local` moves an account's unused configuration (its old install
   record, database, host row and policies) into a `forgotten-<time>` directory inside its
-  configuration directory. Nothing is deleted, so moving the files back restores it. It refuses
-  while a service on the machine runs against that configuration or an agent holds its lock, and
-  it never touches the service's own directories or any secret store. The service report names it
+  configuration directory. Nothing is deleted, so moving the files back restores it. It leaves the
+  state, runtime and log directories where they are, including on macOS, where they sit inside the
+  configuration directory. It refuses while a service on the machine runs against that
+  configuration, while a service manager cannot be asked, or while an agent holds its lock. It
+  never touches the service's own directories or any secret store. The service report names it
   when it finds such a record.
 
 ## 0.4.37

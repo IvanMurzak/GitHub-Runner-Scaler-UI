@@ -4454,7 +4454,6 @@ impl ServiceOperations {
     /// [`ServiceError::NotInstalled`] when there is no record to switch, and
     /// whatever the platform reports.
     pub fn set_start_mode(&self, to: StartMode) -> Result<StartModeChange, ServiceError> {
-        self.refuse_foreign("switch the start mode of")?;
         let Some(record) = InstallRecord::read(&self.paths)? else {
             return Err(ServiceError::NotInstalled {
                 name: self.identity.name().to_string(),
@@ -4474,6 +4473,10 @@ impl ServiceOperations {
                 runner_root: RootAccessSummary::NotApplicable,
             });
         }
+
+        // A real switch only: a no-op touches no service manager at all. Over
+        // another installation's registration it would move that service.
+        self.refuse_foreign("switch the start mode of")?;
 
         #[cfg(windows)]
         let arguments = {
