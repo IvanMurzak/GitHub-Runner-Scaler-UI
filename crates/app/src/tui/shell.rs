@@ -679,6 +679,10 @@ struct ReadinessAssessment {
     state: OperationalReadiness,
     summary: String,
     activity: Vec<screens::ActivityRow>,
+    /// The summary for a machine whose service is another installation's and
+    /// cannot be read from this account: the state is then UNKNOWN, and the
+    /// generic "inspection failed" sentence would misdescribe it.
+    unread_service: Option<String>,
 }
 
 #[derive(Debug)]
@@ -692,6 +696,9 @@ struct LocalServiceReadiness {
     /// Why the service does not come back by itself after an unattended
     /// restart, and what changes that. `None` when it does.
     unattended_gap: Option<runner_manager_platform::service::UnattendedGap>,
+    /// The installation the machine's service belongs to, when it is not this
+    /// account's. See [`runner_manager_platform::service::ForeignService`].
+    foreign: Option<runner_manager_platform::service::ForeignService>,
 }
 
 /// The WSL distribution this process runs inside, if any.
@@ -824,7 +831,11 @@ fn with_host_doctor(
             remediation,
         });
     }
-    assessment.summary = readiness_summary(assessment.state, assessment.activity.len());
+    assessment.summary = readiness_summary(
+        assessment.state,
+        &assessment.activity,
+        assessment.unread_service.as_deref(),
+    );
     assessment
 }
 
@@ -856,6 +867,7 @@ fn inspect_local_service(context: &crate::cli::Context) -> Result<LocalServiceRe
             .collect(),
         legacy_windows_action,
         unattended_gap: service.unattended_gap().cloned(),
+        foreign: service.foreign().cloned(),
     })
 }
 
@@ -872,17 +884,19 @@ fn readiness_from_facts(
 ) -> ReadinessAssessment {
     let mut state = OperationalReadiness::Ready;
     let mut activity = Vec::new();
+    let mut unread_service = None;
     let mut raise = |next| state = state.worse(next);
+    // A `Ready` severity is information: a row that raises nothing.
     let mut issue =
         |id: &str, severity: OperationalReadiness, summary: String, remediation: String| {
             raise(severity);
             activity.push(screens::ActivityRow {
                 id: format!("readiness:{id}"),
                 occurred_at: now.clone(),
-                outcome: if severity == OperationalReadiness::Blocked {
-                    screens::ActivityOutcome::Failed
-                } else {
-                    screens::ActivityOutcome::Retry
+                outcome: match severity {
+                    OperationalReadiness::Blocked => screens::ActivityOutcome::Failed,
+                    OperationalReadiness::Ready => screens::ActivityOutcome::Info,
+                    _ => screens::ActivityOutcome::Retry,
                 },
                 summary,
                 remediation,
@@ -890,6 +904,78 @@ fn readiness_from_facts(
         };
 
     match service {
+        // Another installation's service. Every remedy the arm below offers
+        // acts on this account's directories -- reinstall, switch the start
+        // mode, sign in -- and would break or replace that service, so none of
+        // them is offered: only where to look.
+        Ok(LocalServiceReadiness {
+            foreign: Some(foreign),
+            running,
+            problems,
+            unattended_gap,
+            ..
+        }) => {
+            let look = foreign.where_to_look();
+            let installed_by = foreign.installed_by();
+            for (subject, detail) in problems {
+                issue(
+                    &format!("local:{}", subject.replace(' ', "-")),
+                    OperationalReadiness::Blocked,
+                    format!("Machine service (installed from {installed_by}) {subject}: {detail}"),
+                    format!(
+                        "Run `runner-manager service status` {look}, and follow its remediation \
+                         there. Do not reinstall the service or sign in again from this account: \
+                         it would act on this account's own configuration, not the service's."
+                    ),
+                );
+            }
+            if foreign.unreadable.is_some() && running {
+                let summary = format!(
+                    "This machine's runner-manager service is installed from {installed_by} and \
+                     is running; this account cannot read its health."
+                );
+                issue(
+                    "local:service-elsewhere",
+                    OperationalReadiness::Unknown,
+                    summary.clone(),
+                    format!(
+                        "Run `runner-manager tui` {look} to see it. The counts on this screen \
+                         are this account's own configuration ({}), which the service does not \
+                         run.",
+                        foreign.local_root.display()
+                    ),
+                );
+                unread_service = Some(summary);
+            } else if foreign.unreadable.is_none() {
+                issue(
+                    "local:service-elsewhere",
+                    OperationalReadiness::Ready,
+                    format!("This machine's runner-manager service is installed from {installed_by}."),
+                    format!(
+                        "Its health is shown here; act on it {look}. The counts on this screen \
+                         are this account's own configuration ({}), which the service does not \
+                         run.",
+                        foreign.local_root.display()
+                    ),
+                );
+            }
+            if let Some(gap) = unattended_gap {
+                issue(
+                    "local:login-only",
+                    OperationalReadiness::Degraded,
+                    gap.reason,
+                    format!("{} Act on it {look}.", gap.remedy),
+                );
+            }
+            if let Some(note) = foreign.unused_local_note() {
+                issue(
+                    "local:unused-configuration",
+                    OperationalReadiness::Ready,
+                    format!("This account has {note}"),
+                    "Run `runner-manager host forget-local` to move it aside.".into(),
+                );
+            }
+        }
         Ok(service) if !service.installed => issue(
             "local:service-missing",
             if autoscale_enabled {
@@ -1034,12 +1120,24 @@ fn readiness_from_facts(
 
     ReadinessAssessment {
         state,
-        summary: readiness_summary(state, activity.len()),
+        summary: readiness_summary(state, &activity, unread_service.as_deref()),
         activity,
+        unread_service,
     }
 }
 
-fn readiness_summary(state: OperationalReadiness, issues: usize) -> String {
+fn readiness_summary(
+    state: OperationalReadiness,
+    activity: &[screens::ActivityRow],
+    unread_service: Option<&str>,
+) -> String {
+    let issues = activity
+        .iter()
+        .filter(|row| row.outcome != screens::ActivityOutcome::Info)
+        .count();
+    if let (OperationalReadiness::Unknown, Some(summary)) = (state, unread_service) {
+        return summary.to_owned();
+    }
     match state {
         OperationalReadiness::Ready => {
             "Local service and every managed WSL host are ready for the next job.".to_owned()
@@ -5857,7 +5955,142 @@ fn ready_service() -> LocalServiceReadiness {
         problems: vec![],
         legacy_windows_action: false,
         unattended_gap: None,
+        foreign: None,
     }
+}
+
+/// The second account's view on a Windows host whose boot service another
+/// account installed: the service's own directories, and this account's
+/// abandoned login record.
+#[cfg(test)]
+fn foreign_service(unreadable: bool) -> runner_manager_platform::service::ForeignService {
+    use runner_manager_platform::service::{
+        ForeignService, InstallRecord, ServiceAccount, ServiceDirectories,
+    };
+    let root = std::path::Path::new(r"C:\Users\yuriv\AppData\Local\IvanMurzak\runner-manager");
+    let local = std::path::Path::new(r"C:\Users\ivand\rm");
+    let local_directories = ServiceDirectories {
+        config: local.join("config"),
+        state: local.join("data").join("state"),
+        runtime: local.join("data").join("runtime"),
+        logs: local.join("data").join("logs"),
+    };
+    let record = InstallRecord {
+        schema_version: runner_manager_platform::service::RECORD_SCHEMA_VERSION,
+        service_name: "runner-manager".into(),
+        manager: "Windows Task Scheduler".into(),
+        start_mode: StartMode::Login,
+        account: ServiceAccount::InvokingUser,
+        binary: local_directories
+            .state
+            .join("bin")
+            .join("runner-manager-supervisor.exe"),
+        source_binary: None,
+        arguments: vec!["daemon".into(), "run".into()],
+        restart_delay_secs: 15,
+        restart_reset_secs: 600,
+        log_file: local_directories.log_file(),
+        starts_on_demand: false,
+        definition_path: None,
+        installed_at: chrono::DateTime::from_timestamp(1_791_143_815, 0).expect("a time"),
+        installed_by_version: "0.4.30".into(),
+        directories: local_directories,
+    };
+    ForeignService {
+        directories: ServiceDirectories {
+            config: root.join("config"),
+            state: root.join("data").join("state"),
+            runtime: root.join("data").join("runtime"),
+            logs: root.join("data").join("logs"),
+        },
+        root: root.to_path_buf(),
+        owner: Some("yuriv".into()),
+        local_root: r"C:\Users\ivand\rm".into(),
+        local_record: r"C:\Users\ivand\rm\config\service.toml".into(),
+        unused_local_record: Some(record),
+        unreadable: unreadable.then(|| "this account cannot read service.toml".into()),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn another_installations_service_is_not_blocked_by_this_accounts_stale_record() {
+    const DESTRUCTIVE: [&str; 4] = [
+        "service uninstall",
+        "service install",
+        "auth login",
+        "--start-at",
+    ];
+    let unread = readiness_from_facts(
+        Ok(LocalServiceReadiness {
+            start_mode: None,
+            foreign: Some(foreign_service(true)),
+            ..ready_service()
+        }),
+        true,
+        &[],
+        "12:00:00Z".into(),
+    );
+    assert_eq!(
+        unread.state,
+        OperationalReadiness::Unknown,
+        "{:?}",
+        unread.activity
+    );
+    assert!(unread.summary.contains("yuriv"), "{}", unread.summary);
+    assert!(
+        unread
+            .activity
+            .iter()
+            .any(|row| row.id == "readiness:local:service-elsewhere"
+                && row.remediation.contains("elevated")),
+        "{:?}",
+        unread.activity
+    );
+    assert!(
+        unread
+            .activity
+            .iter()
+            .any(|row| row.id == "readiness:local:unused-configuration"
+                && row.outcome == screens::ActivityOutcome::Info
+                && row.remediation.contains("host forget-local")),
+        "{:?}",
+        unread.activity
+    );
+    for row in &unread.activity {
+        for advice in DESTRUCTIVE {
+            assert!(
+                !row.remediation.contains(advice) && !row.summary.contains(advice),
+                "{advice}: {row:?}"
+            );
+        }
+    }
+
+    // A problem the owner's own records show is still reported -- with a
+    // place to look, never a reinstall from this account.
+    let stalled = readiness_from_facts(
+        Ok(LocalServiceReadiness {
+            problems: vec![("daemon stalled".into(), "no progress since 09:00".into())],
+            foreign: Some(foreign_service(false)),
+            ..ready_service()
+        }),
+        true,
+        &[],
+        "12:00:00Z".into(),
+    );
+    assert_eq!(stalled.state, OperationalReadiness::Blocked);
+    let row = stalled
+        .activity
+        .iter()
+        .find(|row| row.id == "readiness:local:daemon-stalled")
+        .expect("the stall is reported");
+    assert!(row.summary.contains("yuriv"), "{row:?}");
+    assert!(
+        row.remediation
+            .starts_with("Run `runner-manager service status` ")
+            && row.remediation.contains("signed in as yuriv"),
+        "{row:?}"
+    );
 }
 
 #[cfg(test)]
@@ -5876,6 +6109,7 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
             problems: vec![],
             legacy_windows_action: false,
             unattended_gap: None,
+            foreign: None,
         }),
         false,
         &[],
@@ -6009,6 +6243,7 @@ fn a_missing_service_registration_is_one_actionable_problem() {
             )],
             legacy_windows_action: false,
             unattended_gap: None,
+            foreign: None,
         }),
         true,
         &[],

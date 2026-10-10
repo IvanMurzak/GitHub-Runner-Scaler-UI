@@ -134,16 +134,7 @@ fn daemon_arguments(context: &Context, mode: StartMode) -> Vec<OsString> {
 pub(super) fn service_directory_arguments(
     paths: &runner_manager_platform::paths::AppPaths,
 ) -> [OsString; 8] {
-    [
-        OsString::from("--service-config-dir"),
-        paths.config_dir().as_os_str().to_owned(),
-        OsString::from("--service-state-dir"),
-        paths.state_dir().as_os_str().to_owned(),
-        OsString::from("--service-runtime-dir"),
-        paths.runtime_dir().as_os_str().to_owned(),
-        OsString::from("--service-logs-dir"),
-        paths.logs_dir().as_os_str().to_owned(),
-    ]
+    runner_manager_platform::service::ServiceDirectories::of(paths).arguments()
 }
 
 /// The copy of this executable that the service runs, and how to undo making
@@ -540,6 +531,18 @@ pub fn uninstall(context: &Context, out: &mut dyn Write) -> Result<(), CliError>
     writeln!(out, "{result}").map_err(write_failed("this service removal"))
 }
 
+/// `host forget-local`. See [`ServiceOperations::forget_local`].
+///
+/// # Errors
+/// [`Failure::Conflict`] while a service or an agent uses this account's
+/// configuration, and [`Failure::LocalState`] when the move fails.
+pub fn forget_local(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+    let result = operations(context)
+        .forget_local(context.clock().now())
+        .map_err(service_failure)?;
+    writeln!(out, "{result}").map_err(write_failed("this configuration archive"))
+}
+
 pub fn status(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     let result = status_with(&operations(context), out);
     // Last, and whatever the service's own verdict: a host that is not ready
@@ -561,7 +564,7 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
     announce_fixture(operations, "reports", "this service status", out)?;
     let status = operations.status().map_err(service_failure)?;
     writeln!(out, "{status}").map_err(write_failed("this service status"))?;
-    if status.last_github_contact().is_none() {
+    if status.last_github_contact().is_none() && !status.is_unread() {
         writeln!(
             out,
             "  GitHub connectivity       offline (no successful contact recorded)"
@@ -574,7 +577,15 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
         let only_launches = status.problems().iter().all(|problem| {
             problem.subject == runner_manager_platform::service::LAUNCHES_BLOCKED_SUBJECT
         });
-        let remedy = if status
+        let remedy = if let Some(foreign) = status.foreign() {
+            // Every other remedy below acts on this account's directories, and
+            // the service is another installation's: reinstalling it from here
+            // would re-register it against the wrong data root.
+            format!(
+                "runner-manager service status ({})",
+                foreign.where_to_look()
+            )
+        } else if status
             .problems()
             .iter()
             .any(|problem| problem.subject == "registration")
@@ -661,7 +672,9 @@ fn local_state(source: StoreError) -> CliError {
 
 fn service_failure(source: ServiceError) -> CliError {
     let class = match source {
-        ServiceError::LockHeld { .. } | ServiceError::AlreadyInstalled { .. } => Failure::Conflict,
+        ServiceError::LockHeld { .. }
+        | ServiceError::AlreadyInstalled { .. }
+        | ServiceError::LocalConfigurationInUse { .. } => Failure::Conflict,
         ServiceError::NotInstalled { .. } => Failure::NotFound,
         ServiceError::BinaryPath { .. } | ServiceError::BinaryMissing { .. } => {
             Failure::InvalidArgument

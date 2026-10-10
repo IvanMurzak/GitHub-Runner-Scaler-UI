@@ -215,3 +215,57 @@ fn the_elevated_copy_reports_through_its_file_and_touches_no_local_state() {
     assert_eq!(malformed.code, 2, "{}", malformed.both());
     assert!(!scratch.path().join("never.json").exists());
 }
+
+#[test]
+fn host_forget_local_archives_the_configuration_and_deletes_nothing() {
+    let data = tempfile::tempdir().unwrap();
+    // Any command creates the four directories; this one leaves a database.
+    let shown = host(data.path(), &["show"]);
+    assert_eq!(shown.code, 0, "{}", shown.both());
+    let config = data.path().join("config");
+    std::fs::write(config.join("service.toml"), b"an earlier install's record").unwrap();
+    let before: Vec<_> = std::fs::read_dir(&config)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(before.len() >= 2, "{before:?}");
+
+    let forgotten = host(data.path(), &["forget-local"]);
+    assert_eq!(forgotten.code, 0, "{}", forgotten.both());
+    assert!(
+        forgotten
+            .stdout
+            .contains("Archived this account's unused local configuration"),
+        "{}",
+        forgotten.both()
+    );
+    let left: Vec<_> = std::fs::read_dir(&config)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(left.len(), 1, "only the archive is left: {left:?}");
+    let archive = &left[0];
+    assert!(
+        archive
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("forgotten-"),
+        "{archive:?}"
+    );
+    for name in &before {
+        assert!(
+            archive.join(name).exists(),
+            "{name:?} was moved, not deleted"
+        );
+    }
+    assert_eq!(
+        std::fs::read(archive.join("service.toml")).unwrap(),
+        b"an earlier install's record"
+    );
+
+    // A second run finds nothing new and leaves the first archive alone.
+    let again = host(data.path(), &["forget-local"]);
+    assert_eq!(again.code, 0, "{}", again.both());
+    assert!(archive.join("service.toml").exists());
+}
