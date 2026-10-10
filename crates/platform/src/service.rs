@@ -4590,30 +4590,41 @@ impl ServiceOperations {
     /// from this account, breaks a healthy service. So it is reported as what
     /// it is: see [`ForeignService`].
     pub fn status(&self) -> Result<ServiceStatus, ServiceError> {
-        let found = self.registration_for_status()?;
-        if let Some(registration) = &found
-            && let Some(directories) = self.foreign_directories(registration)
-        {
-            return Ok(self.foreign_status(registration.clone(), directories));
+        match self.registration_for_status()? {
+            Some((registration, Some(directories))) => {
+                Ok(self.foreign_status(registration, directories))
+            }
+            found => {
+                let (record, record_refused) = match InstallRecord::read(&self.paths) {
+                    Ok(record) => (record, None),
+                    Err(refusal @ ServiceError::RecordNotPermitted { .. }) => (None, Some(refusal)),
+                    Err(error) => return Err(error),
+                };
+                self.status_at(
+                    &self.paths,
+                    record,
+                    record_refused.as_ref(),
+                    found.map(|(registration, _)| registration),
+                )
+            }
         }
-        self.own_status(found)
     }
 
-    /// [`Self::status`] for a registration this account's own directories made,
-    /// or for none.
-    fn own_status(&self, found: Option<Registration>) -> Result<ServiceStatus, ServiceError> {
-        let (record, record_refused) = match InstallRecord::read(&self.paths) {
-            Ok(record) => (record, None),
-            Err(refusal @ ServiceError::RecordNotPermitted { .. }) => (None, Some(refusal)),
-            Err(error) => return Err(error),
-        };
-        let last_github_contact = last_github_contact(&self.paths)?;
+    /// [`Self::status`] for the installation whose directories are `paths`,
+    /// from the record already read there.
+    fn status_at(
+        &self,
+        paths: &AppPaths,
+        record: Option<InstallRecord>,
+        record_refused: Option<&ServiceError>,
+        found: Option<Registration>,
+    ) -> Result<ServiceStatus, ServiceError> {
+        let last_github_contact = last_github_contact(paths)?;
         let drift = record
             .as_ref()
             .and_then(|record| definition_drift(self.controls.as_ref(), &self.identity, record));
-        let credential_rejected_since =
-            github_credential_rejected_since(&self.paths).ok().flatten();
-        let credential_unreadable_since = credential_unreadable_since(&self.paths).ok().flatten();
+        let credential_rejected_since = github_credential_rejected_since(paths).ok().flatten();
+        let credential_unreadable_since = credential_unreadable_since(paths).ok().flatten();
         let probed = self.controls.unattended_login();
         let unattended = record.as_ref().and_then(|record| {
             // The account is only read where something was probed to judge
@@ -4628,20 +4639,18 @@ impl ServiceOperations {
         Ok(ServiceStatus::compose(
             self.identity.clone(),
             record,
-            record_refused.as_ref(),
+            record_refused,
             found,
             last_github_contact,
-            &self.paths,
+            paths,
         )
         .with_definition_drift(drift)
         .with_credential_rejection(credential_rejected_since)
         .with_credential_unreadable(credential_unreadable_since)
-        .with_launches_blocked(crate::launch_health::launches_blocked(&self.paths, now))
+        .with_launches_blocked(crate::launch_health::launches_blocked(paths, now))
         .with_unattended_gap(unattended)
-        .with_host_unfit(
-            crate::host_fitness::host_unfit_in_force(&self.paths, now).filter(|_| installed),
-        )
-        .with_stall(crate::daemon_heartbeat::liveness(&self.paths, now).stall(last_github_contact)))
+        .with_host_unfit(crate::host_fitness::host_unfit_in_force(paths, now).filter(|_| installed))
+        .with_stall(crate::daemon_heartbeat::liveness(paths, now).stall(last_github_contact)))
     }
 
     /// The installed definition, when it is not what this build renders for
@@ -4797,20 +4806,23 @@ impl ServiceOperations {
         Ok(None)
     }
 
-    /// The registration [`Self::status`] describes: this account's own when
-    /// either domain holds one, else whichever registration there is.
+    /// The registration [`Self::status`] describes, with the directories it
+    /// runs against when they are not this account's: this account's own
+    /// registration when either domain holds one, else whichever there is.
     ///
     /// [`Self::find_registration`] stops at the boot domain, so a boot service
     /// made from another data root would hide this account's own login
     /// registration. The other domain is asked only in that case, and a
     /// failure to ask it is not this status's failure.
-    fn registration_for_status(&self) -> Result<Option<Registration>, ServiceError> {
+    fn registration_for_status(
+        &self,
+    ) -> Result<Option<(Registration, Option<ServiceDirectories>)>, ServiceError> {
         let Some((mode, found)) = self.find_registration()? else {
             return Ok(None);
         };
-        if self.foreign_directories(&found).is_none() {
-            return Ok(Some(found));
-        }
+        let Some(directories) = self.foreign_directories(&found) else {
+            return Ok(Some((found, None)));
+        };
         let other = match mode {
             StartMode::Boot => StartMode::Login,
             StartMode::Login => StartMode::Boot,
@@ -4821,7 +4833,10 @@ impl ServiceOperations {
             .ok()
             .and_then(|control| control.query(&self.identity).ok().flatten())
             .filter(|registration| self.foreign_directories(registration).is_none());
-        Ok(Some(own.unwrap_or(found)))
+        Ok(Some(match own {
+            Some(own) => (own, None),
+            None => (found, Some(directories)),
+        }))
     }
 
     /// The directories `registration` runs against, when they are not this
@@ -4829,6 +4844,35 @@ impl ServiceOperations {
     fn foreign_directories(&self, registration: &Registration) -> Option<ServiceDirectories> {
         ServiceDirectories::from_command_line(&registration.command_line)
             .filter(|directories| !same_directory(&directories.config, self.paths.config_dir()))
+    }
+
+    /// The machine's service and the installation it belongs to, when that is
+    /// not this account's, without reading anything of that installation's
+    /// beyond its path. `None` when the service is this account's, when there
+    /// is none, or when the service manager cannot be asked.
+    #[must_use]
+    pub fn foreign_service(&self) -> Option<(Registration, ForeignService)> {
+        match self.registration_for_status().ok()?? {
+            (registration, Some(directories)) => {
+                Some((registration, self.foreign_service_at(directories)))
+            }
+            (_, None) => None,
+        }
+    }
+
+    /// The [`ForeignService`] for an installation at `directories`, before
+    /// anything of its own is read.
+    fn foreign_service_at(&self, directories: ServiceDirectories) -> ForeignService {
+        let root = directories.root();
+        ForeignService {
+            owner: data_root_owner(&root, host_home().as_deref()),
+            root,
+            directories,
+            local_root: ServiceDirectories::of(&self.paths).root(),
+            local_record: InstallRecord::path(&self.paths),
+            unused_local_record: InstallRecord::read(&self.paths).ok().flatten(),
+            unreadable: None,
+        }
     }
 
     /// [`Self::status`] for a registration made from another data root.
@@ -4843,27 +4887,23 @@ impl ServiceOperations {
         directories: ServiceDirectories,
     ) -> ServiceStatus {
         let service_paths = directories.paths();
-        let root = directories.root();
-        let mut foreign = ForeignService {
-            owner: data_root_owner(&root, host_home().as_deref()),
-            root,
-            directories,
-            local_root: ServiceDirectories::of(&self.paths).root(),
-            local_record: InstallRecord::path(&self.paths),
-            unused_local_record: InstallRecord::read(&self.paths).ok().flatten(),
-            unreadable: None,
-        };
-        let readable = match InstallRecord::read(&service_paths) {
-            Ok(Some(_)) => Self {
-                paths: service_paths.clone(),
-                ..self.clone()
+        let mut foreign = self.foreign_service_at(directories);
+        let unreadable = match InstallRecord::read(&service_paths) {
+            Ok(Some(record)) => {
+                match self.status_at(
+                    &service_paths,
+                    Some(record),
+                    None,
+                    Some(registration.clone()),
+                ) {
+                    Ok(status) => return status.with_foreign(foreign),
+                    Err(error) => error.to_string(),
+                }
             }
-            .own_status(Some(registration.clone()))
-            .map_err(|error| error.to_string()),
-            Ok(None) => Err(format!(
+            Ok(None) => format!(
                 "there is no install record at {}",
                 InstallRecord::path(&service_paths).display()
-            )),
+            ),
             // Not the error's own words: `RecordNotPermitted` and
             // `RecordUnreadable` both end in a `service install` remedy, which
             // from this account would re-register the machine's service
@@ -4872,19 +4912,11 @@ impl ServiceOperations {
                 ServiceError::RecordNotPermitted { path, detail }
                 | ServiceError::RecordUnreadable { path, detail }
                 | ServiceError::Record { path, detail, .. },
-            ) => Err(format!(
-                "this account cannot read {} ({detail})",
-                path.display()
-            )),
-            Err(error) => Err(error.to_string()),
+            ) => format!("this account cannot read {} ({detail})", path.display()),
+            Err(error) => error.to_string(),
         };
-        match readable {
-            Ok(status) => status.with_foreign(foreign),
-            Err(reason) => {
-                foreign.unreadable = Some(reason);
-                ServiceStatus::foreign_unread(self.identity.clone(), registration, foreign)
-            }
-        }
+        foreign.unreadable = Some(unreadable);
+        ServiceStatus::foreign_unread(self.identity.clone(), registration, foreign)
     }
 
     /// Moves this account's own configuration aside, when no registration on
@@ -4908,19 +4940,19 @@ impl ServiceOperations {
         let config = self.paths.config_dir();
         let service_root = match self.registration_for_status()? {
             None => None,
-            Some(registration) => {
-                let Some(directories) = self.foreign_directories(&registration) else {
-                    return Err(ServiceError::LocalConfigurationInUse {
-                        detail: format!(
-                            "{} holds a registration that runs against {}, so it is not unused. \
-                             `service status` describes it",
-                            registration.manager,
-                            config.display()
-                        ),
-                    });
-                };
+            Some((registration, None)) => {
+                return Err(ServiceError::LocalConfigurationInUse {
+                    detail: format!(
+                        "{} holds a registration that runs against {}, so it is not unused. \
+                         `service status` describes it",
+                        registration.manager,
+                        config.display()
+                    ),
+                });
+            }
+            Some((_, Some(directories))) => {
                 if let Some(overlap) = directories.all().into_iter().find(|directory| {
-                    directory.starts_with(config) || config.starts_with(directory)
+                    contains_directory(directory, config) || contains_directory(config, directory)
                 }) {
                     return Err(ServiceError::LocalConfigurationInUse {
                         detail: format!(
@@ -4958,8 +4990,6 @@ impl ServiceOperations {
                 entries.push(entry.path());
             }
         }
-        entries.sort();
-        let archive = config.join(format!("{FORGOTTEN_PREFIX}{}", at.format("%Y%m%dT%H%M%SZ")));
         if entries.is_empty() {
             return Ok(ForgottenLocal {
                 archive: None,
@@ -4967,24 +4997,22 @@ impl ServiceOperations {
                 service_root,
             });
         }
+        entries.sort();
+        let archive = config.join(format!("{FORGOTTEN_PREFIX}{}", at.format("%Y%m%dT%H%M%SZ")));
         std::fs::create_dir(&archive).map_err(failed("create", &archive))?;
-        let mut moved = Vec::new();
-        for entry in &entries {
-            let name = entry.file_name().unwrap_or_default();
-            if let Err(error) = std::fs::rename(entry, archive.join(name)) {
-                for done in moved.iter().rev() {
-                    let done: &PathBuf = done;
-                    let _ =
-                        std::fs::rename(archive.join(done.file_name().unwrap_or_default()), done);
+        let inside = |entry: &Path| archive.join(entry.file_name().unwrap_or_default());
+        for (index, entry) in entries.iter().enumerate() {
+            if let Err(error) = std::fs::rename(entry, inside(entry)) {
+                for done in entries[..index].iter().rev() {
+                    let _ = std::fs::rename(inside(done), done);
                 }
                 let _ = std::fs::remove_dir(&archive);
                 return Err(failed("archive", entry)(error));
             }
-            moved.push(entry.clone());
         }
         Ok(ForgottenLocal {
             archive: Some(archive),
-            moved,
+            moved: entries,
             service_root,
         })
     }
@@ -5049,25 +5077,38 @@ fn same_directory(left: &Path, right: &Path) -> bool {
         )
 }
 
+/// A path's components as this platform compares them: case-insensitively
+/// on Windows.
+fn path_key(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|component| {
+            let text = component.as_os_str().to_string_lossy();
+            if cfg!(windows) {
+                text.to_lowercase()
+            } else {
+                text.into_owned()
+            }
+        })
+        .collect()
+}
+
+/// Whether `inner` is `outer` or a directory under it, by the rule
+/// [`same_directory`] uses: on this platform's terms, or canonically.
+fn contains_directory(outer: &Path, inner: &Path) -> bool {
+    path_key(inner).starts_with(&path_key(outer))
+        || matches!(
+            (std::fs::canonicalize(outer), std::fs::canonicalize(inner)),
+            (Ok(outer), Ok(inner)) if inner.starts_with(&outer)
+        )
+}
+
 /// The account whose data root `root` is, when the path says: the folder
 /// under the directory that holds this account's `home`, `root` for root's
 /// home on Unix, and `LocalSystem` for its profile on Windows. `None` when
 /// the path names nobody, which is reported as the path alone.
 #[must_use]
 pub fn data_root_owner(root: &Path, home: Option<&Path>) -> Option<String> {
-    let key = |path: &Path| -> Vec<String> {
-        path.components()
-            .map(|component| {
-                let text = component.as_os_str().to_string_lossy();
-                if cfg!(windows) {
-                    text.to_lowercase()
-                } else {
-                    text.into_owned()
-                }
-            })
-            .collect()
-    };
-    let target = key(root);
+    let target = path_key(root);
     if cfg!(windows) {
         if target
             .windows(3)
@@ -5081,7 +5122,7 @@ pub fn data_root_owner(root: &Path, home: Option<&Path>) -> Option<String> {
     {
         return Some("root".to_owned());
     }
-    let users = key(home?.parent()?);
+    let users = path_key(home?.parent()?);
     if target.len() > users.len() && target[..users.len()] == users[..] {
         root.components()
             .nth(users.len())
@@ -5140,12 +5181,28 @@ impl ForeignService {
         }
     }
 
+    /// Whether the service's own records could not be read, so only what the
+    /// service manager says is known.
+    #[must_use]
+    pub const fn is_unread(&self) -> bool {
+        self.unreadable.is_some()
+    }
+
     /// Who installed it, for a sentence.
     #[must_use]
     pub fn installed_by(&self) -> String {
         match &self.owner {
             Some(owner) => format!("{owner}'s data root {}", self.root.display()),
             None => format!("the data root {}", self.root.display()),
+        }
+    }
+
+    /// The data root and its owner, for a field: `<root> (<owner>)`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match &self.owner {
+            Some(owner) => format!("{} ({owner})", self.root.display()),
+            None => self.root.display().to_string(),
         }
     }
 
@@ -5631,17 +5688,17 @@ impl ServiceStatus {
     /// account could not read, so only the service manager's facts are here.
     #[must_use]
     pub fn is_unread(&self) -> bool {
-        self.foreign
-            .as_ref()
-            .is_some_and(|foreign| foreign.unreadable.is_some())
+        self.foreign.as_ref().is_some_and(ForeignService::is_unread)
     }
 
     /// The one-word-or-so verdict `service status` ends with.
     #[must_use]
     pub fn verdict(&self) -> String {
+        if !self.is_healthy() {
+            return "NOT healthy".to_owned();
+        }
         match &self.foreign {
-            _ if !self.is_healthy() => "NOT healthy".to_owned(),
-            Some(foreign) if foreign.unreadable.is_some() => format!(
+            Some(foreign) if foreign.is_unread() => format!(
                 "{}; installed from {}, so its health is read {}",
                 if self.is_running() {
                     "running"
@@ -5890,10 +5947,36 @@ impl ServiceStatus {
         self.unattended_gap.as_ref()
     }
 
-    /// The recorded start mode. Journey 5 step 4.
+    /// The recorded start mode. Journey 5 step 4. For another installation's
+    /// service whose record this account cannot read, the mode the service
+    /// manager's domain implies.
     #[must_use]
     pub fn start_mode(&self) -> Option<StartMode> {
-        self.record.as_ref().map(|record| record.start_mode)
+        self.record
+            .as_ref()
+            .map(|record| record.start_mode)
+            .or_else(|| {
+                self.registration
+                    .as_ref()
+                    .filter(|_| self.is_unread())
+                    .map(|registration| registration.start_mode)
+            })
+    }
+
+    /// The binary the service runs: the recorded one, or for another
+    /// installation's service whose record this account cannot read, the one
+    /// the service manager names.
+    #[must_use]
+    pub fn service_binary(&self) -> Option<PathBuf> {
+        self.record
+            .as_ref()
+            .map(|record| record.binary.clone())
+            .or_else(|| {
+                self.registration
+                    .as_ref()
+                    .filter(|_| self.is_unread())
+                    .and_then(Registration::binary)
+            })
     }
 
     /// The resolved absolute binary path and what became of it. Journey 5
@@ -5975,14 +6058,15 @@ impl fmt::Display for ServiceStatus {
                 foreign.installed_by(),
                 foreign.local_root.display()
             )?;
-            if foreign.unreadable.is_some()
+            // Without the record, the service manager's own facts.
+            if foreign.is_unread()
                 && let Some(registration) = &self.registration
             {
                 writeln!(f, "  start mode                {}", registration.start_mode)?;
                 if let Some(account) = &registration.account {
                     writeln!(f, "  account                   {account}")?;
                 }
-                if let Some(binary) = registration.binary() {
+                if let Some(binary) = self.service_binary() {
                     writeln!(f, "  binary                    {}", binary.display())?;
                 }
             }

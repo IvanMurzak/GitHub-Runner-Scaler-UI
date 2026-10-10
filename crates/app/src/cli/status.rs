@@ -184,30 +184,25 @@ impl ServiceView {
     /// is another installation's -- then that installation's, as far as they
     /// can be read. See [`runner_manager_platform::service::ForeignService`].
     fn of(context: &Context) -> Self {
-        let own = || Self {
-            paths: context.paths().clone(),
-            binary: InstallRecord::read(context.paths())
+        let Some((registration, foreign)) = super::service::operations(context).foreign_service()
+        else {
+            return Self {
+                paths: context.paths().clone(),
+                binary: InstallRecord::read(context.paths())
+                    .ok()
+                    .flatten()
+                    .map(|record| record.binary),
+                foreign: None,
+            };
+        };
+        let paths = foreign.directories.paths();
+        Self {
+            binary: InstallRecord::read(&paths)
                 .ok()
                 .flatten()
-                .map(|record| record.binary),
-            foreign: None,
-        };
-        let Ok(status) = super::service::operations(context).status() else {
-            return own();
-        };
-        let Some(foreign) = status.foreign().cloned() else {
-            return own();
-        };
-        Self {
-            paths: foreign.directories.paths(),
-            binary: status
-                .record()
-                .map(|record| record.binary.clone())
-                .or_else(|| {
-                    status
-                        .registration()
-                        .and_then(runner_manager_platform::service::Registration::binary)
-                }),
+                .map(|record| record.binary)
+                .or_else(|| registration.binary()),
+            paths,
             foreign: Some(foreign),
         }
     }
@@ -526,9 +521,12 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
         Ok(value) => (value.is_some(), None),
         Err(source) => (false, Some(source.to_string())),
     };
+    let service = ServiceView::of(context);
     // Not while GitHub is rejecting the service's credential: a contact from
-    // before the rejection vouches for nothing.
+    // before the rejection vouches for nothing. Nor for another
+    // installation's service: it does not read this account's store at all.
     let service_reached_github_secs_ago = (unreadable.is_some()
+        && service.foreign.is_none()
         && github_credential_rejected_since(context.paths())
             .ok()
             .flatten()
@@ -563,8 +561,6 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
         super::doctor::pending_summary(context)
     };
 
-    let service = ServiceView::of(context);
-
     Ok(StatusDocument {
         schema_version: SCHEMA_VERSION,
         generated_at: context.clock().now(),
@@ -593,12 +589,10 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
                     .ok()
                     .flatten(),
             ),
-            service_installed_from: service.foreign.as_ref().map(|foreign| {
-                foreign.owner.as_ref().map_or_else(
-                    || foreign.root.display().to_string(),
-                    |owner| format!("{} ({owner})", foreign.root.display()),
-                )
-            }),
+            service_installed_from: service
+                .foreign
+                .as_ref()
+                .map(runner_manager_platform::service::ForeignService::label),
         },
         github_contacted: false,
         credential: Credential {

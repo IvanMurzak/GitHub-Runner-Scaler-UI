@@ -2401,18 +2401,14 @@ fn installed_service(context: &Context, perspective: Perspective) -> Option<Serv
     if let Some(status) = &status
         && let Some(foreign) = status.foreign()
     {
-        let registration = status.registration()?;
         return Some(ServiceSetup {
-            start_mode: status.start_mode().unwrap_or(registration.start_mode),
-            binary: status
-                .record()
-                .map(|record| record.binary.clone())
-                .or_else(|| registration.binary())?,
+            start_mode: status.start_mode()?,
+            binary: status.service_binary()?,
             definition_path: status
                 .record()
                 .and_then(|record| record.definition_path.clone()),
             label,
-            running: Some(registration.running),
+            running: Some(status.is_running()),
             installed_from: Some(foreign.installed_by()),
         });
     }

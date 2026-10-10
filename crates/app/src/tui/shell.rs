@@ -929,7 +929,12 @@ fn readiness_from_facts(
                     ),
                 );
             }
-            if foreign.unreadable.is_some() && running {
+            let scope = format!(
+                "The counts on this screen are this account's own configuration ({}), which the \
+                 service does not run.",
+                foreign.local_root.display()
+            );
+            if foreign.is_unread() && running {
                 let summary = format!(
                     "This machine's runner-manager service is installed from {installed_by} and \
                      is running; this account cannot read its health."
@@ -938,25 +943,15 @@ fn readiness_from_facts(
                     "local:service-elsewhere",
                     OperationalReadiness::Unknown,
                     summary.clone(),
-                    format!(
-                        "Run `runner-manager tui` {look} to see it. The counts on this screen \
-                         are this account's own configuration ({}), which the service does not \
-                         run.",
-                        foreign.local_root.display()
-                    ),
+                    format!("Run `runner-manager tui` {look} to see it. {scope}"),
                 );
                 unread_service = Some(summary);
-            } else if foreign.unreadable.is_none() {
+            } else if !foreign.is_unread() {
                 issue(
                     "local:service-elsewhere",
                     OperationalReadiness::Ready,
                     format!("This machine's runner-manager service is installed from {installed_by}."),
-                    format!(
-                        "Its health is shown here; act on it {look}. The counts on this screen \
-                         are this account's own configuration ({}), which the service does not \
-                         run.",
-                        foreign.local_root.display()
-                    ),
+                    format!("Its health is shown here; act on it {look}. {scope}"),
                 );
             }
             if let Some(gap) = unattended_gap {
@@ -1131,13 +1126,13 @@ fn readiness_summary(
     activity: &[screens::ActivityRow],
     unread_service: Option<&str>,
 ) -> String {
+    if let (OperationalReadiness::Unknown, Some(summary)) = (state, unread_service) {
+        return summary.to_owned();
+    }
     let issues = activity
         .iter()
         .filter(|row| row.outcome != screens::ActivityOutcome::Info)
         .count();
-    if let (OperationalReadiness::Unknown, Some(summary)) = (state, unread_service) {
-        return summary.to_owned();
-    }
     match state {
         OperationalReadiness::Ready => {
             "Local service and every managed WSL host are ready for the next job.".to_owned()
