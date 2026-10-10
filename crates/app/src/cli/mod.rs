@@ -849,6 +849,14 @@ pub enum HostCommand {
     /// Persistent dependency and tool caches for native runners.
     #[command(subcommand)]
     Cache(HostCacheCommand),
+    /// Move this account's configuration aside when no service runs against it.
+    ///
+    /// For an account whose earlier install was replaced by another
+    /// installation's service: the configuration directory is renamed into a
+    /// `forgotten-<time>` directory beside it, never deleted. Refused while a
+    /// service or an agent uses it; never touches the service's directories or
+    /// any secret.
+    ForgetLocal,
 }
 
 // -- dependency caches -------------------------------------------------------

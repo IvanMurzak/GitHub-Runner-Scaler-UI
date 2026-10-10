@@ -382,6 +382,14 @@ pub const MANIFEST: &[Classification] = &[
          daemon's preflight require; a real-process test drives set, show and clear and pins \
          the refusal of a path-like name."
     ),
+    host_doctor_row!(
+        "host forget-local",
+        "host_forget_local_archives_the_configuration_and_deletes_nothing",
+        "It renames this account's configuration directory's contents aside, which the \
+         generated oracle does not model, and its refusals depend on the machine's service \
+         manager; a real-process test pins the archive under --data-dir, and the refusals and \
+         the untouched service root are unit-tested against recording controls."
+    ),
     cache_row!(
         "host cache show",
         "host_cache_settings_round_trip_through_caches_toml"

@@ -146,7 +146,8 @@ pub struct Product {
     /// The package version plus a commit identity for an unreleased source build.
     pub build_version: &'static str,
     /// The version reported by the product-owned binary registered for the
-    /// local service, or `null` when no readable service installation exists.
+    /// local service, or `null` when no readable service installation exists
+    /// or it is another installation's, whose binary this account never runs.
     pub service_binary_version: Option<String>,
     /// Since when GitHub has rejected the local service's credential, as the
     /// daemon last recorded it; `null` while it is accepted.
@@ -162,6 +163,47 @@ pub struct Product {
     /// stopped making progress; `null` while it beats. See
     /// [`runner_manager_platform::daemon_heartbeat`].
     pub service_stalled: Option<String>,
+    /// The data root of the installation this machine's service belongs to,
+    /// with its owner when the path names one, when that is **not** this
+    /// account's; `null` when the service is this account's or there is none.
+    /// While it is set, every other `service_*` field describes that
+    /// installation as far as this account may read it, and the policies and
+    /// host below are this account's own, which the service does not run.
+    pub service_installed_from: Option<String>,
+}
+
+/// The facts the `service_*` fields are read from: which directories the
+/// installed service runs against, and its binary.
+struct ServiceView {
+    paths: runner_manager_platform::paths::AppPaths,
+    binary: Option<std::path::PathBuf>,
+    foreign: Option<runner_manager_platform::service::ForeignService>,
+}
+
+impl ServiceView {
+    /// This account's directories and record, unless the machine's service
+    /// is another installation's -- then that installation's, as far as they
+    /// can be read. See [`runner_manager_platform::service::ForeignService`].
+    fn of(context: &Context) -> Self {
+        let Some(foreign) = super::service::operations(context).foreign_service() else {
+            return Self {
+                paths: context.paths().clone(),
+                binary: InstallRecord::read(context.paths())
+                    .ok()
+                    .flatten()
+                    .map(|record| record.binary),
+                foreign: None,
+            };
+        };
+        Self {
+            // Never run: the path comes from another account's record, and
+            // `--version` would execute whatever that account put there, as
+            // this account, every time the TUI refreshes.
+            binary: None,
+            paths: foreign.directories.paths(),
+            foreign: Some(foreign),
+        }
+    }
 }
 
 fn binary_version(path: &std::path::Path) -> Option<String> {
@@ -177,11 +219,6 @@ fn binary_version(path: &std::path::Path) -> Option<String> {
         .split_whitespace()
         .last()
         .map(str::to_string)
-}
-
-fn installed_service_version(context: &Context) -> Option<String> {
-    let record = InstallRecord::read(context.paths()).ok().flatten()?;
-    binary_version(&record.binary)
 }
 
 fn outdated_service_definition(context: &Context) -> Option<String> {
@@ -482,9 +519,12 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
         Ok(value) => (value.is_some(), None),
         Err(source) => (false, Some(source.to_string())),
     };
+    let service = ServiceView::of(context);
     // Not while GitHub is rejecting the service's credential: a contact from
-    // before the rejection vouches for nothing.
+    // before the rejection vouches for nothing. Nor for another
+    // installation's service: it does not read this account's store at all.
     let service_reached_github_secs_ago = (unreadable.is_some()
+        && service.foreign.is_none()
         && github_credential_rejected_since(context.paths())
             .ok()
             .flatten()
@@ -526,21 +566,31 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
             name: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION"),
             build_version: env!("RUNNER_MANAGER_BUILD_VERSION"),
-            service_binary_version: installed_service_version(context),
-            service_credential_rejected_since: github_credential_rejected_since(context.paths())
+            service_binary_version: service.binary.as_deref().and_then(binary_version),
+            service_credential_rejected_since: github_credential_rejected_since(&service.paths)
                 .ok()
                 .flatten(),
-            service_definition_outdated_since_version: outdated_service_definition(context),
-            service_launches_blocked: launches_blocked(context.paths(), context.clock().now()),
+            // Drift is judged against this account's record, so it means
+            // nothing for another installation's service.
+            service_definition_outdated_since_version: service
+                .foreign
+                .is_none()
+                .then(|| outdated_service_definition(context))
+                .flatten(),
+            service_launches_blocked: launches_blocked(&service.paths, context.clock().now()),
             service_stalled: runner_manager_platform::daemon_heartbeat::liveness(
-                context.paths(),
+                &service.paths,
                 context.clock().now(),
             )
             .stall(
-                runner_manager_platform::service::last_github_contact(context.paths())
+                runner_manager_platform::service::last_github_contact(&service.paths)
                     .ok()
                     .flatten(),
             ),
+            service_installed_from: service
+                .foreign
+                .as_ref()
+                .map(runner_manager_platform::service::ForeignService::label),
         },
         github_contacted: false,
         credential: Credential {
@@ -663,6 +713,14 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
         "  service start mode        {}",
         document.host.service_start_mode
     )?;
+    if let Some(root) = &document.product.service_installed_from {
+        writeln!(
+            out,
+            "  machine service           installed from {root}, another installation's: the \
+             policies and capacity here are this account's own, which it does not run. \
+             `runner-manager service status` describes it."
+        )?;
+    }
     writeln!(
         out,
         "  runner root               {} ({})",
@@ -834,6 +892,7 @@ mod tests {
                 service_definition_outdated_since_version: None,
                 service_launches_blocked: None,
                 service_stalled: None,
+                service_installed_from: None,
             },
             github_contacted: false,
             credential: Credential {
@@ -1094,6 +1153,7 @@ mod tests {
                 "service_binary_version",
                 "service_credential_rejected_since",
                 "service_definition_outdated_since_version",
+                "service_installed_from",
                 "service_launches_blocked",
                 "service_stalled",
                 "version"

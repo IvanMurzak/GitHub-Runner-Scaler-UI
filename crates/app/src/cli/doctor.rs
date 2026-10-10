@@ -65,7 +65,8 @@ use runner_manager_domain::store::Store as _;
 use runner_manager_platform::host_fitness::{self, ElevationOutcome};
 use runner_manager_platform::runner_env::{self, Inherited, RunnerEnv, RunnerPlatform};
 use runner_manager_platform::service::{
-    InstallRecord, LAUNCHD_PROCESS_TYPE, ServiceAccount, plist_string_value, service_account_name,
+    InstallRecord, LAUNCHD_PROCESS_TYPE, ServiceAccount, ServiceDirectories, ServiceStatus,
+    plist_string_value, service_account_name,
 };
 use runner_manager_platform::unattended_login::{self, Resume, UnattendedLogin};
 use serde::{Deserialize, Serialize};
@@ -218,6 +219,15 @@ pub struct ServiceSetup {
     /// not asked: the daemon's own view, and a service about to be installed.
     #[serde(default)]
     pub running: Option<bool>,
+    /// The other installation the machine's service belongs to, for a
+    /// sentence, when it is not this account's. See
+    /// [`runner_manager_platform::service::ForeignService`].
+    #[serde(default)]
+    pub installed_from: Option<String>,
+    /// That installation's directories, where its daemon records what the
+    /// checks read: its contact, its refusals, its polling.
+    #[serde(default)]
+    pub foreign_directories: Option<ServiceDirectories>,
 }
 
 /// Everything about this host's configuration a check reads. Serializable
@@ -1182,6 +1192,24 @@ fn apply_defender(
 // -- windows.execution_account ------------------------------------------------
 
 fn probe_execution_account(setup: &HostSetup, _: &dyn HostFacts) -> Outcome {
+    // Another installation's login registration is moved to boot by that
+    // installation, never from here.
+    if let Some(installed_from) = setup
+        .service
+        .as_ref()
+        .and_then(|service| service.installed_from.as_ref())
+        && setup.start_mode() == Some(StartMode::Login)
+    {
+        return fail(format!(
+            "the login service installed from {installed_from} runs with its account's standard \
+             token, so a prompt waits for a person who is not there"
+        ))
+        .remedy(format!(
+            "for an autonomous host, the account whose data root that is moves it to `--start-at \
+             boot`; changing it from this account would re-register it against this account's \
+             directories ({installed_from})"
+        ));
+    }
     match setup.start_mode() {
         Some(StartMode::Boot) => pass(
             "the boot service runs as LocalSystem: it needs no signed-in session and nothing it \
@@ -1764,6 +1792,13 @@ fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcom
             "a boot service keeps its credential in the System Keychain, which only root reads",
         );
     }
+    // Probing would run another account's binary as this account.
+    if let Some(installed_from) = &service.installed_from {
+        return not_applicable(format!(
+            "the service is installed from {installed_from}; its login keychain is read only in \
+             its own account"
+        ));
+    }
     let sign_in = || {
         format!(
             "{}{} (sign in again with the service binary; never switch to --start-at boot for \
@@ -2031,6 +2066,12 @@ pub struct Report {
     pub os: HostOs,
     pub perspective: Perspective,
     pub elevated: bool,
+    /// The other installation the machine's service belongs to, when it is
+    /// not this account's: the service checks judge that registration, while
+    /// the runner roots and tools checked are this account's configuration.
+    /// Absent when the service is this account's or there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_installed_from: Option<String>,
     pub findings: Vec<Finding>,
 }
 
@@ -2098,6 +2139,10 @@ pub fn evaluate(setup: &HostSetup, facts: &dyn HostFacts) -> Report {
         os: setup.os,
         perspective: setup.perspective,
         elevated: facts.elevated(),
+        service_installed_from: setup
+            .service
+            .as_ref()
+            .and_then(|service| service.installed_from.clone()),
         findings,
     }
 }
@@ -2153,6 +2198,14 @@ fn write_report(out: &mut dyn Write, report: &Report) -> io::Result<()> {
         "not elevated"
     };
     writeln!(out, "Host doctor ({os}, {view}, {elevated})")?;
+    if let Some(installed_from) = &report.service_installed_from {
+        writeln!(
+            out,
+            "  This machine's service is installed from {installed_from}, another \
+             installation's. The service checks below judge that registration; the runner roots \
+             and tools are this account's own configuration, which it does not run."
+        )?;
+    }
     let widest = report
         .findings
         .iter()
@@ -2330,17 +2383,22 @@ fn current_daemon_contact_age(
 /// [`current_daemon_contact_age`].
 pub(crate) fn installed_service_contact_age(context: &Context) -> Option<u64> {
     let binary = InstallRecord::read(context.paths()).ok().flatten()?.binary;
-    service_contact_age(context, Some(&binary))
+    service_contact_age(context.paths(), context.clock().now(), Some(&binary))
 }
 
-/// [`current_daemon_contact_age`] for the service binary at `binary`.
-fn service_contact_age(context: &Context, binary: Option<&Path>) -> Option<u64> {
+/// [`current_daemon_contact_age`] for the service binary at `binary`, whose
+/// daemon writes its contact under `paths`.
+fn service_contact_age(
+    paths: &runner_manager_platform::paths::AppPaths,
+    now: chrono::DateTime<chrono::Utc>,
+    binary: Option<&Path>,
+) -> Option<u64> {
     current_daemon_contact_age(
-        runner_manager_platform::service::last_github_contact(context.paths())
+        runner_manager_platform::service::last_github_contact(paths)
             .ok()
             .flatten(),
         binary.and_then(replaced_at),
-        context.clock().now(),
+        now,
     )
 }
 
@@ -2361,6 +2419,48 @@ fn replaced_at(binary: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
     }
 }
 
+/// The installed service, as the checks judge it.
+///
+/// This account's own install record, and from the operator's view whether
+/// the service manager reports it running -- unless the machine's service is
+/// another installation's, when it is that registration: an earlier login
+/// install's record left in this account's directories used to fail
+/// `windows.execution_account` with a `service install --start-at boot`
+/// remedy on a machine whose boot service was healthy.
+fn installed_service(context: &Context, perspective: Perspective) -> Option<ServiceSetup> {
+    let label = super::service::identity().launchd_label();
+    let status = (perspective == Perspective::Operator)
+        .then(|| super::service::operations(context).status().ok())
+        .flatten();
+    if let Some(status) = &status
+        && let Some(foreign) = status.foreign()
+    {
+        return Some(ServiceSetup {
+            start_mode: status.start_mode()?,
+            binary: status.service_binary()?,
+            definition_path: status
+                .record()
+                .and_then(|record| record.definition_path.clone()),
+            label,
+            running: Some(status.is_running()),
+            installed_from: Some(foreign.installed_by()),
+            foreign_directories: Some(foreign.directories.clone()),
+        });
+    }
+    InstallRecord::read(context.paths())
+        .ok()
+        .flatten()
+        .map(|record| ServiceSetup {
+            start_mode: record.start_mode,
+            binary: record.binary,
+            definition_path: record.definition_path,
+            label,
+            running: status.as_ref().map(ServiceStatus::is_running),
+            installed_from: None,
+            foreign_directories: None,
+        })
+}
+
 /// Builds the setup from values the caller has already read.
 ///
 /// `service` overrides the installed registration; `service install` passes
@@ -2373,21 +2473,7 @@ fn setup_from_parts(
     runner_root: &HostRoot,
     service: Option<ServiceSetup>,
 ) -> HostSetup {
-    let service = service.or_else(|| {
-        InstallRecord::read(context.paths())
-            .ok()
-            .flatten()
-            .map(|record| ServiceSetup {
-                start_mode: record.start_mode,
-                binary: record.binary,
-                definition_path: record.definition_path,
-                label: super::service::identity().launchd_label(),
-                running: (perspective == Perspective::Operator)
-                    .then(|| super::service::operations(context).status().ok())
-                    .flatten()
-                    .map(|status| status.is_running()),
-            })
-    });
+    let service = service.or_else(|| installed_service(context, perspective));
     let mut runner_roots: Vec<PathBuf> = runner_root
         .effective
         .iter()
@@ -2412,6 +2498,12 @@ fn setup_from_parts(
     {
         runner_roots.push(cache_root);
     }
+    // What the service recorded is read where it runs: another installation's
+    // directories when it is one, as far as this account may read them.
+    let service_paths = service
+        .as_ref()
+        .and_then(|service| service.foreign_directories.as_ref())
+        .map_or_else(|| context.paths().clone(), ServiceDirectories::paths);
     let mode = service.as_ref().map(|service| service.start_mode);
     let (service_account, service_home) = service_account_and_home(perspective, mode);
     let (required_tools, required_tools_error) = match required_tools(context) {
@@ -2429,11 +2521,12 @@ fn setup_from_parts(
         probe_dir: context.paths().state_dir().to_path_buf(),
         data_root: context.data_root.clone(),
         service_contact_age_secs: service_contact_age(
-            context,
+            &service_paths,
+            context.clock().now(),
             service.as_ref().map(|service| service.binary.as_path()),
         ),
         service_credential_unreadable:
-            runner_manager_platform::service::credential_unreadable_since(context.paths())
+            runner_manager_platform::service::credential_unreadable_since(&service_paths)
                 .is_ok_and(|since| since.is_some()),
         own_keychain_readable: (HostOs::current() == HostOs::Macos
             && perspective == Perspective::Operator
@@ -2444,18 +2537,18 @@ fn setup_from_parts(
                 .is_ok_and(|store| store.load().is_ok())
         }),
         launches_blocked: runner_manager_platform::launch_health::launches_blocked(
-            context.paths(),
+            &service_paths,
             context.clock().now(),
         ),
         service_account,
         service_home,
         daemon_unfit: (perspective == Perspective::Operator)
-            .then(|| host_fitness::host_unfit_in_force(context.paths(), context.clock().now()))
+            .then(|| host_fitness::host_unfit_in_force(&service_paths, context.clock().now()))
             .flatten(),
-        polling: runner_manager_platform::polling::idle_interval(context.paths())
+        polling: runner_manager_platform::polling::idle_interval(&service_paths)
             .ok()
             .map(|idle| {
-                let traffic = runner_manager_platform::polling::last_traffic(context.paths())
+                let traffic = runner_manager_platform::polling::last_traffic(&service_paths)
                     .ok()
                     .flatten();
                 let now = context.clock().now();
@@ -2466,7 +2559,7 @@ fn setup_from_parts(
                         |host| host.refresh_interval.as_secs(),
                     ),
                     stale: traffic.as_ref().is_some_and(|traffic| {
-                        super::polling::is_stale(context.paths(), traffic.written_at, now)
+                        super::polling::is_stale(&service_paths, traffic.written_at, now)
                     }),
                     traffic,
                 }
@@ -3893,6 +3986,8 @@ pub fn before_service_install(
             definition_path: None,
             label: super::service::identity().launchd_label(),
             running: None,
+            installed_from: None,
+            foreign_directories: None,
         }),
     ) else {
         return Ok(());
@@ -4284,6 +4379,8 @@ mod tests {
                 definition_path: None,
                 label: "rm".into(),
                 running: None,
+                installed_from: None,
+                foreign_directories: None,
             }),
             runner_roots: vec![PathBuf::from(r"C:\rman")],
             capacity: 2,
@@ -4312,6 +4409,8 @@ mod tests {
                 definition_path: Some(PathBuf::from("/Users/me/Library/LaunchAgents/rm.plist")),
                 label: "io.github.IvanMurzak.runner-manager".into(),
                 running: None,
+                installed_from: None,
+                foreign_directories: None,
             }),
             runner_roots: vec![PathBuf::from("/Volumes/NVME/rman")],
             runner_path: Some("/usr/bin".into()),
