@@ -24,7 +24,7 @@ the version being prepared rather than the version in `Cargo.toml`.
   npm command to run, instead of having a second copy installed somewhere else.
 - When the newest release is already installed but the service still runs an older build (for
   example after `npm install --global` was run by hand), `update` no longer says "Nothing to do".
-  It reports `installed 0.4.40, service still 0.4.39` and starts the same job-safe swap that
+  It says the service still runs the older build and starts the same job-safe swap that
   follows an update: the service finishes every running job, then restarts on the new build.
   It does this by giving the file the service watches a new modification time; the file's
   contents are not changed. When the service was installed from another copy, `update` names
