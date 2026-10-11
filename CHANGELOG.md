@@ -22,15 +22,18 @@ the version being prepared rather than the version in `Cargo.toml`.
   the copy you ran and not the global prefix of the account running it. Seen on a machine with two
   accounts, each with its own copy under `%APPDATA%\npm`, where the machine PATH lists the first
   account's copy first. Afterwards `update` runs the updated binary and says which version it now
-  reports. A copy inside a `node_modules` tree that is not a global install is refused with the
-  npm command to run, instead of having a second copy installed somewhere else.
+  reports. A copy that is not a global install (one in a project's `node_modules`, or a
+  dependency of another package) is refused with the npm command to run, instead of having a
+  second copy installed somewhere else.
 - When the newest release is already installed but the service still runs an older build (for
   example after `npm install --global` was run by hand), `update` no longer says "Nothing to do".
   It says the service still runs the older build and starts the same job-safe swap that
   follows an update: the service finishes every running job, then restarts on the new build.
   It does this by giving the file the service watches a new modification time; the file's
-  contents are not changed. When the service was installed from another copy, `update` names
-  `runner-manager update --force`, which hands this copy over without interrupting a job. After
+  contents are not changed. If the service is not running, `update` says so and names the
+  command that starts it, after which it swaps by itself. When the service was installed from
+  another copy, `update` names `runner-manager update --force`, which hands this copy over
+  without interrupting a job. After
   an update the same case used to name `service install`, which refuses while the service runs.
   A registration from before the service ran its own copy is still told to re-register with
   `service install`. `--check` reports what would happen and changes nothing.

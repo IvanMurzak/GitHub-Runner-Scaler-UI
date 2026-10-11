@@ -331,9 +331,9 @@ pub fn find_on_path(tool: &str, path: &OsStr) -> Option<PathBuf> {
 /// - the current directory and relative `PATH` entries are not searched;
 /// - only `.exe`, `.com`, `.cmd` and `.bat` are tried (a `.ps1` or `.js` in
 ///   `PATHEXT` is skipped), lower-cased so `Command` recognises a batch file;
-/// - a bare name is tried as it is only when it already carries an extension:
-///   `CreateProcess` never runs an extensionless file, and Node.js ships a
-///   POSIX `npm` script beside `npm.cmd`.
+/// - a name is tried as it is only when it already ends in one of those
+///   extensions: `CreateProcess` never runs an extensionless file, and
+///   Node.js ships a POSIX `npm` script beside `npm.cmd`.
 #[must_use]
 pub fn find_on_windows_path(tool: &str, path: &OsStr, pathext: Option<&OsStr>) -> Option<PathBuf> {
     const RUNNABLE: [&str; 4] = [".exe", ".com", ".cmd", ".bat"];
@@ -344,7 +344,15 @@ pub fn find_on_windows_path(tool: &str, path: &OsStr, pathext: Option<&OsStr>) -
         .and_then(OsStr::to_str)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(".COM;.EXE;.BAT;.CMD");
-    let bare = tool.contains('.').then_some("");
+    let bare = Path::new(tool)
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| {
+            RUNNABLE
+                .iter()
+                .any(|runnable| runnable[1..].eq_ignore_ascii_case(extension))
+        })
+        .then_some("");
     let extensions: Vec<&str> = bare
         .into_iter()
         .chain(pathext.split(';').filter_map(|extension| {
@@ -1240,8 +1248,10 @@ mod tests {
         // An unset or blank PATHEXT means cmd.exe's own default.
         assert_eq!(find_on_windows_path("npm", &path, None), cmd);
         assert_eq!(find_on_windows_path("npm", &path, Some(" ".as_ref())), cmd);
-        // A name with its extension is tried as it is.
+        // A name with its extension is tried as it is, but only a runnable one.
         assert_eq!(find_on_windows_path("npm.cmd", &path, None), cmd);
+        touch(&nodejs.path().join("npm.ps1"));
+        assert_eq!(find_on_windows_path("npm.ps1", &path, None), None);
     }
 
     /// `PATHEXT` order decides within one directory; `PATH` order decides
@@ -1279,6 +1289,7 @@ mod tests {
     /// No npm is `None`. An extension `Command` cannot run, and a relative
     /// PATH entry, are not candidates.
     #[test]
+    #[serial_test::serial(current_dir)]
     fn a_missing_npm_is_not_found_on_a_windows_path() {
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(

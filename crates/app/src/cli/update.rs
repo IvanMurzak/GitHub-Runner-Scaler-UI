@@ -417,7 +417,13 @@ impl Installation {
     /// or why there is none. See [`npm_global_prefix`].
     fn npm_prefix(&self) -> Result<String, CliError> {
         npm_global_prefix(&self.path, cfg!(windows))
-            .map(|prefix| display_path(&prefix))
+            // `\\?\UNC\server\share` is `\\server\share` to npm.
+            .map(
+                |prefix| match display_path(&prefix).strip_prefix(r"\\?\UNC\") {
+                    Some(share) => format!(r"\\{share}"),
+                    None => display_path(&prefix),
+                },
+            )
             .ok_or_else(|| {
                 CliError::with_remedy(
                     Failure::UpdateUnsupported,
@@ -461,12 +467,19 @@ fn npm_global_prefix(binary: &Path, windows: bool) -> Option<PathBuf> {
             .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
     };
     let (package_scope, package_name) = NPM_PACKAGE.split_once('/')?;
-    let modules = (0..components.len()).find(|&index| {
-        named(index, "node_modules")
-            && named(index + 1, package_scope)
-            && named(index + 2, package_name)
-    })?;
+    let modules = (0..components.len()).find(|&index| named(index, "node_modules"))?;
+    // The first `node_modules` must hold the package itself: one holding
+    // another package means this is that package's dependency, not a global
+    // install of this one.
+    if !(named(modules + 1, package_scope) && named(modules + 2, package_name)) {
+        return None;
+    }
     let root: PathBuf = components[..modules].iter().collect();
+    // A project directory, not a prefix: npm writes no `package.json` into a
+    // global prefix.
+    if root.join("package.json").exists() {
+        return None;
+    }
     if windows {
         return Some(root);
     }
@@ -821,6 +834,10 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
             ))?;
         }
         Channel::Npm => {
+            // npm replaces the package directory this process runs from. On
+            // Windows that works while the binary runs (measured with npm
+            // 12.2.0: it renames the directory aside, exits 0, and warns that
+            // it could not delete the old one).
             let prefix = installation.npm_prefix()?;
             let package = format!("{NPM_PACKAGE}@{}", published.version);
             run_package_manager(
@@ -1638,6 +1655,11 @@ struct ServiceBehind {
     /// The version the service's private copy reports.
     service: String,
     source: RecordedSource,
+    /// The command that starts the daemon, when the service manager is not
+    /// running the one the record describes. A swap is the running daemon's
+    /// own drain, so without one nothing swaps until it starts. Only read for
+    /// [`RecordedSource::ThisCopy`].
+    not_running: Option<String>,
 }
 
 /// The decision, split out so each state can be tested without a service.
@@ -1658,6 +1680,7 @@ fn decide_service_behind(
     (compare_versions(installed, core) == std::cmp::Ordering::Greater).then(|| ServiceBehind {
         service: service.to_owned(),
         source,
+        not_running: None,
     })
 }
 
@@ -1674,11 +1697,32 @@ fn service_behind(
 ) -> Option<ServiceBehind> {
     let record = InstallRecord::read(context.paths()).ok()??;
     let service = super::status::binary_version(&record.binary);
-    decide_service_behind(
+    let mut behind = decide_service_behind(
         installed,
         service.as_deref(),
         recorded_source(&record, installation),
-    )
+    )?;
+    if matches!(behind.source, RecordedSource::ThisCopy(_)) {
+        behind.not_running = restart_unless_running(context, &record);
+    }
+    Some(behind)
+}
+
+/// `None` when the service manager runs the daemon `record` describes;
+/// otherwise the command that starts it. The registration must name the
+/// record's own private copy, as `update --force` requires: a record from
+/// another data directory says nothing about the machine's registration.
+fn restart_unless_running(context: &Context, record: &InstallRecord) -> Option<String> {
+    let Ok(status) = super::service::operations(context).status() else {
+        return Some("runner-manager service status".to_owned());
+    };
+    let running = status.registration().is_some_and(|registration| {
+        registration.running
+            && registration
+                .binary()
+                .is_some_and(|binary| same_file(&binary, &record.binary))
+    });
+    (!running).then(|| status.restart_command())
 }
 
 /// Reports, and with `check` false performs, what a service behind the newest
@@ -1697,32 +1741,44 @@ fn report_service_behind(
          runs {service}."
     )
     .map_err(failed)?;
-    match &behind.source {
-        RecordedSource::ThisCopy(source) => {
-            let verb = if check { "Would swap" } else { "Swapping" };
-            writeln!(
-                out,
-                "{verb} {service} -> {installed}: the service finishes every job it is running, \
-                 then restarts on {installed}. No job is interrupted."
-            )
-            .map_err(failed)?;
-            if check {
-                writeln!(out, "Nothing has been changed, because --check was given.")
-                    .map_err(failed)?;
-            } else if let Err(error) = nudge_watcher(source) {
-                writeln!(
-                    out,
-                    "warning: could not mark {} as changed ({error}); the service picks it up \
-                     the next time it starts.",
-                    display_path(source)
-                )
-                .map_err(failed)?;
-            }
-            writeln!(out, "Check progress with: runner-manager service status").map_err(failed)
-        }
-        RecordedSource::Other(source) => write_hand_over_with_force(source, installed, out),
-        RecordedSource::None => write_reregister(installed, out),
+    let source = match &behind.source {
+        RecordedSource::ThisCopy(source) => source,
+        RecordedSource::Other(source) => return write_hand_over_with_force(source, installed, out),
+        RecordedSource::None => return write_reregister(installed, out),
+    };
+    // Marked whether or not the daemon runs: a daemon that starts later swaps
+    // as soon as it starts anyway, and the mark is harmless.
+    let marked = if check { Ok(()) } else { nudge_watcher(source) };
+    if let Err(error) = &marked {
+        writeln!(
+            out,
+            "warning: could not mark {} as changed ({error}), so the running service may not \
+             notice it until it restarts.",
+            display_path(source)
+        )
+        .map_err(failed)?;
     }
+    match &behind.not_running {
+        Some(start) => writeln!(
+            out,
+            "The service is not running (or its registration does not match its record), so \
+             nothing swaps it now. It swaps to {installed} as soon as it starts; to start it now: \
+             {start}"
+        )
+        .map_err(failed)?,
+        None if marked.is_ok() => writeln!(
+            out,
+            "{} {service} -> {installed}: the service finishes every job it is running, then \
+             restarts on {installed}. No job is interrupted.",
+            if check { "Would swap" } else { "Swapping" }
+        )
+        .map_err(failed)?,
+        None => {}
+    }
+    if check {
+        writeln!(out, "Nothing has been changed, because --check was given.").map_err(failed)?;
+    }
+    writeln!(out, "Check progress with: runner-manager service status").map_err(failed)
 }
 
 /// Gives `path` a new modification time, so a daemon watching it looks again.
@@ -2075,6 +2131,51 @@ mod tests {
         ]);
         assert_eq!(npm_global_prefix(&local_wrapper, false), None);
 
+        // Windows has no `lib` to tell a prefix from a project, so a project
+        // is recognised by its `package.json`.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), b"{}").unwrap();
+        let in_project = [
+            "node_modules",
+            "@ivan-murzak",
+            "runner-manager",
+            "node_modules",
+            "@ivan-murzak",
+            "runner-manager-win32-x64",
+            "bin",
+            "runner-manager.exe",
+        ]
+        .iter()
+        .fold(project.path().to_path_buf(), |path, part| path.join(part));
+        assert_eq!(npm_global_prefix(&in_project, true), None);
+        // The same layout under a directory with no `package.json` is a prefix.
+        let prefix = tempfile::tempdir().unwrap();
+        let in_prefix = in_project
+            .strip_prefix(project.path())
+            .map(|rest| prefix.path().join(rest))
+            .unwrap();
+        assert_eq!(
+            npm_global_prefix(&in_prefix, true),
+            Some(prefix.path().to_path_buf())
+        );
+
+        // A dependency of another global package is not this package's install.
+        let dependency = parts(&[
+            "C:",
+            "npm",
+            "node_modules",
+            "other-tool",
+            "node_modules",
+            "@ivan-murzak",
+            "runner-manager",
+            "node_modules",
+            "@ivan-murzak",
+            "runner-manager-win32-x64",
+            "bin",
+            "runner-manager.exe",
+        ]);
+        assert_eq!(npm_global_prefix(&dependency, true), None);
+
         let installation = Installation {
             channel: Channel::Npm,
             path: hoisted,
@@ -2094,6 +2195,7 @@ mod tests {
         Some(ServiceBehind {
             service: "0.4.38".into(),
             source,
+            not_running: None,
         })
     }
 
@@ -2159,6 +2261,7 @@ mod tests {
         let follow_up = ServiceBehind {
             service: "0.4.38".into(),
             source: RecordedSource::ThisCopy(source.clone()),
+            not_running: None,
         };
 
         let mut out = Vec::new();
@@ -2181,6 +2284,35 @@ mod tests {
         assert_eq!(std::fs::read(&source).unwrap(), b"the newer build");
     }
 
+    /// No running daemon means no drain to set off: the report says so and
+    /// names the start command instead of claiming a swap, and the copy is
+    /// still marked for the daemon that starts later.
+    #[test]
+    fn a_service_that_is_not_running_is_told_how_to_start_not_that_it_swaps() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("runner-manager");
+        std::fs::write(&source, b"the newer build").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(long_ago())
+            .unwrap();
+        let follow_up = ServiceBehind {
+            service: "0.4.38".into(),
+            source: RecordedSource::ThisCopy(source.clone()),
+            not_running: Some("the-start-command".into()),
+        };
+
+        let mut out = Vec::new();
+        report_service_behind(&follow_up, "0.4.39", false, &mut out).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("is not running"), "{said}");
+        assert!(said.contains("the-start-command"), "{said}");
+        assert!(!said.contains("Swapping"), "{said}");
+        assert!(modified(&source) > long_ago());
+    }
+
     /// A copy watched by another daemon is named with the job-safe command
     /// that hands this one over -- not `service install`, which refuses while
     /// the daemon runs -- and nothing is written.
@@ -2189,6 +2321,7 @@ mod tests {
         let follow_up = ServiceBehind {
             service: "0.4.38".into(),
             source: RecordedSource::Other(PathBuf::from("another-copy")),
+            not_running: None,
         };
         let mut out = Vec::new();
         report_service_behind(&follow_up, "0.4.39", false, &mut out).unwrap();

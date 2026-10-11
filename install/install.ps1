@@ -590,7 +590,7 @@ try {
         Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $stagedSupervisor -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $supervisorBackup -Force -ErrorAction SilentlyContinue
-        Write-Fail "could not replace $destination. Close every runner-manager window or command running from it (the service runs its own copy, so it does not hold this file) and run this again."
+        Write-Fail "could not replace $destination. Close every runner-manager window or command running from it and run this again. A service runs its own copy and does not hold this file, unless it was registered before it had one (runner-manager service status shows the binary it runs)."
     }
     Remove-Item -LiteralPath $supervisorBackup -Force -ErrorAction SilentlyContinue
 

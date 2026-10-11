@@ -747,7 +747,9 @@ fn modified(path: &Path) -> std::time::SystemTime {
 /// ANASTASIIA: npm had installed the newest release by hand, the service still
 /// ran the old build, and `update` said "Nothing to do". The service watches
 /// this copy, so `update` marks it changed and the daemon's own job-safe drain
-/// does the rest; the copy marked is the one running this very command.
+/// does the rest; the copy marked is the one running this very command. No
+/// service manager here runs this record's daemon, so the report says it swaps
+/// when it starts rather than claiming a swap in progress.
 #[test]
 fn an_older_service_behind_the_newest_release_is_swapped_not_nothing_to_do() {
     let fixtures = tempfile::tempdir().expect("a temporary directory");
@@ -779,7 +781,7 @@ fn an_older_service_behind_the_newest_release_is_swapped_not_nothing_to_do() {
         checked.both()
     );
     assert!(
-        checked.stdout.contains("Would swap 0.0.1 ->"),
+        checked.stdout.contains("swaps to") && checked.stdout.contains("as soon as it starts"),
         "{}",
         checked.both()
     );
@@ -805,7 +807,7 @@ fn an_older_service_behind_the_newest_release_is_swapped_not_nothing_to_do() {
     assert!(
         outcome
             .stdout
-            .contains(&format!("Swapping 0.0.1 -> {RUNNING}")),
+            .contains(&format!("swaps to {RUNNING} as soon as it starts")),
         "{}",
         outcome.both()
     );
