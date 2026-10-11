@@ -12,15 +12,11 @@ the version being prepared rather than the version in `Cargo.toml`.
 ### Fixes
 
 - Native runners start with `POWERSHELL_TELEMETRY_OPTOUT=1` on every platform, so a job's
-  PowerShell step shells no longer hang at startup while another job runs. PowerShell 7.6.6 and
-  earlier, starting with no telemetry identity file in its cache directory, takes the
-  session-wide named mutex `CreateUniqueUserId` twice and releases it once, so it keeps the mutex
-  until it exits, and every other shell in the same position waits for it with no timeout. On
-  Windows that cache directory is under local application data, which follows the per-attempt
-  `USERPROFILE`, so the first shell of every job is in that position, and every runner of the
-  service shares one session. Seen as several concurrent `pwsh` step shells holding their runner
-  for two hours with no output and almost no CPU, until killed. The opt-out makes PowerShell
-  skip its telemetry setup, mutex included.
+  PowerShell step shells no longer hang at startup while another job runs. The cause is a
+  telemetry lock in PowerShell 7.6.6 and earlier, which the first `pwsh` of each job takes in its
+  fresh profile and keeps until it exits, while the first `pwsh` of every other job waits for it
+  with no timeout. Seen as several `pwsh` step shells holding their runners for two hours with no
+  output and almost no CPU. The opt-out makes PowerShell skip that code.
 - A value the service's own environment already has for `POWERSHELL_TELEMETRY_OPTOUT` is left
   as it is, and `runner.env` overrides it like any other default:
   `runner-manager host env set POWERSHELL_TELEMETRY_OPTOUT=0` turns PowerShell telemetry back
