@@ -290,7 +290,7 @@ fn report_auth_after_handover(
     Ok(())
 }
 
-pub(super) fn executable_version(path: &Path) -> Option<String> {
+fn executable_version(path: &Path) -> Option<String> {
     let output = Command::new(path).arg("--version").output().ok()?;
     if !output.status.success() {
         return None;

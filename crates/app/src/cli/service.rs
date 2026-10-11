@@ -607,9 +607,7 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
             if status.problems().iter().any(|problem| {
                 problem.subject == runner_manager_platform::service::DAEMON_STALLED_SUBJECT
             }) {
-                operations
-                    .identity()
-                    .restart_command(status.start_mode().unwrap_or(StartMode::Boot))
+                status.restart_command()
             } else {
                 // Nor a host check: the problem line names its fix, and
                 // `host doctor` shows the rest.

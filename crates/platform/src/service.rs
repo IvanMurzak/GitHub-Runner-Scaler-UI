@@ -312,7 +312,7 @@ impl ServiceIdentity {
         if cfg!(windows) {
             match mode {
                 StartMode::Boot => {
-                    format!("Restart-Service -Name {name} (from an elevated PowerShell)")
+                    format!("Restart-Service -Name {name}")
                 }
                 StartMode::Login => format!("schtasks /End /TN {name}; schtasks /Run /TN {name}"),
             }
@@ -4721,14 +4721,7 @@ impl ServiceOperations {
         });
         let now = Utc::now();
         let installed = record.is_some() || found.is_some();
-        let restart = self.identity.restart_command(
-            record
-                .as_ref()
-                .map(|record| record.start_mode)
-                .or_else(|| found.as_ref().map(|found| found.start_mode))
-                .unwrap_or(StartMode::Boot),
-        );
-        Ok(ServiceStatus::compose(
+        let status = ServiceStatus::compose(
             self.identity.clone(),
             record,
             record_refused,
@@ -4741,8 +4734,11 @@ impl ServiceOperations {
         .with_credential_unreadable(credential_unreadable_since)
         .with_launches_blocked(crate::launch_health::launches_blocked(paths, now))
         .with_unattended_gap(unattended)
-        .with_host_unfit(crate::host_fitness::host_unfit_in_force(paths, now).filter(|_| installed))
-        .with_stall(
+        .with_host_unfit(
+            crate::host_fitness::host_unfit_in_force(paths, now).filter(|_| installed),
+        );
+        let restart = status.restart_command();
+        Ok(status.with_stall(
             crate::daemon_heartbeat::liveness(paths, now).stall(last_github_contact, &restart),
         ))
     }
@@ -6216,6 +6212,14 @@ impl ServiceStatus {
     #[must_use]
     pub const fn unattended_gap(&self) -> Option<&UnattendedGap> {
         self.unattended_gap.as_ref()
+    }
+
+    /// The service manager's command that restarts this registration, for its
+    /// start mode (boot when unknown). See [`ServiceIdentity::restart_command`].
+    #[must_use]
+    pub fn restart_command(&self) -> String {
+        self.identity
+            .restart_command(self.start_mode().unwrap_or(StartMode::Boot))
     }
 
     /// The recorded start mode. Journey 5 step 4. For another installation's

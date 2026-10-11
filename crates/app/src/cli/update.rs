@@ -408,8 +408,18 @@ impl Installation {
                 ),
                 "runner-manager service status",
             )),
-            Channel::Npm if npm_global_prefix(&self.path, cfg!(windows)).is_none() => {
-                Some(CliError::with_remedy(
+            Channel::Npm => self.npm_prefix().err(),
+            Channel::Archive | Channel::Homebrew | Channel::Cargo => None,
+        }
+    }
+
+    /// The global npm prefix holding this copy, as an operator would type it,
+    /// or why there is none. See [`npm_global_prefix`].
+    fn npm_prefix(&self) -> Result<String, CliError> {
+        npm_global_prefix(&self.path, cfg!(windows))
+            .map(|prefix| display_path(&prefix))
+            .ok_or_else(|| {
+                CliError::with_remedy(
                     Failure::UpdateUnsupported,
                     format!(
                         "this copy is inside a node_modules tree ({}), but not in the layout of a \
@@ -419,10 +429,8 @@ impl Installation {
                         display_path(&self.path)
                     ),
                     format!("npm install --global {NPM_PACKAGE}"),
-                ))
-            }
-            Channel::Archive | Channel::Npm | Channel::Homebrew | Channel::Cargo => None,
-        }
+                )
+            })
     }
 }
 
@@ -715,15 +723,12 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
         // The newest release can be installed while the service still runs an
         // older one: npm run by hand, or the update of a copy whose service
         // missed the change. "Nothing to do" would be false there.
+        let installed = running_version();
         if ordering == std::cmp::Ordering::Equal
-            && report_service_behind(
-                &service_follow_up(context, &installation, running_version()),
-                running_version(),
-                args.check,
-                out,
-            )?
+            && let Some(behind) = service_behind(context, &installation, installed)
         {
-            return report_managed_wsl_hosts(context.paths(), running_version(), out);
+            report_service_behind(&behind, installed, args.check, out)?;
+            return report_managed_wsl_hosts(context.paths(), installed, out);
         }
         let sentence = if ordering == std::cmp::Ordering::Equal {
             format!(
@@ -816,14 +821,7 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
             ))?;
         }
         Channel::Npm => {
-            // `refusal` returned above when there is no prefix to name.
-            let prefix = npm_global_prefix(&installation.path, cfg!(windows))
-                .map(|prefix| display_path(&prefix))
-                .ok_or_else(|| {
-                    installation.refusal().unwrap_or_else(|| {
-                        CliError::new(Failure::UpdateUnsupported, "no npm prefix to update")
-                    })
-                })?;
+            let prefix = installation.npm_prefix()?;
             let package = format!("{NPM_PACKAGE}@{}", published.version);
             run_package_manager(
                 "npm",
@@ -845,7 +843,7 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
             if let Err(problem) = run_package_manager(
                 "brew",
                 &["update"],
-                "brew update && brew upgrade IvanMurzak/tap/runner-manager".into(),
+                "brew update && brew upgrade IvanMurzak/tap/runner-manager",
                 out,
             ) {
                 writeln!(out, "warning: {}", problem.message()).map_err(failed)?;
@@ -853,7 +851,7 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
             run_package_manager(
                 "brew",
                 &["upgrade", BREW_FORMULA],
-                "brew upgrade IvanMurzak/tap/runner-manager".into(),
+                "brew upgrade IvanMurzak/tap/runner-manager",
                 out,
             )?;
             // ----------------------------------------------------------------
@@ -887,7 +885,7 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
                     "--locked",
                     "--force",
                 ],
-                "cargo install runner-manager --locked".into(),
+                "cargo install runner-manager --locked",
                 out,
             )?;
             confirm_with_version(out)?;
@@ -1419,10 +1417,11 @@ fn install_over(new_binary: &Path, destination: &Path) -> Result<(), CliError> {
 fn run_package_manager(
     program: &str,
     arguments: &[&str],
-    remedy: String,
+    remedy: impl Into<String>,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let failed = write_failed("this update");
+    let remedy: String = remedy.into();
     let not_on_path = || {
         CliError::with_remedy(
             Failure::UpdateUnsupported,
@@ -1491,53 +1490,10 @@ fn run_package_manager(
 /// returned as it is.
 fn resolve_program(name: &str) -> Option<PathBuf> {
     if cfg!(windows) {
-        find_on_windows_path(
-            name,
-            std::env::var_os("PATH").as_deref(),
-            std::env::var_os("PATHEXT").as_deref(),
-        )
+        runner_manager_platform::host_fitness::find_on_path(name, &std::env::var_os("PATH")?)
     } else {
         Some(PathBuf::from(name))
     }
-}
-
-/// What `cmd.exe` would run for `name`: the first `PATH` directory, in order,
-/// holding `name` with one of the `PATHEXT` extensions, tried in `PATHEXT`
-/// order within each directory.
-///
-/// Two deliberate departures from `cmd.exe`. The current directory is not
-/// searched, and neither is a relative `PATH` entry: either would run a file
-/// from wherever the operator happened to be standing. And only `.exe`,
-/// `.com`, `.cmd` and `.bat` are accepted, the extensions `Command` can run
-/// with its arguments intact; a `.ps1` or `.js` listed in `PATHEXT` is skipped.
-fn find_on_windows_path(
-    name: &str,
-    path: Option<&std::ffi::OsStr>,
-    pathext: Option<&std::ffi::OsStr>,
-) -> Option<PathBuf> {
-    const RUNNABLE: [&str; 4] = [".exe", ".com", ".cmd", ".bat"];
-    let pathext = pathext
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(".COM;.EXE;.BAT;.CMD");
-    // Lower-cased: Windows matches either case, and the name is then the one
-    // `Command` recognises as a batch file whatever case PATHEXT used.
-    let extensions: Vec<&str> = pathext
-        .split(';')
-        .filter_map(|extension| {
-            RUNNABLE
-                .into_iter()
-                .find(|runnable| runnable.eq_ignore_ascii_case(extension.trim()))
-        })
-        .collect();
-    std::env::split_paths(path?)
-        .filter(|directory| directory.is_absolute())
-        .find_map(|directory| {
-            extensions.iter().find_map(|extension| {
-                let candidate = directory.join(format!("{name}{extension}"));
-                candidate.is_file().then_some(candidate)
-            })
-        })
 }
 
 /// Says whether npm really replaced the copy this process is, by running it.
@@ -1610,142 +1566,139 @@ fn report_service_consequence(
     };
 
     writeln!(out).map_err(failed)?;
-    match record.source_binary.as_deref() {
-        Some(source) if same_file(source, &installation.path) => {
-            writeln!(
-                out,
-                "The service runs its own copy of this binary. It will finish every job it is \
-                 holding, replace that copy with {version}, and be restarted by the service \
-                 manager. Nothing else is needed."
-            )
-            .map_err(failed)?;
-        }
-        Some(source) => {
-            // Not `service install`: it refuses while the daemon it would
-            // replace holds the agent lock, which is whenever the service runs.
-            writeln!(
-                out,
-                "The service was installed from {}, not from the binary just replaced, so it will \
-                 keep running the version there. Hand this one over to it (the service finishes \
-                 every running job first):",
-                display_path(source)
-            )
-            .map_err(failed)?;
-            writeln!(out, "  runner-manager update --force").map_err(failed)?;
-        }
-        None => {
-            // A registration made before the service ran a copy of its own.
-            // That layout cannot be upgraded underneath a running service --
-            // which is why the copy exists -- so the remedy is to re-register.
-            writeln!(
-                out,
-                "This host's service registration names a binary directly rather than a copy this \
-                 product owns, so it cannot pick up {version} by itself. Re-register it:"
-            )
-            .map_err(failed)?;
-            writeln!(out, "  runner-manager service install").map_err(failed)?;
-        }
+    match recorded_source(&record, installation) {
+        RecordedSource::ThisCopy(_) => writeln!(
+            out,
+            "The service runs its own copy of this binary. It will finish every job it is \
+             holding, replace that copy with {version}, and be restarted by the service \
+             manager. Nothing else is needed."
+        )
+        .map_err(failed),
+        RecordedSource::Other(source) => write_hand_over_with_force(&source, version, out),
+        RecordedSource::None => write_reregister(version, out),
     }
-    Ok(())
-}
-
-/// What the registered service still needs once this copy is the newest
-/// release.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ServiceFollowUp {
-    /// No service, one already at this version or newer, or one whose version
-    /// cannot be read.
-    Nothing,
-    /// The daemon watches this very copy, which is newer than what it runs. It
-    /// swaps by itself, after its running jobs; see [`nudge_watcher`].
-    DaemonSwaps { service: String, source: PathBuf },
-    /// The daemon watches another copy, so this one reaches it only through
-    /// `update --force`, which stages it at that copy's path.
-    HandOverWithForce { service: String, source: PathBuf },
-    /// A registration that names its binary directly, from before the service
-    /// ran a copy of its own.
-    Reregister { service: String },
 }
 
 /// Where the service's recorded source is, relative to this copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecordedSource {
+    /// A registration that names its binary directly, from before the service
+    /// ran a copy of its own.
     None,
+    /// The daemon watches this very copy.
     ThisCopy(PathBuf),
+    /// The daemon watches another copy.
     Other(PathBuf),
 }
 
+fn recorded_source(record: &InstallRecord, installation: &Installation) -> RecordedSource {
+    match &record.source_binary {
+        Some(source) if same_file(source, &installation.path) => {
+            RecordedSource::ThisCopy(source.clone())
+        }
+        Some(source) => RecordedSource::Other(source.clone()),
+        None => RecordedSource::None,
+    }
+}
+
+/// `update --force`, not `service install`: the latter refuses while the
+/// daemon it would replace holds the agent lock, which is whenever it runs.
+fn write_hand_over_with_force(
+    source: &Path,
+    version: &str,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let failed = write_failed("this update");
+    writeln!(
+        out,
+        "The service was installed from {}, not from this copy, so it keeps running the version \
+         there. Hand {version} over to it (the service finishes every running job first):",
+        display_path(source)
+    )
+    .map_err(failed)?;
+    writeln!(out, "  runner-manager update --force").map_err(failed)
+}
+
+/// A registration from before the service ran a copy of its own cannot be
+/// upgraded underneath a running service -- which is why the copy exists.
+fn write_reregister(version: &str, out: &mut dyn Write) -> Result<(), CliError> {
+    let failed = write_failed("this update");
+    writeln!(
+        out,
+        "This host's service registration names a binary directly rather than a copy this \
+         product owns, so it cannot pick up {version} by itself. Re-register it:"
+    )
+    .map_err(failed)?;
+    writeln!(out, "  runner-manager service install").map_err(failed)
+}
+
+/// A service running an older build than the newest release this copy is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceBehind {
+    /// The version the service's private copy reports.
+    service: String,
+    source: RecordedSource,
+}
+
 /// The decision, split out so each state can be tested without a service.
+/// `None` when the service's version is unknown or not older than `installed`.
 ///
 /// Another copy is never executed to learn its version: it may be another
 /// account's file, and `update --force` -- the step that would act on it --
 /// examines it itself.
-fn decide_service_follow_up(
+fn decide_service_behind(
     installed: &str,
     service: Option<&str>,
     source: RecordedSource,
-) -> ServiceFollowUp {
-    let Some(service) = service else {
-        return ServiceFollowUp::Nothing;
-    };
-    if compare_versions(installed, service) != std::cmp::Ordering::Greater {
-        return ServiceFollowUp::Nothing;
-    }
-    let service = service.to_owned();
-    match source {
-        RecordedSource::ThisCopy(source) => ServiceFollowUp::DaemonSwaps { service, source },
-        RecordedSource::Other(source) => ServiceFollowUp::HandOverWithForce { service, source },
-        RecordedSource::None => ServiceFollowUp::Reregister { service },
-    }
+) -> Option<ServiceBehind> {
+    let service = service?;
+    // Without build metadata: a build outside the release workflow reports
+    // `X.Y.Z+git.<sha>`.
+    let core = service.split('+').next().unwrap_or(service);
+    (compare_versions(installed, core) == std::cmp::Ordering::Greater).then(|| ServiceBehind {
+        service: service.to_owned(),
+        source,
+    })
 }
 
-/// Reads this host's service and decides what it still needs.
+/// Reads this host's service and decides whether it is behind.
 ///
 /// The version is read by running the service's private copy, which lives in
-/// this account's own state directory. Anything unreadable is
-/// [`ServiceFollowUp::Nothing`]: `service status` diagnoses a record, and this
-/// command saying nothing beats guessing.
-fn service_follow_up(
+/// this account's own state directory. Anything unreadable is `None`:
+/// `service status` diagnoses a record, and this command saying nothing beats
+/// guessing.
+fn service_behind(
     context: &Context,
     installation: &Installation,
     installed: &str,
-) -> ServiceFollowUp {
-    let Ok(Some(record)) = InstallRecord::read(context.paths()) else {
-        return ServiceFollowUp::Nothing;
-    };
-    let service = force::executable_version(&record.binary);
-    let source = match record.source_binary {
-        Some(source) if same_file(&source, &installation.path) => RecordedSource::ThisCopy(source),
-        Some(source) => RecordedSource::Other(source),
-        None => RecordedSource::None,
-    };
-    decide_service_follow_up(installed, service.as_deref(), source)
+) -> Option<ServiceBehind> {
+    let record = InstallRecord::read(context.paths()).ok()??;
+    let service = super::status::binary_version(&record.binary);
+    decide_service_behind(
+        installed,
+        service.as_deref(),
+        recorded_source(&record, installation),
+    )
 }
 
-/// Reports, and with `check` false performs, what an older service needs.
-/// Returns `false` when it needs nothing, so the caller says so itself.
+/// Reports, and with `check` false performs, what a service behind the newest
+/// release needs.
 fn report_service_behind(
-    follow_up: &ServiceFollowUp,
+    behind: &ServiceBehind,
     installed: &str,
     check: bool,
     out: &mut dyn Write,
-) -> Result<bool, CliError> {
+) -> Result<(), CliError> {
     let failed = write_failed("this update");
-    let service = match follow_up {
-        ServiceFollowUp::Nothing => return Ok(false),
-        ServiceFollowUp::DaemonSwaps { service, .. }
-        | ServiceFollowUp::HandOverWithForce { service, .. }
-        | ServiceFollowUp::Reregister { service } => service,
-    };
+    let service = &behind.service;
     writeln!(
         out,
         "runner-manager {installed} is the newest release and is installed, but the service still \
          runs {service}."
     )
     .map_err(failed)?;
-    match follow_up {
-        ServiceFollowUp::Nothing => {}
-        ServiceFollowUp::DaemonSwaps { source, .. } => {
+    match &behind.source {
+        RecordedSource::ThisCopy(source) => {
             let verb = if check { "Would swap" } else { "Swapping" };
             writeln!(
                 out,
@@ -1765,29 +1718,11 @@ fn report_service_behind(
                 )
                 .map_err(failed)?;
             }
-            writeln!(out, "Check progress with: runner-manager service status").map_err(failed)?;
+            writeln!(out, "Check progress with: runner-manager service status").map_err(failed)
         }
-        ServiceFollowUp::HandOverWithForce { source, .. } => {
-            writeln!(
-                out,
-                "The service was installed from {}, not from this copy. Hand {installed} over to \
-                 it (the service finishes every running job first):",
-                display_path(source)
-            )
-            .map_err(failed)?;
-            writeln!(out, "  runner-manager update --force").map_err(failed)?;
-        }
-        ServiceFollowUp::Reregister { .. } => {
-            writeln!(
-                out,
-                "Its registration names a binary directly rather than a copy this product owns, \
-                 so it cannot pick up {installed} by itself. Re-register it:"
-            )
-            .map_err(failed)?;
-            writeln!(out, "  runner-manager service install").map_err(failed)?;
-        }
+        RecordedSource::Other(source) => write_hand_over_with_force(source, installed, out),
+        RecordedSource::None => write_reregister(installed, out),
     }
-    Ok(true)
 }
 
 /// Gives `path` a new modification time, so a daemon watching it looks again.
@@ -2049,105 +1984,6 @@ mod tests {
         );
     }
 
-    // -- Finding npm on Windows ------------------------------------------------
-
-    /// A `PATH` value naming `directories`, in order.
-    fn path_of(directories: &[&Path]) -> std::ffi::OsString {
-        std::env::join_paths(directories).expect("joinable directories")
-    }
-
-    fn touch(path: &Path) {
-        std::fs::write(path, b"").expect("a fixture file");
-    }
-
-    /// The machine that started this: `C:\Program Files\nodejs\` holds
-    /// `npm.cmd` (and an extensionless shell script named `npm`), and no
-    /// `npm.exe` exists anywhere, which `Command::new("npm")` alone cannot run.
-    #[test]
-    fn npm_shipped_only_as_npm_cmd_is_found_on_path() {
-        let empty = tempfile::tempdir().unwrap();
-        let nodejs = tempfile::tempdir().unwrap();
-        touch(&nodejs.path().join("npm"));
-        touch(&nodejs.path().join("npm.cmd"));
-        let path = path_of(&[empty.path(), nodejs.path()]);
-
-        assert_eq!(
-            find_on_windows_path("npm", Some(&path), Some(".COM;.EXE;.BAT;.CMD".as_ref())),
-            Some(nodejs.path().join("npm.cmd"))
-        );
-        // An unset or empty PATHEXT means cmd.exe's own default.
-        assert_eq!(
-            find_on_windows_path("npm", Some(&path), None),
-            Some(nodejs.path().join("npm.cmd"))
-        );
-        assert_eq!(
-            find_on_windows_path("npm", Some(&path), Some(" ".as_ref())),
-            Some(nodejs.path().join("npm.cmd"))
-        );
-    }
-
-    /// `PATHEXT` order decides within one directory; `PATH` order decides
-    /// across directories, as it does for `cmd.exe`.
-    #[test]
-    fn pathext_orders_extensions_within_a_directory_and_path_orders_directories() {
-        let both = tempfile::tempdir().unwrap();
-        touch(&both.path().join("npm.cmd"));
-        touch(&both.path().join("npm.exe"));
-        let path = path_of(&[both.path()]);
-        assert_eq!(
-            find_on_windows_path("npm", Some(&path), Some(".CMD;.EXE".as_ref())),
-            Some(both.path().join("npm.cmd"))
-        );
-        assert_eq!(
-            find_on_windows_path("npm", Some(&path), Some(".exe;.cmd".as_ref())),
-            Some(both.path().join("npm.exe"))
-        );
-
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        touch(&first.path().join("npm.cmd"));
-        touch(&second.path().join("npm.exe"));
-        assert_eq!(
-            find_on_windows_path(
-                "npm",
-                Some(&path_of(&[first.path(), second.path()])),
-                Some(".EXE;.CMD".as_ref())
-            ),
-            Some(first.path().join("npm.cmd")),
-            "an earlier PATH directory wins over a preferred extension later on"
-        );
-    }
-
-    /// No npm is `None`, which `run_package_manager` turns into "not on this
-    /// PATH". An extension `Command` cannot run, and a relative PATH entry,
-    /// are not candidates.
-    #[test]
-    fn a_missing_npm_is_not_found() {
-        let empty = tempfile::tempdir().unwrap();
-        assert_eq!(
-            find_on_windows_path("npm", Some(&path_of(&[empty.path()])), None),
-            None
-        );
-        assert_eq!(find_on_windows_path("npm", None, None), None);
-
-        let script_only = tempfile::tempdir().unwrap();
-        touch(&script_only.path().join("npm.ps1"));
-        assert_eq!(
-            find_on_windows_path(
-                "npm",
-                Some(&path_of(&[script_only.path()])),
-                Some(".PS1;.EXE;.CMD".as_ref())
-            ),
-            None
-        );
-
-        let relative = Path::new("relative-path-entry");
-        assert_eq!(
-            find_on_windows_path("npm", Some(&path_of(&[relative])), None),
-            None
-        );
-    }
-
     // -- Which npm prefix holds this copy ----------------------------------------
 
     fn parts(components: &[&str]) -> PathBuf {
@@ -2254,38 +2090,30 @@ mod tests {
 
     // -- The service after `update` finds nothing newer --------------------------
 
+    fn behind(source: RecordedSource) -> Option<ServiceBehind> {
+        Some(ServiceBehind {
+            service: "0.4.38".into(),
+            source,
+        })
+    }
+
     /// ANASTASIIA: 0.4.39 installed by hand, the service still on 0.4.38.
     #[test]
     fn an_older_service_behind_the_newest_release_is_a_swap_not_nothing_to_do() {
-        let this_copy = PathBuf::from("this-copy");
-        assert_eq!(
-            decide_service_follow_up(
-                "0.4.39",
-                Some("0.4.38"),
-                RecordedSource::ThisCopy(this_copy.clone())
-            ),
-            ServiceFollowUp::DaemonSwaps {
-                service: "0.4.38".into(),
-                source: this_copy
-            }
-        );
-        let other = PathBuf::from("another-copy");
-        assert_eq!(
-            decide_service_follow_up(
-                "0.4.39",
-                Some("0.4.38"),
-                RecordedSource::Other(other.clone())
-            ),
-            ServiceFollowUp::HandOverWithForce {
-                service: "0.4.38".into(),
-                source: other
-            }
-        );
-        assert_eq!(
-            decide_service_follow_up("0.4.39", Some("0.4.38"), RecordedSource::None),
-            ServiceFollowUp::Reregister {
-                service: "0.4.38".into()
-            }
+        for source in [
+            RecordedSource::ThisCopy(PathBuf::from("this-copy")),
+            RecordedSource::Other(PathBuf::from("another-copy")),
+            RecordedSource::None,
+        ] {
+            assert_eq!(
+                decide_service_behind("0.4.39", Some("0.4.38"), source.clone()),
+                behind(source)
+            );
+        }
+        // A service built outside the release workflow is still compared.
+        assert!(
+            decide_service_behind("0.4.39", Some("0.4.38+git.0123abcd"), RecordedSource::None)
+                .is_some()
         );
     }
 
@@ -2293,22 +2121,18 @@ mod tests {
     fn a_service_at_the_installed_version_or_unreadable_needs_nothing() {
         let this_copy = || RecordedSource::ThisCopy(PathBuf::from("this-copy"));
         assert_eq!(
-            decide_service_follow_up("0.4.39", Some("0.4.39"), this_copy()),
-            ServiceFollowUp::Nothing
+            decide_service_behind("0.4.39", Some("0.4.39"), this_copy()),
+            None
         );
         assert_eq!(
-            decide_service_follow_up("0.4.39", Some("0.4.40"), this_copy()),
-            ServiceFollowUp::Nothing
+            decide_service_behind("0.4.39", Some("0.4.40"), this_copy()),
+            None
         );
+        assert_eq!(decide_service_behind("0.4.39", None, this_copy()), None);
         assert_eq!(
-            decide_service_follow_up("0.4.39", None, this_copy()),
-            ServiceFollowUp::Nothing
+            decide_service_behind("0.4.39", Some("0.4.39+git.0123abcd"), this_copy()),
+            None
         );
-        let mut out = Vec::new();
-        assert!(
-            !report_service_behind(&ServiceFollowUp::Nothing, "0.4.39", false, &mut out).unwrap()
-        );
-        assert!(out.is_empty());
     }
 
     fn modified(path: &Path) -> std::time::SystemTime {
@@ -2332,20 +2156,20 @@ mod tests {
             .unwrap()
             .set_modified(long_ago())
             .unwrap();
-        let follow_up = ServiceFollowUp::DaemonSwaps {
+        let follow_up = ServiceBehind {
             service: "0.4.38".into(),
-            source: source.clone(),
+            source: RecordedSource::ThisCopy(source.clone()),
         };
 
         let mut out = Vec::new();
-        assert!(report_service_behind(&follow_up, "0.4.39", true, &mut out).unwrap());
+        report_service_behind(&follow_up, "0.4.39", true, &mut out).unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(said.contains("still runs 0.4.38"), "{said}");
         assert!(said.contains("Would swap 0.4.38 -> 0.4.39"), "{said}");
         assert_eq!(modified(&source), long_ago(), "--check changed the file");
 
         let mut out = Vec::new();
-        assert!(report_service_behind(&follow_up, "0.4.39", false, &mut out).unwrap());
+        report_service_behind(&follow_up, "0.4.39", false, &mut out).unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(said.contains("Swapping 0.4.38 -> 0.4.39"), "{said}");
         assert!(said.contains("No job is interrupted"), "{said}");
@@ -2362,12 +2186,12 @@ mod tests {
     /// the daemon runs -- and nothing is written.
     #[test]
     fn a_service_from_another_copy_is_told_to_hand_over_with_force() {
-        let follow_up = ServiceFollowUp::HandOverWithForce {
+        let follow_up = ServiceBehind {
             service: "0.4.38".into(),
-            source: PathBuf::from("another-copy"),
+            source: RecordedSource::Other(PathBuf::from("another-copy")),
         };
         let mut out = Vec::new();
-        assert!(report_service_behind(&follow_up, "0.4.39", false, &mut out).unwrap());
+        report_service_behind(&follow_up, "0.4.39", false, &mut out).unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(said.contains("another-copy"), "{said}");
         assert!(said.contains("runner-manager update --force"), "{said}");
@@ -2400,6 +2224,8 @@ mod tests {
             .set_modified(long_ago())
             .unwrap();
 
+        /// `ETXTBSY`.
+        const TEXT_FILE_BUSY: i32 = 26;
         // Retried past `ETXTBSY`: another test thread forking while the copy
         // was open for writing leaves a short window where Linux refuses it.
         let mut child = (0..100)
@@ -2411,7 +2237,7 @@ mod tests {
                     .spawn()
                 {
                     Ok(child) => Some(child),
-                    Err(error) if error.raw_os_error() == Some(26) => {
+                    Err(error) if error.raw_os_error() == Some(TEXT_FILE_BUSY) => {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         None
                     }

@@ -305,34 +305,60 @@ fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
 /// Windows. A name holding a path separator is never searched.
 #[must_use]
 pub fn find_on_path(tool: &str, path: &OsStr) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return find_on_windows_path(tool, path, std::env::var_os("PATHEXT").as_deref());
+    }
     if tool.is_empty() || tool.contains(['/', '\\']) {
         return None;
     }
-    let extensions: Vec<String> = if cfg!(windows) {
-        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-        // A bare name is tried as-is only when it already carries an
-        // extension: `cmd` and `CreateProcess` never run an extensionless file,
-        // and Node.js ships a POSIX `npm` script beside `npm.cmd`.
-        let mut list = Vec::new();
-        if tool.contains('.') {
-            list.push(String::new());
-        }
-        list.extend(
-            pathext
-                .split(';')
-                .filter(|ext| !ext.is_empty())
-                .map(str::to_ascii_lowercase),
-        );
-        list
-    } else {
-        vec![String::new()]
-    };
     std::env::split_paths(path)
         .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(tool))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// What `cmd.exe` would run for `tool`: the first `path` directory, in order,
+/// holding `tool` with one of the `pathext` extensions, tried in `pathext`
+/// order within each directory. Compiled on every platform so every CI leg
+/// tests it; [`find_on_path`] calls it on Windows.
+///
+/// `std::process::Command` cannot do this itself: given a bare name it looks
+/// only for `<name>.exe`, so npm, which ships as `npm.cmd`, reads as missing.
+///
+/// Departures from `cmd.exe`, each so that only a file the operator put on
+/// their `PATH` on purpose can be the answer and `Command` can run it with its
+/// arguments intact:
+/// - the current directory and relative `PATH` entries are not searched;
+/// - only `.exe`, `.com`, `.cmd` and `.bat` are tried (a `.ps1` or `.js` in
+///   `PATHEXT` is skipped), lower-cased so `Command` recognises a batch file;
+/// - a bare name is tried as it is only when it already carries an extension:
+///   `CreateProcess` never runs an extensionless file, and Node.js ships a
+///   POSIX `npm` script beside `npm.cmd`.
+#[must_use]
+pub fn find_on_windows_path(tool: &str, path: &OsStr, pathext: Option<&OsStr>) -> Option<PathBuf> {
+    const RUNNABLE: [&str; 4] = [".exe", ".com", ".cmd", ".bat"];
+    if tool.is_empty() || tool.contains(['/', '\\']) {
+        return None;
+    }
+    let pathext = pathext
+        .and_then(OsStr::to_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(".COM;.EXE;.BAT;.CMD");
+    let bare = tool.contains('.').then_some("");
+    let extensions: Vec<&str> = bare
+        .into_iter()
+        .chain(pathext.split(';').filter_map(|extension| {
+            RUNNABLE
+                .into_iter()
+                .find(|runnable| runnable.eq_ignore_ascii_case(extension.trim()))
+        }))
+        .collect();
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
         .find_map(|dir| {
             extensions.iter().find_map(|extension| {
                 let candidate = dir.join(format!("{tool}{extension}"));
-                is_executable(&candidate).then_some(candidate)
+                candidate.is_file().then_some(candidate)
             })
         })
 }
@@ -1184,6 +1210,98 @@ mod tests {
         std::fs::write(&cmd, b"@echo off\r\n").unwrap();
         assert_eq!(find_on_path("npm", &path), Some(cmd.clone()));
         assert_eq!(find_on_path("npm.cmd", &path), Some(cmd));
+    }
+
+    /// A `PATH` value naming `directories`, in order.
+    fn path_of(directories: &[&Path]) -> OsString {
+        std::env::join_paths(directories).expect("joinable directories")
+    }
+
+    fn touch(path: &Path) {
+        std::fs::write(path, b"").expect("a fixture file");
+    }
+
+    /// The machine `update` failed on: `C:\Program Files\nodejs\` holds
+    /// `npm.cmd` and an extensionless shell script named `npm`, and no
+    /// `npm.exe` exists, which `Command::new("npm")` alone cannot run.
+    #[test]
+    fn npm_shipped_only_as_npm_cmd_is_found_on_a_windows_path() {
+        let empty = tempfile::tempdir().unwrap();
+        let nodejs = tempfile::tempdir().unwrap();
+        touch(&nodejs.path().join("npm"));
+        touch(&nodejs.path().join("npm.cmd"));
+        let path = path_of(&[empty.path(), nodejs.path()]);
+        let cmd = Some(nodejs.path().join("npm.cmd"));
+
+        assert_eq!(
+            find_on_windows_path("npm", &path, Some(".COM;.EXE;.BAT;.CMD".as_ref())),
+            cmd
+        );
+        // An unset or blank PATHEXT means cmd.exe's own default.
+        assert_eq!(find_on_windows_path("npm", &path, None), cmd);
+        assert_eq!(find_on_windows_path("npm", &path, Some(" ".as_ref())), cmd);
+        // A name with its extension is tried as it is.
+        assert_eq!(find_on_windows_path("npm.cmd", &path, None), cmd);
+    }
+
+    /// `PATHEXT` order decides within one directory; `PATH` order decides
+    /// across directories, as it does for `cmd.exe`.
+    #[test]
+    fn pathext_orders_extensions_within_a_directory_and_path_orders_directories() {
+        let both = tempfile::tempdir().unwrap();
+        touch(&both.path().join("npm.cmd"));
+        touch(&both.path().join("npm.exe"));
+        let path = path_of(&[both.path()]);
+        assert_eq!(
+            find_on_windows_path("npm", &path, Some(".CMD;.EXE".as_ref())),
+            Some(both.path().join("npm.cmd"))
+        );
+        assert_eq!(
+            find_on_windows_path("npm", &path, Some(".exe;.cmd".as_ref())),
+            Some(both.path().join("npm.exe"))
+        );
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        touch(&first.path().join("npm.cmd"));
+        touch(&second.path().join("npm.exe"));
+        assert_eq!(
+            find_on_windows_path(
+                "npm",
+                &path_of(&[first.path(), second.path()]),
+                Some(".EXE;.CMD".as_ref())
+            ),
+            Some(first.path().join("npm.cmd")),
+            "an earlier PATH directory wins over a preferred extension later on"
+        );
+    }
+
+    /// No npm is `None`. An extension `Command` cannot run, and a relative
+    /// PATH entry, are not candidates.
+    #[test]
+    fn a_missing_npm_is_not_found_on_a_windows_path() {
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            find_on_windows_path("npm", &path_of(&[empty.path()]), None),
+            None
+        );
+
+        let script_only = tempfile::tempdir().unwrap();
+        touch(&script_only.path().join("npm.ps1"));
+        assert_eq!(
+            find_on_windows_path(
+                "npm",
+                &path_of(&[script_only.path()]),
+                Some(".PS1;.EXE;.CMD".as_ref())
+            ),
+            None
+        );
+
+        let relative = Path::new("relative-path-entry");
+        assert_eq!(
+            find_on_windows_path("npm", &path_of(&[relative]), None),
+            None
+        );
     }
 
     fn unfit_finding(id: &str) -> UnfitFinding {
