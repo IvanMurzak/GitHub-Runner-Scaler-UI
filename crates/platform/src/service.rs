@@ -298,6 +298,38 @@ impl ServiceIdentity {
     pub fn systemd_unit(&self) -> String {
         format!("{}.service", self.name)
     }
+
+    /// The service manager's own command that restarts this registration.
+    ///
+    /// The product has no `service stop` or `service start`, and
+    /// `service install` is no restart either: it refuses while the running
+    /// daemon holds the agent lock. So a remedy that restarts the daemon names
+    /// the service manager's command. A forced restart does not wait for jobs;
+    /// it is for a daemon that has stopped making progress anyway.
+    #[must_use]
+    pub fn restart_command(&self, mode: StartMode) -> String {
+        let name = &self.name;
+        if cfg!(windows) {
+            match mode {
+                StartMode::Boot => {
+                    format!("Restart-Service -Name {name} (from an elevated PowerShell)")
+                }
+                StartMode::Login => format!("schtasks /End /TN {name}; schtasks /Run /TN {name}"),
+            }
+        } else if cfg!(target_os = "macos") {
+            let label = self.launchd_label();
+            match mode {
+                StartMode::Boot => format!("sudo launchctl kickstart -k system/{label}"),
+                StartMode::Login => format!("launchctl kickstart -k gui/$(id -u)/{label}"),
+            }
+        } else {
+            let unit = self.systemd_unit();
+            match mode {
+                StartMode::Boot => format!("sudo systemctl restart {unit}"),
+                StartMode::Login => format!("systemctl --user restart {unit}"),
+            }
+        }
+    }
 }
 
 impl fmt::Display for ServiceIdentity {
@@ -4689,6 +4721,13 @@ impl ServiceOperations {
         });
         let now = Utc::now();
         let installed = record.is_some() || found.is_some();
+        let restart = self.identity.restart_command(
+            record
+                .as_ref()
+                .map(|record| record.start_mode)
+                .or_else(|| found.as_ref().map(|found| found.start_mode))
+                .unwrap_or(StartMode::Boot),
+        );
         Ok(ServiceStatus::compose(
             self.identity.clone(),
             record,
@@ -4703,7 +4742,9 @@ impl ServiceOperations {
         .with_launches_blocked(crate::launch_health::launches_blocked(paths, now))
         .with_unattended_gap(unattended)
         .with_host_unfit(crate::host_fitness::host_unfit_in_force(paths, now).filter(|_| installed))
-        .with_stall(crate::daemon_heartbeat::liveness(paths, now).stall(last_github_contact)))
+        .with_stall(
+            crate::daemon_heartbeat::liveness(paths, now).stall(last_github_contact, &restart),
+        ))
     }
 
     /// The installed definition, when it is not what this build renders for
@@ -11090,7 +11131,46 @@ logs = \"/d\"
         .unwrap();
         let detail = stalled_problem(&operations).expect("a stall is a problem");
         assert!(detail.contains("has made no progress since"), "{detail}");
-        assert!(detail.contains("runner-manager service stop"), "{detail}");
+        // The restart is the service manager's command for this login-mode
+        // registration: the product has no `service stop` or `service start`.
+        let restart = ServiceIdentity::product().restart_command(StartMode::Login);
+        assert!(detail.contains(&restart), "{detail}");
+        assert!(!detail.contains("runner-manager service stop"), "{detail}");
+        assert!(!detail.contains("runner-manager service start"), "{detail}");
+    }
+
+    /// Each platform's restart is its service manager's own command for the
+    /// registration's start mode, never a `runner-manager service` subcommand
+    /// that does not exist.
+    #[test]
+    fn the_restart_command_is_the_service_managers_own() {
+        let identity = ServiceIdentity::product();
+        let boot = identity.restart_command(StartMode::Boot);
+        let login = identity.restart_command(StartMode::Login);
+        for command in [&boot, &login] {
+            assert!(!command.contains("runner-manager service"), "{command}");
+            assert!(command.contains(identity.name()), "{command}");
+        }
+        assert_ne!(boot, login);
+        if cfg!(windows) {
+            assert!(
+                boot.starts_with("Restart-Service -Name runner-manager"),
+                "{boot}"
+            );
+            assert!(
+                login.contains("schtasks /Run /TN runner-manager"),
+                "{login}"
+            );
+        } else if cfg!(target_os = "macos") {
+            assert!(
+                boot.starts_with("sudo launchctl kickstart -k system/"),
+                "{boot}"
+            );
+            assert!(login.starts_with("launchctl kickstart -k gui/"), "{login}");
+        } else {
+            assert_eq!(boot, "sudo systemctl restart runner-manager.service");
+            assert_eq!(login, "systemctl --user restart runner-manager.service");
+        }
     }
 
     /// A daemon refusing every runner is not a healthy service.

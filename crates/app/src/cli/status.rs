@@ -586,6 +586,8 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
                 runner_manager_platform::service::last_github_contact(&service.paths)
                     .ok()
                     .flatten(),
+                &runner_manager_platform::service::ServiceIdentity::product()
+                    .restart_command(start_mode),
             ),
             service_installed_from: service
                 .foreign
