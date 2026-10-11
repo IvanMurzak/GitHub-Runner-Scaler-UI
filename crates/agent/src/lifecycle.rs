@@ -8900,6 +8900,47 @@ mod tests {
         }
     }
 
+    /// Every step shell a runner starts inherits PowerShell's telemetry
+    /// opt-out from the listener, unless the daemon or `runner.env` decided
+    /// otherwise; see [`runner_env::POWERSHELL_TELEMETRY_OPTOUT`].
+    #[test]
+    fn production_listener_opts_powershell_out_of_telemetry() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("attempt");
+        let listener = |host_env: &RunnerEnv| {
+            runner_listener_spec(
+                PathBuf::from("Runner.Listener"),
+                &runtime,
+                Vec::new(),
+                host_env,
+            )
+        };
+        let optout = |spec: &SpawnSpec| {
+            spec.configured_env(runner_env::POWERSHELL_TELEMETRY_OPTOUT)
+                .map(OsStr::to_os_string)
+        };
+
+        let spec = listener(&RunnerEnv::default());
+        if std::env::var_os(runner_env::POWERSHELL_TELEMETRY_OPTOUT)
+            .is_some_and(|value| !value.is_empty())
+        {
+            // The daemon's own value is inherited as it is.
+            assert_eq!(optout(&spec), None);
+        } else {
+            assert_eq!(
+                optout(&spec),
+                Some(runner_env::POWERSHELL_TELEMETRY_OPTOUT_VALUE.into())
+            );
+        }
+
+        let operator = RunnerEnv::parse("POWERSHELL_TELEMETRY_OPTOUT=0\n").unwrap();
+        assert_eq!(
+            optout(&listener(&operator)),
+            Some("0".into()),
+            "runner.env must win over the telemetry opt-out"
+        );
+    }
+
     #[test]
     fn an_invalid_runner_env_fails_the_launch_without_echoing_a_value() {
         let root = tempfile::tempdir().unwrap();

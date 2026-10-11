@@ -2346,6 +2346,7 @@ fn runner_path(
         &Inherited {
             path: inherited.clone(),
             has_locale: true,
+            ..Inherited::default()
         },
         Path::exists,
     );

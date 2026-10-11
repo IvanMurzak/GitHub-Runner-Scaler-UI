@@ -565,11 +565,18 @@ fn write_runner_env(out: &mut dyn Write, path: &Path, env: &RunnerEnv) -> io::Re
             )?;
             writeln!(
                 out,
-                "  (.NET known-folder APIs still report the service account's profile)"
+                "  (.NET known-folder APIs still report the service account's profile, \
+                 except local application data)"
             )?;
         }
-        RunnerPlatform::Linux => writeln!(out, "  nothing")?,
+        RunnerPlatform::Linux => {}
     }
+    writeln!(
+        out,
+        "  {}={}   unless the service's own environment sets it",
+        runner_env::POWERSHELL_TELEMETRY_OPTOUT,
+        runner_env::POWERSHELL_TELEMETRY_OPTOUT_VALUE
+    )?;
     writeln!(out)?;
     writeln!(
         out,

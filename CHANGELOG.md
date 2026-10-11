@@ -7,6 +7,25 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.39
+
+### Fixes
+
+- Native runners start with `POWERSHELL_TELEMETRY_OPTOUT=1` on every platform, so a job's
+  PowerShell step shells on Windows no longer hang at startup while another job runs. The cause
+  is a telemetry lock in PowerShell 7.6.6 and earlier, which the first `pwsh` of each job takes
+  in its fresh profile and keeps until it exits, while the first `pwsh` of every other job waits
+  for it with no timeout. Seen as several `pwsh` step shells holding their runners for two hours
+  with no output and almost no CPU. The opt-out makes PowerShell skip that code. macOS and Linux
+  get it too, as a precaution.
+- A non-empty value the service's own environment already has for `POWERSHELL_TELEMETRY_OPTOUT`
+  is left as it is, and `runner.env` overrides it like any other default:
+  `runner-manager host env set POWERSHELL_TELEMETRY_OPTOUT=0` turns PowerShell telemetry back
+  on. `host env show` lists it.
+- The 0.4.31 note that .NET known-folder APIs still report the service account's profile was
+  not true of local application data, which follows `USERPROFILE`; the README and
+  `host env show` now say so.
+
 ## 0.4.38
 
 ### Features
