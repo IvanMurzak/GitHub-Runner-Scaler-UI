@@ -1548,8 +1548,10 @@ fn find_on_windows_path(
 /// account's copy that comes first on `PATH`.
 fn confirm_npm_copy(binary: &Path, version: &str, out: &mut dyn Write) -> Result<(), CliError> {
     let failed = write_failed("this update");
-    match force::executable_version(binary) {
-        Some(reported) if reported == version => writeln!(
+    // Compared without build metadata: a build outside the release workflow
+    // reports `X.Y.Z+git.<sha>`.
+    match super::status::binary_version(binary) {
+        Some(reported) if reported.split('+').next() == Some(version) => writeln!(
             out,
             "\nInstalled runner-manager {version} to {}",
             display_path(binary)

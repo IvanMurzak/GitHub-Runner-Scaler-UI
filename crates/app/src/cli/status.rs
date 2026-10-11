@@ -206,7 +206,7 @@ impl ServiceView {
     }
 }
 
-fn binary_version(path: &std::path::Path) -> Option<String> {
+pub(super) fn binary_version(path: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new(path)
         .arg("--version")
         .output()
