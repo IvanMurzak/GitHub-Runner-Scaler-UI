@@ -751,7 +751,14 @@ Each platform also adds a few variables unless `runner.env` sets the same name:
 - **Windows:** `USERPROFILE`, `HOME`, `APPDATA` and `LOCALAPPDATA` point at a profile inside
   each runner's own attempt directory, so concurrent jobs no longer share the service account's
   caches. That profile goes with the attempt; the dependency caches below are kept outside it.
-  .NET known-folder APIs ignore these variables and still report the service account's profile.
+  .NET known-folder APIs ignore these variables and still report the service account's profile,
+  except local application data, which Windows expands from `USERPROFILE`.
+- **Every platform:** `POWERSHELL_TELEMETRY_OPTOUT=1`, unless the service's own environment
+  already sets it. PowerShell 7.6.6 and earlier can hang a step shell at startup on a host
+  running several jobs at once: the first `pwsh` of a job finds no telemetry identity file in
+  its fresh profile, takes a machine-session-wide lock to create one and keeps it until it exits,
+  and every other job's first `pwsh` waits for that lock with no timeout. The opt-out skips that
+  code. Set `POWERSHELL_TELEMETRY_OPTOUT=0` in `runner.env` to send PowerShell telemetry again.
 
 `TMPDIR`, `TEMP` and `TMP` are always the attempt's own and cannot be changed. Isolated runners
 do not get any of this; their environment is the image's.

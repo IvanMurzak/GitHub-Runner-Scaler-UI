@@ -7,6 +7,28 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.39
+
+### Fixes
+
+- Native runners start with `POWERSHELL_TELEMETRY_OPTOUT=1` on every platform, so a job's
+  PowerShell step shells no longer hang at startup while another job runs. PowerShell 7.6.6 and
+  earlier, starting with no telemetry identity file in its cache directory, takes the
+  session-wide named mutex `CreateUniqueUserId` twice and releases it once, so it keeps the mutex
+  until it exits, and every other shell in the same position waits for it with no timeout. On
+  Windows that cache directory is under local application data, which follows the per-attempt
+  `USERPROFILE`, so the first shell of every job is in that position, and every runner of the
+  service shares one session. Seen as several concurrent `pwsh` step shells holding their runner
+  for two hours with no output and almost no CPU, until killed. The opt-out makes PowerShell
+  skip its telemetry setup, mutex included.
+- A value the service's own environment already has for `POWERSHELL_TELEMETRY_OPTOUT` is left
+  as it is, and `runner.env` overrides it like any other default:
+  `runner-manager host env set POWERSHELL_TELEMETRY_OPTOUT=0` turns PowerShell telemetry back
+  on. `host env show` lists it.
+- The 0.4.31 note that .NET known-folder APIs still report the service account's profile was
+  not true of local application data, which Windows expands from `USERPROFILE`; the README and
+  `host env show` now say so.
+
 ## 0.4.38
 
 ### Features
