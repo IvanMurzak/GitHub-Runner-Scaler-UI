@@ -1297,11 +1297,38 @@ mod tests {
             None
         );
 
-        let relative = Path::new("relative-path-entry");
-        assert_eq!(
-            find_on_windows_path("npm", &path_of(&[relative]), None),
-            None
-        );
+        // A relative entry that really does lead to an `npm.cmd` from here,
+        // so only the rule can be what refuses it.
+        let planted = tempfile::tempdir().unwrap();
+        touch(&planted.path().join("npm.cmd"));
+        if let Some(relative) = relative_to_current_directory(planted.path()) {
+            assert!(relative.join("npm.cmd").is_file(), "{}", relative.display());
+            assert_eq!(
+                find_on_windows_path("npm", &path_of(&[&relative]), None),
+                None
+            );
+        }
+    }
+
+    /// `target` as a path relative to the current directory, or `None` when
+    /// the two share no root (another Windows drive).
+    fn relative_to_current_directory(target: &Path) -> Option<PathBuf> {
+        let here = std::env::current_dir().ok()?;
+        let target = std::fs::canonicalize(target).ok()?;
+        let here = std::fs::canonicalize(here).ok()?;
+        let (here, target): (Vec<_>, Vec<_>) =
+            (here.components().collect(), target.components().collect());
+        let common = here
+            .iter()
+            .zip(&target)
+            .take_while(|(left, right)| left == right)
+            .count();
+        if common == 0 {
+            return None;
+        }
+        let mut relative: PathBuf = std::iter::repeat_n("..", here.len() - common).collect();
+        relative.extend(&target[common..]);
+        Some(relative)
     }
 
     fn unfit_finding(id: &str) -> UnfitFinding {
