@@ -397,8 +397,9 @@ impl RunnerPlatform {
 
 /// The variable that turns PowerShell 7's telemetry off. Every native runner
 /// gets it as `1` ([`POWERSHELL_TELEMETRY_OPTOUT_VALUE`]) unless the daemon's
-/// environment already sets it, to any value, which the runner then inherits
-/// as it is. `runner.env` replaces it like any other default, so
+/// environment already sets it to a non-empty value, which the runner then
+/// inherits as it is. An empty value counts as unset, as it does for
+/// PowerShell. `runner.env` replaces it like any other default, so
 /// `POWERSHELL_TELEMETRY_OPTOUT=0` there turns telemetry back on.
 ///
 /// Why: `pwsh` 7.6.6 and earlier, on a start that finds no `telemetry.uuid`
@@ -409,7 +410,9 @@ impl RunnerPlatform {
 /// per attempt here, so the first shell of every job has no file, and every
 /// service runner shares session 0. Concurrent jobs' step shells then hang at
 /// startup, with no output, until the first job's shell exits. PowerShell
-/// reads the opt-out before any of that work and skips all of it.
+/// reads the opt-out before any of that work and skips all of it. macOS and
+/// Linux runners share the account's cache directory, so the file is there
+/// after the first shell ever; they get the opt-out as a precaution.
 pub const POWERSHELL_TELEMETRY_OPTOUT: &str = "POWERSHELL_TELEMETRY_OPTOUT";
 
 /// The value [`POWERSHELL_TELEMETRY_OPTOUT`] is given. PowerShell accepts
@@ -422,7 +425,7 @@ pub struct Inherited {
     pub path: Option<OsString>,
     /// Whether `LANG` or `LC_ALL` is set.
     pub has_locale: bool,
-    /// Whether [`POWERSHELL_TELEMETRY_OPTOUT`] is set, to any value.
+    /// Whether [`POWERSHELL_TELEMETRY_OPTOUT`] is set to a non-empty value.
     pub has_powershell_telemetry_optout: bool,
 }
 
@@ -430,11 +433,16 @@ impl Inherited {
     /// This process's environment.
     #[must_use]
     pub fn current() -> Self {
+        Self::from_env(|name| std::env::var_os(name))
+    }
+
+    /// The environment `var` reads, one variable at a time.
+    fn from_env(var: impl Fn(&str) -> Option<OsString>) -> Self {
         Self {
-            path: std::env::var_os("PATH"),
-            has_locale: std::env::var_os("LANG").is_some() || std::env::var_os("LC_ALL").is_some(),
-            has_powershell_telemetry_optout: std::env::var_os(POWERSHELL_TELEMETRY_OPTOUT)
-                .is_some(),
+            path: var("PATH"),
+            has_locale: var("LANG").is_some() || var("LC_ALL").is_some(),
+            has_powershell_telemetry_optout: var(POWERSHELL_TELEMETRY_OPTOUT)
+                .is_some_and(|value| !value.is_empty()),
         }
     }
 }
@@ -462,9 +470,10 @@ pub const DIRECTORY_VARIABLES: [&str; 2] = ["APPDATA", "LOCALAPPDATA"];
 ///   so one job's caches and configuration cannot reach the next job, and
 ///   they go when the attempt's directory goes. Most of .NET's known-folder
 ///   APIs (`Environment.GetFolderPath`) ask Windows rather than these
-///   variables and still answer with the service account's profile; local
-///   application data is the exception, because Windows stores it as
-///   `%USERPROFILE%\AppData\Local` and expands that from this environment.
+///   variables and still answer with the service account's profile. Local
+///   application data is the exception: measured on Windows 11, it follows
+///   `USERPROFILE`, while roaming application data and the profile itself do
+///   not.
 /// - **Linux:** nothing of its own.
 ///
 /// Then, on every platform, [`POWERSHELL_TELEMETRY_OPTOUT`] unless the daemon
@@ -787,8 +796,27 @@ mod tests {
         )
     }
 
-    /// A daemon that already sets the opt-out, to any value, keeps it: nothing
-    /// is set over it, so the runner inherits the daemon's own.
+    /// The daemon's own opt-out counts only when it says something: PowerShell
+    /// reads an empty value as unset, so an empty one is replaced.
+    #[test]
+    fn the_daemon_opt_out_is_read_from_its_environment_and_empty_is_unset() {
+        let with = |value: Option<&str>| {
+            Inherited::from_env(|name| {
+                (name == POWERSHELL_TELEMETRY_OPTOUT)
+                    .then_some(value)
+                    .flatten()
+                    .map(OsString::from)
+            })
+            .has_powershell_telemetry_optout
+        };
+        assert!(with(Some("0")));
+        assert!(with(Some("1")));
+        assert!(!with(Some("")));
+        assert!(!with(None));
+    }
+
+    /// A daemon that already sets the opt-out, to any non-empty value, keeps
+    /// it: nothing is set over it, so the runner inherits the daemon's own.
     #[test]
     fn a_daemon_powershell_telemetry_setting_is_left_alone() {
         let daemon_decided = Inherited {

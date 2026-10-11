@@ -8921,7 +8921,9 @@ mod tests {
         };
 
         let spec = listener(&RunnerEnv::default());
-        if std::env::var_os(runner_env::POWERSHELL_TELEMETRY_OPTOUT).is_some() {
+        if std::env::var_os(runner_env::POWERSHELL_TELEMETRY_OPTOUT)
+            .is_some_and(|value| !value.is_empty())
+        {
             // The daemon's own value is inherited as it is.
             assert_eq!(optout(&spec), None);
         } else {
