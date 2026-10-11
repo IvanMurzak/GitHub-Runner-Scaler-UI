@@ -129,8 +129,45 @@ struct Installed {
 impl Installed {
     /// Copies the built binary into a temporary `bin/` and returns it.
     fn new() -> Self {
+        Self::under(&["bin"])
+    }
+
+    /// The layout `npm install --global --prefix <root>/prefix` writes (npm 12):
+    /// the wrapper package, with the platform package nested inside it.
+    fn npm_global() -> Self {
+        let platform = match std::env::consts::OS {
+            "windows" => "runner-manager-win32-x64",
+            "macos" => "runner-manager-darwin-arm64",
+            _ => "runner-manager-linux-x64",
+        };
+        let lib: &[&str] = if cfg!(windows) { &[] } else { &["lib"] };
+        let mut components = vec!["prefix"];
+        components.extend_from_slice(lib);
+        components.extend_from_slice(&[
+            "node_modules",
+            "@ivan-murzak",
+            "runner-manager",
+            "node_modules",
+            "@ivan-murzak",
+            platform,
+            "bin",
+        ]);
+        Self::under(&components)
+    }
+
+    /// The prefix [`Installed::npm_global`] lives in, as `update` names it.
+    fn npm_prefix(&self) -> String {
+        operator_path(&self._root.path().join("prefix"))
+    }
+
+    /// Copies the built binary into `<temporary root>/<components>/`.
+    fn under(components: &[&str]) -> Self {
         let root = tempfile::tempdir().expect("a temporary directory");
-        let bin = root.path().join("bin");
+        let bin = components
+            .iter()
+            .fold(root.path().to_path_buf(), |path, component| {
+                path.join(component)
+            });
         std::fs::create_dir_all(&bin).expect("the install directory");
         let binary = bin.join(format!("runner-manager{}", std::env::consts::EXE_SUFFIX));
         std::fs::copy(env!("CARGO_BIN_EXE_runner-manager"), &binary)
@@ -152,7 +189,20 @@ impl Installed {
 
     /// Runs the copied binary with the release assets pointed at `assets`.
     fn update(&self, assets: &Path, arguments: &[&str]) -> Outcome {
+        self.update_with_path(assets, arguments, None)
+    }
+
+    /// [`Installed::update`], with `PATH` replaced when `path` is given.
+    fn update_with_path(
+        &self,
+        assets: &Path,
+        arguments: &[&str],
+        path: Option<&std::ffi::OsStr>,
+    ) -> Outcome {
         let mut command = Command::new(&self.binary);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
         // The developer's own exported variables must not change what this
         // measures, exactly as `support::runner_manager` argues.
         for variable in [
@@ -546,6 +596,15 @@ fn a_release_without_this_platform_says_so() {
 /// must fail here rather than pass quietly. Same reasoning as the hand-copied
 /// command list in `cli_command_surface.rs`.
 fn write_install_record(data: &Path, source_binary: Option<&Path>) {
+    write_install_record_for(
+        data,
+        source_binary,
+        &data.join("state").join("bin").join("runner-manager"),
+    );
+}
+
+/// [`write_install_record`], with the service's private copy at `binary`.
+fn write_install_record_for(data: &Path, source_binary: Option<&Path>, binary: &Path) {
     let config = data.join("config");
     std::fs::create_dir_all(&config).expect("the config directory");
     let source_line = match source_binary {
@@ -574,7 +633,7 @@ fn write_install_record(data: &Path, source_binary: Option<&Path>) {
          state = {state}\n\
          runtime = {runtime}\n\
          logs = {logs}\n",
-        binary = toml_path(&data.join("state").join("bin").join("runner-manager")),
+        binary = toml_path(binary),
         log = toml_path(&data.join("logs").join("runner-manager")),
         config_dir = toml_path(&config),
         state = toml_path(&data.join("state")),
@@ -588,6 +647,214 @@ fn write_install_record(data: &Path, source_binary: Option<&Path>) {
 /// so the literal form is the one that survives them.
 fn toml_path(path: &Path) -> String {
     format!("'{}'", path.display())
+}
+
+/// A path the way `update` prints one: canonical (the copy's own path is
+/// canonicalised, which resolves `/var` to `/private/var` on macOS and a short
+/// `RUNNER~1` name on Windows), without Windows' `\\?\` prefix.
+fn operator_path(path: &Path) -> String {
+    let canonical = std::fs::canonicalize(path).expect("an existing path");
+    let rendered = canonical.display().to_string();
+    rendered
+        .strip_prefix(r"\\?\")
+        .map_or(rendered.clone(), str::to_owned)
+}
+
+/// A script named `name` in `directory` that answers like a program would.
+/// A `.cmd` on Windows, which is how npm itself ships there; a shell script
+/// elsewhere.
+fn write_script(directory: &Path, name: &str, windows_body: &str, unix_body: &str) -> PathBuf {
+    std::fs::create_dir_all(directory).expect("the script directory");
+    if cfg!(windows) {
+        let script = directory.join(format!("{name}.cmd"));
+        std::fs::write(&script, format!("@echo off\r\n{windows_body}\r\n")).expect("the script");
+        script
+    } else {
+        let script = directory.join(name);
+        std::fs::write(&script, format!("#!/bin/sh\n{unix_body}\n")).expect("the script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("making the script executable");
+        }
+        script
+    }
+}
+
+/// `directory` ahead of this process's own `PATH`.
+fn path_with_first(directory: &Path) -> std::ffi::OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(
+        std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&inherited)),
+    )
+    .expect("a joinable PATH")
+}
+
+/// ANASTASIIA: an npm copy was refused with "npm is not on this PATH" while
+/// `npm.cmd` sat in `C:\Program Files\nodejs\` -- `Command::new("npm")` only
+/// looks for `npm.exe`. The npm here is likewise only `npm.cmd` on Windows, and
+/// it must be told the prefix that holds this copy, not left to install into
+/// the invoking account's own prefix.
+#[test]
+fn an_npm_copy_is_updated_by_the_npm_on_path_in_its_own_prefix() {
+    let fixtures = tempfile::tempdir().expect("a temporary directory");
+    let newer = one_release_newer();
+    let release = build_release(fixtures.path(), &newer);
+    let installed = Installed::npm_global();
+    let tools = fixtures.path().join("tools");
+    let recorded = tools.join("npm-arguments.txt");
+    write_script(
+        &tools,
+        "npm",
+        "for %%a in (%*) do >>\"%~dp0npm-arguments.txt\" echo %%~a",
+        "for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$(dirname \"$0\")/npm-arguments.txt\"; done",
+    );
+
+    let outcome = installed.update_with_path(&release.assets, &[], Some(&path_with_first(&tools)));
+    assert_eq!(outcome.code, 0, "output was:\n{}", outcome.both());
+    let arguments = std::fs::read_to_string(&recorded)
+        .unwrap_or_else(|error| panic!("npm was never run ({error}):\n{}", outcome.both()));
+    let arguments: Vec<&str> = arguments.lines().map(str::trim).collect();
+    let package = format!("@ivan-murzak/runner-manager@{newer}");
+    assert_eq!(
+        arguments,
+        [
+            "install",
+            "--global",
+            "--prefix",
+            installed.npm_prefix().as_str(),
+            package.as_str()
+        ],
+        "output was:\n{}",
+        outcome.both()
+    );
+    // The stand-in npm changed nothing, and the copy that was meant to be
+    // updated is run to say so rather than trusting npm's exit status.
+    assert!(
+        outcome.stdout.contains(&format!("still reports {RUNNING}")),
+        "output was:\n{}",
+        outcome.both()
+    );
+}
+
+fn modified(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .expect("a modification time")
+}
+
+/// ANASTASIIA: npm had installed the newest release by hand, the service still
+/// ran the old build, and `update` said "Nothing to do". The service watches
+/// this copy, so `update` marks it changed and the daemon's own job-safe drain
+/// does the rest; the copy marked is the one running this very command. No
+/// service manager here runs this record's daemon, so the report says it swaps
+/// when it starts rather than claiming a swap in progress.
+#[test]
+fn an_older_service_behind_the_newest_release_is_swapped_not_nothing_to_do() {
+    let fixtures = tempfile::tempdir().expect("a temporary directory");
+    let release = build_release(fixtures.path(), RUNNING);
+    let installed = Installed::new();
+    let service = write_script(
+        &installed.data.join("state").join("bin"),
+        "runner-manager",
+        "echo runner-manager 0.0.1",
+        "echo runner-manager 0.0.1",
+    );
+    write_install_record_for(&installed.data, Some(&installed.binary), &service);
+    let long_ago =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    let mark_long_ago = || {
+        std::fs::File::options()
+            .write(true)
+            .open(&installed.binary)
+            .and_then(|file| file.set_modified(long_ago))
+            .expect("an old modification time");
+    };
+
+    mark_long_ago();
+    let checked = installed.update(&release.assets, &["--check"]);
+    assert_eq!(checked.code, 0, "output was:\n{}", checked.both());
+    assert!(
+        checked.stdout.contains("still runs 0.0.1"),
+        "{}",
+        checked.both()
+    );
+    assert!(
+        checked.stdout.contains("swaps to") && checked.stdout.contains("as soon as it starts"),
+        "{}",
+        checked.both()
+    );
+    assert!(
+        !checked.stdout.contains("Nothing to do"),
+        "{}",
+        checked.both()
+    );
+    assert_eq!(
+        modified(&installed.binary),
+        long_ago,
+        "--check changed the copy"
+    );
+
+    let before = installed.bytes();
+    let outcome = installed.update(&release.assets, &[]);
+    assert_eq!(outcome.code, 0, "output was:\n{}", outcome.both());
+    assert!(
+        outcome.stdout.contains("still runs 0.0.1"),
+        "{}",
+        outcome.both()
+    );
+    assert!(
+        outcome
+            .stdout
+            .contains(&format!("swaps to {RUNNING} as soon as it starts")),
+        "{}",
+        outcome.both()
+    );
+    assert!(!outcome.stdout.contains("warning"), "{}", outcome.both());
+    assert!(
+        modified(&installed.binary) > long_ago,
+        "the copy the daemon watches was not marked changed:\n{}",
+        outcome.both()
+    );
+    assert_eq!(
+        installed.bytes(),
+        before,
+        "the copy's bytes must not change"
+    );
+}
+
+/// The same, with the service registered from another copy: only
+/// `update --force` can hand this one over without interrupting a job, and
+/// neither file is touched.
+#[test]
+fn an_older_service_from_another_copy_is_told_to_hand_over_with_force() {
+    let fixtures = tempfile::tempdir().expect("a temporary directory");
+    let release = build_release(fixtures.path(), RUNNING);
+    let installed = Installed::new();
+    let service = write_script(
+        &installed.data.join("state").join("bin"),
+        "runner-manager",
+        "echo runner-manager 0.0.1",
+        "echo runner-manager 0.0.1",
+    );
+    let elsewhere = installed.data.join("another").join("runner-manager");
+    write_install_record_for(&installed.data, Some(&elsewhere), &service);
+    let before = modified(&installed.binary);
+
+    let outcome = installed.update(&release.assets, &[]);
+    assert_eq!(outcome.code, 0, "output was:\n{}", outcome.both());
+    assert!(
+        outcome.stdout.contains("still runs 0.0.1"),
+        "{}",
+        outcome.both()
+    );
+    assert!(
+        outcome.stdout.contains("runner-manager update --force"),
+        "{}",
+        outcome.both()
+    );
+    assert_eq!(modified(&installed.binary), before);
 }
 
 /// The step an operator upgrading by hand forgets: the service runs a copy, so

@@ -57,9 +57,14 @@ pub enum Liveness {
 
 impl Liveness {
     /// Why a stalled daemon reads unhealthy, with what to do. `None`
-    /// otherwise.
+    /// otherwise. `restart` is the service manager's restart command, from
+    /// [`crate::service::ServiceIdentity::restart_command`].
     #[must_use]
-    pub fn stall(&self, last_github_contact: Option<DateTime<Utc>>) -> Option<String> {
+    pub fn stall(
+        &self,
+        last_github_contact: Option<DateTime<Utc>>,
+        restart: &str,
+    ) -> Option<String> {
         let Self::Stalled { since, pid } = self else {
             return None;
         };
@@ -72,8 +77,7 @@ impl Liveness {
              beaten for over {} minutes, and {contact}. A daemon blocked in a file system call \
              looks like this, for example on a runner root behind a macOS question nobody has \
              answered (look for a dialog on the Mac's desktop). If nothing is waiting and the \
-             machine has not just woken from sleep, restart it: `runner-manager service stop` \
-             then `runner-manager service start`",
+             machine has not just woken from sleep, restart it: `{restart}`",
             since.to_rfc3339(),
             STALLED_AFTER.as_secs() / 60
         ))
@@ -178,8 +182,11 @@ mod tests {
         // The same running process, not heard from for long enough.
         let stalled = liveness(&paths, Utc::now() + chrono::Duration::minutes(16));
         assert!(matches!(stalled, Liveness::Stalled { pid, .. } if pid == std::process::id()));
-        let said = stalled.stall(None).expect("a stall is a problem");
+        let said = stalled
+            .stall(None, "the-restart-command")
+            .expect("a stall is a problem");
         assert!(said.contains("made no progress since"), "{said}");
+        assert!(said.contains("`the-restart-command`"), "{said}");
         assert!(said.contains("never reached GitHub"), "{said}");
 
         stop(&paths).unwrap();

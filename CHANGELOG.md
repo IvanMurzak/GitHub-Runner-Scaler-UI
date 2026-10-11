@@ -7,6 +7,43 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.40
+
+### Fixes
+
+- `runner-manager update` on a Windows copy installed with npm no longer says npm is not on the
+  PATH when it is. Rust's process API looks only for `npm.exe`, and npm ships as `npm.cmd`, so
+  `update` now searches the PATH with each `PATHEXT` extension the way `cmd.exe` does and runs
+  the `npm.cmd` it finds. Unlike `cmd.exe` it skips the current directory and relative PATH
+  entries, and tries only `.exe`, `.com`, `.cmd` and `.bat`. `host doctor`'s tool checks use
+  the same search. The standard library escapes the arguments for `cmd.exe`, so no command line
+  is assembled by hand.
+- `update` on an npm copy passes `--prefix` with the prefix that copy lives in, so it updates
+  the copy you ran and not the global prefix of the account running it. Seen on a machine with two
+  accounts, each with its own copy under `%APPDATA%\npm`, where the machine PATH lists the first
+  account's copy first. Afterwards `update` runs the updated binary and says which version it now
+  reports. A copy that is not a global install (one in a project's `node_modules`, or a
+  dependency of another package) is refused with the npm command to run, instead of having a
+  second copy installed somewhere else.
+- When the newest release is already installed but the service still runs an older build (for
+  example after `npm install --global` was run by hand), `update` no longer says "Nothing to do".
+  It says the service still runs the older build and starts the same job-safe swap that
+  follows an update: the service finishes every running job, then restarts on the new build.
+  It does this by giving the file the service watches a new modification time; the file's
+  contents are not changed. If the service is not running, `update` says so and names the
+  command that starts it, after which it swaps by itself. When the service was installed from
+  another copy, `update` names `runner-manager update --force`, which hands this copy over
+  without interrupting a job. After
+  an update the same case used to name `service install`, which refuses while the service runs.
+  A registration from before the service ran its own copy is still told to re-register with
+  `service install`. `--check` reports what would happen and changes nothing.
+- The advice for a service that has stopped making progress, in `status`, `service status` and
+  `status --json`, named `runner-manager service stop` and `service start`, which do not exist.
+  It now names the service manager's own restart command for the service's start mode:
+  `Restart-Service` or `schtasks` on Windows, `launchctl kickstart` on macOS, and
+  `systemctl restart` on Linux. The Windows install script's advice for a binary it cannot
+  replace no longer names `service stop` either.
+
 ## 0.4.39
 
 ### Fixes

@@ -607,7 +607,7 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
             if status.problems().iter().any(|problem| {
                 problem.subject == runner_manager_platform::service::DAEMON_STALLED_SUBJECT
             }) {
-                "runner-manager service stop && runner-manager service start".into()
+                status.restart_command()
             } else {
                 // Nor a host check: the problem line names its fix, and
                 // `host doctor` shows the rest.
@@ -958,9 +958,20 @@ mod tests {
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("daemon progress"), "{rendered}");
         assert!(rendered.contains("host fitness"), "{rendered}");
+        // `service` has only install, uninstall and status, so the restart is
+        // the service manager's own command for this boot-mode registration.
         assert_eq!(
             error.remedy(),
-            Some("runner-manager service stop && runner-manager service start"),
+            Some(
+                operations
+                    .identity()
+                    .restart_command(StartMode::Boot)
+                    .as_str()
+            ),
+            "{error:?}"
+        );
+        assert!(
+            !error.remedy().unwrap_or_default().contains("service st"),
             "{error:?}"
         );
     }

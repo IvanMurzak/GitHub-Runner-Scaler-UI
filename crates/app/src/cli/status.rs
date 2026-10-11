@@ -177,6 +177,9 @@ pub struct Product {
 struct ServiceView {
     paths: runner_manager_platform::paths::AppPaths,
     binary: Option<std::path::PathBuf>,
+    /// The recorded start mode, which the restart advice is for. `None` for
+    /// another installation's service, or with no record.
+    start_mode: Option<StartMode>,
     foreign: Option<runner_manager_platform::service::ForeignService>,
 }
 
@@ -186,12 +189,11 @@ impl ServiceView {
     /// can be read. See [`runner_manager_platform::service::ForeignService`].
     fn of(context: &Context) -> Self {
         let Some(foreign) = super::service::operations(context).foreign_service() else {
+            let record = InstallRecord::read(context.paths()).ok().flatten();
             return Self {
                 paths: context.paths().clone(),
-                binary: InstallRecord::read(context.paths())
-                    .ok()
-                    .flatten()
-                    .map(|record| record.binary),
+                start_mode: record.as_ref().map(|record| record.start_mode),
+                binary: record.map(|record| record.binary),
                 foreign: None,
             };
         };
@@ -200,13 +202,14 @@ impl ServiceView {
             // `--version` would execute whatever that account put there, as
             // this account, every time the TUI refreshes.
             binary: None,
+            start_mode: None,
             paths: foreign.directories.paths(),
             foreign: Some(foreign),
         }
     }
 }
 
-fn binary_version(path: &std::path::Path) -> Option<String> {
+pub(super) fn binary_version(path: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new(path)
         .arg("--version")
         .output()
@@ -586,6 +589,9 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
                 runner_manager_platform::service::last_github_contact(&service.paths)
                     .ok()
                     .flatten(),
+                &super::service::operations(context)
+                    .identity()
+                    .restart_command(service.start_mode.unwrap_or(start_mode)),
             ),
             service_installed_from: service
                 .foreign
