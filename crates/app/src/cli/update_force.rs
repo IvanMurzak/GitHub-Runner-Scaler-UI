@@ -188,7 +188,7 @@ pub(super) fn force_service_handover(
             "the registered daemon binary does not answer --version",
         )
     })?;
-    match compare_versions(version, &service_version) {
+    match compare_executable_versions(version, &service_version) {
         std::cmp::Ordering::Less => {
             return Err(CliError::new(
                 Failure::UpdateUnsupported,
@@ -218,7 +218,7 @@ pub(super) fn force_service_handover(
         std::cmp::Ordering::Greater => {}
     }
     if let Some(source_version) = executable_version(&source)
-        && compare_versions(&source_version, version) == std::cmp::Ordering::Greater
+        && compare_executable_versions(&source_version, version) == std::cmp::Ordering::Greater
     {
         return Err(CliError::new(
             Failure::UpdateUnsupported,
@@ -300,7 +300,35 @@ fn executable_version(path: &Path) -> Option<String> {
         .split_whitespace()
         .last()?
         .to_owned();
-    parse_version(&version).map(|_| version)
+    executable_version_core(&version)?;
+    Some(version)
+}
+
+/// Local builds use `X.Y.Z+git.<sha>[.dirty]`. Accept that identity only for
+/// installed executables; published release versions still require `X.Y.Z`.
+fn executable_version_core(version: &str) -> Option<&str> {
+    let core = match version.split_once('+') {
+        Some((core, build)) => {
+            let sha = build.strip_prefix("git.")?;
+            let sha = sha.strip_suffix(".dirty").unwrap_or(sha);
+            if sha.is_empty() || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            core
+        }
+        None => version,
+    };
+    parse_version(core).map(|_| core)
+}
+
+fn compare_executable_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    match (
+        executable_version_core(left),
+        executable_version_core(right),
+    ) {
+        (Some(left), Some(right)) => compare_versions(left, right),
+        _ => std::cmp::Ordering::Less,
+    }
 }
 
 fn credential_readable(candidate: &Path, context: &Context) -> bool {
@@ -422,6 +450,39 @@ fn back_up_and_stage_source(candidate: &Path, source: &Path) -> Result<PathBuf, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_published_release_can_replace_an_older_source_build_without_downgrading() {
+        use std::cmp::Ordering;
+
+        for installed in ["0.4.40+git.592f0796a15b", "0.4.40+git.592f0796a15b.dirty"] {
+            assert_eq!(executable_version_core(installed), Some("0.4.40"));
+            assert_eq!(
+                compare_executable_versions("0.4.41", installed),
+                Ordering::Greater
+            );
+            assert_eq!(
+                compare_executable_versions(installed, "0.4.39"),
+                Ordering::Greater
+            );
+            assert_eq!(
+                compare_executable_versions("0.4.40", installed),
+                Ordering::Equal
+            );
+            assert!(
+                parse_version(installed).is_none(),
+                "release parsing stays strict"
+            );
+        }
+        for invalid in [
+            "0.4.40-rc.1",
+            "0.4.40+git.",
+            "0.4.40+git.nope",
+            "0.4.40+other",
+        ] {
+            assert_eq!(executable_version_core(invalid), None, "{invalid}");
+        }
+    }
 
     #[test]
     fn source_backup_is_byte_identical_and_replacement_is_atomic() {

@@ -1,0 +1,5 @@
+# Measure the 16 ms frame budget without other test processes competing for CPU.
+# Reserve the entire configured pool, including when --test-threads is changed.
+[[profile.default.overrides]]
+filter = 'test(=tui::shell::tests::in_memory_frame_meets_budget_and_render_has_no_io_capability)'
+threads-required = "num-test-threads"

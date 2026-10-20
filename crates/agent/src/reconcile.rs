@@ -40,7 +40,7 @@
 //!    [`AttemptOutcome::ExitedIdleWithoutWork`], is cleaned like any other, and
 //!    is counted apart from a failure — see [`ReconcileReport::idle_exits`].
 //! 2. **The same job is still `queued` on the next poll** while its runner
-//!    starts. The `- active_owned_runners` term in
+//!    starts. Subtracting only unassigned supply in
 //!    [`HostAllocator::allocate`] is what stops that from starting a second
 //!    runner, and then a third. This module's only job in that arithmetic is to
 //!    hand the allocator the attempt set the host actually holds — which is why
@@ -4112,6 +4112,38 @@ mod tests {
         assert_eq!(harness.launcher.live_count(), 1);
     }
 
+    #[tokio::test]
+    async fn draining_parallel_workflow_starts_runners_for_the_remaining_queue() {
+        let mut harness = Harness::simple(10, 8, "acme/app");
+        let policy = policy(1, "acme/app", 10);
+        let first = harness
+            .reconciler
+            .reconcile(std::slice::from_ref(&policy))
+            .await;
+        assert_eq!(first.started, 8);
+
+        // Five jobs finish while three longer jobs keep their runners busy.
+        let attempts = harness.launcher.snapshot();
+        *harness.launcher.attempts.lock().unwrap() = attempts
+            .iter()
+            .take(3)
+            .map(|attempt| attempt_in(AttemptState::Busy, attempt.id.as_uuid().as_u128(), 1))
+            .collect();
+        harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("acme/app"),
+            jobs(2),
+        )));
+
+        for poll in 0..3 {
+            let report = harness
+                .reconciler
+                .reconcile(std::slice::from_ref(&policy))
+                .await;
+            assert_eq!(report.started, if poll == 0 { 2 } else { 0 });
+            assert_eq!(harness.launcher.live_count(), 5);
+        }
+    }
+
     /// The other half of the measurement above: the loop must terminate even
     /// when the attempt set never catches up with it.
     ///
@@ -5574,9 +5606,8 @@ mod tests {
         let offline = report.offline_state().expect("an offline state to display");
         assert!(offline.to_string().contains("24 hours"));
 
-        // Recovery: the same job is still queued, and one runner is already
-        // serving it. Demand is recomputed from the current queued set rather
-        // than accumulated, so the reconnect starts nothing new.
+        // Recovery: two jobs are queued, but only the starting runner can
+        // cover them. The busy runner consumes capacity and serves other work.
         demand.set(PollOutcome::Ready(QueuedDemand::of(
             repo("acme/app"),
             jobs(2),
@@ -5586,12 +5617,11 @@ mod tests {
         assert!(!recovered.is_offline());
         assert_eq!(recovered.next_poll.pace, PollPace::Nominal);
         assert_eq!(
-            recovered.started, 0,
-            "two queued runs, two attempts already in flight: a reconnect cannot \
-             double-count work"
+            recovered.started, 1,
+            "two queued jobs and one starting runner leave one job uncovered"
         );
         assert_eq!(recovered.allocations[0].active_owned, 2);
-        assert_eq!(launcher.live_count(), 2);
+        assert_eq!(launcher.live_count(), 3);
     }
 
     /// One unreachable target must not idle a whole host.
