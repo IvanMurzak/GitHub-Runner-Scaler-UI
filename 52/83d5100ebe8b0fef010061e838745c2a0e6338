@@ -1,0 +1,19 @@
+.config/nextest.toml
+  s_c932267213fe57::t_dab0f0ba95c964 1-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5283d5100ebe8b0fef010061e838745c2a0e6338",
+  "prompts": {},
+  "sessions": {
+    "s_c932267213fe57": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15745-c000-70e2-8cf8-d1b34bbde421",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
