@@ -15,6 +15,10 @@ the version being prepared rather than the version in `Cargo.toml`.
   Busy runners still consume host and policy capacity, but only unassigned runners that
   are preparing, starting, or idle cover queued demand. This prevents the last few jobs
   of a parallel workflow from staying queued while capacity is available (#108).
+- `update --force` recognizes the application's `X.Y.Z+git.<sha>` source-build
+  identity when upgrading an installed service to a newer published release.
+  Version comparisons still prevent downgrades and same-version replacements
+  with different bytes; published release versions remain strictly `X.Y.Z`.
 
 ## 0.4.40
 

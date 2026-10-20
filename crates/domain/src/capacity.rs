@@ -347,6 +347,20 @@ mod tests {
     /// one is supplied rather than letting the fixture build a row the domain
     /// would refuse to load.
     fn attempt_in(state: AttemptState, id: u128, policy: u128) -> RunnerAttempt {
+        attempt_with_execution(
+            state,
+            id,
+            policy,
+            matches!(state, AttemptState::Preparing | AttemptState::Prepared),
+        )
+    }
+
+    fn attempt_with_execution(
+        state: AttemptState,
+        id: u128,
+        policy: u128,
+        isolated: bool,
+    ) -> RunnerAttempt {
         let outcome = state.is_terminal().then(|| match state {
             AttemptState::Failed => {
                 AttemptOutcome::failed(FailureReason::ProcessExitedUnexpectedly)
@@ -361,7 +375,7 @@ mod tests {
             state,
             outcome,
             process_id: None,
-            execution: if matches!(state, AttemptState::Preparing | AttemptState::Prepared) {
+            execution: if isolated {
                 crate::execution::AttemptExecution::Isolated {
                     provider_kind: crate::execution::Backend::Oci,
                     environment_id: Some(format!("env-{id}")),
@@ -493,6 +507,32 @@ mod tests {
         let mut allocator = HostAllocator::from_attempts(&host, &attempts);
         assert_eq!(allocator.allocate(&policy, 0).to_start, 0);
         assert_eq!(allocator.allocate(&policy, u32::MAX).to_start, 9);
+    }
+
+    #[test]
+    fn isolated_cleanup_consumes_capacity_without_covering_queued_demand() {
+        for state in [
+            AttemptState::Busy,
+            AttemptState::Finished,
+            AttemptState::Failed,
+            AttemptState::Orphaned,
+            AttemptState::Destroying,
+            AttemptState::CleanupDeferred,
+            AttemptState::Cleaned,
+        ] {
+            let attempts = [attempt_with_execution(state, 1, 1, true)];
+            let occupied = u16::from(state != AttemptState::Cleaned);
+            for (host_capacity, policy_capacity, expected) in
+                [(4, 4, 2), (2, 4, 2 - occupied), (4, 2, 2 - occupied)]
+            {
+                let host = host(host_capacity);
+                let policy = active_policy(1, "home", policy_capacity);
+                let mut allocator = HostAllocator::from_attempts(&host, &attempts);
+                let allocation = allocator.allocate(&policy, 2);
+                assert_eq!(allocation.active_owned, occupied, "{state:?}");
+                assert_eq!(allocation.to_start, expected, "{state:?}");
+            }
+        }
     }
 
     #[test]
