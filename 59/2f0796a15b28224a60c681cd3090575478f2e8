@@ -1,0 +1,24 @@
+CHANGELOG.md
+  s_c932267213fe57::t_de678906f3381b 10-18
+crates/domain/src/capacity.rs
+  s_c932267213fe57::t_47222456903873 7-8,22,25,30-32,93-94,187-188,243-264,266,364-377,447-497
+crates/agent/src/reconcile.rs
+  s_c932267213fe57::t_8d9b8f4593cb99 43,5609-5610,5620-5621,5624
+  s_c932267213fe57::t_47222456903873 4115-4146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "592f0796a15b28224a60c681cd3090575478f2e8",
+  "prompts": {},
+  "sessions": {
+    "s_c932267213fe57": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15745-c000-70e2-8cf8-d1b34bbde421",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
