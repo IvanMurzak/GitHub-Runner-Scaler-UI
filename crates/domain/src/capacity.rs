@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! demand        = queued jobs whose required labels match this policy's routing labels
-//! desired       = clamp(demand, min_capacity, max_capacity)
+//! unavailable   = active_owned_runners - unassigned_supply
+//! desired       = clamp(demand + unavailable, min_capacity, max_capacity)
 //! host_headroom = host_capacity - active_owned_runners_all_policies
 //! to_start      = max(0, min(desired - active_owned_runners, host_headroom))
 //! ```
@@ -18,14 +19,17 @@
 //! from it on every grant, and is the only way to obtain a `to_start`, so there
 //! is no call shape in which the ceiling is skipped.
 //!
-//! **Why `- active_owned_runners` is load-bearing.** Under scale sets, demand was
+//! **Why unassigned supply is subtracted from demand.** Under scale sets, demand was
 //! a count of *assigned* jobs. Over REST it is a count of *queued* jobs, and a
 //! job stays queued across consecutive polls while its runner is starting. A
-//! formula that ignored attempts already in flight would start a fresh runner on
+//! formula that ignored unassigned attempts already in flight would start a fresh runner on
 //! every poll until the job was finally picked up — runaway runners, with no
 //! error anywhere. `e1`'s Definition of Done tests three consecutive polls;
 //! [`tests::the_same_queued_job_on_two_polls_yields_one_attempt_not_two`] tests
 //! the arithmetic underneath it.
+//! Busy runners cannot accept queued work: they consume capacity but do not
+//! cover queued demand. The same applies to concluded isolated attempts whose
+//! environments still hold capacity until cleanup.
 //!
 //! **There is no reservation here.** Nothing in this module claims, leases, or
 //! acknowledges a job. The surplus runner that results is an accepted, bounded
@@ -86,7 +90,8 @@ pub struct Allocation {
     pub policy_id: PolicyId,
     /// Queued jobs matching this policy's routing labels.
     pub demand: u32,
-    /// `clamp(demand, min_capacity, max_capacity)`.
+    /// Total target: queued demand plus occupied slots unable to accept work,
+    /// clamped to the policy's minimum and maximum capacity.
     pub desired: u16,
     /// Attempts already in flight for this policy.
     pub active_owned: u16,
@@ -179,7 +184,8 @@ impl<'a> HostAllocator<'a> {
     ///
     /// `active_owned` — the attempts belonging to `policy` and still occupying a
     /// slot — is selected from the set this allocator was built with. It is the
-    /// term that stops a job still sitting in the queue from being served twice,
+    /// ceiling consumption. Its unassigned subset stops a job still sitting in
+    /// the queue from being served twice,
     /// and it is deliberately read from the *same* set as the host-wide total:
     /// the two are different questions over one set, the total being host-wide
     /// (D9) and this one per-policy (D7), and `to_start` is bound by both.
@@ -234,11 +240,30 @@ impl<'a> HostAllocator<'a> {
         // (`policy::AutoscaleConfig::new`), which is what keeps this `clamp`
         // total -- Rust's `clamp` panics on an inverted range.
         debug_assert!(min <= max, "PolicyMode invariant");
-        let desired = demand.clamp(u32::from(min), u32::from(max)) as u16;
+        let unassigned_supply = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.policy_id == policy.id)
+            .filter(|attempt| {
+                matches!(
+                    attempt.state(),
+                    crate::attempt::AttemptState::Allocated
+                        | crate::attempt::AttemptState::Preparing
+                        | crate::attempt::AttemptState::Prepared
+                        | crate::attempt::AttemptState::JitReceived
+                        | crate::attempt::AttemptState::Starting
+                        | crate::attempt::AttemptState::Idle
+                )
+            })
+            .count()
+            .min(usize::from(u16::MAX)) as u16;
+        let target =
+            demand.saturating_add(u32::from(active_owned.saturating_sub(unassigned_supply)));
+        let desired = target.clamp(u32::from(min), u32::from(max)) as u16;
 
-        let limiting_factor = if demand > u32::from(max) {
+        let limiting_factor = if target > u32::from(max) {
             LimitingFactor::MaxCapacity
-        } else if demand < u32::from(min) {
+        } else if target < u32::from(min) {
             LimitingFactor::MinCapacity
         } else {
             LimitingFactor::Demand
@@ -336,7 +361,20 @@ mod tests {
             state,
             outcome,
             process_id: None,
-            execution: crate::execution::AttemptExecution::Native { process_id: None },
+            execution: if matches!(state, AttemptState::Preparing | AttemptState::Prepared) {
+                crate::execution::AttemptExecution::Isolated {
+                    provider_kind: crate::execution::Backend::Oci,
+                    environment_id: Some(format!("env-{id}")),
+                    resolved_image: crate::execution::ImageReference::new(format!(
+                        "sha256:{}",
+                        "a".repeat(64)
+                    ))
+                    .unwrap(),
+                    generation: format!("gen-{id}"),
+                }
+            } else {
+                crate::execution::AttemptExecution::Native { process_id: None }
+            },
             runtime_path: "runtime/p/a".into(),
             workspace_kind: WorkspaceKind::Ephemeral,
             workspace_slot: None,
@@ -405,6 +443,57 @@ mod tests {
     // =======================================================================
     // The in-flight term
     // =======================================================================
+
+    #[test]
+    fn busy_runners_do_not_cover_queued_jobs_but_still_consume_capacity() {
+        let attempts: Vec<_> = (1..=3)
+            .map(|id| attempt_in(AttemptState::Busy, id, 1))
+            .collect();
+        for (host_capacity, policy_capacity, expected) in
+            [(10, 10, 2), (4, 10, 1), (10, 4, 1), (3, 10, 0), (10, 3, 0)]
+        {
+            let host = host(host_capacity);
+            let policy = active_policy(1, "home", policy_capacity);
+            let mut allocator = HostAllocator::from_attempts(&host, &attempts);
+            let allocation = allocator.allocate(&policy, 2);
+            assert_eq!(allocation.active_owned, 3);
+            assert_eq!(allocation.to_start, expected);
+            assert!(allocator.active_total() <= host_capacity);
+            assert!(allocation.active_owned + allocation.to_start <= policy_capacity);
+        }
+    }
+
+    #[test]
+    fn every_unassigned_state_covers_demand_alongside_busy_runners() {
+        for state in [
+            AttemptState::Allocated,
+            AttemptState::Preparing,
+            AttemptState::Prepared,
+            AttemptState::JitReceived,
+            AttemptState::Starting,
+            AttemptState::Idle,
+        ] {
+            let host = host(10);
+            let policy = active_policy(1, "home", 10);
+            let attempts = [
+                attempt_in(AttemptState::Busy, 1, 1),
+                attempt_in(state, 2, 1),
+                attempt_in(state, 3, 1),
+            ];
+            let mut allocator = HostAllocator::from_attempts(&host, &attempts);
+            assert_eq!(allocator.allocate(&policy, 2).to_start, 0, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn busy_runners_without_queued_work_do_not_start_more_runners() {
+        let host = host(10);
+        let policy = active_policy(1, "home", 10);
+        let attempts = [attempt_in(AttemptState::Busy, 1, 1)];
+        let mut allocator = HostAllocator::from_attempts(&host, &attempts);
+        assert_eq!(allocator.allocate(&policy, 0).to_start, 0);
+        assert_eq!(allocator.allocate(&policy, u32::MAX).to_start, 9);
+    }
 
     #[test]
     fn the_same_queued_job_on_two_polls_yields_one_attempt_not_two() {

@@ -7,6 +7,15 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.41
+
+### Fixes
+
+- Autoscaling starts additional runners for queued jobs even when other runners are busy.
+  Busy runners still consume host and policy capacity, but only unassigned runners that
+  are preparing, starting, or idle cover queued demand. This prevents the last few jobs
+  of a parallel workflow from staying queued while capacity is available (#108).
+
 ## 0.4.40
 
 ### Fixes
