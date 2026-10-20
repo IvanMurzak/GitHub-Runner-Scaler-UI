@@ -1,0 +1,37 @@
+CHANGELOG.md
+  s_468234d3364cc1::t_2bad5d33b26fb4 59-64
+crates/app/src/cli/doctor.rs
+  s_468234d3364cc1::t_41874eed270ad6 1295
+  s_468234d3364cc1::t_0e0009eac5a6d3 1146
+  s_468234d3364cc1::t_abf7cc40dfd502 1747
+  s_468234d3364cc1::t_75c8cd95b5d0e1 1147-1149
+  s_468234d3364cc1::t_d89f89619a4637 1292-1294
+  s_468234d3364cc1::t_af5461081c1dbe 1296-1298
+  s_468234d3364cc1::t_c74fc5c32c23d4 1744-1746
+  s_468234d3364cc1::t_e13bb192c8fcd3 1748-1750
+  s_1aeea0f33ae1af::t_4deeb03926c80f 219-222,250-252,255-258,1150-1151,1283-1291,1299-1301,1307-1308,1334,1732-1743,1751-1769,1791-1794,1836-1847,3201,3547,3557,3570,3990-4072
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "97297123bfd4ee1062aa202b27656ea8fe30052f",
+  "prompts": {},
+  "sessions": {
+    "s_1aeea0f33ae1af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a494efda8b92d4d91",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

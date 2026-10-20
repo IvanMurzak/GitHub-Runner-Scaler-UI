@@ -1,0 +1,45 @@
+CHANGELOG.md
+  s_468234d3364cc1::t_f91cf3e29ce5e3 10-37
+.github/workflows/release.yml
+  s_468234d3364cc1::t_162d54a2c1c8a4 344-347
+  s_468234d3364cc1::t_bc960937f5d1dc 398-408
+  s_468234d3364cc1::t_2600b516eae17b 985-994
+  s_468234d3364cc1::t_8b74afabbecf16 538-540
+  s_468234d3364cc1::t_b1b2d18a06d78d 620-631,633-637,639-646,650-653,655-656,662-667,670
+  s_468234d3364cc1::t_6749e74c717f77 138-162
+.github/scripts/release.sh
+  s_468234d3364cc1::t_98a6f53ed5aa56 14-15
+  s_468234d3364cc1::t_63bd56e947cb67 86-101
+  s_468234d3364cc1::t_f0b457b6cf9c78 966-968,970
+  s_468234d3364cc1::t_7909454fe16be4 858
+  s_468234d3364cc1::t_600a25d9e9accb 1395
+  s_468234d3364cc1::t_e65a0a74a74bde 1079-1164
+  s_468234d3364cc1::t_6cccdbd2951ad1 771-857,859-965,969,971-1023,1028-1038,1040
+  s_468234d3364cc1::t_41d690a8f10c4e 1394
+crates/app/tests/release_workflow.rs
+  s_468234d3364cc1::t_7b07fc077c425f 181-199,205-210,797,927,1572-1589,2092-2093,2178-2193,2371-2380,2384,2579-2614
+  s_468234d3364cc1::t_ec7bf21c28ddd9 2437-2578
+  s_468234d3364cc1::t_e1cebc2256f369 822
+  s_468234d3364cc1::t_d50d260cf15cfb 833-835
+  s_468234d3364cc1::t_23b7cc2282f38c 928-1056,1058-1061,1063-1571
+  s_468234d3364cc1::t_aad578ea5518f3 1057,1062
+  s_468234d3364cc1::t_d9514672df1d5d 786-794,796,798-802,808
+README.md
+  s_468234d3364cc1::t_cd6fc73910e18b 72-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "62d063efe7a2e9e9646ef448de64f1dd871a6d16",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+crates/app/src/cli/doctor.rs
+  s_468234d3364cc1::t_da341f142f3598 3751
+  s_468234d3364cc1::t_73c237ecf7e559 3704-3708,3713-3717,3752
+  s_468234d3364cc1::t_144c619dc05fc3 1129-1133,1137,1140-1142
+  s_468234d3364cc1::t_fcd9fbb83c06b7 348-349,1143-1146,1161,1171,1192,1842,1845,3228,3230-3231,3276-3280,3718-3721,3736,3753-3755
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b7f8c2632f928818b4034d71b6b7590dbc7229c0",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

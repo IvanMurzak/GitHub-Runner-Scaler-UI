@@ -1,0 +1,49 @@
+crates/agent/src/reconcile.rs
+  s_468234d3364cc1::t_65cacb7172f6f9 651
+crates/app/src/cli/daemon.rs
+  s_468234d3364cc1::t_f4226d600f5434 310,403,415,2003-2010,2013,2018,2024-2026,2032-2034
+crates/app/src/cli/doctor.rs
+  s_5c48825f3404b2::t_c63e926e19dbac 1306-1307,1315-1316,1336-1337,2453-2455,5930-5941
+crates/app/src/cli/polling.rs
+  s_5c48825f3404b2::t_7acf80dece3ac6 42-44,119-128,139-141,227,299,303-311,356-362,370,377,387-390,484-492,525,604-609,685
+crates/app/src/cli/status.rs
+  s_468234d3364cc1::t_c7005d85994769 499-500,797-798,897-900,1017-1020
+crates/app/tests/command_accountability/mod.rs
+  s_468234d3364cc1::t_69b373655ec6ed 330-334
+crates/app/tests/poll_interval_commands.rs
+  s_468234d3364cc1::t_3eb7adb12a33e9 70-79
+crates/github/src/traffic.rs
+  s_468234d3364cc1::t_6c0aba842fa8e1 345,347-351,398-402,467-470
+crates/platform/src/polling.rs
+  s_468234d3364cc1::t_1cf02883e6e898 46
+crates/github/src/conditional.rs
+  s_5c48825f3404b2::t_7d428c2952932c 37-45,204,221,225-230
+crates/github/src/demand.rs
+  s_5c48825f3404b2::t_d0cd470e5f2152 734-735,828
+crates/github/src/lib.rs
+  s_5c48825f3404b2::t_887f1628dbaaae 1253,1413,1425
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4f896615311444c0816a2d689821c375235d4168",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_5c48825f3404b2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9d55988a-2bda-4809-8159-ebc349935942",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

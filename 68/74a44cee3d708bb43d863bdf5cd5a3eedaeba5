@@ -1,0 +1,19 @@
+crates/agent/src/reconcile.rs
+  s_468234d3364cc1::t_11d4293427a267 180-197,650-653,788,810-812,814-816,893-895,899-906,2717,5187,5244,5256,5276,5295,5311,5323,5336-5424
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6874a44cee3d708bb43d863bdf5cd5a3eedaeba5",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

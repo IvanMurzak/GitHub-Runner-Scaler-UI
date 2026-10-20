@@ -1,0 +1,51 @@
+crates/platform/src/wsl/fence.rs
+  s_468234d3364cc1::t_df82b04fac2eb8 912-913,916,919-921
+  s_468234d3364cc1::t_da645555a6d39d 858,860
+  s_468234d3364cc1::t_29752b85f949b1 873,904,936,954,962,1087-1088,1090,1092-1093,1095,1097,1105-1113
+  s_468234d3364cc1::t_e568df8dc52d33 303-304,309-331,352-354,359,366-367,371,385,405,415,458,497-498,504-521,523-530,532-538,547-551,560,562-565,567-569,584-588,597,609-610,701,939,943,947,980,1061,1067,1076,1080
+crates/agent/src/reconcile.rs
+  s_468234d3364cc1::t_a6edadac7e0f5e 1207-1208,1216-1217,1224-1230,1237-1254,1265-1266,1274-1277,1281-1282,1284-1288,1298,1304-1311,1316-1317,1320,1333,1338-1340,1344,1347,1364,1369,1376,1392,3460,3462,3473,3475,3483-3518,3521
+  s_468234d3364cc1::t_c5da89a8f8bd15 3519-3520,3522-3525
+crates/platform/src/service.rs
+  s_468234d3364cc1::t_98d7b7ceb8ee00 5066
+  s_468234d3364cc1::t_a41d2554415301 8585
+crates/platform/src/launch_health.rs
+  s_468234d3364cc1::t_25d104c0c3f70b 200-201
+  s_468234d3364cc1::t_043fee3b57973d 221-230,234-235,247
+  s_468234d3364cc1::t_aec66bc8452997 66-72
+  s_468234d3364cc1::t_32ad1db8208ebf 163-164,179
+  s_468234d3364cc1::t_34bfa1d480632d 26
+  s_468234d3364cc1::t_4422171abd35cf 31,46,207,281
+crates/app/src/cli/wsl.rs
+  s_468234d3364cc1::t_ac04f50fe4d73c 1582
+crates/app/src/cli/doctor.rs
+  s_468234d3364cc1::t_289a99f11daf09 1432-1433
+crates/app/src/cli/status.rs
+  s_468234d3364cc1::t_6e4e3ef79d9a57 676
+crates/app/src/cli/service.rs
+  s_468234d3364cc1::t_b2ee3771375e0c 584
+crates/platform/src/process.rs
+  s_468234d3364cc1::t_0cb6714c02c246 420-436
+  s_468234d3364cc1::t_5fd4ba1ac36a91 1787-1804,1808-1809
+  s_468234d3364cc1::t_0316550ef115e2 1944,1975,1994
+crates/app/src/cli/daemon.rs
+  s_468234d3364cc1::t_f61113e94fc4ae 2055,2063
+crates/platform/tests/no_wsl_credential_outside_child_stdin.rs
+  s_468234d3364cc1::t_e0b38f85cac903 311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f1c03a9b19edfaacda5cda13b6dc087bc2e4ef22",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

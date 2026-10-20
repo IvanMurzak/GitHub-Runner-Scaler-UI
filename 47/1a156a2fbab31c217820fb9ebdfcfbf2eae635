@@ -1,0 +1,24 @@
+crates/app/src/cli/auth.rs
+  s_468234d3364cc1::t_cbace48abe0337 367,403,405-406,423,1999-2053
+  s_468234d3364cc1::t_c3853806c3b600 364-366
+  s_468234d3364cc1::t_dbc73baa3780c0 400-402
+  s_468234d3364cc1::t_64fe237a095600 404
+  s_468234d3364cc1::t_c962733566a749 407-409,420-422
+  s_468234d3364cc1::t_5d909c079f5ae6 424-425
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "471a156a2fbab31c217820fb9ebdfcfbf2eae635",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

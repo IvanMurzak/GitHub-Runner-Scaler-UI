@@ -1,0 +1,45 @@
+crates/app/src/cli/cache.rs
+  s_468234d3364cc1::t_ac73a6fd0e5b6f 26,321,340,389-395,408,416-426,430-431,433,435-447,454,969-972
+crates/app/src/cli/doctor.rs
+  s_468234d3364cc1::t_3cd70e0cce049d 67-69,94,1439,1445,1474-1475,1481,1503-1510,1512-1514,1527,1548,1578-1590,2213-2217,2222,2311-2313,2351-2354,2357-2358,3921
+crates/app/src/tui/shell.rs
+  s_468234d3364cc1::t_adb34eb94813c2 694,858,956,960-961,5890-5893
+crates/platform/src/dependency_cache.rs
+  s_468234d3364cc1::t_af5ff690fe9459 144,153,171-177,183-188
+crates/platform/src/host_fitness.rs
+  s_468234d3364cc1::t_25822cbe4bd912 138-154,166-168,173-174,176,207,213,217-219,395-403,498,1157,1162-1165,1167,1169-1186
+crates/platform/src/secrets.rs
+  s_468234d3364cc1::t_1f9c299a0f6d09 2151-2177,2179-2182,2408,2412,2726-2729
+crates/platform/src/service.rs
+  s_468234d3364cc1::t_a138c8e2a2d6c9 4493,4495-4500,4502,4514,4516,4727-4730,4765-4771,5233,5673-5674
+crates/platform/src/service_request.rs
+  s_468234d3364cc1::t_16edd96b06fba0 11,31-38,126-139,145-158,167,185-186
+crates/agent/src/lifecycle.rs
+  s_6d68a7dfc55409::t_613e5443ef6182 3182-3186,3188-3189,3191-3197,3199,3229,3231-3232,3302,3545-3556,4751-4759
+crates/app/src/cli/status.rs
+  s_6d68a7dfc55409::t_f8eeb8a9a04431 655-682,687-688,692,1237
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "76e47a70361d73444ac637602b0b258128ba0efc",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_6d68a7dfc55409": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6c6c6bd085963990",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
