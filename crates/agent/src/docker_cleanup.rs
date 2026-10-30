@@ -421,7 +421,17 @@ pub fn creation_intent(
                 mounts.iter().any(|mount| {
                     mount.get("Target").and_then(Value::as_str) == Some("/var/lib/buildkit")
                 })
-            }))
+            })
+            || host_config
+                .get("Binds")
+                .and_then(Value::as_array)
+                .is_some_and(|binds| {
+                    binds.iter().filter_map(Value::as_str).any(|bind| {
+                        let mut parts = bind.split(':');
+                        let source = parts.next();
+                        parts.next().or(source) == Some("/var/lib/buildkit")
+                    })
+                }))
     {
         return Ok(None);
     }

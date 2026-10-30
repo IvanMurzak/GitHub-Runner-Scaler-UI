@@ -124,6 +124,14 @@ fn named_volumes_builders_retained_resources_and_build_requests_are_not_owned() 
             "/v1.49/containers/create",
             json!({"Image":"custom/builder","HostConfig":{"Mounts":[{"Source":"builder-state","Target":"/var/lib/buildkit","Type":"volume"}]}}),
         ),
+        (
+            "/v1.49/containers/create",
+            json!({"Image":"custom/builder","HostConfig":{"Binds":["builder-state:/var/lib/buildkit:rw"]}}),
+        ),
+        (
+            "/v1.49/containers/create",
+            json!({"Image":"custom/builder","HostConfig":{"Binds":["/var/lib/buildkit"]}}),
+        ),
         ("/v1.49/build", json!({"arbitrary":"build cache"})),
     ] {
         let before = body.clone();

@@ -342,6 +342,25 @@ mod live {
             ],
         );
 
+        // A custom builder with the older -v API must retain its container as
+        // well as the state volume, even without the standard buildx name.
+        let custom_builder = format!("rm-cleanup-live-custom-builder-{nonce}");
+        fixture.containers.push(custom_builder.clone());
+        fixture.docker(
+            true,
+            &[
+                "run",
+                "-d",
+                "--name",
+                &custom_builder,
+                "-v",
+                &format!("{named_cache}:/var/lib/buildkit"),
+                &image,
+                "sleep",
+                "600",
+            ],
+        );
+
         // Docker attach upgrades and stdin half-close must still behave normally.
         let interactive_name = format!("rm-cleanup-live-interactive-{nonce}");
         fixture.containers.push(interactive_name.clone());
@@ -558,6 +577,7 @@ mod live {
         assert!(!parallel_directory.join("stop").exists());
         assert!(fixture.exists("container", &unrelated));
         assert!(fixture.exists("container", &kept));
+        assert!(fixture.exists("container", &custom_builder));
         assert!(fixture.exists("volume", &named_cache));
         assert!(fixture.exists("image", &image));
         assert!(fixture.exists("image", &image_tag));
