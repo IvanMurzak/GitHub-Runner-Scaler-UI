@@ -87,6 +87,8 @@ pub enum LockKind {
     /// prune moves an idle one aside, so a prune never takes a namespace a
     /// runner is about to use. It lives in the cache root, not in `state/`.
     DependencyCache,
+    /// Serializes daemon and operator Docker cleanup sweeps.
+    DockerCleanup,
 }
 
 impl LockKind {
@@ -98,6 +100,7 @@ impl LockKind {
             Self::Allocation => "allocation.lock",
             Self::CredentialRenewal => "credential-renewal.lock",
             Self::DependencyCache => ".lock",
+            Self::DockerCleanup => ".sweep.lock",
         }
     }
 
@@ -109,6 +112,7 @@ impl LockKind {
             Self::Allocation => "the runtime allocation lock",
             Self::CredentialRenewal => "the credential-renewal lock",
             Self::DependencyCache => "the dependency-cache lock",
+            Self::DockerCleanup => "the Docker cleanup lock",
         }
     }
 
@@ -117,6 +121,7 @@ impl LockKind {
     #[must_use]
     pub const fn advice(self) -> &'static str {
         match self {
+            Self::DockerCleanup => "Another Docker cleanup sweep is running; retry shortly.",
             Self::SingleInstance => {
                 "Only one agent may reconcile policies on a host. Stop the other agent, or wait \
                  for it to exit; the operating system releases this lock when that process ends, \

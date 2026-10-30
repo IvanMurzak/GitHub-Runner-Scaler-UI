@@ -43,6 +43,7 @@
 pub mod auth;
 pub mod cache;
 pub mod daemon;
+pub mod docker_cleanup;
 pub mod doctor;
 pub mod host;
 pub mod policy;
@@ -849,6 +850,9 @@ pub enum HostCommand {
     /// Persistent dependency and tool caches for native runners.
     #[command(subcommand)]
     Cache(HostCacheCommand),
+    /// Account for and clean temporary Docker resources of native Linux attempts.
+    #[command(subcommand)]
+    DockerCleanup(HostDockerCleanupCommand),
     /// Move this account's configuration aside when no service runs against it.
     ///
     /// For an account whose earlier install was replaced by another
@@ -860,6 +864,24 @@ pub enum HostCommand {
 }
 
 // -- dependency caches -------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum HostDockerCleanupCommand {
+    /// Show the platform support, mode and journal directory.
+    Show,
+    /// Choose off, report (default), or apply. Read at each launch and sweep.
+    SetMode(DockerCleanupModeArgs),
+    /// Inspect cleanup candidates without deleting Docker resources.
+    Report,
+    /// Sweep cleaned attempts using the configured mode; report mode never deletes.
+    Sweep,
+}
+
+#[derive(Debug, Args)]
+pub struct DockerCleanupModeArgs {
+    #[arg(long, value_parser = ["off", "report", "apply"])]
+    pub mode: String,
+}
 
 #[derive(Debug, Subcommand)]
 pub enum HostCacheCommand {

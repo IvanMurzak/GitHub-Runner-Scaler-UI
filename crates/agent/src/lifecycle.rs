@@ -2097,6 +2097,7 @@ pub struct NativeProcesses {
     runner_env_file: Option<PathBuf>,
     /// Persistent dependency caches. `None` gives runners none.
     dependency_caches: Option<DependencyCaches>,
+    docker_cleanup: Option<crate::docker_cleanup::DockerCleanup>,
     #[cfg(test)]
     post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
     #[cfg(test)]
@@ -2140,6 +2141,12 @@ impl PlatformExecutionProvider {
     #[must_use]
     pub fn with_dependency_caches(mut self, caches: DependencyCaches) -> Self {
         self.native = self.native.with_dependency_caches(caches);
+        self
+    }
+
+    #[must_use]
+    pub fn with_docker_cleanup(mut self, cleanup: crate::docker_cleanup::DockerCleanup) -> Self {
+        self.native.docker_cleanup = Some(cleanup);
         self
     }
 
@@ -2407,6 +2414,29 @@ impl NativeProcesses {
         };
         #[cfg(not(test))]
         let spec = runner_listener_spec(program, attempt.runtime_path(), caches, &host_env);
+        let (spec, docker_proxy) = if let Some(cleanup) = &self.docker_cleanup {
+            let repository = cache_target.map(ToString::to_string).unwrap_or_default();
+            match cleanup.launch_environment(attempt.id, &repository, &host_env) {
+                Ok(Some(endpoint)) => (
+                    spec.env("DOCKER_HOST", endpoint),
+                    Some(cleanup.root.join(attempt.id.to_string())),
+                ),
+                Ok(None) => (spec, None),
+                Err(error) => {
+                    tracing::warn!(attempt_id = %attempt.id, event = "docker_accounting_unavailable", reason = ?error.kind(), "native Docker accounting could not start");
+                    if crate::docker_cleanup::Config::load(&cleanup.config).map_or(true, |config| {
+                        config.mode == crate::docker_cleanup::Mode::Apply
+                    }) {
+                        return Err(ProcessStartFailure::before_spawn(
+                            FailureReason::ProcessStartFailed,
+                        ));
+                    }
+                    (spec, None)
+                }
+            }
+        } else {
+            (spec, None)
+        };
         let child = spec
             .spawn_runner_with_handoff(&handoff)
             .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
@@ -2430,6 +2460,12 @@ impl NativeProcesses {
             }
         };
         if self.persist_identity(attempt, &identity).is_err() {
+            return Err(self.abort_spawned_child(child, attempt, true));
+        }
+        if let Some(directory) = docker_proxy
+            && crate::docker_cleanup::write_json(&directory.join("runner.json"), child.identity())
+                .is_err()
+        {
             return Err(self.abort_spawned_child(child, attempt, true));
         }
         let pid = child.pid();

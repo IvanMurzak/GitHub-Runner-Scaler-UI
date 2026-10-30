@@ -1755,6 +1755,7 @@ fn build_appender(
     tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix(stem)
+        .max_log_files(30)
         .build(directory)
         .map_err(|error| error.to_string())
 }
@@ -1812,6 +1813,39 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[test]
+    fn opening_the_sink_bounds_rotated_logs_without_pruning_attempt_summaries() {
+        let root = tempfile::tempdir().unwrap();
+        let today = chrono::Utc::now();
+        for days in 1..=35 {
+            let date = (today - chrono::Duration::days(days)).format("%Y-%m-%d");
+            std::fs::write(
+                root.path().join(format!("{SERVICE_LOG_STEM}.{date}")),
+                b"old",
+            )
+            .unwrap();
+        }
+        let summary = root
+            .path()
+            .join(format!("{}.log", uuid::Uuid::from_u128(1)));
+        std::fs::write(&summary, b"attempt summary").unwrap();
+        let mut appender = build_appender(root.path(), SERVICE_LOG_STEM).unwrap();
+        appender.write_all(b"current diagnostics\n").unwrap();
+        appender.flush().unwrap();
+        let rotated = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(SERVICE_LOG_STEM)
+            })
+            .count();
+        assert_eq!(rotated, 30);
+        assert_eq!(std::fs::read(summary).unwrap(), b"attempt summary");
+    }
 
     // -----------------------------------------------------------------------
     // Capturing what the sink actually wrote

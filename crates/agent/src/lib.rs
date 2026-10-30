@@ -41,6 +41,7 @@
 //! tripwire against the shape being reintroduced.
 
 pub mod dependency_caches;
+pub mod docker_cleanup;
 pub mod lifecycle;
 pub mod oci;
 pub mod package;

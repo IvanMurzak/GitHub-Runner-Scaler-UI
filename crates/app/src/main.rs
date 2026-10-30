@@ -19,5 +19,8 @@ mod cli;
 mod tui;
 
 fn main() -> std::process::ExitCode {
+    if let Some(code) = runner_manager_agent::docker_cleanup::internal_proxy_entry() {
+        return code;
+    }
     cli::dispatch()
 }
