@@ -609,7 +609,12 @@ impl ExecutionProvider for WindowsHyperVContainers {
             }
         }
         if !Self::configuration_is_exact(&expected.name, &expected.image, *resources) {
-            let _ = Self::docker(&os_args(["rm", "--force", expected.name.as_str()]));
+            let _ = Self::docker(&os_args([
+                "rm",
+                "--force",
+                "--volumes",
+                expected.name.as_str(),
+            ]));
             self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
             return Err(failure(
                 "Windows Hyper-V resource or isolation attestation failed",
@@ -624,7 +629,12 @@ impl ExecutionProvider for WindowsHyperVContainers {
         let destination = format!("{}:C:\\runner", expected.name);
         let copied = Self::docker(&os_args(["cp", &source, &destination]));
         if !matches!(copied, Ok(result) if result.success) {
-            let _ = Self::docker(&os_args(["rm", "--force", expected.name.as_str()]));
+            let _ = Self::docker(&os_args([
+                "rm",
+                "--force",
+                "--volumes",
+                expected.name.as_str(),
+            ]));
             self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
             return Err(failure(
                 "runner package copy into Windows Hyper-V container failed",
@@ -660,7 +670,12 @@ impl ExecutionProvider for WindowsHyperVContainers {
                     && record.exit_code == Some(0)
             })
         {
-            let _ = Self::docker(&os_args(["rm", "--force", expected.name.as_str()]));
+            let _ = Self::docker(&os_args([
+                "rm",
+                "--force",
+                "--volumes",
+                expected.name.as_str(),
+            ]));
             self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
             return Err(failure(
                 "Windows Hyper-V image bootstrap compatibility check failed",
@@ -823,8 +838,13 @@ impl ExecutionProvider for WindowsHyperVContainers {
                 Err(failure("Windows Hyper-V container ownership mismatch"))
             };
         }
-        let removed = Self::docker(&os_args(["rm", "--force", expected.name.as_str()]))
-            .map_err(|_| failure("Windows Hyper-V container destroy failed"))?;
+        let removed = Self::docker(&os_args([
+            "rm",
+            "--force",
+            "--volumes",
+            expected.name.as_str(),
+        ]))
+        .map_err(|_| failure("Windows Hyper-V container destroy failed"))?;
         if (removed.success || removed.is_missing_resource())
             && Self::inspect_record(&expected.name)
                 .ok()

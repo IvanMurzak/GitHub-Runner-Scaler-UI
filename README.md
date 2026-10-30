@@ -924,6 +924,24 @@ awaiting cleanup, so run it once that repository is idle. Switching off persiste
 it to another directory, keeps every slot you already have: no old directory is moved or
 deleted. Remove the ones you no longer want yourself.
 
+### Diagnostics retention and Docker resources
+
+The daemon checks completed-attempt summaries in `logs/` at startup and hourly,
+including while scaling is disabled. It keeps the newest 1,000 summaries for up to
+30 days. Service and operator diagnostics rotate daily and keep at most 30 files per
+log stem. Dependency caches follow their separate configured size cap.
+
+Native workflows share the host's Docker engine. Their containers and volumes need
+workflow cleanup: remove disposable containers with `docker rm --force --volumes`
+to remove their anonymous volumes too. Named volumes need explicit lifecycle rules.
+The manager only removes containers it can attribute to its own isolation provider;
+it does not run a host-wide Docker prune. Its Windows Hyper-V provider removes
+anonymous volumes along with its owned containers, including on preparation failure.
+
+Old manually installed runners and workspaces retained after a runner-root change
+remain an operator cleanup task; the daemon does not infer ownership from a directory
+name.
+
 ### Store application data somewhere else
 
 Add `--data-dir DIR` to any command to place config, state, logs and the package cache under

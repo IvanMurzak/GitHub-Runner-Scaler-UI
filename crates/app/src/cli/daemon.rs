@@ -170,6 +170,9 @@ async fn run_generation(
             () = answer_github_requests(context, host.service_start_mode) => {
                 unreachable!("GitHub requests are answered until the daemon is stopped")
             },
+            () = maintain_diagnostics(context.paths().logs_dir().to_path_buf()) => {
+                unreachable!("diagnostics maintenance runs until the daemon is stopped")
+            },
             // No runner grows the caches on an idle host, so nothing prunes on
             // a schedule; an operator's `host cache prune` is still honoured.
             () = maintain_dependency_caches(
@@ -501,6 +504,9 @@ async fn run_generation(
         () = answer_github_requests(context, mode) => {
             unreachable!("GitHub requests are answered until the daemon is stopped")
         }
+        () = maintain_diagnostics(context.paths().logs_dir().to_path_buf()) => {
+            unreachable!("diagnostics maintenance runs until the daemon is stopped")
+        }
         () = maintain_wsl_recovery(watchdog_paths, wsl_inventory, windows_service_host) => {
             unreachable!("WSL recovery watchdog runs until the daemon is stopped")
         }
@@ -628,6 +634,35 @@ const fn wsl_recovery_is_available(windows_service_host: bool) -> bool {
 }
 
 const WSL_GUEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Bound completed-attempt diagnostics even while every policy is disabled.
+/// The filesystem walk runs off the async executor, once at start and hourly.
+async fn maintain_diagnostics(directory: std::path::PathBuf) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let directory = directory.clone();
+        match tokio::task::spawn_blocking(move || {
+            runner_manager_platform::log_retention::prune_attempt_logs(
+                &directory,
+                std::time::SystemTime::now(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(report)) if report.failed == 0 => {
+                if report.removed > 0 {
+                    tracing::info!(event = "diagnostics_pruned", count = report.removed);
+                }
+            }
+            _ => tracing::warn!(
+                event = "diagnostics_prune_failed",
+                "some old attempt diagnostics could not be removed; retrying next hour"
+            ),
+        }
+    }
+}
 
 /// Measures the dependency caches and prunes them to the cap, at start and
 /// then every [`PRUNE_INTERVAL`](runner_manager_platform::dependency_cache::PRUNE_INTERVAL)
@@ -2487,6 +2522,34 @@ impl RepositoryDirectory for GithubDirectory {
 mod tests {
     use super::*;
     use secrecy::SecretString;
+
+    #[tokio::test]
+    async fn diagnostics_maintenance_expires_history_without_waiting_for_a_job() {
+        let root = tempfile::tempdir().unwrap();
+        let summary = root.path().join(format!("{}.log", AttemptId::from_u128(1)));
+        let file = std::fs::File::create(&summary).unwrap();
+        file.set_modified(
+            std::time::SystemTime::now()
+                - runner_manager_platform::log_retention::ATTEMPT_LOG_MAX_AGE
+                - Duration::from_secs(1),
+        )
+        .unwrap();
+        drop(file);
+        let service = root.path().join("runner-manager.service.log.2020-01-01");
+        std::fs::write(&service, b"not an attempt summary").unwrap();
+
+        let maintenance = tokio::spawn(maintain_diagnostics(root.path().to_path_buf()));
+        let expired = tokio::time::timeout(Duration::from_secs(10), async {
+            while summary.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        maintenance.abort();
+        let _ = maintenance.await;
+        expired.expect("the first maintenance pass runs at startup without any job");
+        assert!(service.exists());
+    }
 
     fn rooted(root: &std::path::Path) -> Context {
         let endpoints =
