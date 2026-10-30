@@ -1,0 +1,24 @@
+crates/app/tests/native_docker_cleanup.rs
+  s_40e429996e8fb2::t_34df6548b58af8 345-363,580
+crates/agent/src/docker_cleanup.rs
+  s_40e429996e8fb2::t_103f7b18030d15 434
+  s_40e429996e8fb2::t_0ff4a5bdc43876 424-433
+crates/agent/src/docker_cleanup/tests.rs
+  s_40e429996e8fb2::t_d3d5287a907b2a 127-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "14d187aedfa5a79671992bd2d6aac5d7975c2a61",
+  "prompts": {},
+  "sessions": {
+    "s_40e429996e8fb2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18eb1-e6b1-7901-8b7b-29203095c4cd",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
