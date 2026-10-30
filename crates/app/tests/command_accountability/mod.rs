@@ -82,11 +82,15 @@ pub enum Boundary {
     RunnerEnvironmentFile,
     HostConfiguration,
     DependencyCacheFile,
+    DockerResourceJournal,
 }
 
 impl Boundary {
     pub const fn describe(self) -> &'static str {
         match self {
+            Self::DockerResourceJournal => {
+                "reads or changes an attempt-scoped Docker resource journal and local engine state outside the generated policy/workspace oracle"
+            }
             Self::NonTerminating => {
                 "runs until it is signalled, so a chain would never reach its next action"
             }
@@ -287,6 +291,66 @@ macro_rules! host_doctor_row {
 
 /// The reviewed classification of every published leaf.
 pub const MANIFEST: &[Classification] = &[
+    Classification {
+        leaf: "host docker-cleanup show",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/app/tests/native_docker_cleanup.rs",
+            "host_controls_default_to_report_and_do_not_walk_caches_or_workspaces",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::DockerResourceJournal,
+            reason: "Reports Docker cleanup support and configuration, which are outside the generated policy oracle; the dedicated cross-platform CLI test checks report defaults and Windows refusal without touching caches.",
+        }),
+    },
+    Classification {
+        leaf: "host docker-cleanup set-mode",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/app/tests/native_docker_cleanup.rs",
+            "host_controls_default_to_report_and_do_not_walk_caches_or_workspaces",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::DockerResourceJournal,
+            reason: "Changes docker-cleanup.json rather than policy state; dedicated CLI tests round-trip the modes on Linux and prove unsupported Windows commands write no configuration.",
+        }),
+    },
+    Classification {
+        leaf: "host docker-cleanup report",
+        coverage: Coverage::Dedicated,
+        evidence: &[
+            at(
+                "crates/app/tests/native_docker_cleanup.rs",
+                "host_controls_default_to_report_and_do_not_walk_caches_or_workspaces",
+            ),
+            at(
+                "crates/agent/src/docker_cleanup/tests.rs",
+                "report_is_read_only_and_apply_deletes_owned_resources_in_dependency_order",
+            ),
+        ],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::DockerResourceJournal,
+            reason: "Inventories exact attempt-owned Docker resources outside the generated filesystem oracle; dedicated CLI and engine-port tests prove read-only reporting and leave unrelated state untouched.",
+        }),
+    },
+    Classification {
+        leaf: "host docker-cleanup sweep",
+        coverage: Coverage::Dedicated,
+        evidence: &[
+            at(
+                "crates/app/tests/native_docker_cleanup.rs",
+                "host_controls_default_to_report_and_do_not_walk_caches_or_workspaces",
+            ),
+            at(
+                "crates/agent/src/docker_cleanup/tests.rs",
+                "report_is_read_only_and_apply_deletes_owned_resources_in_dependency_order",
+            ),
+        ],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::DockerResourceJournal,
+            reason: "Sweeps journalled Docker resources instead of policy workspaces; dedicated CLI and engine-port tests cover mode gating, dependency-order deletion and no host-wide prune, with explicit live Linux acceptance for actual engine effects.",
+        }),
+    },
     // -- auth: sign-in state is modelled as credential presence -------------
     generated("auth login"),
     Classification {

@@ -46,8 +46,11 @@ original WSL `E_UNEXPECTED` failure.
   unrelated files and caches alone, and retries failed removals on later passes.
 - Remove anonymous volumes with an owned Windows Hyper-V container in normal
   cleanup and each preparation rollback, using `docker rm --force --volumes`.
-- Document native-workflow Docker cleanup and the limits of ownership-based
-  automatic cleanup. No global Docker prune is added to the daemon.
+- Add native Linux per-attempt Docker accounting with default read-only report
+  mode and opt-in apply mode. Exact ownership journals survive daemon reloads;
+  only cleaned attempts qualify. Named volumes, images, build caches, filesystem
+  dependency caches and persistent workspaces are preserved. No global Docker
+  prune is added to the daemon. See [design and verification](native-docker-cleanup-plan.md).
 
 These changes require a built and installed new binary to affect this machine.
 The running 0.4.41 services are not replaced by this investigation.

@@ -6658,6 +6658,19 @@ mod tests {
     fn nothing_in_this_crate_reserves_or_claims_a_job() {
         const SOURCES: &[(&str, &str)] = &[
             ("dependency_caches.rs", include_str!("dependency_caches.rs")),
+            ("docker_cleanup.rs", include_str!("docker_cleanup.rs")),
+            (
+                "docker_cleanup/http.rs",
+                include_str!("docker_cleanup/http.rs"),
+            ),
+            (
+                "docker_cleanup/proxy.rs",
+                include_str!("docker_cleanup/proxy.rs"),
+            ),
+            (
+                "docker_cleanup/tests.rs",
+                include_str!("docker_cleanup/tests.rs"),
+            ),
             ("lib.rs", include_str!("lib.rs")),
             ("lifecycle.rs", include_str!("lifecycle.rs")),
             (

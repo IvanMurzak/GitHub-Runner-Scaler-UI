@@ -327,6 +327,10 @@ runner-manager host cache reset-root                           # Keep the caches
 runner-manager host cache set-max-size N                       # Cap the caches' total size in GiB (0 removes the cap)
 runner-manager host cache set-tool TOOL --state on|off|default # Turn one cache on or off for every policy
 runner-manager host cache prune                                # Remove least recently used idle caches over the cap now
+runner-manager host docker-cleanup show                         # Show Linux Docker cleanup support and mode
+runner-manager host docker-cleanup set-mode --mode off|report|apply
+runner-manager host docker-cleanup report                       # Report tracked cleanup candidates without deleting them
+runner-manager host docker-cleanup sweep                        # Sweep cleaned attempts using the configured mode
 runner-manager host forget-local                               # Move this account's unused configuration aside
 
 runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode
@@ -931,12 +935,33 @@ including while scaling is disabled. It keeps the newest 1,000 summaries for up 
 30 days. Service and operator diagnostics rotate daily and keep at most 30 files per
 log stem. Dependency caches follow their separate configured size cap.
 
-Native workflows share the host's Docker engine. Their containers and volumes need
-workflow cleanup: remove disposable containers with `docker rm --force --volumes`
-to remove their anonymous volumes too. Named volumes need explicit lifecycle rules.
-The manager only removes containers it can attribute to its own isolation provider;
-it does not run a host-wide Docker prune. Its Windows Hyper-V provider removes
-anonymous volumes along with its owned containers, including on preparation failure.
+Native Linux runners can account for Docker resources through a private local
+endpoint for each attempt. The default `report` mode records ownership and reports
+cleanup candidates without deleting Docker resources. Inspect the report, then use
+`host docker-cleanup set-mode --mode apply` to enable cleanup after attempts have
+been cleaned. `off` disables accounting for new attempts. The daemon reads changes
+without a restart; WSL settings are addressed with `--host wsl:Ubuntu`.
+
+Only newly tracked temporary containers, networks and anonymous volumes are
+eligible. Named volumes, images, BuildKit/buildx caches, filesystem dependency
+caches and persistent workspaces are retained. Add `--label runner-manager.retain=true`
+at creation to retain a container, network or unnamed volume. Unreferenced does not
+mean disposable: unknown and historical resources are never inferred to be owned.
+Shared volumes/networks are not force-deleted; the engine refuses deletion while
+another container uses them. Uncertain creations retain a recovery record so a
+Docker operation that finishes after a crash can still be found.
+
+The journal lives outside the attempt's workspace and survives daemon reloads.
+Cleanup checks the host, authoritative attempt state, engine identity, resource
+labels and creation fingerprints before acting. Docker images and build caches
+continue to serve later jobs. No host-wide Docker prune is run. Linux accounting
+does not change Windows behavior; the Windows Hyper-V provider separately removes
+anonymous volumes with its owned containers, including on preparation failure.
+
+An explicit remote endpoint, selected Docker context, or access to a raw engine
+socket bypasses this accounting and needs workflow-managed cleanup. Ownership
+labels are for trusted native workflows, not isolation from a job with Docker-root
+access. Windows/macOS can inspect support but cannot enable the Linux feature.
 
 Old manually installed runners and workspaces retained after a runner-root change
 remain an operator cleanup task; the daemon does not infer ownership from a directory

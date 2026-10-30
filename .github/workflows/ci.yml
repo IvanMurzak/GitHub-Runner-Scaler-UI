@@ -204,6 +204,10 @@ jobs:
           RUNNER_MANAGER_LAUNCHD_ACCEPTANCE: ${{ runner.os == 'macOS' && '1' || '' }}
         run: cargo nextest run --workspace
 
+      - name: Native Docker cleanup live acceptance
+        if: runner.os == 'Linux'
+        run: cargo test -p runner-manager --test native_docker_cleanup live::live_proxy_report_apply_recovery_streams_and_cache_preservation -- --ignored --exact --nocapture
+
       - name: cargo test --doc
         run: cargo test --doc --workspace
 
