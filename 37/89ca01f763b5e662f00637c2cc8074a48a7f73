@@ -1,0 +1,36 @@
+crates/platform/src/log_retention.rs
+  s_40e429996e8fb2::t_66a8841f430c8c 162-163,168-172,183
+  s_40e429996e8fb2::t_d04a37bf0a60c8 1-20,22,24-156,186-187
+  s_40e429996e8fb2::t_0a5a543f0b1367 21,23,157-161,164-167,173,181-182,184-185
+  s_40e429996e8fb2::t_d19dfef5c1243f 174-180
+crates/agent/src/lifecycle/windows_hyperv.rs
+  s_40e429996e8fb2::t_205ec7be06c161 612-617,632-637,673-678,841-847
+docs/resource-retention-investigation.md
+  s_40e429996e8fb2::t_0a5a543f0b1367 1-11,13-53
+  s_40e429996e8fb2::t_fa2b137aa55caa 12
+README.md
+  s_40e429996e8fb2::t_0a5a543f0b1367 927-944
+crates/app/src/cli/daemon.rs
+  s_40e429996e8fb2::t_751cacf92ef25d 2526-2553
+  s_40e429996e8fb2::t_d04a37bf0a60c8 173-175,507-509,638-666
+crates/platform/src/lib.rs
+  s_40e429996e8fb2::t_d04a37bf0a60c8 56
+crates/platform/src/logging.rs
+  s_40e429996e8fb2::t_92c75ab564c82c 1758,1817-1849
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3789ca01f763b5e662f00637c2cc8074a48a7f73",
+  "prompts": {},
+  "sessions": {
+    "s_40e429996e8fb2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18eb1-e6b1-7901-8b7b-29203095c4cd",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
