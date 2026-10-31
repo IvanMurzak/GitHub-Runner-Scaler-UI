@@ -154,7 +154,30 @@ impl DependencyCaches {
             platform,
             &runtime_holds_runner,
         ) {
-            Ok(launch) => launch.variables,
+            Ok(launch) => {
+                if matches!(target, ScaleTarget::Repository(_))
+                    && let Some((_, git_dir)) = launch
+                        .variables
+                        .iter()
+                        .find(|(name, _)| *name == runner_manager_platform::git_cache::ENVIRONMENT)
+                {
+                    match runner_manager_platform::git_cache::prepare(
+                        &root.path,
+                        Path::new(git_dir),
+                        target,
+                        runtime,
+                    ) {
+                        Ok(outcome) => {
+                            tracing::info!(event = "git_cache_prepare", reason = ?outcome, "Git checkout cache prepared")
+                        }
+                        Err(_) => tracing::warn!(
+                            event = "git_cache_unavailable",
+                            "starting the runner without a Git checkout seed"
+                        ),
+                    }
+                }
+                launch.variables
+            }
             Err(error) => {
                 tracing::warn!(
                     reason = "dependency_cache_unavailable",
@@ -162,6 +185,57 @@ impl DependencyCaches {
                 );
                 Vec::new()
             }
+        }
+    }
+
+    /// Refresh the object snapshot after native runner termination. Cache
+    /// failures never prevent ordinary workspace cleanup, and switches changed
+    /// while a job ran are respected before any publication.
+    pub fn capture_git(&self, runtime: &Path) {
+        // A partial cleanup retry may no longer own a cache lease. It must not
+        // race pruning to publish a snapshot after the runner package is gone.
+        if !runtime_holds_runner(runtime) {
+            return;
+        }
+        let result = (|| -> Result<(), String> {
+            let Some(target) = runner_manager_platform::git_cache::target_for_runtime(runtime)
+                .map_err(|error| error.to_string())?
+            else {
+                return Ok(());
+            };
+            let config = CacheConfig::load(&self.config_file).map_err(|error| error.to_string())?;
+            let platform = RunnerPlatform::current();
+            let mut selection = dependency_cache::select(&config, &target, platform);
+            if selection.disabled.is_some()
+                || !selection.enabled_tools().any(|tool| tool.id == "git")
+            {
+                return Ok(());
+            }
+            let root = self.root(&config)?;
+            selection.tools.retain(|state| state.tool.id == "git");
+            // Re-pin the effective namespace if root/namespace settings changed
+            // while the job ran. This takes the global lock only for the lease,
+            // never for the potentially expensive Git copy.
+            dependency_cache::prepare_launch(
+                &root.path,
+                &selection,
+                runtime,
+                platform,
+                &runtime_holds_runner,
+            )
+            .map_err(|error| error.to_string())?;
+            let git_dir = selection.namespace.dir(&root.path).join("git");
+            let outcome =
+                runner_manager_platform::git_cache::capture(&root.path, &git_dir, &target, runtime)
+                    .map_err(|error| error.to_string())?;
+            tracing::info!(event = "git_cache_capture", reason = ?outcome, "Git checkout cache publication finished");
+            Ok(())
+        })();
+        if result.is_err() {
+            tracing::warn!(
+                event = "git_cache_capture_skipped",
+                "Git checkout cache could not be refreshed; ordinary workspace cleanup continues"
+            );
         }
     }
 

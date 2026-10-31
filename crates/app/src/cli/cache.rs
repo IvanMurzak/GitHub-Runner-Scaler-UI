@@ -66,6 +66,23 @@ fn save(context: &Context, config: &CacheConfig) -> Result<(), CliError> {
     config.save(&config_path(context)).map_err(cache_failure)
 }
 
+/// The Git setting edited by both host/repository forms and CLI commands.
+pub fn git_setting(
+    context: &Context,
+    target: Option<&ScaleTarget>,
+) -> Result<CacheToolState, CliError> {
+    let config = load(context)?;
+    let setting = target.map_or_else(
+        || config.tools.get("git"),
+        |target| config.target(target).and_then(|own| own.tools.get("git")),
+    );
+    Ok(match setting {
+        Some(true) => CacheToolState::On,
+        Some(false) => CacheToolState::Off,
+        None => CacheToolState::Default,
+    })
+}
+
 /// The cache root for this host's current runner root.
 fn root(
     context: &Context,
@@ -793,6 +810,15 @@ fn target_command(
         }
         TargetCommand::SetTool(args) => {
             let id = known_tool(&args.tool)?;
+            if id == "git"
+                && matches!(target, ScaleTarget::Organization(_))
+                && args.state == CacheToolState::On
+            {
+                return Err(CliError::new(
+                    Failure::InvalidArgument,
+                    "Git checkout caching requires a repository policy; use repo cache set-tool OWNER/REPO git --state on",
+                ));
+            }
             set_tool_state(&mut config.target_mut(target).tools, id, args.state);
             save(context, &config)?;
             let word = match args.state {

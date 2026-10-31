@@ -50,6 +50,7 @@
 
 pub mod daemon_heartbeat;
 pub mod dependency_cache;
+pub mod git_cache;
 pub mod host_fitness;
 pub mod launch_health;
 pub mod lock;

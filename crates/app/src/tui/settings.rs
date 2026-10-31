@@ -635,6 +635,8 @@ pub enum Control {
     HostRunnerRoot,
     HostRootReset,
     HostRootSave,
+    GitCacheState,
+    GitCacheSave,
     PolicyScale,
     PolicyCapacity,
     PolicyCache,
@@ -679,6 +681,7 @@ impl Control {
         matches!(
             self,
             Control::HostCapacity
+                | Control::GitCacheState
                 | Control::HostStartMode
                 | Control::HostInterval
                 | Control::PolicyScale
@@ -762,6 +765,8 @@ pub struct SettingsUi {
     pub host_capacity: u16,
     pub host_mode: StartMode,
     pub host_interval_secs: u16,
+    pub git_cache_state: cli::CacheToolState,
+    pub git_cache_notice: Option<String>,
     pub policy_draft: PolicyDraft,
     pub awaiting_drain_confirmation: bool,
     pub drain_observation: Option<cli::policy::ScaleObservation>,
@@ -852,6 +857,7 @@ pub enum SettingsCommand {
     CheckWorkspaceRoot,
     /// `repo set-workspace OWNER/REPO --mode <draft> [--path <draft>]`.
     SaveWorkspace,
+    SaveGitCache,
     /// The optional routing labels of this policy, made to equal the field.
     SaveLabels,
     SaveExecution,
@@ -1041,6 +1047,7 @@ impl SettingsUi {
             }
             SettingsCommand::CheckWorkspaceRoot => self.check_workspace_root(context),
             SettingsCommand::SaveWorkspace => self.save_workspace(context),
+            SettingsCommand::SaveGitCache => self.save_git_cache(context),
             SettingsCommand::SaveLabels => self.save_labels(context),
             SettingsCommand::SaveExecution => self.save_execution(context),
             SettingsCommand::DrainProfile => {
@@ -1058,6 +1065,8 @@ impl SettingsUi {
 
     fn load_host(&mut self, context: &Context) -> Result<(), CliError> {
         let form = HostSettings::load(context)?;
+        self.git_cache_state = cli::cache::git_setting(context, None)?;
+        self.git_cache_notice = None;
         self.host_capacity = form.current_capacity;
         self.host_mode = form.current_start_mode;
         self.host_interval_secs = form.current_refresh_interval.as_secs();
@@ -1074,6 +1083,8 @@ impl SettingsUi {
         profile: Option<&str>,
     ) -> Result<(), CliError> {
         let form = PolicySettings::load_selected(context, target, profile)?;
+        self.git_cache_state = cli::cache::git_setting(context, Some(target))?;
+        self.git_cache_notice = None;
         self.policy_draft = PolicyDraft::default();
         self.workspace_mode = form.workspace.kind();
         self.workspace_path.reset_to(&form.configured_root_text());
@@ -1122,6 +1133,32 @@ impl SettingsUi {
         self.awaiting_drain_confirmation = false;
         self.drain_observation = None;
         self.view = SettingsView::Policy(Box::new(form));
+        Ok(())
+    }
+
+    fn save_git_cache(&mut self, context: &Context) -> Result<(), CliError> {
+        let args = cli::CacheToolArgs {
+            tool: "git".into(),
+            state: self.git_cache_state,
+        };
+        let mut output = Vec::new();
+        match &self.view {
+            SettingsView::Host(_) => cli::cache::dispatch_host(
+                context,
+                &cli::HostCacheCommand::SetTool(args),
+                &mut output,
+            )?,
+            SettingsView::Policy(form) if !form.is_organization() => cli::cache::dispatch_repo(
+                context,
+                &cli::RepoCacheCommand::SetTool(cli::RepoCacheToolArgs {
+                    repository: form.target.slug(),
+                    tool: args,
+                }),
+                &mut output,
+            )?,
+            _ => return Ok(()),
+        }
+        self.git_cache_notice = Some(String::from_utf8_lossy(&output).trim().to_owned());
         Ok(())
     }
 
@@ -1632,6 +1669,8 @@ Select another profile in Repositories or create one with the CLI.",
                 Control::HostRunnerRoot,
                 Control::HostRootReset,
                 Control::HostRootSave,
+                Control::GitCacheState,
+                Control::GitCacheSave,
             ],
             SettingsView::Policy(form) => {
                 let mut controls = Vec::with_capacity(7);
@@ -1687,6 +1726,10 @@ Select another profile in Repositories or create one with the CLI.",
                         controls.push(Control::ProfileCreateCancel);
                     }
                 }
+                if !form.is_organization() {
+                    controls.push(Control::GitCacheState);
+                    controls.push(Control::GitCacheSave);
+                }
                 controls
             }
             // A notice is a screenful of text: nothing to focus, nothing to
@@ -1727,6 +1770,18 @@ Select another profile in Repositories or create one with the CLI.",
             _ => None,
         };
         match control {
+            Control::GitCacheState => {
+                self.git_cache_state = match (self.git_cache_state, increase) {
+                    (cli::CacheToolState::Default, true) | (cli::CacheToolState::Off, false) => {
+                        cli::CacheToolState::On
+                    }
+                    (cli::CacheToolState::On, true) | (cli::CacheToolState::Default, false) => {
+                        cli::CacheToolState::Off
+                    }
+                    _ => cli::CacheToolState::Default,
+                };
+                self.git_cache_notice = None;
+            }
             Control::HostCapacity => {
                 self.host_capacity = if increase {
                     self.host_capacity.saturating_add(1)
@@ -1839,6 +1894,7 @@ Select another profile in Repositories or create one with the CLI.",
                 self.workspace_notice = None;
             }
             Control::HostSave
+            | Control::GitCacheSave
             | Control::HostRunnerRoot
             | Control::HostRootReset
             | Control::HostRootSave
@@ -1867,6 +1923,7 @@ Select another profile in Repositories or create one with the CLI.",
     fn activate(&mut self) -> Option<SettingsCommand> {
         match self.focused()? {
             Control::HostSave => Some(SettingsCommand::ApplyHost),
+            Control::GitCacheSave => Some(SettingsCommand::SaveGitCache),
             Control::HostRunnerRoot => {
                 self.host_root.begin();
                 None
@@ -1908,7 +1965,11 @@ Select another profile in Repositories or create one with the CLI.",
             Control::ProfileCreateCancel => {
                 self.profile_create_open = false;
                 self.create_notice = None;
-                self.focus = self.focus.min(self.control_count().saturating_sub(1));
+                self.focus = self
+                    .controls()
+                    .iter()
+                    .position(|control| *control == Control::PolicyAddProfile)
+                    .unwrap_or(0);
                 None
             }
             Control::WorkspacePath => {
@@ -1917,6 +1978,7 @@ Select another profile in Repositories or create one with the CLI.",
             }
             Control::WorkspaceSave => Some(SettingsCommand::SaveWorkspace),
             Control::HostCapacity
+            | Control::GitCacheState
             | Control::HostStartMode
             | Control::HostInterval
             | Control::PolicyScale
@@ -2044,6 +2106,7 @@ Select another profile in Repositories or create one with the CLI.",
         }
         lines.push(FormLine::text("Reset to platform default [Enter/click]").at(5));
         lines.push(FormLine::keep("Save runner root [Enter/click]").at(6));
+        lines.extend(self.git_cache_lines(7));
         lines.push(FormLine::text(format!(
             "Focused form actions: {}/{} capacity, {}/{} runner root",
             form.focused_action_count(),
@@ -2131,6 +2194,7 @@ Select another profile in Repositories or create one with the CLI.",
         if !form.is_organization() {
             lines.push(FormLine::text(""));
             lines.extend(self.profile_create_lines(form, width, &mut next));
+            lines.extend(self.git_cache_lines(next));
         }
         lines.push(FormLine::text(format!(
             "Focused form actions: {}/{} scaling, {}/{} labels, {}/{} workspace",
@@ -2141,6 +2205,28 @@ Select another profile in Repositories or create one with the CLI.",
             form.workspace_action_count(self.workspace_mode),
             MAX_FOCUSED_FORM_ACTIONS
         )));
+        lines
+    }
+
+    fn git_cache_lines(&self, control: usize) -> Vec<FormLine> {
+        let mut lines = vec![
+            FormLine::text(""),
+            FormLine::keep(format!(
+                "Git checkout cache: {:?}  [cycle]",
+                self.git_cache_state
+            ))
+            .at(control),
+            FormLine::text(
+                "Default: host setting for a repository; off for the host. Native runners only.",
+            ),
+            FormLine::text(
+                "Uses the dependency-cache root and size cap; workspaces remain independent.",
+            ),
+            FormLine::keep("Save Git cache [Enter/click]").at(control + 1),
+        ];
+        if let Some(notice) = &self.git_cache_notice {
+            lines.push(FormLine::keep(notice));
+        }
         lines
     }
 
@@ -3131,6 +3217,8 @@ mod tests {
             ui
         };
         let new_controls = [
+            Control::GitCacheState,
+            Control::GitCacheSave,
             Control::PolicyLabels,
             Control::PolicyLabelsSave,
             Control::PolicyExecutionMode,
@@ -3215,6 +3303,8 @@ mod tests {
     ) {
         match control {
             Control::PolicyLabels => assert!(ui.policy_labels.is_editing()),
+            Control::GitCacheState => assert_eq!(ui.git_cache_state, cli::CacheToolState::On),
+            Control::GitCacheSave => assert_eq!(command, Some(&SettingsCommand::SaveGitCache)),
             Control::PolicyLabelsSave => assert_eq!(command, Some(&SettingsCommand::SaveLabels)),
             Control::PolicyExecutionMode => assert_eq!(ui.execution_mode, ExecutionMode::Native),
             Control::PolicyExecutionBackend => assert_ne!(ui.execution_backend, BackendMode::Auto),
@@ -4305,16 +4395,63 @@ mod tests {
         assert!(form.workspace_action_count(WorkspaceKind::Persistent) <= MAX_FOCUSED_FORM_ACTIONS);
         assert!(!form.is_organization());
 
-        // The host screen exposes exactly the seven controls its two tasks add
+        // The host screen exposes the nine controls its three tasks add
         // up to, and the repository screen's path control appears only in the
         // mode that has a path.
-        assert_eq!(fixture.host_screen().controls().len(), 7);
+        assert_eq!(fixture.host_screen().controls().len(), 9);
         let mut policy = fixture.policy_screen();
         assert!(!policy.controls().contains(&Control::WorkspacePath));
         focus_by_keyboard(&mut policy, Control::WorkspaceMode);
         let _ = policy.key(KeyCode::Right);
         assert_eq!(policy.workspace_mode, WorkspaceKind::Persistent);
         assert!(policy.controls().contains(&Control::WorkspacePath));
+    }
+
+    #[test]
+    fn git_cache_settings_save_through_cli_and_survive_reloading() {
+        use runner_manager_platform::dependency_cache::{CONFIG_FILE, CacheConfig};
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadHost);
+        assert_eq!(ui.git_cache_state, cli::CacheToolState::Default);
+        focus_by_keyboard(&mut ui, Control::GitCacheState);
+        let _ = ui.key(KeyCode::Right);
+        assert_eq!(ui.git_cache_state, cli::CacheToolState::On);
+        ui.execute(&context, SettingsCommand::SaveGitCache);
+        let path = context.paths().config_dir().join(CONFIG_FILE);
+        assert_eq!(
+            CacheConfig::load(&path).unwrap().tools.get("git"),
+            Some(&true)
+        );
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.slug()));
+        focus_by_keyboard(&mut ui, Control::GitCacheState);
+        let _ = ui.key(KeyCode::Left);
+        assert_eq!(ui.git_cache_state, cli::CacheToolState::Off);
+        ui.execute(&context, SettingsCommand::SaveGitCache);
+        let saved = std::fs::read(&path).unwrap();
+        for state in [cli::CacheToolState::Default, cli::CacheToolState::Off] {
+            cli::cache::dispatch_repo(
+                &context,
+                &cli::RepoCacheCommand::SetTool(cli::RepoCacheToolArgs {
+                    repository: target.slug(),
+                    tool: cli::CacheToolArgs {
+                        tool: "git".into(),
+                        state,
+                    },
+                }),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            saved,
+            std::fs::read(&path).unwrap(),
+            "TUI and CLI persist identical settings"
+        );
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.slug()));
+        assert_eq!(ui.git_cache_state, cli::CacheToolState::Off);
+        ui.execute(&context, SettingsCommand::LoadHost);
+        assert_eq!(ui.git_cache_state, cli::CacheToolState::On);
     }
 
     /// The layout invariant the mouse map depends on: the controls a frame
@@ -5247,6 +5384,11 @@ mod tests {
         Override: (none - platform default)  [Enter to edit]
         Reset to platform default [Enter/click]
         Save runner root [Enter/click]
+
+        Git checkout cache: Default  [cycle]
+        Default: host setting for a repository; off for the host. Native runners only.
+        Uses the dependency-cache root and size cap; workspaces remain independent.
+        Save Git cache [Enter/click]
         Focused form actions: 4/5 capacity, 3/5 runner root
         --- host/configured ---
         Host settings
@@ -5265,6 +5407,11 @@ mod tests {
         Override: <CONFIGURED>  [Enter to edit]
         Reset to platform default [Enter/click]
         Save runner root [Enter/click]
+
+        Git checkout cache: Default  [cycle]
+        Default: host setting for a repository; off for the host. Native runners only.
+        Uses the dependency-cache root and size cap; workspaces remain independent.
+        Save Git cache [Enter/click]
         Focused form actions: 4/5 capacity, 3/5 runner root
         --- host/invalid ---
         Host settings
@@ -5286,6 +5433,11 @@ mod tests {
         (runner-manager host set-runtime-root --path <PATH>)
         Reset to platform default [Enter/click]
         Save runner root [Enter/click]
+
+        Git checkout cache: Default  [cycle]
+        Default: host setting for a repository; off for the host. Native runners only.
+        Uses the dependency-cache root and size cap; workspaces remain independent.
+        Save Git cache [Enter/click]
         Focused form actions: 4/5 capacity, 3/5 runner root
         --- host/active-refusal ---
         Host settings
@@ -5306,6 +5458,11 @@ mod tests {
         cleanup. Nothing was changed.
         Reset to platform default [Enter/click]
         Save runner root [Enter/click]
+
+        Git checkout cache: Default  [cycle]
+        Default: host setting for a repository; off for the host. Native runners only.
+        Uses the dependency-cache root and size cap; workspaces remain independent.
+        Save Git cache [Enter/click]
         Focused form actions: 4/5 capacity, 3/5 runner root
         --- host/compact ---
         Current capacity: 4
@@ -5319,6 +5476,8 @@ mod tests {
         depends on the process working directory (runner-manager
         host set-runtime-root --path <PATH>)
         Save runner root [Enter/click]
+        Git checkout cache: Default  [cycle]
+        Save Git cache [Enter/click]
         --- repository/ephemeral ---
         Target: octo/repo
         Profile: default
@@ -5360,6 +5519,11 @@ mod tests {
         Save workspace [Enter/click]
 
         Add sibling profile [Enter/click]
+
+        Git checkout cache: Default  [cycle]
+        Default: host setting for a repository; off for the host. Native runners only.
+        Uses the dependency-cache root and size cap; workspaces remain independent.
+        Save Git cache [Enter/click]
         Focused form actions: 4/5 scaling, 2/5 labels, 2/5 workspace
         --- repository/isolated ---
         Target: octo/repo
@@ -5414,6 +5578,11 @@ mod tests {
         Save workspace [Enter/click]
 
         Add sibling profile [Enter/click]
+
+        Git checkout cache: Default  [cycle]
+        Default: host setting for a repository; off for the host. Native runners only.
+        Uses the dependency-cache root and size cap; workspaces remain independent.
+        Save Git cache [Enter/click]
         Focused form actions: 4/5 scaling, 2/5 labels, 2/5 workspace
         --- repository/create-isolated ---
         Target: octo/repo
@@ -5480,6 +5649,11 @@ mod tests {
         Selected provider: not installed; remedy: install and configure an OCI execution provider
         Create profile [Enter/click]
         Cancel profile creation [Enter/click]
+
+        Git checkout cache: Default  [cycle]
+        Default: host setting for a repository; off for the host. Native runners only.
+        Uses the dependency-cache root and size cap; workspaces remain independent.
+        Save Git cache [Enter/click]
         Focused form actions: 4/5 scaling, 2/5 labels, 2/5 workspace
         --- repository/create-isolated-compact ---
         Target: octo/repo
@@ -5536,6 +5710,8 @@ mod tests {
         Selected provider: not installed; remedy: install and
         configure an OCI execution provider
         Create profile [Enter/click]
+        Git checkout cache: Default  [cycle]
+        Save Git cache [Enter/click]
         --- repository/persistent-warning ---
         Target: octo/repo
         Profile: default
@@ -5586,6 +5762,11 @@ mod tests {
         Save workspace [Enter/click]
 
         Add sibling profile [Enter/click]
+
+        Git checkout cache: Default  [cycle]
+        Default: host setting for a repository; off for the host. Native runners only.
+        Uses the dependency-cache root and size cap; workspaces remain independent.
+        Save Git cache [Enter/click]
         Focused form actions: 4/5 scaling, 2/5 labels, 3/5 workspace
         --- repository/cleanup-blocked ---
         Target: octo/repo
@@ -5640,6 +5821,11 @@ mod tests {
         Save workspace [Enter/click]
 
         Add sibling profile [Enter/click]
+
+        Git checkout cache: Default  [cycle]
+        Default: host setting for a repository; off for the host. Native runners only.
+        Uses the dependency-cache root and size cap; workspaces remain independent.
+        Save Git cache [Enter/click]
         Focused form actions: 4/5 scaling, 2/5 labels, 3/5 workspace
         "#);
     }

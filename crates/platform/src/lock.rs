@@ -89,6 +89,8 @@ pub enum LockKind {
     DependencyCache,
     /// Serializes daemon and operator Docker cleanup sweeps.
     DockerCleanup,
+    /// Serializes independent Git snapshot readers/writers for one repository.
+    GitCache,
 }
 
 impl LockKind {
@@ -101,6 +103,7 @@ impl LockKind {
             Self::CredentialRenewal => "credential-renewal.lock",
             Self::DependencyCache => ".lock",
             Self::DockerCleanup => ".sweep.lock",
+            Self::GitCache => ".git-cache.lock",
         }
     }
 
@@ -113,6 +116,7 @@ impl LockKind {
             Self::CredentialRenewal => "the credential-renewal lock",
             Self::DependencyCache => "the dependency-cache lock",
             Self::DockerCleanup => "the Docker cleanup lock",
+            Self::GitCache => "the repository Git cache lock",
         }
     }
 
@@ -122,6 +126,9 @@ impl LockKind {
     pub const fn advice(self) -> &'static str {
         match self {
             Self::DockerCleanup => "Another Docker cleanup sweep is running; retry shortly.",
+            Self::GitCache => {
+                "Another copy or publication uses this repository's Git cache; retry shortly."
+            }
             Self::SingleInstance => {
                 "Only one agent may reconcile policies on a host. Stop the other agent, or wait \
                  for it to exit; the operating system releases this lock when that process ends, \
@@ -257,17 +264,27 @@ fn describe(holder: Option<&LockHolder>) -> String {
 /// A held lock. Releasing it is dropping it.
 ///
 /// There is no `release()` returning a `Result`, deliberately: releasing is
-/// closing a file descriptor, the kernel does it whether this program asks or
-/// not, and an API that suggested release could fail would invite a caller to
-/// handle a failure that does not exist.
+/// dropping the guard. Unix explicitly unlocks before closing: a transient
+/// fork/exec copy of its descriptor must not extend the guard's lifetime.
+/// Kernel descriptor cleanup still releases locks if the owner crashes.
 #[derive(Debug)]
 pub struct HostLock {
-    /// Held open for the lock's whole life. Closing it *is* the release, which
-    /// is why this field exists even though nothing reads it after
-    /// acquisition.
+    /// Held open for the lock's whole life.
     file: File,
+    #[cfg(unix)]
+    owner_pid: u32,
     path: PathBuf,
     kind: LockKind,
+}
+
+#[cfg(unix)]
+impl Drop for HostLock {
+    fn drop(&mut self) {
+        // A copied guard dropped in a forked child must not unlock its parent.
+        if std::process::id() == self.owner_pid {
+            sys::unlock(&self.file);
+        }
+    }
 }
 
 impl HostLock {
@@ -352,6 +369,8 @@ impl HostLock {
 
         let lock = Self {
             file,
+            #[cfg(unix)]
+            owner_pid: std::process::id(),
             path: path.to_path_buf(),
             kind,
         };
@@ -619,6 +638,19 @@ mod sys {
         Err(error)
     }
 
+    pub(super) fn unlock(file: &File) {
+        loop {
+            // SAFETY: the guard still owns this valid descriptor. Unlocking
+            // changes no memory and does not wait for another lock holder.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+                return;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return; // Closing the owned File remains the kernel fallback.
+            }
+        }
+    }
+
     /// `EWOULDBLOCK` — and `EAGAIN`, which is the same number on Linux and
     /// macOS but is written both ways in the documentation.
     pub(super) fn is_contention(error: &io::Error) -> bool {
@@ -705,6 +737,26 @@ mod tests {
             .expect("the lock must be free once the holder drops it");
         assert_eq!(second.path(), path);
         assert_eq!(second.kind(), LockKind::SingleInstance);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_owner_releases_a_lock_even_with_an_inherited_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = lock_path(&directory, LockKind::SingleInstance);
+        let first = HostLock::try_acquire_at(&path, LockKind::SingleInstance).unwrap();
+        // Like a descriptor inherited between fork and exec: the duplicate
+        // refers to the same open file description, even with CLOEXEC set.
+        let inherited = first.file.try_clone().unwrap();
+        drop(first);
+        let second = HostLock::try_acquire_at(&path, LockKind::SingleInstance)
+            .expect("the owner dropped its lock, even though a fork-like copy is still open");
+        drop(inherited);
+        assert!(
+            HostLock::try_acquire_at(&path, LockKind::SingleInstance).is_err(),
+            "closing the old descriptor must not release the new owner's lock"
+        );
+        drop(second);
     }
 
     #[test]
