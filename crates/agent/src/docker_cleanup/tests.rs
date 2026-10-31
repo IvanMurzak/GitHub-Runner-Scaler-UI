@@ -430,6 +430,20 @@ fn journal_rejects_duplicate_operations_and_unowned_resource_associations() {
     assert!(Journal::load(&path).is_ok());
 }
 
+#[test]
+fn oversized_publication_keeps_the_last_readable_docker_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("journal.json");
+    let journal = journal();
+    write_json(&path, &journal).unwrap();
+    let before = fs::read(&path).unwrap();
+    assert!(Journal::load(&path).is_ok());
+    let oversized = json!({"payload": "x".repeat(8 * 1024 * 1024)});
+    assert!(write_json(&path, &oversized).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(Journal::load(&path).is_ok());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn explicit_context_and_remote_endpoints_never_start_a_proxy_or_change_routing() {

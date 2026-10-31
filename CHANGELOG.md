@@ -35,6 +35,8 @@ the version being prepared rather than the version in `Cargo.toml`.
   refs and credentials from new workspaces, and stages checkout copies outside
   retained workspaces for crash cleanup. Oversized merged shallow metadata is
   refused before replacing the last readable copy.
+- Docker accounting journals enforce their reader's size limit before atomic
+  replacement and bound reads even if a file grows during inspection.
 
 ## 0.4.41
 
