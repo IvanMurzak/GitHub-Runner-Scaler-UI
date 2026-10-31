@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use runner_manager_domain::model::{AttemptId, HostId};
@@ -26,6 +26,7 @@ pub const OPERATION_LABEL: &str = "runner-manager.operation";
 pub const RETAIN_LABEL: &str = "runner-manager.retain";
 const SCHEMA: u32 = 1;
 const PENDING_ENGINE: &str = "runner-manager-pending-engine";
+const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -257,10 +258,17 @@ impl Journal {
 
     pub fn load(path: &Path) -> io::Result<Self> {
         let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_file() || metadata.len() > 8 * 1024 * 1024 {
+        if !metadata.is_file() || metadata.len() > MAX_JOURNAL_BYTES {
             return Err(invalid("invalid Docker journal file"));
         }
-        let value: Self = serde_json::from_slice(&fs::read(path)?).map_err(invalid)?;
+        let mut bytes = Vec::new();
+        fs::File::open(path)?
+            .take(MAX_JOURNAL_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_JOURNAL_BYTES {
+            return Err(invalid("Docker journal grew beyond its size limit"));
+        }
+        let value: Self = serde_json::from_slice(&bytes).map_err(invalid)?;
         if value.schema != SCHEMA
             || !value.upstream.is_absolute()
             || value.engine.is_empty()
@@ -339,6 +347,12 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer(temporary.as_file_mut(), value).map_err(invalid)?;
     temporary.flush()?;
+    // Keep the last readable journal if accumulated accounting metadata grows
+    // beyond the reader's bound. An intent that cannot be recorded is never
+    // forwarded, and an acknowledged creation still has its recovery intent.
+    if temporary.as_file().metadata()?.len() > MAX_JOURNAL_BYTES {
+        return Err(invalid("Docker journal exceeds its size limit"));
+    }
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
     #[cfg(unix)]

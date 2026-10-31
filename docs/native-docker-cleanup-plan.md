@@ -36,7 +36,10 @@ and container logs are never journalled. Explicit mount destinations are stored
 as digests, not raw paths.
 
 Journals live in `state/docker-cleanup/<attempt UUID>/`, outside disposable
-workspaces. Writes use an atomic replacement and directory sync. Private
+workspaces. Writes use an atomic replacement and directory sync.
+JSON publications are limited to the same 8 MiB bound as journal reads; an
+oversized update leaves the previous recovery journal intact. Reads remain
+bounded if the file grows after its metadata was inspected. Private
 directories are mode 0700 and sockets 0600. The companion survives daemon reloads
 but exits when the exact runner process disappears, or after 30 seconds if its
 parent never starts the runner. Startup is bounded to five seconds. An accounting

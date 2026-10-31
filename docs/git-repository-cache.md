@@ -83,6 +83,10 @@ origins/alternates. Unix tests also refuse a symlinked workspace. CLI and TUI
 tests verify inheritance, persistence, keyboard/mouse reachability, constrained
 layouts and identical configuration writes.
 
+The shallow metadata limit applies to both inputs and their combined output.
+A boundary regression first fills a readable destination up to the limit, then
+adds a distinct boundary and verifies refusal without replacing that destination.
+
 Review also exposed a Unix lock-release race when concurrent subprocess creation
 temporarily duplicates a locked descriptor. The owner now explicitly unlocks
 before closing; a regression test holds a duplicate open and verifies immediate
