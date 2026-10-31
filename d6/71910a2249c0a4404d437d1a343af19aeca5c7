@@ -1,0 +1,24 @@
+docs/git-repository-cache.md
+  s_40e429996e8fb2::t_533a8e5bf222d4 86-89
+CHANGELOG.md
+  s_40e429996e8fb2::t_533a8e5bf222d4 10-38
+crates/platform/src/git_cache.rs
+  s_40e429996e8fb2::t_2af9af73affb0d 22,495,500,502,516-517,612-639
+  s_40e429996e8fb2::t_533a8e5bf222d4 518-520
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d671910a2249c0a4404d437d1a343af19aeca5c7",
+  "prompts": {},
+  "sessions": {
+    "s_40e429996e8fb2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18eb1-e6b1-7901-8b7b-29203095c4cd",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
