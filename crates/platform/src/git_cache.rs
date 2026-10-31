@@ -352,9 +352,12 @@ pub fn prepare(
     }
     let source = box_dir.join(cached.generation.to_string());
     independent(&source)?;
+    // Keep staging outside retained _work: after a manager crash, ordinary
+    // native cleanup removes it even for a persistent slot. The runtime and
+    // its work directory normally share the filesystem needed for rename.
     let stage = tempfile::Builder::new()
         .prefix("git-seed-")
-        .tempdir_in(checkout.parent().expect("checkout parent"))?;
+        .tempdir_in(runtime)?;
     let template = stage.path().join("template");
     fs::create_dir(&template)?;
     let format = command(&source, &["rev-parse", "--show-object-format"])?;

@@ -65,9 +65,11 @@ or failed cache operation falls back to normal checkout/cleanup.
 
 An already seeded workspace remains valid after replacement or deletion of its
 cache. Failed publication leaves the last good pointer intact. Cancellation or
-a crash can leave an unreferenced generation/staging directory; it is part of
+a crash can leave an unreferenced cache generation/staging directory; it is part of
 the namespace's measured usage and eligible for the existing idle-namespace LRU
-cleanup. The common cap is a periodic soft limit, like other dependency caches,
+cleanup. Checkout seeding stages outside retained `_work`, so existing attempt
+cleanup removes an interrupted seed even for persistent slots.
+The common cap is a periodic soft limit, like other dependency caches,
 and temporary snapshot copies can exceed it during publication. This feature
 does not promise a speedup when local disk copying costs more than a shallow
 network fetch; assess it on the repositories that benefit.
