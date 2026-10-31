@@ -489,6 +489,7 @@ pub struct SpawnSpec {
     program: PathBuf,
     args: Vec<OsString>,
     envs: Vec<(OsString, OsString)>,
+    removed_envs: Vec<OsString>,
     working_dir: Option<PathBuf>,
     output: OutputMode,
     normal_scheduling: bool,
@@ -501,6 +502,7 @@ impl SpawnSpec {
             program: program.into(),
             args: Vec::new(),
             envs: Vec::new(),
+            removed_envs: Vec::new(),
             working_dir: None,
             output: OutputMode::Discard,
             normal_scheduling: false,
@@ -532,6 +534,13 @@ impl SpawnSpec {
     pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         self.envs
             .push((key.as_ref().to_os_string(), value.as_ref().to_os_string()));
+        self
+    }
+
+    /// Prevents an inherited variable from changing a subprocess's operation.
+    #[must_use]
+    pub fn without_env(mut self, key: impl AsRef<OsStr>) -> Self {
+        self.removed_envs.push(key.as_ref().to_owned());
         self
     }
 
@@ -622,6 +631,9 @@ impl SpawnSpec {
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
 
         command.args(&self.args);
+        for key in &self.removed_envs {
+            command.env_remove(key);
+        }
         for (key, value) in &self.envs {
             command.env(key, value);
         }

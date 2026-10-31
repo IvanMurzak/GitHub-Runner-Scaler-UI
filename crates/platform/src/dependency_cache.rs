@@ -319,6 +319,14 @@ impl CacheTool {
 /// the same table with its sources.
 pub const TOOLS: &[CacheTool] = &[
     CacheTool {
+        id: "git",
+        dir: "git",
+        sharing: Sharing::Namespace,
+        default_enabled: false,
+        variables: &[all("RUNNER_MANAGER_GIT_CACHE_DIR", VarValue::Dir)],
+        note: "Independent Git object snapshots for standard HTTPS checkout in native repository runners; no credentials, worktree files, LFS or submodule cache.",
+    },
+    CacheTool {
         id: "xdg",
         dir: "xdg",
         sharing: Sharing::Namespace,
@@ -1120,7 +1128,10 @@ pub fn select(config: &CacheConfig, target: &ScaleTarget, platform: RunnerPlatfo
     };
     let tools = TOOLS
         .iter()
-        .filter(|tool| tool.applies_to(platform))
+        .filter(|tool| {
+            tool.applies_to(platform)
+                && (tool.id != "git" || matches!(target, ScaleTarget::Repository(_)))
+        })
         .map(|tool| {
             let mut state = ToolState {
                 tool,

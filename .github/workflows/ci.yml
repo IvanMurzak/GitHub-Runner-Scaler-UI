@@ -208,6 +208,17 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test -p runner-manager --test native_docker_cleanup live::live_proxy_report_apply_recovery_streams_and_cache_preservation -- --ignored --exact --nocapture
 
+      - name: Git cache acceptance with official checkout
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/git-cache-checkout-fixture"
+          git init "$fixture"
+          git -C "$fixture" fetch --depth=1 https://github.com/actions/checkout.git 3d3c42e5aac5ba805825da76410c181273ba90b1
+          git -C "$fixture" checkout --detach FETCH_HEAD
+          RUNNER_MANAGER_CHECKOUT_ACTION="$fixture" cargo test -p runner-manager --test git_repository_cache official_checkout_fetches_exact_pr_commit_after_independent_cache_seed -- --ignored --exact --nocapture
+
       - name: cargo test --doc
         run: cargo test --doc --workspace
 

@@ -810,6 +810,7 @@ it until its attempt is cleaned up.
 
 | Cache | Variables | Platforms | Shared | Default | Verified against |
 |---|---|---|---|---|---|
+| `git` | `RUNNER_MANAGER_GIT_CACHE_DIR` | all | yes | off | Git local cloning; actions/checkout repository reuse |
 | `xdg` | `XDG_CACHE_HOME` | macOS, Linux | yes | on | XDG base directory specification |
 | `tool-cache` | `RUNNER_TOOL_CACHE`, `AGENT_TOOLSDIRECTORY` | all | per runner | on | actions/runner `HostContext.cs`; @actions/tool-cache `_getCacheDirectory` |
 | `dotnet` | `DOTNET_INSTALL_DIR` | all | per runner | on | actions/setup-dotnet `installer.ts` |
@@ -882,6 +883,48 @@ names each such policy.
 **WSL.** A managed WSL distribution is a Linux host of its own: `--host wsl:NAME host cache ...`
 runs in the distribution and edits its settings, and its caches live under its own runner root
 on the Linux filesystem, never on `/mnt/c`.
+
+### Reuse Git objects in ephemeral runners
+
+Opt a repository into the Git checkout cache:
+
+```sh
+runner-manager repo cache set-tool OWNER/REPO git --state on
+runner-manager repo cache show OWNER/REPO
+```
+
+Or set the host default with `host cache set-tool git --state on`. `off` disables
+it; `default` removes the override (repository settings inherit the host). Host
+and Repository Settings also expose **Git checkout cache** and its save action.
+This setting is shared by a repository's profiles and applies to future native
+runner launches without restarting the service. It is off by default because
+preparing `.git` changes workflows that expect an entirely empty directory.
+
+The first job checks out normally. Before removing that runner's workspace, the
+manager saves a local Git object snapshot. The next runner gets an independent
+`.git` in the standard `_work/<repo>/<repo>` workspace. `actions/checkout` then
+authenticates and fetches the workflow's exact ref/commit as usual, including
+shallow PR merge checkouts. `clean: true` remains compatible. Working files,
+build output, credentials, hooks and source Git configuration are not copied.
+No workflow hook or authentication token is required by the cache itself.
+
+Snapshots use the dependency-cache root and its configured size cap/LRU pruning.
+Namespace leases protect copies from pruning; per-repository locks serialize
+Git copies and publication. A seeded job does not borrow
+objects through alternates or hardlinks, so replacing or pruning the cache does
+not invalidate it. Concurrent publications retain objects from both jobs and
+retire the previous snapshot generation. A cache error falls back to ordinary
+checkout and does not prevent workspace cleanup. Already populated persistent
+workspaces are left intact and may refresh the same cache.
+
+This automatic integration targets native **repository** policies, the standard
+checkout path and HTTPS `github.com` origins. Organization policies, isolated
+providers, SSH/custom-server origins, custom checkout paths and existing
+repositories backed by external object stores are not accelerated. LFS payloads
+and submodule repositories are not cached by this feature. A workflow that
+manually runs `git clone ... .` should leave it disabled: its destination must
+be empty. Snapshots are cache inputs within the same native-workflow trust
+boundary as dependency caches. See [Git cache design and validation](docs/git-repository-cache.md).
 
 ### Keep a build cache between jobs
 

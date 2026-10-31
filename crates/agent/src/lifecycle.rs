@@ -2696,6 +2696,20 @@ impl NativeProcesses {
 }
 
 impl ProcessSupervisor for NativeProcesses {
+    fn destroy(&self, attempt: &RunnerAttempt) -> Result<ProviderDestroy, FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        // Existing native reconciliation has already settled process termination
+        // before this boundary. Capture before ephemeral workspace deletion.
+        if let Some(caches) = &self.dependency_caches {
+            caches.capture_git(attempt.runtime_path());
+        }
+        Ok(ProviderDestroy::Destroyed)
+    }
+
     fn prepare(
         &self,
         attempt: &RunnerAttempt,

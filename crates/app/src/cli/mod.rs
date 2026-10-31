@@ -926,16 +926,17 @@ pub struct HostCacheSetMaxSizeArgs {
 }
 
 /// `on`, `off`, or back to the tool's default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum CacheToolState {
     On,
     Off,
+    #[default]
     Default,
 }
 
 #[derive(Debug, Args)]
 pub struct CacheToolArgs {
-    /// The cache, as `host cache show` names it (npm, pnpm, tool-cache, cargo, ...).
+    /// The cache, as `host cache show` names it (git, npm, pnpm, tool-cache, cargo, ...).
     #[arg(value_name = "TOOL")]
     pub tool: String,
     #[arg(long, value_enum)]
