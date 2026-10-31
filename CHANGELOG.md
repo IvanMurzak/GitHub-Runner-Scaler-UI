@@ -7,6 +7,35 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.42
+
+### Added
+
+- Native repository runners can reuse an independent local Git object cache,
+  including across ephemeral attempts and profiles with different workspace
+  directories. Enable it in Host/Repository Settings or with
+  `repo cache set-tool OWNER/REPO git --state on`. It is off by default and
+  supports standard GitHub HTTPS checkout; the workflow still fetches its exact
+  ref/commit. Existing dependency-cache roots, limits and pruning apply.
+- Native Linux/WSL runners account for temporary Docker resources through a
+  per-attempt local proxy. The default `report` mode does not delete resources;
+  `host docker-cleanup set-mode --mode apply` enables cleanup after an attempt
+  is cleaned. Named volumes, build caches, images and unrelated resources are
+  preserved; no global prune is used.
+
+### Fixes
+
+- Completed-attempt summaries expire after 30 days and retain at most 1,000
+  files. Rotating service logs retain at most 30 files per stem. Dependency
+  caches and persistent workspaces are excluded from diagnostics cleanup.
+- Owned Windows Hyper-V container cleanup also removes anonymous volumes.
+- Unix file locks release immediately when their owning guard is dropped,
+  even while a subprocess temporarily holds a duplicate descriptor.
+- Git cache publication keeps concurrent shallow histories, excludes stale
+  refs and credentials from new workspaces, and stages checkout copies outside
+  retained workspaces for crash cleanup. Oversized merged shallow metadata is
+  refused before replacing the last readable copy.
+
 ## 0.4.41
 
 ### Fixes

@@ -19,6 +19,7 @@ pub const ENVIRONMENT: &str = "RUNNER_MANAGER_GIT_CACHE_DIR";
 const PLAN: &str = "runner-manager-git-cache.json";
 const POINTER: &str = "current.json";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SHALLOW_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -491,15 +492,14 @@ fn merge_shallow(source: &Path, destination: &Path) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             other => other?,
         };
-        const LIMIT: u64 = 8 * 1024 * 1024;
-        if !metadata.is_file() || !plain(&metadata) || metadata.len() > LIMIT {
+        if !metadata.is_file() || !plain(&metadata) || metadata.len() > MAX_SHALLOW_BYTES {
             return Err(failure("invalid shallow boundary file"));
         }
         let mut bytes = Vec::new();
         fs::File::open(&path)?
-            .take(LIMIT + 1)
+            .take(MAX_SHALLOW_BYTES + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > LIMIT {
+        if bytes.len() as u64 > MAX_SHALLOW_BYTES {
             return Err(failure("shallow boundary file is too large"));
         }
         let text =
@@ -513,6 +513,11 @@ fn merge_shallow(source: &Path, destination: &Path) -> io::Result<()> {
     }
     if !boundaries.is_empty() {
         let text = boundaries.into_iter().collect::<Vec<_>>().join("\n") + "\n";
+        // Two individually bounded inputs can have an oversized union. Never
+        // publish a shallow file that our next launch would refuse to read.
+        if text.len() as u64 > MAX_SHALLOW_BYTES {
+            return Err(failure("merged shallow boundaries are too large"));
+        }
         crate::host_fitness::write_atomically(&destination.join("shallow"), text.as_bytes())?;
     }
     Ok(())
@@ -603,6 +608,34 @@ pub fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shallow_union_limit_preserves_the_last_readable_destination() {
+        use std::fmt::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let count = MAX_SHALLOW_BYTES as usize / 41;
+        let mut before = String::new();
+        for index in 0..count {
+            writeln!(before, "{index:040x}").unwrap();
+        }
+        fs::write(destination.join("shallow"), &before).unwrap();
+        fs::write(source.join("shallow"), format!("{:040x}\n", count - 1)).unwrap();
+        merge_shallow(&source, &destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("shallow")).unwrap(),
+            before.as_bytes()
+        );
+        fs::write(source.join("shallow"), format!("{count:040x}\n")).unwrap();
+        assert!(merge_shallow(&source, &destination).is_err());
+        assert_eq!(
+            fs::read(destination.join("shallow")).unwrap(),
+            before.as_bytes()
+        );
+    }
 
     struct Fixture {
         root: tempfile::TempDir,
