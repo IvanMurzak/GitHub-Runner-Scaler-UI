@@ -1,0 +1,46 @@
+crates/app/src/cli/daemon.rs
+  s_844c26f8b755ab::t_80bbe9e1c0fe7b 77,138,1610,1629
+  s_844c26f8b755ab::t_dc6cb5799020a1 139
+crates/app/Cargo.toml
+  s_844c26f8b755ab::t_1532b42c8fb6f3 32
+crates/app/src/cli/mod.rs
+  s_844c26f8b755ab::t_cc23eef5bbfca6 44,829-833,1674
+crates/app/src/cli/host.rs
+  s_844c26f8b755ab::t_cc23eef5bbfca6 443-445
+  s_844c26f8b755ab::t_c97e15f364aa40 934-939
+crates/platform/src/lock.rs
+  s_844c26f8b755ab::t_80bbe9e1c0fe7b 94-95,109,123,132
+crates/app/src/cli/auto_update.rs
+  s_844c26f8b755ab::t_cc23eef5bbfca6 1-2,4-50,72-87,89-158,218-219
+  s_844c26f8b755ab::t_f4610624d29b32 51-67,88,159-217
+  s_844c26f8b755ab::t_678abb0c6ddb6f 3,68-71
+crates/app/src/tui/settings.rs
+  s_844c26f8b755ab::t_1532b42c8fb6f3 630,766,862,1053-1065,1086,1691,1914-1915,1944,2130-2136,4426,4437-4448,5431,5455,5482,5508,5524
+  s_844c26f8b755ab::t_657440d319f2a4 4425,4428
+CHANGELOG.md
+  s_844c26f8b755ab::t_1135210697d36b 10-23
+Cargo.lock
+  s_844c26f8b755ab::t_f1bf4762ed8974 2599
+README.md
+  s_844c26f8b755ab::t_163222d226c68b 1124-1143
+crates/app/src/cli/update.rs
+  s_844c26f8b755ab::t_dc405a71cb81a7 357-384,706-719,723-746,1181-1184,1232-1235,1543-1551
+crates/app/src/tui/shell.rs
+  s_844c26f8b755ab::t_db8c2b4331ed5e 3386-3387,3397-3399,3406-3409,3411-3431
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "29b4b03945e94dc55f8312bca6f235d29d17c7d5",
+  "prompts": {},
+  "sessions": {
+    "s_844c26f8b755ab": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19c25-b92a-73e1-8ee6-4a5e78d08120",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
