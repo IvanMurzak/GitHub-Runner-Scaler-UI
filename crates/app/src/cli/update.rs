@@ -371,6 +371,28 @@ pub(crate) fn restart_path(path: &Path) -> PathBuf {
 mod restart_path_tests {
     use super::*;
     #[test]
+    #[cfg(windows)]
+    fn repeated_replacement_does_not_need_to_delete_a_locked_old_image() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("runner-manager.exe");
+        let source = dir.path().join("new.exe");
+        let old = destination.with_extension("old");
+        std::fs::write(&old, b"still running").unwrap();
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&old)
+            .unwrap();
+        std::fs::write(&destination, b"version one").unwrap();
+        std::fs::write(&source, b"version two").unwrap();
+        install_over(&source, &destination).unwrap();
+        std::fs::write(&source, b"version three").unwrap();
+        install_over(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), b"version three");
+        assert_eq!(std::fs::read(old).unwrap(), b"still running");
+    }
+    #[test]
     fn brew_restart_follows_opt_but_other_installations_keep_their_path() {
         let prefix = std::env::temp_dir().join("brew-prefix");
         assert_eq!(
@@ -1464,8 +1486,26 @@ fn install_over(new_binary: &Path, destination: &Path) -> Result<(), CliError> {
     }
 
     if cfg!(windows) {
-        let aside = destination.with_extension("old");
-        let _ = std::fs::remove_file(&aside);
+        // A Windows TUI waits for its restarted child to preserve terminal
+        // ownership. That older image can remain mapped across several updates.
+        // Never reuse its backup pathname for the next generation.
+        let aside = destination.with_extension(format!("old.{}", uuid::Uuid::new_v4()));
+        if let Some(stem) = destination.file_stem().and_then(|s| s.to_str()) {
+            let prefix = format!("{stem}.old.");
+            if let Ok(entries) = std::fs::read_dir(directory) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name
+                        .to_str()
+                        .and_then(|name| name.strip_prefix(&prefix))
+                        .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
+                    {
+                        // Deleting a still-mapped executable is refused by Windows.
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
         if destination.exists() {
             std::fs::rename(destination, &aside).map_err(|error| {
                 let _ = std::fs::remove_file(&staged);
