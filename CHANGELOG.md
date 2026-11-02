@@ -7,6 +7,18 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.43
+
+### Fixes
+
+- Changes to `host set-capacity` take effect without restarting the service,
+  including on WSL hosts. All projects share the current host ceiling, which
+  is checked again under the allocation lock before each new runner attempt.
+  Lowering the limit preserves existing attempts and waits for free capacity.
+- Missing host records and unreadable host settings block new runners and
+  report their own diagnostic reasons. An unreadable local journal no longer
+  makes a busy host switch to the faster idle polling interval (#113).
+
 ## 0.4.42
 
 ### Added
