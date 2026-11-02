@@ -1,0 +1,25 @@
+README.md
+  s_844c26f8b755ab::t_736e21474d07d6 312
+crates/app/tests/auto_update_commands.rs
+  s_844c26f8b755ab::t_b03cd415918dfd 1-47
+crates/app/tests/cli_command_surface.rs
+  s_844c26f8b755ab::t_622686c2470458 58
+crates/app/tests/command_accountability/mod.rs
+  s_844c26f8b755ab::t_a334a9a7a09f89 379-396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f07dbea63a39e7213d7616c3c84ac9d682f10c19",
+  "prompts": {},
+  "sessions": {
+    "s_844c26f8b755ab": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19c25-b92a-73e1-8ee6-4a5e78d08120",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
