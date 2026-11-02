@@ -1,0 +1,28 @@
+crates/agent/src/reconcile.rs
+  s_67baf72cf317a4::t_590f3c955cfb63 4842-4844
+  s_67baf72cf317a4::t_bc61cd5df51d1c 114,1077-1081,1190-1193,2815-2818,2820,2899-2900,3441-3443,3530-3538,3586-3588,4667-4734,4847-4848
+  s_67baf72cf317a4::t_53f0a53a386bbc 4761,4793,4807-4810,4812,4840-4841,4845-4846
+crates/app/src/cli/mod.rs
+  s_67baf72cf317a4::t_62d3312e55061f 1154
+crates/agent/src/lifecycle.rs
+  s_67baf72cf317a4::t_bc61cd5df51d1c 4737-4753,5700-5720
+README.md
+  s_67baf72cf317a4::t_53f0a53a386bbc 397-402
+  s_67baf72cf317a4::t_612bf437bcc9ea 311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9c904d90c62d323e8ffbf1b1522ace3fd818fd06",
+  "prompts": {},
+  "sessions": {
+    "s_67baf72cf317a4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19ae1-dd22-7280-8a52-84f6c0762ba3",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
