@@ -4734,6 +4734,23 @@ fn canonical_or_raw(path: &Path) -> PathBuf {
 
 #[async_trait]
 impl RunnerLauncher for LifecycleLauncher {
+    async fn host_capacity(
+        &self,
+        host: &runner_manager_domain::model::Host,
+    ) -> Result<std::num::NonZeroU16, LaunchFailure> {
+        self.ports
+            .store
+            .host(host.id)
+            .ok()
+            .flatten()
+            .map(|current| current.host_capacity)
+            .ok_or_else(|| {
+                LaunchFailure::new(FailureReason::Other(
+                    "host journal could not be read or host is missing".into(),
+                ))
+            })
+    }
+
     async fn supervise(
         &self,
         policy: &ScalePolicy,
@@ -5678,6 +5695,27 @@ mod tests {
         async fn wait(&self, duration: Duration) {
             self.0.lock().unwrap().push(duration);
         }
+    }
+
+    #[tokio::test]
+    async fn live_capacity_reads_the_updated_sqlite_host_and_rejects_a_missing_host() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        let mut updated = harness.host.clone();
+        updated.host_capacity = std::num::NonZeroU16::new(12).unwrap();
+        harness.store.put_host(&updated).unwrap();
+        assert_eq!(
+            harness
+                .launcher
+                .host_capacity(&harness.host)
+                .await
+                .unwrap()
+                .get(),
+            12
+        );
+
+        let mut missing = harness.host.clone();
+        missing.id = HostId::from_u128(999);
+        assert!(harness.launcher.host_capacity(&missing).await.is_err());
     }
 
     struct Harness {

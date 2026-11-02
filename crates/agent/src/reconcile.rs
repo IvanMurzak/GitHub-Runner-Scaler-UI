@@ -111,6 +111,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1073,6 +1074,11 @@ impl LaunchFailure {
 ///   measurement that made this necessary.
 #[async_trait::async_trait]
 pub trait RunnerLauncher: fmt::Debug + Send + Sync {
+    /// Read this host's current ceiling from the journal, including edits made
+    /// after daemon startup. An unreadable or missing host is an error, never
+    /// permission to fall back to the startup ceiling.
+    async fn host_capacity(&self, host: &Host) -> Result<NonZeroU16, LaunchFailure>;
+
     /// Reconcile this policy's existing processes before demand is read and
     /// capacity is recomputed. A concluded pre-acceptance attempt thereby
     /// becomes an ordinary allocation candidate in this same pass; replacement
@@ -1181,6 +1187,10 @@ impl FitnessGatedLauncher {
 
 #[async_trait::async_trait]
 impl RunnerLauncher for FitnessGatedLauncher {
+    async fn host_capacity(&self, host: &Host) -> Result<NonZeroU16, LaunchFailure> {
+        self.inner.host_capacity(host).await
+    }
+
     async fn supervise(
         &self,
         policy: &ScalePolicy,
@@ -2802,8 +2812,12 @@ impl Reconciler {
         demand: u32,
         launched: &[RunnerAttempt],
     ) -> Result<Allocation, LaunchFailure> {
+        // Read again under the shared launch lock, not just at each target's
+        // poll boundary: another target must not use an old, higher ceiling.
+        let mut host = self.host.clone();
+        host.host_capacity = self.launcher.host_capacity(&self.host).await?;
         let attempts = self.host_attempts(launched).await?;
-        let mut allocator = HostAllocator::from_attempts(&self.host, &attempts);
+        let mut allocator = HostAllocator::from_attempts(&host, &attempts);
         Ok(allocator.allocate(policy, demand))
     }
 
@@ -2882,16 +2896,14 @@ impl Reconciler {
             // whole sequence rather than on the decision alone -- reading the
             // headroom outside the lock is the shape in which two policies both
             // find room for the last slot.
-            let attempts = match self.host_attempts(launched).await {
-                Ok(attempts) => attempts,
+            let allocation = match self.allocate_only(policy, demand, launched).await {
+                Ok(allocation) => allocation,
                 Err(failure) => {
                     drop(guard);
                     self.report_unreadable_attempts(report, &failure);
                     break;
                 }
             };
-            let mut allocator = HostAllocator::from_attempts(&self.host, &attempts);
-            let allocation = allocator.allocate(policy, demand);
 
             if decided.is_none() {
                 // The under-lock decision may be smaller than the pre-check, and
@@ -3426,6 +3438,9 @@ mod tests {
     /// `e3`, faked: an attempt table and a launch counter, no process anywhere.
     #[derive(Debug, Default)]
     struct FakeLauncher {
+        capacity: Mutex<Option<NonZeroU16>>,
+        capacity_unreadable: AtomicBool,
+        capacity_after_launch: Mutex<Option<NonZeroU16>>,
         attempts: Mutex<Vec<RunnerAttempt>>,
         next_id: AtomicU64,
         launches: AtomicUsize,
@@ -3512,6 +3527,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RunnerLauncher for FakeLauncher {
+        async fn host_capacity(&self, host: &Host) -> Result<NonZeroU16, LaunchFailure> {
+            if self.capacity_unreadable.load(Ordering::SeqCst) {
+                return Err(LaunchFailure::new(FailureReason::Other(
+                    "host journal could not be read".into(),
+                )));
+            }
+            Ok(self.capacity.lock().unwrap().unwrap_or(host.host_capacity))
+        }
+
         async fn supervise(
             &self,
             policy: &ScalePolicy,
@@ -3559,6 +3583,9 @@ mod tests {
                 request.host.created_at,
             );
             self.launches.fetch_add(1, Ordering::SeqCst);
+            if let Some(capacity) = self.capacity_after_launch.lock().unwrap().take() {
+                *self.capacity.lock().unwrap() = Some(capacity);
+            }
             if !self.forgetful {
                 self.attempts.lock().unwrap().push(created.clone());
             }
@@ -4638,6 +4665,74 @@ mod tests {
     }
 
     // =======================================================================
+    // Live host capacity, including changes while a pass is creating runners.
+    // =======================================================================
+
+    #[tokio::test]
+    async fn live_capacity_increase_is_used_without_rebuilding_the_reconciler() {
+        let mut harness = Harness::simple(1, 5, "acme/app");
+        let policies = [policy(1, "acme/app", 5)];
+        assert_eq!(harness.reconciler.reconcile(&policies).await.started, 1);
+
+        *harness.launcher.capacity.lock().unwrap() = NonZeroU16::new(4);
+        assert_eq!(harness.reconciler.reconcile(&policies).await.started, 3);
+        assert_eq!(harness.launcher.live_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn live_capacity_decrease_keeps_busy_runners_and_waits_for_headroom() {
+        let mut harness = Harness::simple(5, 5, "acme/app");
+        let busy: Vec<_> = (1..=3)
+            .map(|id| attempt_in(AttemptState::Busy, id, 1))
+            .collect();
+        *harness.launcher.attempts.lock().unwrap() = busy.clone();
+        *harness.launcher.capacity.lock().unwrap() = NonZeroU16::new(2);
+        let policies = [policy(1, "acme/app", 5)];
+
+        assert_eq!(harness.reconciler.reconcile(&policies).await.started, 0);
+        assert_eq!(harness.launcher.snapshot(), busy);
+        assert!(harness.launcher.cleaned().is_empty());
+
+        // Two jobs finish; one busy job still owns a slot.
+        harness.launcher.attempts.lock().unwrap().truncate(1);
+        assert_eq!(harness.reconciler.reconcile(&policies).await.started, 1);
+        assert_eq!(harness.launcher.live_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn live_capacity_is_rechecked_between_launches_in_the_same_pass() {
+        let mut harness = Harness::simple(5, 5, "acme/app");
+        *harness.launcher.capacity_after_launch.lock().unwrap() = NonZeroU16::new(1);
+
+        let report = harness
+            .reconciler
+            .reconcile(&[policy(1, "acme/app", 5)])
+            .await;
+        assert_eq!(report.started, 1);
+        assert_eq!(harness.launcher.live_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn live_capacity_unreadable_blocks_launches_until_the_journal_recovers() {
+        let mut harness = Harness::simple(5, 5, "acme/app");
+        harness
+            .launcher
+            .capacity_unreadable
+            .store(true, Ordering::SeqCst);
+        let policies = [policy(1, "acme/app", 5)];
+        let report = harness.reconciler.reconcile(&policies).await;
+        assert_eq!(report.started, 0);
+        assert!(report.attempts_unreadable > 0);
+
+        harness
+            .launcher
+            .capacity_unreadable
+            .store(false, Ordering::SeqCst);
+        *harness.launcher.capacity.lock().unwrap() = NonZeroU16::new(2);
+        assert_eq!(harness.reconciler.reconcile(&policies).await.started, 2);
+    }
+
+    // =======================================================================
     // D9 under concurrency: the other silent failure
     // =======================================================================
 
@@ -4663,7 +4758,7 @@ mod tests {
     async fn two_policies_reconciling_concurrently_never_exceed_host_capacity() {
         let lock = Arc::new(CountingLock::new());
         let (launches, live) =
-            two_policies_concurrently(Arc::clone(&lock) as Arc<dyn AllocationLock>).await;
+            two_policies_concurrently(Arc::clone(&lock) as Arc<dyn AllocationLock>, None).await;
 
         assert_eq!(
             launches, 3,
@@ -4695,7 +4790,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn without_the_allocation_lock_two_policies_oversubscribe_the_host() {
         let (launches, _) =
-            two_policies_concurrently(Arc::new(NoLock) as Arc<dyn AllocationLock>).await;
+            two_policies_concurrently(Arc::new(NoLock) as Arc<dyn AllocationLock>, None).await;
 
         assert!(
             launches > 3,
@@ -4709,8 +4804,12 @@ mod tests {
     /// Two policies, one host of three, each allowed three, reconciled at once.
     ///
     /// Returns `(launches, live attempts)`.
-    async fn two_policies_concurrently(lock: Arc<dyn AllocationLock>) -> (usize, usize) {
+    async fn two_policies_concurrently(
+        lock: Arc<dyn AllocationLock>,
+        live_capacity: Option<NonZeroU16>,
+    ) -> (usize, usize) {
         let launcher = Arc::new(FakeLauncher::new().with_yields(4));
+        *launcher.capacity.lock().unwrap() = live_capacity;
         let host = host_with(3);
 
         let mut left = Harness::build(
@@ -4736,6 +4835,15 @@ mod tests {
         let (_, _) = (left.await.unwrap(), right.await.unwrap());
 
         (launcher.launches(), launcher.live_count())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_capacity_is_shared_by_concurrent_targets_with_stale_startup_hosts() {
+        let (launches, live) =
+            two_policies_concurrently(Arc::new(InProcessAllocationLock::new()), NonZeroU16::new(2))
+                .await;
+        assert_eq!(launches, 2);
+        assert_eq!(live, 2);
     }
 
     // =======================================================================
