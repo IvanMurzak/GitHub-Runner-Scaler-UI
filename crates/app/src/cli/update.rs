@@ -354,6 +354,34 @@ struct Installation {
     path: PathBuf,
 }
 
+/// Homebrew moves versioned Cellar paths on upgrade. Follow its stable opt link
+/// both for old service records and for restarting an already-running TUI.
+pub(crate) fn restart_path(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if ancestor.file_name() == Some(std::ffi::OsStr::new("Cellar"))
+            && let Some(prefix) = ancestor.parent()
+        {
+            return prefix.join("opt/runner-manager/bin/runner-manager");
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(test)]
+mod restart_path_tests {
+    use super::*;
+    #[test]
+    fn brew_restart_follows_opt_but_other_installations_keep_their_path() {
+        let prefix = std::env::temp_dir().join("brew-prefix");
+        assert_eq!(
+            restart_path(&prefix.join("Cellar/runner-manager/0.4.43/bin/runner-manager")),
+            prefix.join("opt/runner-manager/bin/runner-manager")
+        );
+        let archive = prefix.join("bin/runner-manager");
+        assert_eq!(restart_path(&archive), archive);
+    }
+}
+
 impl Installation {
     /// Reads the running process's own path and classifies it.
     ///
@@ -675,10 +703,47 @@ fn running_version() -> &'static str {
 /// Every class named on the helpers below, plus [`Failure::Unclassified`] when
 /// the report cannot be written.
 pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Result<(), CliError> {
+    let _lock = runner_manager_platform::lock::HostLock::try_acquire(
+        context.paths(),
+        runner_manager_platform::lock::LockKind::Update,
+    )
+    .map_err(|error| CliError::new(Failure::Conflict, error.to_string()))?;
+    perform(context, args, out, false)
+}
+
+pub(super) fn perform(
+    context: &Context,
+    args: &UpdateArgs,
+    out: &mut dyn Write,
+    automatic: bool,
+) -> Result<(), CliError> {
     let failed = write_failed("this update");
     let mut err = std::io::stderr();
 
-    let installation = Installation::detect(context)?;
+    let mut installation = Installation::detect(context)?;
+    if automatic && matches!(installation.channel, Channel::ServiceCopy) {
+        let record = InstallRecord::read(context.paths())
+            .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?;
+        if let Some(path) = record.and_then(|record| record.source_binary) {
+            let path = restart_path(&path);
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            installation = Installation {
+                channel: classify(&path, context.paths().state_dir()),
+                path,
+            };
+        }
+    }
+    if automatic {
+        if matches!(installation.channel, Channel::SourceBuild) {
+            return Ok(());
+        }
+        // The daemon may still be draining after its source was updated.
+        if super::daemon::upgraded_version(&installation.path)
+            .is_some_and(|version| compare_versions(&version, running_version()).is_gt())
+        {
+            return Ok(());
+        }
+    }
     let target = host_target()?;
     let source = AssetSource::resolve(&mut err)?;
 
@@ -1113,7 +1178,10 @@ pub(crate) async fn fetch_text(source: &AssetSource, asset: &str) -> Result<Stri
         }
         AssetSource::Remote { base } => {
             let url = format!("{base}/{asset}");
-            let response = reqwest::get(&url)
+            let response = reqwest::Client::new()
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(600))
+                .send()
                 .await
                 .and_then(reqwest::Response::error_for_status)
                 .map_err(|error| unreachable_release(&url, &error))?;
@@ -1161,7 +1229,10 @@ pub(crate) async fn fetch_file(
             use tokio::io::AsyncWriteExt as _;
 
             let url = format!("{base}/{asset}");
-            let response = reqwest::get(&url)
+            let response = reqwest::Client::new()
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(600))
+                .send()
                 .await
                 .and_then(reqwest::Response::error_for_status)
                 .map_err(|error| unreachable_release(&url, &error))?;
@@ -1469,7 +1540,15 @@ fn run_package_manager(
     // A resolved `.cmd` or `.bat` is run by the standard library through
     // `cmd.exe`, which quotes every argument for it (and refuses one it cannot
     // quote safely, CVE-2024-24576) -- so no command line is assembled here.
-    let status = Command::new(&executable).args(arguments).status();
+    let status = Command::new(&executable)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .and_then(|output| {
+            out.write_all(&output.stdout)?;
+            out.write_all(&output.stderr)?;
+            Ok(output.status)
+        });
     match status {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(CliError::with_remedy(

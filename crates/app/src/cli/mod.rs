@@ -41,6 +41,7 @@
 //! | [`Endpoints`] + [`AppRegistration`] | `c2` | The published App is a product fact, not a per-command one |
 
 pub mod auth;
+pub mod auto_update;
 pub mod cache;
 pub mod daemon;
 pub mod docker_cleanup;
@@ -825,6 +826,11 @@ pub struct AuthStatusArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum HostCommand {
+    /// Enable or disable automatic daily updates (enabled by default).
+    SetAutoUpdate {
+        #[arg(action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
+        enabled: bool,
+    },
     /// Set the ceiling on concurrent runner attempts for this machine.
     SetCapacity(HostSetCapacityArgs),
     /// Set how often GitHub is polled for work: when idle, and when busy.
@@ -1665,7 +1671,7 @@ impl From<StartAt> for StartMode {
 // ---------------------------------------------------------------------------
 
 /// Everything a command needs, resolved once.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Context {
     paths: AppPaths,
     /// `Some` when `--data-dir` was given: the secret store is rooted there too.

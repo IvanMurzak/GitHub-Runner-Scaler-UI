@@ -1121,3 +1121,23 @@ RUNNER_MANAGER_WSL_CHAIN_CASE=wsl-0007 cargo test -p runner-manager \
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
+
+### Automatic updates
+
+Runner-manager checks for releases once every 24 hours while the TUI or daemon
+is running (the first check starts after one minute). Automatic installation is
+enabled by default, including when upgrading an existing installation. Change it
+in TUI **Host settings**, or run `runner-manager host set-auto-update false`;
+`true` enables it again. Disabled installations still check and record availability.
+The preference lives in `config/updates.toml`; the last report is
+`state/update-status.txt` within the application data directories.
+
+TUI and background services sharing the same data directory coordinate checks
+and updates. Updates use the existing installation channel and checksum verification.
+Services finish active jobs before handing over to the new version; the TUI
+restores the terminal and restarts with its original arguments. Linux (including
+WSL), macOS and Windows use the same scheduler. Each WSL host checks independently.
+The service account must have permission to update the installation and access to
+its package manager. Failed checks are recorded and retried the following day;
+`runner-manager update` remains available for an immediate retry. Checkout builds
+are never automatically overwritten.

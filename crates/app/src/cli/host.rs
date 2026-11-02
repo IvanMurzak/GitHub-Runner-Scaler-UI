@@ -440,6 +440,9 @@ pub fn dispatch(
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
+        HostCommand::SetAutoUpdate { enabled } => {
+            super::auto_update::set_enabled(context, *enabled, out)
+        }
         HostCommand::SetCapacity(args) => set_capacity(context, args, out),
         HostCommand::SetPollInterval(args) => super::polling::set_poll_interval(context, args, out),
         HostCommand::SetRuntimeRoot(args) => runtime_root(context, Some(&args.path), styling, out),
@@ -928,6 +931,12 @@ pub fn set_capacity(
 /// # Errors
 /// The local-state and secret-store failures.
 pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+    writeln!(
+        out,
+        "Automatic daily updates: {}",
+        super::auto_update::enabled(context)?
+    )
+    .map_err(write_failed("this host's settings"))?;
     let failed = write_failed("this host's settings");
     let store = context.store()?;
     let host = local_host(&store)?;

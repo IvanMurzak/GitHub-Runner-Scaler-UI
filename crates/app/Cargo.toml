@@ -29,6 +29,7 @@ name = "runner-manager-supervisor"
 path = "src/supervisor_main.rs"
 
 [dependencies]
+toml.workspace = true
 # Needed by `StoringRenewal`, which implements `c2`'s `CredentialRenewal`.
 async-trait = { workspace = true }
 anyhow = { workspace = true }

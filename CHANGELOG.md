@@ -7,6 +7,20 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.44
+
+### Added
+
+- Daily release checks in the TUI and background daemon, coordinated across
+  processes and persisted across restarts. Automatic updates default to enabled
+  for both new and existing installations. Host settings and
+  `host set-auto-update true|false` control installation; checks continue when disabled.
+- Automatic updates reuse the installation channel and checksum validation.
+  Background services drain active jobs before restarting, and the TUI restores
+  its terminal and relaunches with the original arguments. Windows, macOS,
+  Linux and WSL share the scheduler. Update results are saved in
+  `state/update-status.txt`.
+
 ## 0.4.43
 
 ### Fixes

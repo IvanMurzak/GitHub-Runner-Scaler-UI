@@ -3383,6 +3383,8 @@ pub fn run_terminal_with_agent_events(
 
 pub fn run_terminal(context: Arc<crate::cli::Context>) -> io::Result<()> {
     require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
+    let updates = crate::cli::auto_update::Worker::start(context.as_ref().clone());
+    let executable = crate::cli::update::restart_path(&std::env::current_exe()?);
     let (source, agent_events) =
         LocalAgentEventSource::start(Arc::clone(&context), LOCAL_AGENT_POLL_RATE)?;
     let mut session = TerminalSession::start(CrosstermActions::new(io::stdout(), SystemRawMode))?;
@@ -3392,18 +3394,41 @@ pub fn run_terminal(context: Arc<crate::cli::Context>) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let result = runtime
-        .block_on(run_loop(
+    let result = runtime.block_on(async {
+        tokio::select! {
+            result = run_loop(
             &mut terminal,
             &mut session,
             EventStream::new(),
             agent_events,
             &source,
             Some(context.as_ref()),
-        ))
-        .map(|_| ());
+        ) => result.map(|_| false),
+            _ = crate::cli::daemon::wait_for_upgrade(executable.clone()) => Ok(true),
+        }
+    });
     let _ = terminal.show_cursor();
-    result
+    drop(terminal);
+    drop(session);
+    drop(source);
+    drop(updates);
+    if result? {
+        let mut command = std::process::Command::new(executable);
+        command.args(std::env::args_os().skip(1));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            return Err(command.exec());
+        }
+        #[cfg(windows)]
+        {
+            let status = command.status()?;
+            if !status.success() {
+                return Err(io::Error::other("restarted TUI failed"));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

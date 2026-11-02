@@ -91,6 +91,8 @@ pub enum LockKind {
     DockerCleanup,
     /// Serializes independent Git snapshot readers/writers for one repository.
     GitCache,
+    /// Serializes manual and automatic application updates.
+    Update,
 }
 
 impl LockKind {
@@ -104,6 +106,7 @@ impl LockKind {
             Self::DependencyCache => ".lock",
             Self::DockerCleanup => ".sweep.lock",
             Self::GitCache => ".git-cache.lock",
+            Self::Update => "update.lock",
         }
     }
 
@@ -117,6 +120,7 @@ impl LockKind {
             Self::DependencyCache => "the dependency-cache lock",
             Self::DockerCleanup => "the Docker cleanup lock",
             Self::GitCache => "the repository Git cache lock",
+            Self::Update => "the application update lock",
         }
     }
 
@@ -125,6 +129,7 @@ impl LockKind {
     #[must_use]
     pub const fn advice(self) -> &'static str {
         match self {
+            Self::Update => "Another application update is running; retry shortly.",
             Self::DockerCleanup => "Another Docker cleanup sweep is running; retry shortly.",
             Self::GitCache => {
                 "Another copy or publication uses this repository's Git cache; retry shortly."

@@ -627,6 +627,7 @@ pub struct PolicyPreview {
 /// middle silently moved a click from *Save* to *Reset*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
+    AutoUpdate,
     HostCapacity,
     HostStartMode,
     HostInterval,
@@ -762,6 +763,7 @@ impl FormLine {
 pub struct SettingsUi {
     pub view: SettingsView,
     pub focus: usize,
+    pub auto_update: bool,
     pub host_capacity: u16,
     pub host_mode: StartMode,
     pub host_interval_secs: u16,
@@ -857,6 +859,7 @@ pub enum SettingsCommand {
     CheckWorkspaceRoot,
     /// `repo set-workspace OWNER/REPO --mode <draft> [--path <draft>]`.
     SaveWorkspace,
+    ToggleAutoUpdate,
     SaveGitCache,
     /// The optional routing labels of this policy, made to equal the field.
     SaveLabels,
@@ -1047,6 +1050,19 @@ impl SettingsUi {
             }
             SettingsCommand::CheckWorkspaceRoot => self.check_workspace_root(context),
             SettingsCommand::SaveWorkspace => self.save_workspace(context),
+            SettingsCommand::ToggleAutoUpdate => {
+                let result =
+                    cli::auto_update::set_enabled(context, !self.auto_update, &mut Vec::new());
+                match result {
+                    Ok(()) => {
+                        self.auto_update = !self.auto_update;
+                        self.message =
+                            Some(format!("Automatic daily updates: {}", self.auto_update));
+                    }
+                    Err(error) => self.message = Some(format!("error: {error}")),
+                }
+                Ok(())
+            }
             SettingsCommand::SaveGitCache => self.save_git_cache(context),
             SettingsCommand::SaveLabels => self.save_labels(context),
             SettingsCommand::SaveExecution => self.save_execution(context),
@@ -1067,6 +1083,7 @@ impl SettingsUi {
         let form = HostSettings::load(context)?;
         self.git_cache_state = cli::cache::git_setting(context, None)?;
         self.git_cache_notice = None;
+        self.auto_update = cli::auto_update::enabled(context)?;
         self.host_capacity = form.current_capacity;
         self.host_mode = form.current_start_mode;
         self.host_interval_secs = form.current_refresh_interval.as_secs();
@@ -1671,6 +1688,7 @@ Select another profile in Repositories or create one with the CLI.",
                 Control::HostRootSave,
                 Control::GitCacheState,
                 Control::GitCacheSave,
+                Control::AutoUpdate,
             ],
             SettingsView::Policy(form) => {
                 let mut controls = Vec::with_capacity(7);
@@ -1893,7 +1911,8 @@ Select another profile in Repositories or create one with the CLI.",
                 // compare the two modes does not throw the path away.
                 self.workspace_notice = None;
             }
-            Control::HostSave
+            Control::AutoUpdate
+            | Control::HostSave
             | Control::GitCacheSave
             | Control::HostRunnerRoot
             | Control::HostRootReset
@@ -1922,6 +1941,7 @@ Select another profile in Repositories or create one with the CLI.",
 
     fn activate(&mut self) -> Option<SettingsCommand> {
         match self.focused()? {
+            Control::AutoUpdate => Some(SettingsCommand::ToggleAutoUpdate),
             Control::HostSave => Some(SettingsCommand::ApplyHost),
             Control::GitCacheSave => Some(SettingsCommand::SaveGitCache),
             Control::HostRunnerRoot => {
@@ -2107,6 +2127,13 @@ Select another profile in Repositories or create one with the CLI.",
         lines.push(FormLine::text("Reset to platform default [Enter/click]").at(5));
         lines.push(FormLine::keep("Save runner root [Enter/click]").at(6));
         lines.extend(self.git_cache_lines(7));
+        lines.push(
+            FormLine::keep(format!(
+                "Automatic daily updates: {} [Enter/click to toggle]",
+                self.auto_update
+            ))
+            .at(9),
+        );
         lines.push(FormLine::text(format!(
             "Focused form actions: {}/{} capacity, {}/{} runner root",
             form.focused_action_count(),
@@ -4395,16 +4422,28 @@ mod tests {
         assert!(form.workspace_action_count(WorkspaceKind::Persistent) <= MAX_FOCUSED_FORM_ACTIONS);
         assert!(!form.is_organization());
 
-        // The host screen exposes the nine controls its three tasks add
-        // up to, and the repository screen's path control appears only in the
+        // The host screen exposes ten controls including the auto-update toggle;
+        // the repository screen's path control appears only in the
         // mode that has a path.
-        assert_eq!(fixture.host_screen().controls().len(), 9);
+        assert_eq!(fixture.host_screen().controls().len(), 10);
         let mut policy = fixture.policy_screen();
         assert!(!policy.controls().contains(&Control::WorkspacePath));
         focus_by_keyboard(&mut policy, Control::WorkspaceMode);
         let _ = policy.key(KeyCode::Right);
         assert_eq!(policy.workspace_mode, WorkspaceKind::Persistent);
         assert!(policy.controls().contains(&Control::WorkspacePath));
+    }
+
+    #[test]
+    fn automatic_updates_toggle_persists_and_reloads() {
+        let (_dir, context, _) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadHost);
+        assert!(ui.auto_update);
+        ui.execute(&context, SettingsCommand::ToggleAutoUpdate);
+        assert!(!cli::auto_update::enabled(&context).unwrap());
+        ui.execute(&context, SettingsCommand::LoadHost);
+        assert!(!ui.auto_update);
     }
 
     #[test]
@@ -5389,6 +5428,7 @@ mod tests {
         Default: host setting for a repository; off for the host. Native runners only.
         Uses the dependency-cache root and size cap; workspaces remain independent.
         Save Git cache [Enter/click]
+        Automatic daily updates: true [Enter/click to toggle]
         Focused form actions: 4/5 capacity, 3/5 runner root
         --- host/configured ---
         Host settings
@@ -5412,6 +5452,7 @@ mod tests {
         Default: host setting for a repository; off for the host. Native runners only.
         Uses the dependency-cache root and size cap; workspaces remain independent.
         Save Git cache [Enter/click]
+        Automatic daily updates: true [Enter/click to toggle]
         Focused form actions: 4/5 capacity, 3/5 runner root
         --- host/invalid ---
         Host settings
@@ -5438,6 +5479,7 @@ mod tests {
         Default: host setting for a repository; off for the host. Native runners only.
         Uses the dependency-cache root and size cap; workspaces remain independent.
         Save Git cache [Enter/click]
+        Automatic daily updates: true [Enter/click to toggle]
         Focused form actions: 4/5 capacity, 3/5 runner root
         --- host/active-refusal ---
         Host settings
@@ -5463,6 +5505,7 @@ mod tests {
         Default: host setting for a repository; off for the host. Native runners only.
         Uses the dependency-cache root and size cap; workspaces remain independent.
         Save Git cache [Enter/click]
+        Automatic daily updates: true [Enter/click to toggle]
         Focused form actions: 4/5 capacity, 3/5 runner root
         --- host/compact ---
         Current capacity: 4
@@ -5478,6 +5521,7 @@ mod tests {
         Save runner root [Enter/click]
         Git checkout cache: Default  [cycle]
         Save Git cache [Enter/click]
+        Automatic daily updates: true [Enter/click to toggle]
         --- repository/ephemeral ---
         Target: octo/repo
         Profile: default

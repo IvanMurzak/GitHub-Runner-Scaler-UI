@@ -74,6 +74,7 @@ pub fn dispatch(
                     ),
                 }
             }
+            let _updates = super::auto_update::Worker::start(context.clone());
             let runtime = super::runtime()?;
             runtime.block_on(run(
                 context,
@@ -134,7 +135,8 @@ async fn run_generation(
     let own_binary = InstallRecord::read(context.paths())
         .ok()
         .flatten()
-        .and_then(|record| record.source_binary);
+        .and_then(|record| record.source_binary)
+        .map(|path| super::update::restart_path(&path));
 
     writeln!(out, "daemon running (pid {})", std::process::id()).map_err(failed)?;
 
@@ -1605,7 +1607,7 @@ impl BinaryStamp {
 /// this daemon already is. A same-version rewrite — a reinstall of what is
 /// already there — is deliberately not an upgrade, because restarting for it
 /// would interrupt runners to change nothing.
-fn upgraded_version(path: &std::path::Path) -> Option<String> {
+pub(crate) fn upgraded_version(path: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new(path)
         .arg("--version")
         .output()
@@ -1624,7 +1626,7 @@ fn changed_build_version(reported: &str) -> Option<String> {
 
 /// Resolves when a different, runnable version has replaced this daemon's own
 /// binary. Never resolves otherwise.
-async fn wait_for_upgrade(path: std::path::PathBuf) -> String {
+pub(crate) async fn wait_for_upgrade(path: std::path::PathBuf) -> String {
     // The stamp this daemon started from. A binary replaced *before* the first
     // look is still caught, because the version comparison below is against
     // what this process was compiled as rather than against the file.
