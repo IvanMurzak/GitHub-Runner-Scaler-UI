@@ -1,0 +1,19 @@
+crates/app/src/cli/update.rs
+  s_844c26f8b755ab::t_edc8b456103021 374-395,1489-1508
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "36b819f7117509d4e3d18bf71b01d67e34ae60b3",
+  "prompts": {},
+  "sessions": {
+    "s_844c26f8b755ab": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19c25-b92a-73e1-8ee6-4a5e78d08120",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
