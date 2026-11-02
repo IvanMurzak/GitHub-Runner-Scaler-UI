@@ -308,7 +308,7 @@ runner-manager auth status [--list] [--permissions]            # Inspect access 
 runner-manager auth logout                                     # Purge the local credential
 
 runner-manager host show                                       # Show capacity, secret store and REST budget
-runner-manager host set-capacity N                             # Limit concurrent runners on this machine
+runner-manager host set-capacity N                             # Change the host limit without restarting the service
 runner-manager host set-poll-interval [--idle 10s] [--active 60s] # How often GitHub is polled, idle and busy
 runner-manager host set-runtime-root --path PATH               # Put disposable runner workspaces under PATH
 runner-manager host reset-runtime-root                         # Return runner placement to the platform default
@@ -393,6 +393,12 @@ runner-manager wsl install --distribution NAME [--capacity N]  # Make a WSL2 dis
 runner-manager wsl status --distribution NAME [--json]         # Report that host's real state
 runner-manager wsl detach --distribution NAME                  # Stop managing it, deleting no Linux data
 ```
+
+Host capacity changes take effect on the next allocation without restarting the
+service. The limit is shared by all projects on that host and is checked again
+before each runner starts. Lowering it lets current jobs finish and prevents
+new runners until the host has room under the new limit. If the host settings
+cannot be read, new launches wait until they can be read again.
 
 On Windows, the preview isolated backend targets **Hyper-V-isolated Windows
 containers** through a Docker-compatible Windows container runtime. Candidate

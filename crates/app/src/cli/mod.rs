@@ -1151,6 +1151,7 @@ pub struct HostSetPollIntervalArgs {
 #[derive(Debug, Args)]
 pub struct HostSetCapacityArgs {
     /// Concurrent runner attempts this machine may hold, across every policy.
+    /// Applied to new allocations without restarting the service; running jobs finish normally.
     #[arg(value_name = "N")]
     pub capacity: u16,
 }
