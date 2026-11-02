@@ -377,6 +377,24 @@ pub const MANIFEST: &[Classification] = &[
     // -- host ----------------------------------------------------------------
     generated("host set-capacity"),
     Classification {
+        leaf: "host set-auto-update",
+        coverage: Coverage::Dedicated,
+        evidence: &[
+            at(
+                "crates/app/tests/auto_update_commands.rs",
+                "auto_update_defaults_and_explicit_preferences_round_trip",
+            ),
+            at(
+                "crates/app/tests/auto_update_commands.rs",
+                "invalid_auto_update_value_preserves_preference",
+            ),
+        ],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::HostConfiguration,
+            reason: "Automatic updates configure application release installation, outside the generated policy and runner oracle. Dedicated process tests cover default opt-in, both boolean values, persistence and invalid-value refusal without networking or installing a release.",
+        }),
+    },
+    Classification {
         leaf: "host set-poll-interval",
         coverage: Coverage::Dedicated,
         evidence: &[

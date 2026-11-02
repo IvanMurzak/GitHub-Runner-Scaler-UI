@@ -309,6 +309,7 @@ runner-manager auth logout                                     # Purge the local
 
 runner-manager host show                                       # Show capacity, secret store and REST budget
 runner-manager host set-capacity N                             # Change the host limit without restarting the service
+runner-manager host set-auto-update BOOL                      # Daily automatic updates (default: true)
 runner-manager host set-poll-interval [--idle 10s] [--active 60s] # How often GitHub is polled, idle and busy
 runner-manager host set-runtime-root --path PATH               # Put disposable runner workspaces under PATH
 runner-manager host reset-runtime-root                         # Return runner placement to the platform default
