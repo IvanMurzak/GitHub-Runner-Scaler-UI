@@ -71,9 +71,9 @@ use runner_manager_domain::attempt::active_count;
 use runner_manager_domain::coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CoordinatorUrl, EnrollRequest, EnrollResponse,
     HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, HostMessage, HostSigningKey, LAUNCH_VERSION,
-    MIN_PROTOCOL_VERSION, Profile, STATS_VERSION, ServerMessage, SessionPurpose, StatsReport,
-    Target, TargetRef, TargetScope, Wake, decode_nonce, decode_signing_key, encode_public_key,
-    encode_signing_key, negotiate, sign_challenge, signing_key_from_seed,
+    MAX_MESSAGE_BYTES, MIN_PROTOCOL_VERSION, Profile, STATS_VERSION, ServerMessage, SessionPurpose,
+    StatsReport, Target, TargetRef, TargetScope, Wake, decode_nonce, decode_signing_key,
+    encode_public_key, encode_signing_key, negotiate, sign_challenge, signing_key_from_seed,
 };
 use runner_manager_domain::model::{OwnerRepo, ScaleTarget, StartMode};
 use runner_manager_domain::policy::ScalePolicy;
@@ -1198,12 +1198,8 @@ async fn open_socket(
     tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<Socket, SessionEnd> {
     let socket_config = tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(
-            runner_manager_domain::coordinator_protocol::MAX_MESSAGE_BYTES,
-        ))
-        .max_frame_size(Some(
-            runner_manager_domain::coordinator_protocol::MAX_MESSAGE_BYTES,
-        ));
+        .max_message_size(Some(MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_MESSAGE_BYTES));
     // Never let tungstenite fall back to a root-less default for `wss://`.
     let connector = match tls {
         Some(config) => Some(tokio_tungstenite::Connector::Rustls(config)),
@@ -1458,6 +1454,7 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runner_manager_domain::coordinator_protocol::{PROTOCOL_VERSION, WakeReason};
 
     #[test]
     fn a_wake_never_moves_a_poll_sooner_than_the_gap_or_later_than_scheduled() {
@@ -1482,7 +1479,7 @@ mod tests {
                 name: name.into(),
             },
             repository: "octo/app".into(),
-            reason: runner_manager_domain::coordinator_protocol::WakeReason::JobQueued,
+            reason: WakeReason::JobQueued,
             delivery_id: "d".into(),
         };
         assert!(routes.deliver(&wake(TargetScope::Repo, "octo/app")));
@@ -2007,11 +2004,8 @@ mod tests {
         assert_eq!(negotiated(1, None), Some(1));
         // This coordinator.
         assert_eq!(
-            negotiated(
-                1,
-                Some(runner_manager_domain::coordinator_protocol::PROTOCOL_VERSION)
-            ),
-            Some(runner_manager_domain::coordinator_protocol::PROTOCOL_VERSION)
+            negotiated(1, Some(PROTOCOL_VERSION)),
+            Some(PROTOCOL_VERSION)
         );
         // A future one that dropped everything this build speaks.
         assert_eq!(negotiated(7, Some(9)), None);

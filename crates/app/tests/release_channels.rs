@@ -2070,8 +2070,21 @@ fn cargo_publish_reads_the_exact_version_from_the_index() {
     );
 }
 
-/// The workspace's normal (non-dev) dependency graph among its own members,
-/// read with `cargo metadata --no-deps`, which needs no network. Maps each
+/// Crate names that already exist on crates.io. Trusted Publishing, the only
+/// credential the release has, cannot create a crate: a name that is not here
+/// needs a one-time first publish by the owner before a release can depend on
+/// it, or belongs as a module of one of these. Deliberately not
+/// [`PUBLISH_ORDER`]: extending that list does not register a name.
+const REGISTERED_ON_CRATES_IO: [&str; 5] = [
+    "runner-manager",
+    "runner-manager-agent",
+    "runner-manager-domain",
+    "runner-manager-github",
+    "runner-manager-platform",
+];
+
+/// The workspace's non-dev (normal and build) dependency graph among its own
+/// members, read with `cargo metadata --no-deps`, which needs no network. Maps each
 /// member to whether it may be published and the members it depends on.
 fn workspace_publish_graph() -> BTreeMap<String, (bool, BTreeSet<String>)> {
     let output = Command::new(env!("CARGO"))
@@ -2107,7 +2120,7 @@ fn workspace_publish_graph() -> BTreeMap<String, (bool, BTreeSet<String>)> {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|dependency| dependency["kind"].is_null())
+                .filter(|dependency| dependency["kind"] != "dev")
                 .map(|dependency| dependency["name"].as_str().unwrap())
                 .filter(|name| members.contains(name))
                 .map(str::to_owned)
@@ -2125,7 +2138,8 @@ fn workspace_publish_graph() -> BTreeMap<String, (bool, BTreeSet<String>)> {
 /// not resolve it and every channel after the GitHub Release stayed behind.
 /// What `cargo-publish` actually publishes must be the whole non-dev closure
 /// of `runner-manager` among the workspace members, none of them
-/// `publish = false`, each after every member it depends on.
+/// `publish = false` or new to crates.io, each after every member it depends
+/// on.
 #[test]
 fn cargo_publish_covers_the_dependency_closure_of_runner_manager_in_order() {
     let state = TempDir::new().unwrap();
@@ -2146,6 +2160,12 @@ fn cargo_publish_covers_the_dependency_closure_of_runner_manager_in_order() {
         assert!(
             graph[name].0,
             "{name} is a normal dependency of runner-manager but is `publish = false`"
+        );
+        assert!(
+            REGISTERED_ON_CRATES_IO.contains(&name.as_str()),
+            "{name} is a dependency of runner-manager that crates.io has never seen, \
+             and Trusted Publishing cannot create it: fold it into an existing crate, \
+             or have the owner publish its first version by hand"
         );
     }
     assert_eq!(

@@ -15,7 +15,7 @@ use runner_manager_coordinator::server::{AppState, Config, serve};
 use runner_manager_coordinator::stats::{self, StatsConfig, Weights};
 use runner_manager_coordinator::store::{HostRecord, Store};
 use runner_manager_coordinator::sweep::{self, Sweeper};
-use runner_manager_domain::coordinator_protocol::CoordinatorUrl;
+use runner_manager_domain::coordinator_protocol::{CoordinatorUrl, StatsReport};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 
@@ -348,7 +348,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 struct StatsDocument<'a> {
                     schema_version: u32,
                     #[serde(flatten)]
-                    report: &'a runner_manager_domain::coordinator_protocol::StatsReport,
+                    report: &'a StatsReport,
                 }
                 serde_json::to_writer_pretty(
                     &mut out,
