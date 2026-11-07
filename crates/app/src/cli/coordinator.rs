@@ -426,7 +426,7 @@ pub struct CoordinatorSnapshot {
     /// How often the coordinator's reconciliation sweep runs, as its last
     /// `hello_ack` said; `null` when it runs none, or never said.
     pub reconcile_interval_secs: Option<u32>,
-    /// The targets that sweep covers.
+    /// The targets that sweep covers, as `repo:owner/name` or `org:login`.
     pub covered: Vec<String>,
     /// Each of this host's targets and its poll mode. Empty where the
     /// reader did not ask about targets.
@@ -475,12 +475,13 @@ impl CoordinatorSnapshot {
     /// How `target` is polled, as far as the daemon's record says.
     #[must_use]
     pub fn mode_for(&self, target: &ScaleTarget, now: DateTime<Utc>) -> PollMode {
-        let slug = target.slug();
+        // The same rule as `HelloAck::covers`: scope and name, case-blind.
+        let reference = target_ref(target).to_string();
         let covered = self.reconcile_interval_secs.is_some()
             && self
                 .covered
                 .iter()
-                .any(|covered| covered.eq_ignore_ascii_case(&slug));
+                .any(|covered| covered.eq_ignore_ascii_case(&reference));
         let down_for = (self.link == LinkState::Disconnected)
             .then(|| {
                 self.since
@@ -848,12 +849,14 @@ impl Recorder {
     }
 
     fn acknowledged(&mut self, ack: &HelloAck) {
+        let covered: Vec<String> = ack.covered.iter().map(ToString::to_string).collect();
+        if self.record.reconcile_interval_secs == ack.reconcile_interval_secs
+            && self.record.covered == covered
+        {
+            return;
+        }
         self.record.reconcile_interval_secs = ack.reconcile_interval_secs;
-        self.record.covered = ack
-            .covered
-            .iter()
-            .map(|target| target.name.clone())
-            .collect();
+        self.record.covered = covered;
         self.write();
     }
 
@@ -908,11 +911,15 @@ pub async fn maintain_link(ports: LinkPorts) {
         });
         let started = tokio::time::Instant::now();
         let end = session(&ports, &config, tls.clone(), &mut recorder).await;
-        ports.coordination.send_modify(|view| {
-            if view.connected || view.down_since.is_none() {
+        // Only the first failure after a session changes anything; repeated
+        // failed reconnects must not wake every target loop.
+        ports.coordination.send_if_modified(|view| {
+            let changed = view.connected || view.down_since.is_none();
+            if changed {
                 view.down_since = Some(tokio::time::Instant::now());
+                view.connected = false;
             }
-            view.connected = false;
+            changed
         });
         tracing::info!(reason = end.as_str(), "the coordinator link ended");
         if end == SessionEnd::Reconfigured {
@@ -1079,7 +1086,8 @@ async fn session(
         return SessionEnd::Unreachable;
     };
     match handshake(&mut socket, &url, &config.host_id, &key).await {
-        Ok(Handshake { heartbeat, version }) => {
+        Ok(handshake) => {
+            let version = handshake.version;
             drop(key);
             recorder.connected(version);
             ports.coordination.send_modify(|view| {
@@ -1094,7 +1102,7 @@ async fn session(
                 }
             });
             tracing::info!(coordinator = %url, version, "connected to the coordinator");
-            serve(&mut socket, ports, config, (heartbeat, version), recorder).await
+            serve(&mut socket, ports, config, handshake, recorder).await
         }
         Err(end) => end,
     }
@@ -1162,7 +1170,10 @@ async fn serve(
     socket: &mut Socket,
     ports: &LinkPorts,
     config: &CoordinatorConfig,
-    (interval, version): (Duration, u32),
+    Handshake {
+        heartbeat: interval,
+        version,
+    }: Handshake,
     recorder: &mut Recorder,
 ) -> SessionEnd {
     let policies = ports.store.policies().unwrap_or_default();
@@ -1553,7 +1564,7 @@ mod tests {
         assert_eq!(snapshot.mode_for(&target, now), PollMode::Standalone);
         snapshot.configured = true;
         snapshot.link = LinkState::Connected;
-        snapshot.covered = vec!["octo/app".into()];
+        snapshot.covered = vec!["repo:octo/app".into()];
         assert_eq!(
             snapshot.mode_for(&target, now),
             PollMode::Fallback,

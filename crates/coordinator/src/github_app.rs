@@ -35,11 +35,13 @@ use chrono::{DateTime, Utc};
 use reqwest::Method;
 use runner_manager_domain::model::{Clock, OwnerRepo, Timestamp};
 use runner_manager_github::demand::{DemandGateway, RestDemand};
+use runner_manager_github::rest::PER_PAGE;
 use runner_manager_github::{
-    ApiRequest, AuthenticatedClient, Endpoints, GithubError, UserAccessToken,
+    ApiRequest, AuthenticatedClient, Endpoints, GithubError, MAX_PAGES, UserAccessToken,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 /// How long a JWT is valid. GitHub's ceiling is ten minutes.
 const JWT_LIFETIME: Duration = Duration::from_secs(9 * 60);
@@ -49,11 +51,6 @@ const JWT_BACKDATE: Duration = Duration::from_secs(60);
 
 /// An installation token is replaced once less than this is left on it.
 pub const TOKEN_REFRESH_WINDOW: Duration = Duration::from_secs(10 * 60);
-
-/// Page budget for the installation and repository listings.
-const MAX_PAGES: usize = 20;
-
-const PER_PAGE: u32 = 100;
 
 /// Why the App's credentials or GitHub's answers were unusable.
 #[derive(Debug, thiserror::Error)]
@@ -187,12 +184,6 @@ impl Installation {
     pub fn demand(&self) -> Arc<dyn DemandGateway> {
         Arc::clone(&self.demand) as Arc<dyn DemandGateway>
     }
-
-    /// The client, for its traffic counters.
-    #[must_use]
-    pub fn client(&self) -> &AuthenticatedClient {
-        &self.client
-    }
 }
 
 #[derive(Deserialize)]
@@ -207,7 +198,9 @@ struct RawInstallation {
 
 #[derive(Deserialize)]
 struct RawAccount {
-    login: String,
+    /// Absent for an enterprise account, which no target names.
+    #[serde(default)]
+    login: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -289,7 +282,7 @@ impl GithubApp {
         let listed = list_installations(&app).await?;
         let mut kept = BTreeMap::new();
         for raw in listed {
-            let Some(account) = raw.account.map(|account| account.login) else {
+            let Some(account) = raw.account.and_then(|account| account.login) else {
                 continue;
             };
             if raw.suspended_at.is_some() {
@@ -325,10 +318,14 @@ impl GithubApp {
         selection: Option<String>,
         existing: Option<Installation>,
     ) -> Result<Installation, AppError> {
-        let mut installation = match existing {
+        let (client, demand, token_expires_at) = match existing {
             Some(mut installation) => {
                 self.refresh_token_with(app, &mut installation).await?;
-                installation
+                (
+                    installation.client,
+                    installation.demand,
+                    installation.token_expires_at,
+                )
             }
             None => {
                 let (token, expires_at) = mint_token(app, id).await?;
@@ -342,21 +339,19 @@ impl GithubApp {
                     Arc::clone(&client),
                     Arc::clone(&self.clock),
                 ));
-                Installation {
-                    id,
-                    account: String::new(),
-                    all_repositories: false,
-                    repositories: Vec::new(),
-                    client,
-                    demand,
-                    token_expires_at: expires_at,
-                }
+                (client, demand, expires_at)
             }
         };
-        installation.account = account;
-        installation.all_repositories = selection.as_deref() == Some("all");
-        installation.repositories = list_repositories(&installation.client).await?;
-        Ok(installation)
+        let repositories = list_repositories(&client).await?;
+        Ok(Installation {
+            id,
+            account,
+            all_repositories: selection.as_deref() == Some("all"),
+            repositories,
+            client,
+            demand,
+            token_expires_at,
+        })
     }
 
     /// Replaces every installation token within [`TOKEN_REFRESH_WINDOW`] of
@@ -367,12 +362,17 @@ impl GithubApp {
     /// Signing the JWT.
     pub async fn refresh_tokens(&mut self) -> Result<(), AppError> {
         let now = self.clock.now();
-        if !self.installations.values().any(|i| due(i, now)) {
+        let due: Vec<u64> = self
+            .installations
+            .values()
+            .filter(|installation| due(installation, now))
+            .map(|installation| installation.id)
+            .collect();
+        if due.is_empty() {
             return Ok(());
         }
         let app = self.app_client()?;
-        let ids: Vec<u64> = self.installations.keys().copied().collect();
-        for id in ids {
+        for id in due {
             let Some(mut installation) = self.installations.remove(&id) else {
                 continue;
             };
@@ -404,7 +404,8 @@ impl GithubApp {
         let (token, expires_at) = mint_token(app, installation.id).await?;
         installation
             .client
-            .replace_credential(UserAccessToken::new(token));
+            .replace_credential(UserAccessToken::new(token))
+            .await;
         installation.token_expires_at = expires_at;
         tracing::info!(
             installation = installation.id,
@@ -426,18 +427,36 @@ fn due(installation: &Installation, now: Timestamp) -> bool {
     installation.token_expires_at - now <= window
 }
 
-async fn list_installations(app: &AuthenticatedClient) -> Result<Vec<RawInstallation>, AppError> {
-    let mut request = Some(ApiRequest::get("/app/installations").query("per_page", PER_PAGE));
+/// Every page of a listing, up to [`MAX_PAGES`]; `items` takes one page's
+/// items out of its envelope.
+async fn paginate<P: DeserializeOwned, T>(
+    client: &AuthenticatedClient,
+    path: &str,
+    items: impl Fn(P) -> Vec<T>,
+) -> Result<Vec<T>, AppError> {
+    let mut request = Some(ApiRequest::get(path).query("per_page", PER_PAGE));
     let mut all = Vec::new();
     for _ in 0..MAX_PAGES {
-        let Some(next) = request.take() else { break };
-        let response = app.send(&next).await?;
+        let Some(next) = request.take() else {
+            return Ok(all);
+        };
+        let response = client.send(&next).await?;
         request = response
             .next_page()
             .map(|url| ApiRequest::get(url.as_str()));
-        all.extend(response.json::<Vec<RawInstallation>>()?);
+        all.extend(items(response.json::<P>()?));
+    }
+    if request.is_some() {
+        tracing::warn!(
+            pages = MAX_PAGES,
+            "stopped a GitHub App listing at the page budget; what it did not reach is not swept"
+        );
     }
     Ok(all)
+}
+
+async fn list_installations(app: &AuthenticatedClient) -> Result<Vec<RawInstallation>, AppError> {
+    paginate(app, "/app/installations", |page: Vec<RawInstallation>| page).await
 }
 
 async fn mint_token(
@@ -455,23 +474,17 @@ async fn mint_token(
 }
 
 async fn list_repositories(client: &AuthenticatedClient) -> Result<Vec<OwnerRepo>, AppError> {
-    let mut request =
-        Some(ApiRequest::get("/installation/repositories").query("per_page", PER_PAGE));
-    let mut all = Vec::new();
-    for _ in 0..MAX_PAGES {
-        let Some(next) = request.take() else { break };
-        let response = client.send(&next).await?;
-        request = response
-            .next_page()
-            .map(|url| ApiRequest::get(url.as_str()));
-        let page: RawRepositories = response.json()?;
-        all.extend(
+    paginate(
+        client,
+        "/installation/repositories",
+        |page: RawRepositories| {
             page.repositories
                 .into_iter()
-                .filter_map(|repository| OwnerRepo::parse(&repository.full_name).ok()),
-        );
-    }
-    Ok(all)
+                .filter_map(|repository| OwnerRepo::parse(&repository.full_name).ok())
+                .collect()
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

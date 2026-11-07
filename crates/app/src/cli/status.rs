@@ -544,7 +544,7 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
     // an unreadable `polling.toml` is reported by `host show`, which refuses.
     let configured = super::polling::configured(context, &store).unwrap_or_else(|error| {
         (
-            super::polling::Intervals::with_default_idle(interval),
+            super::polling::Intervals::with_defaults(interval),
             Some(error.to_string()),
         )
     });
@@ -882,7 +882,8 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
     for target in &document.coordinator.targets {
         let how = match target.mode {
             super::coordinator::PollMode::Coordinated => format!(
-                "polled every {}s; the coordinator reads its queue and wakes this host",
+                "polled every {}s while no runner of this host runs for it; the coordinator \
+                 reads its queue and wakes this host",
                 document.polling.coordinated_interval_secs
             ),
             super::coordinator::PollMode::Fallback => {
@@ -1528,7 +1529,7 @@ mod tests {
         coordinator.url = Some("https://runners.example.com".into());
         coordinator.link = LinkState::Connected;
         coordinator.reconcile_interval_secs = Some(120);
-        coordinator.covered = vec!["acme/app".into()];
+        coordinator.covered = vec!["repo:acme/app".into()];
         coordinator.targets = vec![
             TargetPollMode {
                 target: "acme/app".into(),
@@ -1547,7 +1548,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("acme/app                  coordinated (polled every 300s;"),
+            text.contains("acme/app                  coordinated (polled every 300s while"),
             "{text}"
         );
         assert!(

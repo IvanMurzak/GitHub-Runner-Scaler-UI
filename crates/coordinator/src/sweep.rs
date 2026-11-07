@@ -20,20 +20,17 @@
 //!
 //! [`RestDemand`]: runner_manager_github::demand::RestDemand
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use runner_manager_coordinator_protocol::{TargetRef, TargetScope, WakeReason};
-use runner_manager_domain::model::{Label, OwnerRepo};
+use runner_manager_coordinator_protocol::{TargetRef, WakeReason};
+use runner_manager_domain::model::OwnerRepo;
 use runner_manager_github::demand::DemandGateway;
 use runner_manager_github::rest::{ActivityScope, CancelToken, InventoryError};
 
 use crate::github_app::{AppError, GithubApp};
 use crate::registry::{Coverage, Registry};
-
-/// The default sweep interval.
-pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(120);
 
 /// The shortest sweep interval accepted.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(30);
@@ -43,55 +40,6 @@ pub const INVENTORY_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// The delivery id a sweep's wakes carry.
 pub const SWEEP_DELIVERY: &str = "reconcile";
-
-/// When a wake was last sent for a repository and a set of required labels,
-/// by the webhook or by the sweep.
-///
-/// A job is identified by what decides which hosts it wakes: its repository
-/// and its required labels. Two queued jobs with the same labels in the same
-/// repository wake the same hosts, and one poll answers both.
-#[derive(Debug, Default)]
-pub struct WakeLog {
-    sent: Mutex<HashMap<(String, BTreeSet<Label>), Instant>>,
-}
-
-/// Wake log entries kept at most this long.
-const WAKE_MEMORY: Duration = Duration::from_secs(60 * 60);
-
-impl WakeLog {
-    fn key(repository: &str, required: &[Label]) -> (String, BTreeSet<Label>) {
-        (
-            repository.to_ascii_lowercase(),
-            required.iter().cloned().collect(),
-        )
-    }
-
-    /// Records a wake sent now.
-    pub fn record(&self, repository: &str, required: &[Label], now: Instant) {
-        let mut sent = self
-            .sent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sent.retain(|_, at| now.saturating_duration_since(*at) < WAKE_MEMORY);
-        sent.insert(Self::key(repository, required), now);
-    }
-
-    /// Whether a wake was sent within `within` of `now`.
-    #[must_use]
-    pub fn recent(
-        &self,
-        repository: &str,
-        required: &[Label],
-        within: Duration,
-        now: Instant,
-    ) -> bool {
-        self.sent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&Self::key(repository, required))
-            .is_some_and(|at| now.saturating_duration_since(*at) < within)
-    }
-}
 
 /// One installation, as the sweep reads it.
 pub struct Reachable {
@@ -146,12 +94,6 @@ impl Reach for GithubApp {
     }
 }
 
-/// The sweep's settings.
-#[derive(Debug, Clone, Copy)]
-pub struct SweepConfig {
-    pub interval: Duration,
-}
-
 /// What one sweep did, for its log line and for tests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
@@ -171,33 +113,28 @@ pub struct SweepReport {
 
 /// The sweep and its state.
 pub struct Sweeper {
-    config: SweepConfig,
+    interval: Duration,
     reach: Box<dyn Reach>,
     registry: Arc<Registry>,
-    wakes: Arc<WakeLog>,
     inventory_at: Option<Instant>,
 }
 
 impl Sweeper {
+    /// Sweeps every `interval`; wakes go through `registry`, whose wake log
+    /// the webhook shares.
     #[must_use]
-    pub fn new(
-        config: SweepConfig,
-        reach: Box<dyn Reach>,
-        registry: Arc<Registry>,
-        wakes: Arc<WakeLog>,
-    ) -> Self {
+    pub fn new(interval: Duration, reach: Box<dyn Reach>, registry: Arc<Registry>) -> Self {
         Self {
-            config,
+            interval,
             reach,
             registry,
-            wakes,
             inventory_at: None,
         }
     }
 
     /// Sweeps every interval, forever.
     pub async fn run(mut self) {
-        let mut ticks = tokio::time::interval(self.config.interval);
+        let mut ticks = tokio::time::interval(self.interval);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
@@ -230,7 +167,7 @@ impl Sweeper {
         }
         let installations = self.reach.installations();
         self.registry
-            .set_coverage(coverage(&installations, self.config.interval));
+            .set_coverage(coverage(&installations, self.interval));
 
         let advertised = self.registry.advertised();
         let mut report = SweepReport::default();
@@ -290,10 +227,10 @@ impl Sweeper {
                 continue;
             };
             report.queued += 1;
-            let now = Instant::now();
             if self
-                .wakes
-                .recent(&name, &required, self.config.interval, now)
+                .registry
+                .wakes()
+                .recent(&name, &required, self.interval, Instant::now())
             {
                 report.already_woken += 1;
                 continue;
@@ -301,10 +238,7 @@ impl Sweeper {
             let woken =
                 self.registry
                     .wake_for(&name, &required, WakeReason::Reconcile, SWEEP_DELIVERY);
-            if woken > 0 {
-                self.wakes.record(&name, &required, now);
-                report.wakes += u32::try_from(woken).unwrap_or(u32::MAX);
-            }
+            report.wakes += u32::try_from(woken).unwrap_or(u32::MAX);
         }
         Ok(())
     }
@@ -329,25 +263,24 @@ pub fn coverage(installations: &[Reachable], interval: Duration) -> Coverage {
 }
 
 /// The repositories of `installation` some advertised target serves.
-fn served(installation: &Reachable, advertised: &[TargetRef]) -> Vec<OwnerRepo> {
-    let mut repositories: BTreeMap<String, OwnerRepo> = BTreeMap::new();
-    for repository in &installation.repositories {
-        let name = repository.to_string();
-        if advertised.iter().any(|target| match target.scope {
-            TargetScope::Repo => target.covers(&name),
-            TargetScope::Org => target.name.eq_ignore_ascii_case(&installation.account),
-        }) {
-            repositories.insert(name.to_ascii_lowercase(), repository.clone());
-        }
-    }
-    repositories.into_values().collect()
+fn served(installation: &Reachable, advertised: &[TargetRef]) -> BTreeSet<OwnerRepo> {
+    installation
+        .repositories
+        .iter()
+        .filter(|repository| {
+            let name = repository.to_string();
+            advertised.iter().any(|target| target.covers(&name))
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use runner_manager_coordinator_protocol::{
-        Hello, HelloAck, PROTOCOL_VERSION, Profile, ServerMessage, Target, Wake,
+        Hello, HelloAck, PROTOCOL_VERSION, Profile, ServerMessage, Target, TargetScope, Wake,
     };
+    use runner_manager_domain::model::Label;
     use runner_manager_domain::policy::RunsOn;
     use runner_manager_testkit::github::FakeGithub;
     use tokio::sync::mpsc;
@@ -386,7 +319,7 @@ mod tests {
     }
 
     fn job(labels: &[&str]) -> RunsOn {
-        RunsOn::from_job_labels(labels.iter().map(ToString::to_string))
+        runner_manager_testkit::fixtures::queued_job(labels)
     }
 
     fn host(
@@ -450,15 +383,12 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let mut repo_host = host(&registry, "repo-host", TargetScope::Repo, "octo/app");
         let mut org_host = host(&registry, "org-host", TargetScope::Org, "octo");
-        let wakes = Arc::new(WakeLog::default());
         // The webhook already woke the hosts for octo/app's linux job.
         let linux = required(&["self-hosted", "linux"]);
-        wakes.record("Octo/App", &linux, Instant::now());
+        registry.wakes().record("Octo/App", &linux, Instant::now());
 
         let mut sweeper = Sweeper::new(
-            SweepConfig {
-                interval: Duration::from_secs(120),
-            },
+            Duration::from_secs(120),
             Box::new(Fixed(vec![(
                 1,
                 "octo",
@@ -467,7 +397,6 @@ mod tests {
                 Arc::clone(&fake),
             )])),
             Arc::clone(&registry),
-            Arc::clone(&wakes),
         );
         let report = sweeper.sweep_once().await;
         assert_eq!(report.repositories, 3, "the org host serves all three");
@@ -513,7 +442,7 @@ mod tests {
 
     #[test]
     fn the_wake_log_forgets_after_the_interval() {
-        let log = WakeLog::default();
+        let log = crate::registry::WakeLog::default();
         let start = Instant::now();
         let linux = required(&["linux"]);
         log.record("a/b", &linux, start);

@@ -18,7 +18,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use runner_manager_coordinator::github_app::{AppKey, GithubApp};
 use runner_manager_coordinator::registry::{Outbound, Registry};
-use runner_manager_coordinator::sweep::{SweepConfig, Sweeper, WakeLog};
+use runner_manager_coordinator::sweep::Sweeper;
 use runner_manager_coordinator_protocol::{Hello, PROTOCOL_VERSION, Profile, Target, TargetScope};
 use runner_manager_domain::model::SystemClock;
 use runner_manager_github::Endpoints;
@@ -260,14 +260,7 @@ pub fn host(registry: &Registry) -> mpsc::Receiver<Outbound> {
 }
 
 pub fn sweeper(app: GithubApp, registry: &Arc<Registry>) -> Sweeper {
-    Sweeper::new(
-        SweepConfig {
-            interval: Duration::from_secs(30),
-        },
-        Box::new(app),
-        Arc::clone(registry),
-        Arc::new(WakeLog::default()),
-    )
+    Sweeper::new(Duration::from_secs(30), Box::new(app), Arc::clone(registry))
 }
 
 /// Requests the fake received for `at`, and how many carried

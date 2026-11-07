@@ -34,10 +34,9 @@ use tokio::sync::mpsc;
 
 use crate::registry::{OUTBOUND_QUEUE, Outbound, Registry};
 use crate::store::{EnrollError, Store};
-use crate::sweep::WakeLog;
 use crate::webhook::{
-    DELIVERY_MEMORY, DeliveryLog, MAX_BODY_BYTES, WorkflowJobEvent, action_name, required_labels,
-    signature_valid, valid_delivery_id,
+    DELIVERY_MEMORY, DeliveryLog, MAX_BODY_BYTES, WorkflowJobEvent, action_name, signature_valid,
+    valid_delivery_id,
 };
 
 /// Largest enrollment request body.
@@ -86,9 +85,6 @@ pub struct AppState {
     pub config: Config,
     pub store: Mutex<Store>,
     pub registry: Arc<Registry>,
-    /// Wakes sent, shared with the reconciliation sweep so it does not
-    /// repeat one the webhook just sent.
-    pub wakes: Arc<WakeLog>,
     deliveries: Mutex<DeliveryLog>,
     limiter: RateLimiter,
 }
@@ -101,7 +97,6 @@ impl AppState {
             config,
             store: Mutex::new(store),
             registry: Arc::new(Registry::default()),
-            wakes: Arc::new(WakeLog::default()),
             deliveries: Mutex::new(DeliveryLog::new(DELIVERY_MEMORY)),
         })
     }
@@ -202,19 +197,11 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             };
             let action = action_name(&job.action);
             if action == "queued" {
-                let repository = &job.repository.full_name;
-                let woken = required_labels(&job.workflow_job.labels).map_or(0, |required| {
-                    let woken = state.registry.wake_for(
-                        repository,
-                        &required,
-                        runner_manager_coordinator_protocol::WakeReason::JobQueued,
-                        delivery,
-                    );
-                    if woken > 0 {
-                        state.wakes.record(repository, &required, Instant::now());
-                    }
-                    woken
-                });
+                let woken = state.registry.wake_for_job(
+                    &job.repository.full_name,
+                    &job.workflow_job.labels,
+                    delivery,
+                );
                 tracing::info!(
                     %delivery,
                     job_id = job.workflow_job.id,
@@ -376,7 +363,6 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         .await;
         return;
     }
-    let version = protocol_version;
     // Unknown, revoked and wrong-key look the same from outside.
     let record = state.store().active_host(&host_id).ok().flatten();
     let verified = record.as_ref().is_some_and(|record| {
@@ -391,7 +377,7 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
     };
     let host_id = record.id;
     let welcome = ServerMessage::Welcome {
-        protocol_version: version,
+        protocol_version,
         heartbeat_interval_secs: u32::try_from(state.config.heartbeat_interval.as_secs())
             .unwrap_or(u32::MAX),
     };
@@ -399,14 +385,14 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
     let (sender, receiver) = mpsc::channel(OUTBOUND_QUEUE);
-    let connection = state.registry.register(&host_id, version, sender);
-    tracing::info!(%host_id, version, "a host connected");
+    let connection = state.registry.register(&host_id, protocol_version, sender);
+    tracing::info!(%host_id, version = protocol_version, "a host connected");
     let _ = state.store().touch(&host_id, Utc::now());
     serve_host(
         &mut socket,
         &state,
         &host_id,
-        (connection, version),
+        (connection, protocol_version),
         receiver,
     )
     .await;

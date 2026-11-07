@@ -1547,7 +1547,17 @@ impl AuthenticatedClient {
     /// tokens, which last an hour. Keeping the client (rather than building a
     /// new one per token) keeps its conditional cache and rate-limit state.
     /// Returns whether the credential changed.
-    pub fn replace_credential(&self, fresh: UserAccessToken) -> bool {
+    ///
+    /// Taken under the same gate as a `401`'s renewal, so the two never race.
+    pub async fn replace_credential(&self, fresh: UserAccessToken) -> bool {
+        let _gate = self.revalidation_gate.lock().await;
+        self.swap_in(fresh)
+    }
+
+    /// Installs `fresh` unless it is the credential already held, and bumps
+    /// the generation a queued `401` retry checks. The caller holds
+    /// `revalidation_gate`.
+    fn swap_in(&self, fresh: UserAccessToken) -> bool {
         {
             let mut guard = self
                 .credential
@@ -1601,17 +1611,9 @@ impl AuthenticatedClient {
         let Some(fresh) = produce(self).await else {
             return false;
         };
-        {
-            let mut guard = self
-                .credential
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.secret().expose_secret() == fresh.secret().expose_secret() {
-                return false;
-            }
-            *guard = fresh;
+        if !self.swap_in(fresh) {
+            return false;
         }
-        self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
         tracing::info!("{note}");
         true
     }

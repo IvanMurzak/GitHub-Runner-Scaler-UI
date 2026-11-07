@@ -337,7 +337,7 @@ async fn run_generation(
         }
         Err(error) => {
             tracing::warn!(%error, "the poll intervals could not be read; using the defaults");
-            super::polling::Intervals::with_default_idle(host.refresh_interval)
+            super::polling::Intervals::with_defaults(host.refresh_interval)
         }
     };
     let demand_gateway = Arc::new(RestDemand::new(Arc::clone(&client), Arc::clone(&clock)));
@@ -2068,15 +2068,15 @@ trait TargetReconciler: Send + 'static {
         None
     }
 
-    /// The link's view, for this target's poll mode, and the interval a
-    /// `coordinated` target is polled at. `None` where no link is wired.
-    fn coordination(
-        &self,
-    ) -> Option<(
-        tokio::sync::watch::Receiver<super::coordinator::LinkView>,
-        Duration,
-    )> {
+    /// The link's view, for this target's poll mode. `None` where no link
+    /// is wired.
+    fn coordination(&self) -> Option<tokio::sync::watch::Receiver<super::coordinator::LinkView>> {
         None
+    }
+
+    /// The interval a `coordinated` target is polled at.
+    fn coordinated_interval(&self) -> Duration {
+        runner_manager_domain::model::CoordinatedPollInterval::default().as_duration()
     }
 
     fn active_owned(&self, report: &ReconcileReport) -> Option<u16> {
@@ -2137,16 +2137,12 @@ impl TargetReconciler for ManagedTarget {
         Some(Arc::clone(&self.wake))
     }
 
-    fn coordination(
-        &self,
-    ) -> Option<(
-        tokio::sync::watch::Receiver<super::coordinator::LinkView>,
-        Duration,
-    )> {
-        Some((
-            self.coordination.clone(),
-            self.polling.intervals().coordinated.as_duration(),
-        ))
+    fn coordination(&self) -> Option<tokio::sync::watch::Receiver<super::coordinator::LinkView>> {
+        Some(self.coordination.clone())
+    }
+
+    fn coordinated_interval(&self) -> Duration {
+        self.polling.intervals().coordinated.as_duration()
     }
 
     fn policies(&self) -> &[ScalePolicy] {
@@ -2343,7 +2339,11 @@ async fn run_target_loop<T: TargetReconciler>(
         target.begin_drain();
     }
     let wake = target.wake();
-    let mut coordination = target.coordination().map(|(view, _)| view);
+    let mut coordination = target.coordination();
+    let target_name = target
+        .policies()
+        .first()
+        .map(|policy| policy.target.clone());
     loop {
         if drain_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             // Whatever is still running is startup recovery's to adopt.
@@ -2417,14 +2417,9 @@ async fn run_target_loop<T: TargetReconciler>(
         // interval. Never while draining, and never while this host runs a
         // runner for the target: a finished job frees a slot that queued work
         // the coordinator already announced may need now.
-        let stretched = target
-            .coordination()
-            .filter(|_| draining.is_none() && target.local_active() == Some(0))
-            .map(|(_, interval)| slept_at + delay.max(interval));
-        let target_name = target
-            .policies()
-            .first()
-            .map(|policy| policy.target.clone());
+        let stretched =
+            (coordination.is_some() && draining.is_none() && target.local_active() == Some(0))
+                .then(|| slept_at + delay.max(target.coordinated_interval()));
         // A coordinator's wake brings the next poll forward -- never while
         // draining, never while the schedule is a slowdown GitHub asked for
         // (rate limited, stretched, offline...), and never sooner than
@@ -3067,10 +3062,7 @@ mod tests {
         wake: Option<Arc<tokio::sync::Notify>>,
         /// The link's view and the coordinated interval, when a test wires
         /// one.
-        coordination: Option<(
-            tokio::sync::watch::Receiver<super::super::coordinator::LinkView>,
-            Duration,
-        )>,
+        coordination: Option<tokio::sync::watch::Receiver<super::super::coordinator::LinkView>>,
     }
 
     impl FakeTarget {
@@ -3178,10 +3170,7 @@ mod tests {
 
         fn coordination(
             &self,
-        ) -> Option<(
-            tokio::sync::watch::Receiver<super::super::coordinator::LinkView>,
-            Duration,
-        )> {
+        ) -> Option<tokio::sync::watch::Receiver<super::super::coordinator::LinkView>> {
             self.coordination.clone()
         }
     }
@@ -3918,7 +3907,7 @@ mod tests {
         let name = policy.target.clone();
         let (mut target, calls) = FakeTarget::repeating(policy, report);
         let (link, view) = tokio::sync::watch::channel(LinkView::default());
-        target.coordination = Some((view, Duration::from_secs(300)));
+        target.coordination = Some(view);
         let (stop, _) = tokio::sync::watch::channel(false);
         let daemon = tokio::spawn(run_target_loop(
             target,
@@ -4029,7 +4018,7 @@ mod tests {
                 }],
             }),
         });
-        target.coordination = Some((view, Duration::from_secs(300)));
+        target.coordination = Some(view);
         let (stop, _) = tokio::sync::watch::channel(false);
         let daemon = tokio::spawn(run_target_loop(
             target,

@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use runner_manager_coordinator_protocol::{
     CLOSE_REPLACED, HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, ServerMessage, Target,
@@ -85,6 +85,64 @@ pub struct Registry {
     hosts: Mutex<HashMap<String, Connected>>,
     next: AtomicU64,
     coverage: Mutex<Coverage>,
+    /// Every wake sent, by the webhook or the sweep, so the sweep does not
+    /// repeat one.
+    wakes: WakeLog,
+}
+
+/// When a wake was last sent for a repository and a set of required labels,
+/// by the webhook or by the sweep.
+///
+/// A job is identified by what decides which hosts it wakes: its repository
+/// and its required labels. Two queued jobs with the same labels in the same
+/// repository wake the same hosts, and one poll answers both.
+#[derive(Debug, Default)]
+pub struct WakeLog {
+    sent: Mutex<HashMap<(String, BTreeSet<Label>), Instant>>,
+}
+
+/// Wake log entries kept at most this long, once the log is pruned.
+const WAKE_MEMORY: Duration = Duration::from_secs(60 * 60);
+
+/// Entries at which the log is pruned.
+const WAKE_PRUNE_AT: usize = 1024;
+
+impl WakeLog {
+    fn key(repository: &str, required: &[Label]) -> (String, BTreeSet<Label>) {
+        (
+            repository.to_ascii_lowercase(),
+            required.iter().cloned().collect(),
+        )
+    }
+
+    /// Records a wake sent now.
+    pub fn record(&self, repository: &str, required: &[Label], now: Instant) {
+        let mut sent = self
+            .sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Pruned only once the map has grown, not on every wake.
+        if sent.len() >= WAKE_PRUNE_AT {
+            sent.retain(|_, at| now.saturating_duration_since(*at) < WAKE_MEMORY);
+        }
+        sent.insert(Self::key(repository, required), now);
+    }
+
+    /// Whether a wake was sent within `within` of `now`.
+    #[must_use]
+    pub fn recent(
+        &self,
+        repository: &str,
+        required: &[Label],
+        within: Duration,
+        now: Instant,
+    ) -> bool {
+        self.sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&Self::key(repository, required))
+            .is_some_and(|at| now.saturating_duration_since(*at) < within)
+    }
 }
 
 /// A connected host, as `hosts list` would describe it.
@@ -160,13 +218,25 @@ impl Registry {
             .clone()
     }
 
+    /// The wakes sent recently.
+    #[must_use]
+    pub const fn wakes(&self) -> &WakeLog {
+        &self.wakes
+    }
+
     /// Replaces the sweep's coverage and tells every version-2 host whose
     /// answer changed.
     pub fn set_coverage(&self, coverage: Coverage) {
-        *self
-            .coverage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = coverage.clone();
+        {
+            let mut current = self
+                .coverage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *current == coverage {
+                return;
+            }
+            current.clone_from(&coverage);
+        }
         for (host_id, connected) in self.lock().iter_mut() {
             acknowledge(host_id, connected, &coverage);
         }
@@ -175,19 +245,13 @@ impl Registry {
     /// Every target some connected host advertised, once each.
     #[must_use]
     pub fn advertised(&self) -> Vec<TargetRef> {
-        let mut targets: Vec<TargetRef> = Vec::new();
-        for connected in self.lock().values() {
-            for target in connected.hello.iter().flat_map(|hello| &hello.targets) {
-                let reference = target.reference();
-                if !targets.iter().any(|known| {
-                    known.scope == reference.scope
-                        && known.name.eq_ignore_ascii_case(&reference.name)
-                }) {
-                    targets.push(reference);
-                }
-            }
-        }
-        targets
+        let mut seen = BTreeSet::new();
+        self.lock()
+            .values()
+            .flat_map(|connected| connected.hello.iter().flat_map(|hello| &hello.targets))
+            .map(Target::reference)
+            .filter(|target| seen.insert((target.scope, target.name.to_ascii_lowercase())))
+            .collect()
     }
 
     pub fn set_heartbeat(&self, host_id: &str, connection: u64, heartbeat: Heartbeat) {
@@ -224,6 +288,7 @@ impl Registry {
     }
 
     /// [`Self::wake_for_job`] for a job whose required labels are resolved.
+    /// A wake that reached a host is recorded in [`Self::wakes`].
     pub fn wake_for(
         &self,
         repository: &str,
@@ -256,6 +321,10 @@ impl Registry {
                     tracing::warn!(%host_id, "a host's outbound queue is full; its wake was dropped");
                 }
             }
+        }
+        drop(hosts);
+        if woken > 0 {
+            self.wakes.record(repository, required, Instant::now());
         }
         woken
     }

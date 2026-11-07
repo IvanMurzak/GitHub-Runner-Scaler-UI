@@ -126,7 +126,7 @@ impl Intervals {
     /// `active`, with the default idle and coordinated intervals: what a
     /// reader that could not read `polling.toml` falls back to.
     #[must_use]
-    pub fn with_default_idle(active: RefreshInterval) -> Self {
+    pub fn with_defaults(active: RefreshInterval) -> Self {
         Self {
             active,
             idle: IdlePollInterval::default(),
@@ -180,10 +180,7 @@ pub fn configured(
             },
             None,
         ),
-        Err(error) => (
-            Intervals::with_default_idle(active),
-            Some(error.to_string()),
-        ),
+        Err(error) => (Intervals::with_defaults(active), Some(error.to_string())),
     })
 }
 
@@ -287,9 +284,9 @@ pub fn set_poll_interval(
 
     // An unreadable file is rewritten even when the value is unchanged: that
     // is how this command repairs it.
-    let idle_written =
+    let settings_written =
         idle != before.idle || coordinated != before.coordinated || unreadable.is_some();
-    if idle_written {
+    if settings_written {
         settings::set_intervals(context.paths(), idle, coordinated).map_err(|source| {
             CliError::new(
                 Failure::LocalState,
@@ -309,7 +306,7 @@ pub fn set_poll_interval(
                 Failure::LocalState,
                 format!(
                     "cannot store the active poll interval: {error}{}",
-                    if idle_written {
+                    if settings_written {
                         format!(
                             "; the idle and coordinated intervals were already stored as {idle} \
                              and {coordinated}"
@@ -916,12 +913,12 @@ mod tests {
 
     #[test]
     fn idle_load_is_two_listings_per_repository_per_idle_interval() {
-        let intervals = Intervals::with_default_idle(RefreshInterval::default());
+        let intervals = Intervals::with_defaults(RefreshInterval::default());
         // The owner's IVANPC: ten repository targets at 10 s.
         assert_eq!(intervals.idle_requests_per_minute(10), 120);
         let clamped = Intervals {
             idle: IdlePollInterval::from_secs(60).expect("valid"),
-            ..Intervals::with_default_idle(RefreshInterval::from_secs(30).expect("the floor"))
+            ..Intervals::with_defaults(RefreshInterval::from_secs(30).expect("the floor"))
         };
         assert_eq!(clamped.effective_idle(), Duration::from_secs(30));
     }

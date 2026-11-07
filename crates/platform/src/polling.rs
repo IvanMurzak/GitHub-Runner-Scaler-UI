@@ -69,15 +69,6 @@ pub fn idle_interval(paths: &AppPaths) -> Result<IdlePollInterval, ServiceError>
     intervals(paths).map(|(idle, _)| idle)
 }
 
-/// The configured coordinated interval, or the default when none was set.
-///
-/// # Errors
-/// As [`idle_interval`], and for a coordinated value under
-/// [`CoordinatedPollInterval::MIN_SECS`].
-pub fn coordinated_interval(paths: &AppPaths) -> Result<CoordinatedPollInterval, ServiceError> {
-    intervals(paths).map(|(_, coordinated)| coordinated)
-}
-
 /// Both intervals the file holds.
 ///
 /// # Errors
@@ -108,7 +99,9 @@ pub fn intervals(
 /// # Errors
 /// [`ServiceError::Record`] when `config/` cannot be written.
 pub fn set_idle_interval(paths: &AppPaths, idle: IdlePollInterval) -> Result<(), ServiceError> {
-    let coordinated = coordinated_interval(paths).unwrap_or_default();
+    let coordinated = intervals(paths)
+        .map(|(_, coordinated)| coordinated)
+        .unwrap_or_default();
     set_intervals(paths, idle, coordinated)
 }
 
@@ -284,6 +277,7 @@ mod tests {
     #[test]
     fn the_coordinated_interval_round_trips_beside_the_idle_one() {
         let (_dir, paths) = paths();
+        let coordinated_interval = |paths: &AppPaths| intervals(paths).map(|(_, c)| c);
         assert_eq!(
             coordinated_interval(&paths).expect("a default"),
             CoordinatedPollInterval::default()

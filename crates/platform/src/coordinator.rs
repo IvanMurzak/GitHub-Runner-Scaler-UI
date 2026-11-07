@@ -108,8 +108,8 @@ pub struct LinkRecord {
     /// How often the coordinator's reconciliation sweep runs, as its last
     /// `hello_ack` said; `None` when it runs none or never said.
     pub reconcile_interval_secs: Option<u32>,
-    /// The targets that sweep covers, as `ScaleTarget::slug` writes them
-    /// (`owner/repo`, or an organization's login).
+    /// The targets that sweep covers, scope included: `repo:owner/name` or
+    /// `org:login`.
     pub covered: Vec<String>,
 }
 

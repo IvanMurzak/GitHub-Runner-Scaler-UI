@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use runner_manager_coordinator::github_app::{AppKey, GithubApp};
 use runner_manager_coordinator::server::{AppState, Config, serve};
 use runner_manager_coordinator::store::{HostRecord, Store};
-use runner_manager_coordinator::sweep::{self, SweepConfig, Sweeper};
+use runner_manager_coordinator::sweep::{self, Sweeper};
 use runner_manager_coordinator_protocol::CoordinatorUrl;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
@@ -217,12 +217,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     );
                     tokio::spawn(
                         Sweeper::new(
-                            SweepConfig {
-                                interval: reconcile_interval,
-                            },
+                            reconcile_interval,
                             Box::new(app),
                             Arc::clone(&state.registry),
-                            Arc::clone(&state.wakes),
                         )
                         .run(),
                     );
