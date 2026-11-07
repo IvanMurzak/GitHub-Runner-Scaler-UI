@@ -772,13 +772,7 @@ fn pool_labels_follow_the_host_os_and_belong_to_one_profile_per_target() {
             policy.target.slug() == "octo/one" && policy.profile_name().as_str() == "default"
         })
         .unwrap();
-    assert_eq!(
-        default
-            .routing_labels()
-            .and_then(|labels| labels.pool_label()),
-        None,
-        "nothing was changed"
-    );
+    assert_eq!(default.pool_label(), None, "nothing was changed");
 
     // An organization target has its own pool profile.
     let org = run_command(&["org", "set-pool", "octo", "--pool", "on"]);

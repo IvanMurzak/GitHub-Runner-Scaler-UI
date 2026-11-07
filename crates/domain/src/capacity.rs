@@ -244,17 +244,7 @@ impl<'a> HostAllocator<'a> {
             .attempts
             .iter()
             .filter(|attempt| attempt.policy_id == policy.id)
-            .filter(|attempt| {
-                matches!(
-                    attempt.state(),
-                    crate::attempt::AttemptState::Allocated
-                        | crate::attempt::AttemptState::Preparing
-                        | crate::attempt::AttemptState::Prepared
-                        | crate::attempt::AttemptState::JitReceived
-                        | crate::attempt::AttemptState::Starting
-                        | crate::attempt::AttemptState::Idle
-                )
-            })
+            .filter(|attempt| attempt.state().is_unassigned())
             .count()
             .min(usize::from(u16::MAX)) as u16;
         let target =

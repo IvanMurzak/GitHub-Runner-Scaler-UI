@@ -306,6 +306,21 @@ impl AttemptState {
         !self.is_terminal()
     }
 
+    /// A runner that holds a slot and is still waiting for a job: the supply
+    /// `HostAllocator` subtracts from demand.
+    #[must_use]
+    pub const fn is_unassigned(self) -> bool {
+        matches!(
+            self,
+            AttemptState::Allocated
+                | AttemptState::Preparing
+                | AttemptState::Prepared
+                | AttemptState::JitReceived
+                | AttemptState::Starting
+                | AttemptState::Idle
+        )
+    }
+
     /// The three terminal states that require an outcome before `cleaned`.
     #[must_use]
     pub const fn is_concluded(self) -> bool {

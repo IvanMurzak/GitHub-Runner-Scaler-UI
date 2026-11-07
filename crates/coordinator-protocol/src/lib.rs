@@ -137,6 +137,13 @@ pub struct TargetRef {
 }
 
 impl TargetRef {
+    /// Whether `other` names the same target: same scope, and the name
+    /// compared the way GitHub compares names, case-insensitively.
+    #[must_use]
+    pub fn same_as(&self, other: &Self) -> bool {
+        self.scope == other.scope && self.name.eq_ignore_ascii_case(&other.name)
+    }
+
     /// Whether this target covers `repository` (`owner/name`), compared the
     /// way GitHub compares names: case-insensitively.
     #[must_use]
@@ -280,9 +287,7 @@ impl HelloAck {
     #[must_use]
     pub fn covers(&self, target: &TargetRef) -> bool {
         self.reconcile_interval_secs.is_some()
-            && self.covered.iter().any(|covered| {
-                covered.scope == target.scope && covered.name.eq_ignore_ascii_case(&target.name)
-            })
+            && self.covered.iter().any(|covered| covered.same_as(target))
     }
 }
 

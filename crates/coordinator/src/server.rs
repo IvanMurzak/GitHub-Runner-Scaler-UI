@@ -26,13 +26,13 @@ use chrono::Utc;
 use runner_manager_coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CONNECT_PATH, ENROLL_PATH, EnrollRequest,
     EnrollResponse, HEALTH_PATH, HostMessage, LAUNCH_VERSION, MAX_MESSAGE_BYTES,
-    MIN_PROTOCOL_VERSION, NONCE_LEN, PROTOCOL_VERSION, ServerMessage, WEBHOOK_PATH,
+    MIN_PROTOCOL_VERSION, NONCE_LEN, PROTOCOL_VERSION, ServerMessage, WEBHOOK_PATH, WakeReason,
     decode_public_key, encode_nonce, supported, verify_challenge,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use tokio::sync::mpsc;
 
-use crate::placement::{CLAIM_GRACE, JobKey, Placement};
+use crate::placement::{CLAIM_GRACE, Placement};
 use crate::registry::{OUTBOUND_QUEUE, Outbound, Registry};
 use crate::store::{EnrollError, Store};
 use crate::webhook::{
@@ -60,8 +60,7 @@ pub struct Config {
     pub auth_timeout: Duration,
     /// How often the server checks whether the admin CLI wrote to the
     /// database (SQLite's `data_version`, no query), and if so closes the
-    /// connections of revoked hosts. Also how often a connection checks that
-    /// its host is still heard from.
+    /// connections of revoked hosts.
     pub revocation_check: Duration,
     /// Connection and enrollment attempts allowed per client address per
     /// minute.
@@ -119,26 +118,6 @@ impl AppState {
         let record = self.store().revoke(host, Utc::now())?;
         close_revoked(self);
         Ok(record)
-    }
-
-    /// Rebalances `key` after `delay`, off the caller's task.
-    fn rebalance_later(&self, key: JobKey, delay: Duration) {
-        let placement = Arc::clone(&self.placement);
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            placement.rebalance(&key).await;
-        });
-    }
-
-    /// Retries every unplaced pool job, off the caller's task: a slot was
-    /// freed somewhere.
-    fn retry_placement(&self) {
-        let placement = Arc::clone(&self.placement);
-        tokio::spawn(async move {
-            for key in placement.expire(Instant::now()) {
-                placement.rebalance(&key).await;
-            }
-        });
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
@@ -285,17 +264,18 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             let required = required_labels(&job.workflow_job.labels);
             let repository = &job.repository.full_name;
             if action == "queued" {
-                let woken =
+                let woken = required.as_ref().map_or(0, |required| {
                     state
                         .registry
-                        .wake_for_job(repository, &job.workflow_job.labels, delivery);
+                        .wake_for(repository, required, WakeReason::JobQueued, delivery)
+                });
                 let placed = required
                     .and_then(|required| {
                         state
                             .placement
                             .queued(repository, &required, job.workflow_job.id)
                     })
-                    .map(|key| state.rebalance_later(key, Duration::ZERO))
+                    .map(|key| state.placement.spawn_rebalance(key, Duration::ZERO))
                     .is_some();
                 tracing::info!(
                     %delivery,
@@ -316,7 +296,7 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                             .dequeued(repository, &required, job.workflow_job.id)
                     })
                 {
-                    state.rebalance_later(key, CLAIM_GRACE);
+                    state.placement.spawn_rebalance(key, CLAIM_GRACE);
                 }
                 // Recorded for later stages (statistics, lease confirmation).
                 tracing::info!(
@@ -528,7 +508,7 @@ async fn serve_host(
     let mut last_heard = Instant::now();
     // `connection` touched the record just before this.
     let mut last_touched = Instant::now();
-    let mut checks = tokio::time::interval(state.config.revocation_check);
+    let mut checks = tokio::time::interval(state.config.heartbeat_interval);
     checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -574,7 +554,7 @@ async fn serve_host(
                     }
                     Ok(HostMessage::AttemptFinished(finished)) if version >= LAUNCH_VERSION => {
                         state.placement.attempt_finished(host_id, &finished);
-                        state.retry_placement();
+                        state.placement.spawn_retry_all();
                     }
                     // A second `auth`, a message its version does not have, a
                     // newer message type, or garbage: skipped.

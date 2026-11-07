@@ -276,10 +276,7 @@ impl Sweeper {
         }
         if let Some(placement) = &self.placement {
             for key in placement.swept(&name, &pool) {
-                let placement = Arc::clone(placement);
-                tokio::spawn(async move {
-                    placement.rebalance(&key).await;
-                });
+                placement.spawn_rebalance(key, Duration::ZERO);
             }
         }
         Ok(())

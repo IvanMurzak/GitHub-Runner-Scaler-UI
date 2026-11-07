@@ -12,12 +12,12 @@ use runner_manager_agent::lifecycle::{
 use runner_manager_domain::attempt::active_count_for;
 use runner_manager_domain::execution::ExecutionPolicy;
 use runner_manager_domain::model::{
-    CachePolicy, Host, HostLabel, Label, PolicyId, ProfileName, RefreshInterval, ScaleTarget,
+    CachePolicy, Host, HostLabel, Label, Os, PolicyId, ProfileName, RefreshInterval, ScaleTarget,
     TargetScope,
 };
 use runner_manager_domain::policy::{
     NamedProfileSpec, PolicyMode, PolicyState, RoutingLabels, ScalePolicy, check_pool_label,
-    is_pool_label, pool_label,
+    pool_label,
 };
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::WorkspaceKind;
@@ -483,31 +483,13 @@ fn record_named_policy(
 /// # Errors
 /// A mismatched pool label, or another profile of the target carrying it.
 pub fn check_pool_labels(store: &dyn Store, policy: &ScalePolicy) -> Result<(), CliError> {
-    let Some(labels) = policy.routing_labels() else {
+    let (Some(labels), Some(pool)) = (policy.routing_labels(), policy.pool_label()) else {
         return Ok(());
     };
-    if !labels
-        .additional()
-        .any(|label| is_pool_label(label.as_str()))
-    {
-        return Ok(());
-    }
-    let os = store
-        .host(policy.host_id)
-        .map_err(store_failure)?
-        .ok_or_else(|| {
-            CliError::new(
-                Failure::LocalState,
-                "the policy refers to a missing local host",
-            )
-        })?
-        .os;
+    let os = host_os(store, policy)?;
     for label in labels.additional() {
         check_pool_label(label, os).map_err(invalid)?;
     }
-    let Some(pool) = labels.pool_label() else {
-        return Ok(());
-    };
     let sibling = store
         .policies()
         .map_err(store_failure)?
@@ -535,6 +517,20 @@ pub fn check_pool_labels(store: &dyn Store, policy: &ScalePolicy) -> Result<(), 
     Ok(())
 }
 
+/// The operating system of the host `policy` belongs to.
+fn host_os(store: &dyn Store, policy: &ScalePolicy) -> Result<Os, CliError> {
+    Ok(store
+        .host(policy.host_id)
+        .map_err(store_failure)?
+        .ok_or_else(|| {
+            CliError::new(
+                Failure::LocalState,
+                "the policy refers to a missing local host",
+            )
+        })?
+        .os)
+}
+
 fn pool_remedy(target: &ScaleTarget, profile: &str) -> String {
     match target.scope() {
         TargetScope::Repository => {
@@ -557,16 +553,7 @@ pub fn set_pool_selected(
 ) -> Result<(), CliError> {
     let store = context.store()?;
     let policy = find_policy_selected(&store, target, profile)?;
-    let os = store
-        .host(policy.host_id)
-        .map_err(store_failure)?
-        .ok_or_else(|| {
-            CliError::new(
-                Failure::LocalState,
-                "the policy refers to a missing local host",
-            )
-        })?
-        .os;
+    let os = host_os(&store, &policy)?;
     drop(store);
     let label = pool_label(os).as_str().to_string();
     mutate_labels_selected(

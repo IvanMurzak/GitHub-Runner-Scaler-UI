@@ -677,22 +677,19 @@ impl WakeRoutes {
 
     /// Runs `target`'s next pass as soon as a wake may: a launch was
     /// accepted for it. The shared reading is kept; the pass needs none.
-    pub fn nudge(&self, target: &TargetRef) -> bool {
-        let Some(route) = self
+    pub fn nudge(&self, target: &TargetRef) {
+        if let Some(route) = self
             .routes
             .iter()
             .find(|route| same_target(&route.target, target))
-        else {
-            return false;
-        };
-        route.notify.notify_one();
-        true
+        {
+            route.notify.notify_one();
+        }
     }
 }
 
-fn same_target(local: &ScaleTarget, remote: &TargetRef) -> bool {
-    let local = target_ref(local);
-    local.scope == remote.scope && local.name.eq_ignore_ascii_case(&remote.name)
+pub(super) fn same_target(local: &ScaleTarget, remote: &TargetRef) -> bool {
+    target_ref(local).same_as(remote)
 }
 
 pub(super) fn target_ref(target: &ScaleTarget) -> TargetRef {

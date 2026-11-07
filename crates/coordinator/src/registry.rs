@@ -43,6 +43,14 @@ struct Connected {
     acked: Option<HelloAck>,
 }
 
+impl Connected {
+    /// Whether this host's pool profiles on `target` are in launch mode: the
+    /// one rule that decides between a `launch` and a wake.
+    fn launch_mode(&self, coverage: &Coverage, target: &TargetRef) -> bool {
+        self.version >= LAUNCH_VERSION && coverage.covers(target)
+    }
+}
+
 /// What the reconciliation sweep reads: repositories by name, and the
 /// accounts whose every repository it reads (an installation with
 /// `repository_selection: all`). Names are lower-cased.
@@ -257,15 +265,12 @@ impl Registry {
         let hosts = self.lock();
         let mut candidates = Vec::new();
         for (host_id, connected) in hosts.iter() {
-            if connected.version < LAUNCH_VERSION {
-                continue;
-            }
             let (Some(hello), Some(heartbeat)) = (&connected.hello, &connected.heartbeat) else {
                 continue;
             };
             for target in &hello.targets {
                 let reference = target.reference();
-                if !reference.covers(repository) || !coverage.covers(&reference) {
+                if !reference.covers(repository) || !connected.launch_mode(&coverage, &reference) {
                     continue;
                 }
                 if let Some(profile) = target.profiles.iter().find(|profile| {
@@ -404,7 +409,7 @@ impl Registry {
             };
             // A pool job reaches a host in launch mode as a `launch` to one
             // of them (see `crate::placement`), never as a wake to all.
-            if pool && connected.version >= LAUNCH_VERSION && coverage.covers(&target) {
+            if pool && connected.launch_mode(&coverage, &target) {
                 continue;
             }
             let wake = Wake {

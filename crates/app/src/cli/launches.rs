@@ -39,9 +39,8 @@ use std::time::Duration;
 use runner_manager_agent::reconcile::DemandDirector;
 use runner_manager_coordinator_protocol::{
     AttemptFinished, AttemptOutcomeKind, AttemptStarted, Launch, LaunchAck, RefusalReason,
-    TargetRef,
 };
-use runner_manager_domain::attempt::{AttemptOutcome, AttemptState, RunnerAttempt};
+use runner_manager_domain::attempt::{AttemptOutcome, RunnerAttempt};
 use runner_manager_domain::capacity::{HostAllocator, LimitingFactor};
 use runner_manager_domain::model::{AttemptId, Host, PolicyId};
 use runner_manager_domain::policy::ScalePolicy;
@@ -49,7 +48,7 @@ use runner_manager_domain::store::Store;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use super::coordinator::{LinkView, target_ref};
+use super::coordinator::{LinkView, same_target, target_ref};
 
 /// Lease ids remembered so a repeat is refused.
 const SEEN_MEMORY: usize = 1024;
@@ -100,20 +99,6 @@ impl Book {
     }
 }
 
-/// Whether an attempt is a runner still waiting for a job: what
-/// `HostAllocator` counts as unassigned supply.
-const fn unassigned(state: AttemptState) -> bool {
-    matches!(
-        state,
-        AttemptState::Allocated
-            | AttemptState::Preparing
-            | AttemptState::Prepared
-            | AttemptState::JitReceived
-            | AttemptState::Starting
-            | AttemptState::Idle
-    )
-}
-
 /// The host's launches, shared by the link (which accepts and cancels them)
 /// and every target loop (whose passes start their runners).
 #[derive(Debug)]
@@ -146,10 +131,7 @@ impl Launches {
     #[must_use]
     pub fn is_directed(&self, policy: &ScalePolicy) -> bool {
         policy.is_owned_by(self.host.id)
-            && policy
-                .routing_labels()
-                .and_then(|labels| labels.pool_label())
-                .is_some()
+            && policy.pool_label().is_some()
             && self
                 .view
                 .borrow()
@@ -171,22 +153,28 @@ impl Launches {
     /// Closes every open launch that expired, and every one whose runner is
     /// no longer waiting for a job.
     fn settle(&self, now: Instant) {
-        let mut book = self.book();
-        let started: Vec<(String, AttemptId)> = book
+        let started: Vec<(String, AttemptId)> = self
+            .book()
             .open
             .iter()
             .filter_map(|(id, open)| open.attempt.map(|attempt| (id.clone(), attempt)))
             .collect();
-        for (lease_id, attempt) in started {
-            let waiting = self
-                .store
-                .attempt(attempt)
-                .ok()
-                .flatten()
-                .is_some_and(|attempt| unassigned(attempt.state()));
-            if !waiting {
-                book.open.remove(&lease_id);
-            }
+        // Read without holding the book: the link and the passes use it.
+        let done: Vec<String> = started
+            .into_iter()
+            .filter(|(_, attempt)| {
+                !self
+                    .store
+                    .attempt(*attempt)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|attempt| attempt.state().is_unassigned())
+            })
+            .map(|(lease_id, _)| lease_id)
+            .collect();
+        let mut book = self.book();
+        for lease_id in done {
+            book.open.remove(&lease_id);
         }
         book.open.retain(|_, open| open.expires > now);
     }
@@ -215,13 +203,10 @@ impl Launches {
             Err(_) => return refuse(RefusalReason::Other),
         };
         let Some(policy) = policies.iter().find(|policy| {
-            same_target(&target_ref(&policy.target), &launch.target)
+            same_target(&policy.target, &launch.target)
                 && policy.profile_name().as_str() == launch.profile
                 && policy.is_owned_by(self.host.id)
-                && policy
-                    .routing_labels()
-                    .and_then(|labels| labels.pool_label())
-                    .is_some()
+                && policy.pool_label().is_some()
         }) else {
             return refuse(RefusalReason::UnknownProfile);
         };
@@ -242,9 +227,9 @@ impl Launches {
             .flatten()
             .collect();
         let open = self.open_for(policy.id);
-        let without = HostAllocator::from_attempts(&host, &attempts).allocate(policy, open);
-        let with =
-            HostAllocator::from_attempts(&host, &attempts).allocate(policy, open.saturating_add(1));
+        let allocator = HostAllocator::from_attempts(&host, &attempts);
+        let without = allocator.clone().allocate(policy, open);
+        let with = allocator.clone().allocate(policy, open.saturating_add(1));
         // One more runner than the open launches already take, or an idle
         // runner of this profile that can take the job: accepted. A ceiling
         // that stops it: refused, and the coordinator tries another host.
@@ -314,10 +299,6 @@ impl DemandDirector for Launches {
     }
 }
 
-fn same_target(local: &TargetRef, remote: &TargetRef) -> bool {
-    local.scope == remote.scope && local.name.eq_ignore_ascii_case(&remote.name)
-}
-
 /// What the attempt reports need to remember between two looks.
 #[derive(Debug, Clone, Copy)]
 struct Watched {
@@ -376,7 +357,7 @@ impl AttemptReports {
                         started: false,
                     }),
                 };
-                if !watched.started && !unassigned(attempt.state()) && !concluded {
+                if !watched.started && !attempt.state().is_unassigned() && !concluded {
                     watched.started = true;
                     reports.push(AttemptReport::Started(AttemptStarted {
                         lease_id: launches.lease_of(attempt.id),
@@ -429,6 +410,7 @@ fn finished(attempt: &RunnerAttempt, launches: &Launches) -> AttemptReport {
 #[cfg(test)]
 mod tests {
     use runner_manager_coordinator_protocol::{HelloAck, LAUNCH_VERSION};
+    use runner_manager_domain::attempt::AttemptState;
     use runner_manager_domain::policy::pool_label;
     use runner_manager_domain::store::SqliteStore;
     use runner_manager_testkit::fixtures;
@@ -436,7 +418,7 @@ mod tests {
     use super::*;
 
     fn directed_view(policy: &ScalePolicy, version: u32) -> watch::Receiver<LinkView> {
-        let (sender, receiver) = watch::channel(LinkView {
+        let (_sender, receiver) = watch::channel(LinkView {
             configured: true,
             connected: true,
             down_since: None,
@@ -446,8 +428,7 @@ mod tests {
             }),
             version: Some(version),
         });
-        // Kept alive for the receiver's lifetime.
-        std::mem::forget(sender);
+        // A dropped sender leaves the last value readable.
         receiver
     }
 
@@ -495,11 +476,7 @@ mod tests {
         );
 
         let (store, mut policy, launches) = setup(LAUNCH_VERSION);
-        let pool = policy
-            .routing_labels()
-            .and_then(|labels| labels.pool_label())
-            .cloned()
-            .expect("pool");
+        let pool = policy.pool_label().cloned().expect("pool");
         policy.remove_routing_label(&pool).expect("removed");
         store
             .update_policy(&policy, policy.revision() - 1)

@@ -333,10 +333,7 @@ fn show_policy(
         .workspace_policy()
         .root()
         .map_or("-", |root| root.as_str());
-    let pool = policy
-        .routing_labels()
-        .and_then(|labels| labels.pool_label())
-        .map_or("-", |label| label.as_str());
+    let pool = policy.pool_label().map_or("-", |label| label.as_str());
     writeln!(
         out,
         "{} profile={} host_label={} selector={} labels={} pool={} enabled={} state={} min={} max={} workspace={} workspace_path={} execution={}",

@@ -2262,11 +2262,6 @@ impl EventSink for TeeEvents {
 // The reconciler
 // ---------------------------------------------------------------------------
 
-/// Everything one reconciler needs, written down at the call site.
-///
-/// A struct rather than seven positional arguments, for the reason `b1` gives at
-/// `PersistedAttempt`: several of these are `Arc<dyn …>` and transposing two of
-/// them type-checks. Construct it with a struct literal so every port is named.
 /// Where a policy's demand comes from when the optional coordinator places
 /// its runners (coordinator stage 3).
 ///
@@ -2298,6 +2293,11 @@ impl DemandDirector for OwnDemand {
     fn launched(&self, _policy: &ScalePolicy, _attempt: AttemptId) {}
 }
 
+/// Everything one reconciler needs, written down at the call site.
+///
+/// A struct rather than seven positional arguments, for the reason `b1` gives at
+/// `PersistedAttempt`: several of these are `Arc<dyn …>` and transposing two of
+/// them type-checks. Construct it with a struct literal so every port is named.
 pub struct ReconcilerPorts {
     pub demand: Arc<dyn DemandSource>,
     pub launcher: Arc<dyn RunnerLauncher>,

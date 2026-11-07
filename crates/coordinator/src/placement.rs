@@ -88,10 +88,6 @@ impl JobKey {
             labels: required.iter().cloned().collect(),
         }
     }
-
-    fn required(&self) -> Vec<Label> {
-        self.labels.iter().cloned().collect()
-    }
 }
 
 #[derive(Debug, Default)]
@@ -127,7 +123,7 @@ struct Lease {
     key: JobKey,
     host_id: String,
     state: LeaseState,
-    sent_at: Instant,
+    /// Every lease lives as long, so this also orders them by age.
     expires: Instant,
 }
 
@@ -230,8 +226,8 @@ impl Placement {
 
     // -- Events --------------------------------------------------------------
 
-    /// A webhook announced a queued job. `false` (nothing recorded) for a job
-    /// that asks for no pool.
+    /// A webhook announced a queued job; its key, or `None` (nothing
+    /// recorded) for a job that asks for no pool.
     pub fn queued(&self, repository: &str, required: &[Label], job_id: u64) -> Option<JobKey> {
         if !is_pool_job(required) {
             return None;
@@ -334,29 +330,26 @@ impl Placement {
 
     /// A host's runner took a job. Closes its lease.
     pub fn attempt_started(&self, host_id: &str, started: &AttemptStarted) {
-        if let Some(lease_id) = &started.lease_id {
-            let mut state = self.state();
-            if state
-                .leases
-                .get(lease_id)
-                .is_some_and(|lease| lease.host_id == host_id)
-            {
-                state.leases.remove(lease_id);
-            }
-        }
+        self.close(host_id, started.lease_id.as_deref());
     }
 
     /// A host's attempt ended. Closes its lease, if it still had one.
     pub fn attempt_finished(&self, host_id: &str, finished: &AttemptFinished) {
-        if let Some(lease_id) = &finished.lease_id {
-            let mut state = self.state();
-            if state
-                .leases
-                .get(lease_id)
-                .is_some_and(|lease| lease.host_id == host_id)
-            {
-                state.leases.remove(lease_id);
-            }
+        self.close(host_id, finished.lease_id.as_deref());
+    }
+
+    /// Closes `lease_id` if `host_id` holds it.
+    fn close(&self, host_id: &str, lease_id: Option<&str>) {
+        let Some(lease_id) = lease_id else {
+            return;
+        };
+        let mut state = self.state();
+        if state
+            .leases
+            .get(lease_id)
+            .is_some_and(|lease| lease.host_id == host_id)
+        {
+            state.leases.remove(lease_id);
         }
     }
 
@@ -387,13 +380,34 @@ impl Placement {
                 .retain(|_, at| now.saturating_duration_since(*at) < JOB_MEMORY);
         }
         state.queues.retain(|_, queue| queue.len() > 0);
-        let deficit: Vec<JobKey> = state
+        state
             .queues
             .iter()
             .filter(|(key, queue)| queue.len() > state.leases_for(key))
             .map(|(key, _)| key.clone())
-            .collect();
-        deficit
+            .collect()
+    }
+
+    /// Expires leases, then places every job still short of one.
+    pub async fn retry_all(&self) {
+        for key in self.expire(Instant::now()) {
+            self.rebalance(&key).await;
+        }
+    }
+
+    /// [`Self::rebalance`] after `delay`, off the caller's task.
+    pub fn spawn_rebalance(self: &Arc<Self>, key: JobKey, delay: Duration) {
+        let placement = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            placement.rebalance(&key).await;
+        });
+    }
+
+    /// [`Self::retry_all`], off the caller's task: a slot was freed somewhere.
+    pub fn spawn_retry_all(self: &Arc<Self>) {
+        let placement = Arc::clone(self);
+        tokio::spawn(async move { placement.retry_all().await });
     }
 
     /// Expires and retries every [`TICK`], forever.
@@ -402,9 +416,7 @@ impl Placement {
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
-            for key in self.expire(Instant::now()) {
-                self.rebalance(&key).await;
-            }
+            self.retry_all().await;
         }
     }
 
@@ -474,7 +486,7 @@ impl Placement {
         tried: &HashSet<String>,
         report: &mut Rebalanced,
     ) -> Option<(String, String, Launch)> {
-        let required = key.required();
+        let required: Vec<Label> = key.labels.iter().cloned().collect();
         // Read before the placement lock: the registry has its own.
         let candidates = self.registry.launch_candidates(&key.repository, &required);
         let mut state = self.state();
@@ -508,7 +520,6 @@ impl Placement {
                 key: key.clone(),
                 host_id: chosen.host_id.clone(),
                 state: LeaseState::Offered,
-                sent_at: now,
                 expires: now + ttl + self.ack_timeout,
             },
         );
@@ -545,7 +556,7 @@ impl Placement {
             .leases
             .iter()
             .filter(|(_, lease)| &lease.key == key && lease.state == LeaseState::Accepted)
-            .map(|(id, lease)| (id.clone(), lease.sent_at))
+            .map(|(id, lease)| (id.clone(), lease.expires))
             .collect();
         accepted.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
         for (lease_id, _) in accepted.into_iter().take(surplus) {
@@ -707,12 +718,16 @@ mod tests {
     }
 
     fn setup() -> (Arc<Registry>, Arc<Placement>) {
+        setup_with_ttl(Duration::from_secs(300))
+    }
+
+    fn setup_with_ttl(lease_ttl: Duration) -> (Arc<Registry>, Arc<Placement>) {
         let registry = Arc::new(Registry::default());
         registry.set_coverage(covering());
         let placement = Arc::new(Placement::with_timings(
             Arc::clone(&registry),
             Duration::from_millis(150),
-            Duration::from_secs(300),
+            lease_ttl,
         ));
         (registry, placement)
     }
@@ -828,13 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lease_expires_and_its_job_is_placed_again() {
-        let registry = Arc::new(Registry::default());
-        registry.set_coverage(covering());
-        let placement = Arc::new(Placement::with_timings(
-            Arc::clone(&registry),
-            Duration::from_millis(150),
-            Duration::from_millis(50),
-        ));
+        let (registry, placement) = setup_with_ttl(Duration::from_millis(50));
         let host = connect(&registry, "h", LAUNCH_VERSION, POOL, 4, 8 << 30);
         let host = answer(&placement, "h", host, Answer::Accept);
         let key = placement

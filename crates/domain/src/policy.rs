@@ -1381,6 +1381,13 @@ impl ScalePolicy {
         self.mode.routing_labels()
     }
 
+    /// The shared pool label this profile answers, if any (coordinator
+    /// stage 3).
+    #[must_use]
+    pub fn pool_label(&self) -> Option<&Label> {
+        self.routing_labels().and_then(RoutingLabels::pool_label)
+    }
+
     /// D4: this repository's configured workspace behaviour.
     #[must_use]
     pub const fn workspace_policy(&self) -> &WorkspacePolicy {
