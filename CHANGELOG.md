@@ -13,8 +13,8 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 - 0.4.45 reached the GitHub Release and the install scripts, but not the
   `runner-manager` crate on crates.io, npm or Homebrew; 0.4.46 publishes the
-  same coordinator features to every channel. Nothing else changed: the coordinator protocol and
-  every command behave exactly as in 0.4.45.
+  same coordinator features to every channel. Nothing else changed: the
+  coordinator protocol and every command behave exactly as in 0.4.45.
 - Internal: the coordinator wire protocol now lives in the already-published
   `runner-manager-domain` crate, and a test fails any pull request whose crates.io
   publish list misses a crate `runner-manager` depends on.
