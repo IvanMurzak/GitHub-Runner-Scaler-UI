@@ -1,8 +1,10 @@
-//! The coordinator's SQLite database: enrolled hosts and one-time invites.
+//! The coordinator's SQLite database: enrolled hosts and one-time invites
+//! (stage 1), and the job weight statistics (stage 4, schema 2): measured
+//! attempts, all-time counters and the last placement decisions.
 //!
 //! An invite's code is shown once, to the operator who ran `invite`, and only
 //! its SHA-256 is stored. A host's **public** key is stored; its private key
-//! never leaves the host. Nothing else is kept in stage 1.
+//! never leaves the host.
 
 use std::path::Path;
 use std::time::Duration;
@@ -13,7 +15,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// The prefix every invite code carries, so one is recognisable in a paste.
 pub const INVITE_PREFIX: &str = "rmc_";
@@ -140,6 +142,32 @@ impl Store {
                     used_at TEXT
                 );
                 PRAGMA user_version = 1;",
+            )?;
+        }
+        if version < 2 {
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS job_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_key TEXT NOT NULL,
+                    repository TEXT NOT NULL,
+                    host_id TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    duration_secs INTEGER,
+                    peak_rss_bytes INTEGER,
+                    cpu_avg_millicores INTEGER,
+                    cpu_peak_millicores INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS job_samples_by_key ON job_samples (job_key, id);
+                CREATE INDEX IF NOT EXISTS job_samples_by_age ON job_samples (finished_at);
+                CREATE TABLE IF NOT EXISTS counters (
+                    name TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS placement_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decision TEXT NOT NULL
+                );
+                PRAGMA user_version = 2;",
             )?;
         }
         Ok(Self { connection })
@@ -318,6 +346,184 @@ impl Store {
     }
 }
 
+/// One measured attempt: a job of `job_key` that ran on `host_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobSample {
+    /// `owner/repo/workflow/job`, as [`crate::stats::JobIdentity::key`] makes it.
+    pub job_key: String,
+    /// `owner/repo`, lower-cased.
+    pub repository: String,
+    pub host_id: String,
+    pub finished_at: DateTime<Utc>,
+    pub duration_secs: Option<u64>,
+    pub peak_rss_bytes: Option<u64>,
+    pub cpu_avg_millicores: Option<u32>,
+    pub cpu_peak_millicores: Option<u32>,
+}
+
+/// The all-time counters `stats` shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counters {
+    pub launches: u64,
+    pub wakes: u64,
+    pub samples: u64,
+}
+
+fn to_sql(value: Option<u64>) -> Option<i64> {
+    value.map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+}
+
+fn from_sql(value: Option<i64>) -> Option<u64> {
+    value.and_then(|value| u64::try_from(value).ok())
+}
+
+impl Store {
+    /// Records a measured attempt, keeps only the newest `keep` of its job
+    /// key, and drops every sample finished before `oldest`.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn record_sample(
+        &mut self,
+        sample: &JobSample,
+        keep: u32,
+        oldest: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO job_samples (job_key, repository, host_id, finished_at, duration_secs,
+                peak_rss_bytes, cpu_avg_millicores, cpu_peak_millicores)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                sample.job_key,
+                sample.repository,
+                sample.host_id,
+                sample.finished_at,
+                to_sql(sample.duration_secs),
+                to_sql(sample.peak_rss_bytes),
+                sample.cpu_avg_millicores,
+                sample.cpu_peak_millicores
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM job_samples WHERE job_key = ?1 AND id NOT IN (
+                SELECT id FROM job_samples WHERE job_key = ?1 ORDER BY id DESC LIMIT ?2)",
+            params![sample.job_key, keep],
+        )?;
+        transaction.execute(
+            "DELETE FROM job_samples WHERE finished_at < ?1",
+            params![oldest],
+        )?;
+        transaction.execute(
+            "INSERT INTO counters (name, value) VALUES ('samples', 1)
+             ON CONFLICT (name) DO UPDATE SET value = value + 1",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every kept sample finished at or after `oldest`, oldest first.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn samples(&self, oldest: DateTime<Utc>) -> Result<Vec<JobSample>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT job_key, repository, host_id, finished_at, duration_secs, peak_rss_bytes,
+                cpu_avg_millicores, cpu_peak_millicores
+             FROM job_samples WHERE finished_at >= ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![oldest], |row| {
+            Ok(JobSample {
+                job_key: row.get(0)?,
+                repository: row.get(1)?,
+                host_id: row.get(2)?,
+                finished_at: row.get(3)?,
+                duration_secs: from_sql(row.get(4)?),
+                peak_rss_bytes: from_sql(row.get(5)?),
+                cpu_avg_millicores: row.get(6)?,
+                cpu_peak_millicores: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Adds to the all-time launch and wake counters.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn add_counters(&mut self, launches: u64, wakes: u64) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        for (name, value) in [("launches", launches), ("wakes", wakes)] {
+            if value > 0 {
+                transaction.execute(
+                    "INSERT INTO counters (name, value) VALUES (?1, ?2)
+                     ON CONFLICT (name) DO UPDATE SET value = value + ?2",
+                    params![name, i64::try_from(value).unwrap_or(i64::MAX)],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// The all-time counters.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn counters(&self) -> Result<Counters, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT name, value FROM counters")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut counters = Counters::default();
+        for row in rows {
+            let (name, value) = row?;
+            let value = u64::try_from(value).unwrap_or(0);
+            match name.as_str() {
+                "launches" => counters.launches = value,
+                "wakes" => counters.wakes = value,
+                "samples" => counters.samples = value,
+                _ => {}
+            }
+        }
+        Ok(counters)
+    }
+
+    /// Records a placement decision (its JSON), keeping the newest `keep`.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn record_decision(&mut self, decision: &str, keep: u32) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO placement_decisions (decision) VALUES (?1)",
+            params![decision],
+        )?;
+        transaction.execute(
+            "DELETE FROM placement_decisions WHERE id NOT IN (
+                SELECT id FROM placement_decisions ORDER BY id DESC LIMIT ?1)",
+            params![keep],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// The newest `limit` placement decisions, newest first, as JSON.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn decisions(&self, limit: u32) -> Result<Vec<String>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT decision FROM placement_decisions ORDER BY id DESC LIMIT ?1")?;
+        let rows = statement.query_map(params![limit], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
 /// Whether an active (not revoked) host already holds `name`.
 fn name_taken(connection: &Connection, name: &str) -> Result<bool, StoreError> {
     Ok(connection.query_row(
@@ -458,6 +664,95 @@ mod tests {
         store
             .create_invite("win", TTL, now())
             .expect("name reusable");
+    }
+
+    fn sample(key: &str, at: DateTime<Utc>) -> JobSample {
+        JobSample {
+            job_key: key.into(),
+            repository: "octo/app".into(),
+            host_id: "h1".into(),
+            finished_at: at,
+            duration_secs: Some(60),
+            peak_rss_bytes: Some(u64::MAX),
+            cpu_avg_millicores: Some(1500),
+            cpu_peak_millicores: None,
+        }
+    }
+
+    #[test]
+    fn samples_are_capped_per_key_and_expire_and_counters_add_up() {
+        let mut store = Store::open_in_memory().expect("store");
+        let long_ago = now() - chrono::TimeDelta::days(200);
+        for minute in 0..5 {
+            let at = now() + chrono::TimeDelta::minutes(minute);
+            store
+                .record_sample(&sample("a", at), 3, long_ago)
+                .expect("recorded");
+        }
+        store
+            .record_sample(&sample("b", long_ago), 3, long_ago)
+            .expect("recorded");
+        let kept = store.samples(long_ago).expect("read");
+        assert_eq!(kept.iter().filter(|s| s.job_key == "a").count(), 3);
+        assert_eq!(kept[0].finished_at, now() + chrono::TimeDelta::minutes(2));
+        assert_eq!(kept[0].peak_rss_bytes, Some(i64::MAX as u64), "saturated");
+        // The next sample, 90 days on, drops the old one of `b`.
+        let cutoff = now() - chrono::TimeDelta::days(90);
+        store
+            .record_sample(&sample("c", now()), 3, cutoff)
+            .expect("recorded");
+        let kept = store.samples(long_ago).expect("read");
+        assert!(kept.iter().all(|s| s.job_key != "b"));
+        assert_eq!(
+            store
+                .samples(now() + chrono::TimeDelta::days(1))
+                .expect("read"),
+            vec![]
+        );
+        store.add_counters(2, 7).expect("counted");
+        store.add_counters(1, 0).expect("counted");
+        assert_eq!(
+            store.counters().expect("read"),
+            Counters {
+                launches: 3,
+                wakes: 7,
+                samples: 7,
+            }
+        );
+        for index in 0..5 {
+            store
+                .record_decision(&format!("{{\"n\":{index}}}"), 2)
+                .expect("recorded");
+        }
+        assert_eq!(
+            store.decisions(10).expect("read"),
+            vec!["{\"n\":4}".to_string(), "{\"n\":3}".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_stage_one_database_is_upgraded_in_place() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("coordinator.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE hosts (id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                        hostname TEXT NOT NULL, public_key TEXT NOT NULL,
+                        enrolled_at TEXT NOT NULL, revoked_at TEXT, last_seen_at TEXT);
+                     CREATE TABLE invites (code_hash TEXT PRIMARY KEY, name TEXT NOT NULL,
+                        created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT);
+                     INSERT INTO hosts VALUES ('h1','win','w','K','2026-11-07T12:00:00Z',NULL,NULL);
+                     PRAGMA user_version = 1;",
+                )
+                .expect("a stage-1 database");
+        }
+        let mut store = Store::open(&path).expect("upgraded");
+        assert_eq!(store.hosts().expect("hosts").len(), 1, "hosts kept");
+        store
+            .record_sample(&sample("a", now()), 30, now() - chrono::TimeDelta::days(90))
+            .expect("the new tables exist");
     }
 
     #[test]

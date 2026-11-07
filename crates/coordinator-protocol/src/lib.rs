@@ -17,6 +17,13 @@
 //! (`attempt_started`, `attempt_finished`) so the coordinator knows when a
 //! launched runner took a job.
 //!
+//! Stage 4 (version 4) adds job weight statistics: `attempt_finished` carries
+//! what the attempt used ([`AttemptUsage`]: peak memory and CPU of the
+//! runner's process tree), and a **query session** (`auth` with
+//! [`SessionPurpose::Query`]) lets an enrolled host ask for the
+//! coordinator's statistics ([`HostMessage::StatsRequest`] answered by
+//! [`ServerMessage::Stats`]) without taking over its daemon's link.
+//!
 //! # Versioning
 //!
 //! Every message is one JSON object tagged by `type`. Fields may be **added**
@@ -50,7 +57,7 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol this build speaks.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The oldest protocol this build still speaks: stage 1's.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
@@ -62,6 +69,12 @@ pub const HELLO_ACK_VERSION: u32 = 2;
 /// [`ServerMessage::CancelLaunch`], [`HostMessage::LaunchAck`] and the
 /// attempt reports. A version-2 peer never sees or sends them.
 pub const LAUNCH_VERSION: u32 = 3;
+
+/// The first version with [`AttemptUsage`] in `attempt_finished` and with
+/// query sessions ([`SessionPurpose::Query`], [`HostMessage::StatsRequest`],
+/// [`ServerMessage::Stats`]). A version-3 peer ignores the usage field and
+/// never opens or is offered a query session.
+pub const STATS_VERSION: u32 = 4;
 
 /// The version a connection runs at, given the newest version the peer
 /// speaks and the oldest it still accepts: the highest both sides speak, or
@@ -434,6 +447,330 @@ pub struct AttemptFinished {
     /// From the attempt's creation to its end.
     #[serde(default)]
     pub duration_secs: Option<u64>,
+    /// Version 4: what the runner's process tree used, when this host could
+    /// measure it (a native runner it sampled at least once). Absent from a
+    /// version-3 host, and from an isolated attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AttemptUsage>,
+}
+
+/// What one attempt's runner process tree used, sampled every few seconds.
+///
+/// CPU is in millicores: 1000 is one logical CPU busy for the whole interval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AttemptUsage {
+    /// The largest resident memory of the whole tree in one sample.
+    pub peak_rss_bytes: u64,
+    /// CPU time over wall time between the first and the last sample.
+    pub cpu_avg_millicores: u32,
+    /// The busiest interval between two consecutive samples.
+    pub cpu_peak_millicores: u32,
+    /// How many samples were taken.
+    pub samples: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Statistics (version 4)
+// ---------------------------------------------------------------------------
+
+impl StatsReport {
+    /// The report as an operator reads it, for `stats` on either side.
+    ///
+    /// # Errors
+    /// The writer's.
+    pub fn render(&self, out: &mut dyn fmt::Write) -> fmt::Result {
+        writeln!(
+            out,
+            "Job statistics: the last {} samples per job, kept {} days",
+            self.samples_per_job, self.retention_days
+        )?;
+        writeln!(
+            out,
+            "  launches accepted {}, wakes sent {}, samples recorded {}",
+            self.launches, self.wakes, self.samples
+        )?;
+        if self.jobs.is_empty() {
+            writeln!(out, "\nNo job has been measured yet.")?;
+        } else {
+            writeln!(
+                out,
+                "\nHeaviest jobs (p90 peak memory, p90 CPU, p50 duration, samples):"
+            )?;
+            for job in &self.jobs {
+                writeln!(
+                    out,
+                    "  {}\n      {}  {}  {}  ({})",
+                    printable(&job.job_key),
+                    bytes(job.p90_peak_rss_bytes),
+                    cores(job.p90_cpu_millicores),
+                    duration(job.p50_duration_secs),
+                    job.samples
+                )?;
+                for host in &job.hosts {
+                    writeln!(
+                        out,
+                        "      on {:<24} {:>3} samples  p50 {}  {}",
+                        host_label(&host.host_id, host.host_name.as_deref()),
+                        host.samples,
+                        duration(host.p50_duration_secs),
+                        host.duration_ratio_permille.map_or_else(
+                            || "-".to_string(),
+                            |ratio| format!(
+                                "{}.{:02}x the usual time",
+                                ratio / 1000,
+                                ratio % 1000 / 10
+                            )
+                        )
+                    )?;
+                }
+            }
+        }
+        if !self.hosts.is_empty() {
+            writeln!(out, "\nSamples per host:")?;
+            for host in &self.hosts {
+                writeln!(
+                    out,
+                    "  {:<28} {:>4} samples over {} jobs, p90 peak memory {}",
+                    host_label(&host.host_id, host.host_name.as_deref()),
+                    host.samples,
+                    host.job_keys,
+                    bytes(host.p90_peak_rss_bytes)
+                )?;
+            }
+        }
+        if !self.decisions.is_empty() {
+            writeln!(out, "\nLast placements, newest first (scores in points):")?;
+            for decision in &self.decisions {
+                writeln!(
+                    out,
+                    "  {} ago  {} [{}] needs {} ({}), {}: {}",
+                    duration(u64::try_from(self.generated_at.saturating_sub(decision.at)).ok()),
+                    printable(&decision.repository),
+                    printable(&decision.labels),
+                    bytes(Some(decision.estimate_bytes)),
+                    decision.estimate_source,
+                    decision.method,
+                    decision
+                        .chosen
+                        .as_deref()
+                        .map_or_else(|| "no host fits".to_string(), printable)
+                )?;
+                for score in &decision.scores {
+                    writeln!(
+                        out,
+                        "      {:<24} {:<8} free after {:<10} cache {} headroom {} speed {} bigfit -{} = {}",
+                        printable(&score.host_id),
+                        if score.fits { "fits" } else { "too full" },
+                        bytes(score.free_after_bytes),
+                        points(score.cache),
+                        points(score.headroom),
+                        points(score.speed),
+                        points(score.bigfit),
+                        points(score.total)
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn host_label(id: &str, name: Option<&str>) -> String {
+    let id = printable(id);
+    name.map_or_else(|| id.clone(), |name| format!("{} ({id})", printable(name)))
+}
+
+fn bytes(value: Option<u64>) -> String {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    match value {
+        None => "-".into(),
+        Some(value) if value >= GIB => {
+            format!("{}.{} GiB", value / GIB, value % GIB * 10 / GIB)
+        }
+        Some(value) => format!("{} MiB", value / MIB),
+    }
+}
+
+fn cores(millicores: Option<u32>) -> String {
+    millicores.map_or_else(
+        || "-".into(),
+        |value| format!("{}.{:02} cores", value / 1000, value % 1000 / 10),
+    )
+}
+
+fn duration(secs: Option<u64>) -> String {
+    secs.map_or_else(
+        || "-".into(),
+        |secs| {
+            if secs >= 60 {
+                format!("{}m {:02}s", secs / 60, secs % 60)
+            } else {
+                format!("{secs}s")
+            }
+        },
+    )
+}
+
+fn points(thousandths: i64) -> String {
+    let sign = if thousandths < 0 { "-" } else { "" };
+    let value = thousandths.unsigned_abs();
+    format!("{sign}{}.{:02}", value / 1000, value % 1000 / 10)
+}
+
+/// The prefix of every runner name `runner-manager` registers
+/// (`runner-manager-<attempt id>`): what the coordinator correlates webhooks
+/// with, and the only runner names it remembers.
+pub const RUNNER_NAME_PREFIX: &str = "runner-manager-";
+
+/// The longest runner name the coordinator correlates.
+pub const MAX_RUNNER_NAME: usize = 128;
+
+/// Whether `name` is one `runner-manager` could have registered.
+#[must_use]
+pub fn is_managed_runner_name(name: &str) -> bool {
+    name.len() <= MAX_RUNNER_NAME
+        && name
+            .get(..RUNNER_NAME_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RUNNER_NAME_PREFIX))
+}
+
+/// `text` without the characters that could rewrite a terminal: control
+/// characters (ESC, C1), bidirectional overrides and isolates, zero-width
+/// characters and line or paragraph separators. Names in `stats` come from
+/// webhooks, and a workflow or job name is whatever a pull request wrote.
+#[must_use]
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2060}'..='\u{206F}'
+                        | '\u{FEFF}'
+                )
+        })
+        .collect()
+}
+
+/// What a connection is for, named in `auth` (version 4). Always a plain
+/// string on the wire: a later purpose that needs parameters carries them in
+/// new `auth` fields, so an older coordinator reads it as [`Self::Other`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPurpose {
+    /// The daemon's link: `hello`, heartbeats, wakes and launches. What a
+    /// connection without a purpose is.
+    #[default]
+    Link,
+    /// One question from the operator's terminal: the connection is not
+    /// registered as the host's link (the daemon's link stays up), answers
+    /// one [`HostMessage::StatsRequest`], and closes.
+    Query,
+    #[serde(other)]
+    Other,
+}
+
+/// The coordinator's job weight statistics, as `stats` prints them.
+///
+/// Repository, workflow and job names come from GitHub's webhooks for the
+/// owner's own repositories and are shown only to the owner's enrolled
+/// hosts and on the coordinator's machine (D3, D5).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StatsReport {
+    /// Unix seconds.
+    pub generated_at: i64,
+    /// Samples kept per job key.
+    pub samples_per_job: u32,
+    /// Samples older than this are dropped.
+    pub retention_days: u32,
+    /// Launches hosts accepted, wakes sent, samples recorded, all time.
+    pub launches: u64,
+    pub wakes: u64,
+    pub samples: u64,
+    /// The heaviest job keys by p90 peak memory, heaviest first.
+    pub jobs: Vec<JobStats>,
+    /// How the samples spread over the hosts.
+    pub hosts: Vec<HostStats>,
+    /// The last placement decisions, newest first.
+    pub decisions: Vec<PlacementDecision>,
+}
+
+/// One job key (`owner/repo/workflow/job`) and its aggregates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JobStats {
+    pub job_key: String,
+    pub samples: u32,
+    pub p50_duration_secs: Option<u64>,
+    pub p90_peak_rss_bytes: Option<u64>,
+    pub p90_cpu_millicores: Option<u32>,
+    /// Per host: its samples, its median duration and that median over the
+    /// usual duration (the mean of every host's median), in thousandths
+    /// (1000: as fast as usual, 2000: twice as slow).
+    pub hosts: Vec<HostJobStats>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostJobStats {
+    pub host_id: String,
+    pub host_name: Option<String>,
+    pub samples: u32,
+    pub p50_duration_secs: Option<u64>,
+    pub duration_ratio_permille: Option<u32>,
+}
+
+/// One host's share of the samples.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostStats {
+    pub host_id: String,
+    pub host_name: Option<String>,
+    pub samples: u32,
+    pub job_keys: u32,
+    pub p90_peak_rss_bytes: Option<u64>,
+}
+
+/// Why one host was chosen for a pool queue (design 4.5).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlacementDecision {
+    /// Unix seconds.
+    pub at: i64,
+    pub repository: String,
+    /// The queue's required labels, comma-separated.
+    pub labels: String,
+    /// The memory the queue's heaviest job is expected to need.
+    pub estimate_bytes: u64,
+    /// Where the estimate came from: `job` (that job key's p90), `repository`
+    /// (the repository's p90, for a job never measured) or `default`.
+    pub estimate_source: String,
+    /// `weighted`, or `stage3` when no statistics were there to weigh.
+    pub method: String,
+    pub chosen: Option<String>,
+    /// Every candidate, best first.
+    pub scores: Vec<HostScore>,
+}
+
+/// One candidate's score parts, in thousandths of a point.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostScore {
+    pub host_id: String,
+    /// The estimate fits its free memory (less its open leases' estimates)
+    /// with the safety margin. A host that does not fit is not placed on.
+    pub fits: bool,
+    pub free_after_bytes: Option<u64>,
+    pub cache: i64,
+    pub headroom: i64,
+    pub speed: i64,
+    pub bigfit: i64,
+    pub total: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +787,9 @@ pub enum HostMessage {
         host_id: String,
         /// Base64 Ed25519 signature over [`auth_message`].
         signature: String,
+        /// Version 4: what the connection is for; absent means the link.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<SessionPurpose>,
     },
     Hello(Hello),
     Heartbeat(Heartbeat),
@@ -459,6 +799,8 @@ pub enum HostMessage {
     AttemptStarted(AttemptStarted),
     /// Version 3.
     AttemptFinished(AttemptFinished),
+    /// Version 4, on a query session only: send the statistics.
+    StatsRequest,
     #[serde(other)]
     Unknown,
 }
@@ -491,6 +833,8 @@ pub enum ServerMessage {
     Launch(Launch),
     /// Version 3: drop a launch whose runner has not started.
     CancelLaunch(CancelLaunch),
+    /// Version 4: the answer to a [`HostMessage::StatsRequest`].
+    Stats(StatsReport),
     #[serde(other)]
     Unknown,
 }
@@ -768,7 +1112,15 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 host_id: "h1".into(),
                 signature: "c2ln".into(),
+                purpose: None,
             },
+            HostMessage::Auth {
+                protocol_version: PROTOCOL_VERSION,
+                host_id: "h1".into(),
+                signature: "c2ln".into(),
+                purpose: Some(SessionPurpose::Query),
+            },
+            HostMessage::StatsRequest,
             HostMessage::Hello(hello()),
             HostMessage::Heartbeat(Heartbeat {
                 free_slots: 2,
@@ -796,6 +1148,19 @@ mod tests {
                 runner_name: "runner-manager-1".into(),
                 outcome: AttemptOutcomeKind::IdleExit,
                 duration_secs: Some(42),
+                usage: None,
+            }),
+            HostMessage::AttemptFinished(AttemptFinished {
+                lease_id: Some("l1".into()),
+                runner_name: "runner-manager-1".into(),
+                outcome: AttemptOutcomeKind::CompletedJob,
+                duration_secs: Some(600),
+                usage: Some(AttemptUsage {
+                    peak_rss_bytes: 3 << 30,
+                    cpu_avg_millicores: 1500,
+                    cpu_peak_millicores: 7900,
+                    samples: 300,
+                }),
             }),
         ];
         for message in messages.into_iter().chain(attempts) {
@@ -842,6 +1207,54 @@ mod tests {
             }),
             ServerMessage::CancelLaunch(CancelLaunch {
                 lease_id: "l1".into(),
+            }),
+            ServerMessage::Stats(StatsReport {
+                generated_at: 1_800_000_000,
+                samples_per_job: 30,
+                retention_days: 90,
+                launches: 4,
+                wakes: 9,
+                samples: 2,
+                jobs: vec![JobStats {
+                    job_key: "octo/app/ci/build (linux)".into(),
+                    samples: 2,
+                    p50_duration_secs: Some(60),
+                    p90_peak_rss_bytes: Some(1 << 30),
+                    p90_cpu_millicores: Some(2000),
+                    hosts: vec![HostJobStats {
+                        host_id: "h1".into(),
+                        host_name: Some("linux".into()),
+                        samples: 2,
+                        p50_duration_secs: Some(60),
+                        duration_ratio_permille: Some(1000),
+                    }],
+                }],
+                hosts: vec![HostStats {
+                    host_id: "h1".into(),
+                    host_name: None,
+                    samples: 2,
+                    job_keys: 1,
+                    p90_peak_rss_bytes: Some(1 << 30),
+                }],
+                decisions: vec![PlacementDecision {
+                    at: 1_800_000_000,
+                    repository: "octo/app".into(),
+                    labels: "rm-pool-linux".into(),
+                    estimate_bytes: 1 << 30,
+                    estimate_source: "job".into(),
+                    method: "weighted".into(),
+                    chosen: Some("h1".into()),
+                    scores: vec![HostScore {
+                        host_id: "h1".into(),
+                        fits: true,
+                        free_after_bytes: Some(7 << 30),
+                        cache: 0,
+                        headroom: 1750,
+                        speed: 0,
+                        bigfit: 0,
+                        total: 1750,
+                    }],
+                }],
             }),
         ];
         for message in server {
@@ -989,6 +1402,147 @@ mod tests {
             Ok(HostMessage::AttemptFinished(AttemptFinished {
                 outcome: AttemptOutcomeKind::Other,
                 lease_id: None,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn a_report_renders_every_section_an_operator_reads() {
+        let report = StatsReport {
+            samples_per_job: 30,
+            retention_days: 90,
+            launches: 3,
+            jobs: vec![JobStats {
+                job_key: "octo/app/ci/build".into(),
+                samples: 4,
+                p50_duration_secs: Some(372),
+                p90_peak_rss_bytes: Some(3 << 30),
+                p90_cpu_millicores: Some(2150),
+                hosts: vec![HostJobStats {
+                    host_id: "h1".into(),
+                    host_name: Some("linux".into()),
+                    samples: 4,
+                    p50_duration_secs: Some(372),
+                    duration_ratio_permille: Some(910),
+                }],
+            }],
+            decisions: vec![PlacementDecision {
+                repository: "octo/app".into(),
+                labels: "rm-pool-linux".into(),
+                estimate_bytes: 3 << 30,
+                estimate_source: "job".into(),
+                method: "weighted".into(),
+                chosen: Some("h1".into()),
+                scores: vec![HostScore {
+                    host_id: "h1".into(),
+                    fits: true,
+                    total: -1250,
+                    ..HostScore::default()
+                }],
+                ..PlacementDecision::default()
+            }],
+            ..StatsReport::default()
+        };
+        let mut text = String::new();
+        report.render(&mut text).expect("renders");
+        for expected in [
+            "launches accepted 3",
+            "octo/app/ci/build",
+            "3.0 GiB  2.15 cores  6m 12s  (4)",
+            "linux (h1)",
+            "0.91x the usual time",
+            "needs 3.0 GiB (job), weighted: h1",
+            "= -1.25",
+        ] {
+            assert!(text.contains(expected), "missing `{expected}`:\n{text}");
+        }
+        let hostile = StatsReport {
+            jobs: vec![JobStats {
+                job_key: "a\u{1b}[2Jb\u{202E}c\u{200B}d".into(),
+                ..JobStats::default()
+            }],
+            ..StatsReport::default()
+        };
+        let mut text = String::new();
+        hostile.render(&mut text).expect("renders");
+        assert!(
+            text.contains("a[2Jbcd") && !text.contains('\u{1b}'),
+            "{text:?}"
+        );
+        assert!(is_managed_runner_name("Runner-Manager-0a1b"));
+        assert!(!is_managed_runner_name("GitHub Actions 2"));
+        assert!(!is_managed_runner_name(&format!(
+            "runner-manager-{}",
+            "x".repeat(200)
+        )));
+        let mut empty = String::new();
+        StatsReport::default().render(&mut empty).expect("renders");
+        assert!(empty.contains("No job has been measured yet."));
+    }
+
+    #[test]
+    fn a_version_three_peer_and_this_one_keep_working() {
+        assert_eq!(negotiate(1, 3), Some(3));
+        assert!(STATS_VERSION > LAUNCH_VERSION && supported(STATS_VERSION));
+        // A version-3 host's `attempt_finished` and `auth`: no usage, no
+        // purpose, which means the link.
+        let finished = r#"{"type":"attempt_finished","runner_name":"r","outcome":"completed_job","duration_secs":5}"#;
+        assert!(matches!(
+            HostMessage::decode(finished),
+            Ok(HostMessage::AttemptFinished(AttemptFinished {
+                usage: None,
+                ..
+            }))
+        ));
+        let auth = r#"{"type":"auth","protocol_version":3,"host_id":"h","signature":"s"}"#;
+        assert!(matches!(
+            HostMessage::decode(auth),
+            Ok(HostMessage::Auth { purpose: None, .. })
+        ));
+        // What this build sends without usage or purpose is byte-for-byte
+        // what a version-3 build sent.
+        let plain = HostMessage::AttemptFinished(AttemptFinished {
+            lease_id: None,
+            runner_name: "r".into(),
+            outcome: AttemptOutcomeKind::CompletedJob,
+            duration_secs: Some(5),
+            usage: None,
+        })
+        .encode();
+        assert!(!plain.contains("usage"), "{plain}");
+        let auth = HostMessage::Auth {
+            protocol_version: 3,
+            host_id: "h".into(),
+            signature: "s".into(),
+            purpose: None,
+        }
+        .encode();
+        assert!(!auth.contains("purpose"), "{auth}");
+        // The new messages are unknown types to a version-3 decoder, which
+        // skips them; a newer purpose is not mistaken for the link.
+        assert_eq!(
+            ServerMessage::decode(r#"{"type":"stats","later":1}"#)
+                .map(|m| matches!(m, ServerMessage::Stats(_))),
+            Ok(true)
+        );
+        let future = r#"{"type":"auth","protocol_version":4,"host_id":"h","signature":"s","purpose":"watch"}"#;
+        assert!(matches!(
+            HostMessage::decode(future),
+            Ok(HostMessage::Auth {
+                purpose: Some(SessionPurpose::Other),
+                ..
+            })
+        ));
+        let usage = r#"{"type":"attempt_finished","runner_name":"r","outcome":"completed_job","usage":{"peak_rss_bytes":7,"gpu":1}}"#;
+        assert!(matches!(
+            HostMessage::decode(usage),
+            Ok(HostMessage::AttemptFinished(AttemptFinished {
+                usage: Some(AttemptUsage {
+                    peak_rss_bytes: 7,
+                    samples: 0,
+                    ..
+                }),
                 ..
             }))
         ));

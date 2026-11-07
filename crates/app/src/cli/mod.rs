@@ -49,6 +49,7 @@ pub mod docker_cleanup;
 pub mod doctor;
 pub mod host;
 pub mod launches;
+pub mod meters;
 pub mod policy;
 pub mod polling;
 pub mod profile;
@@ -656,6 +657,8 @@ pub enum CoordinatorCommand {
     Status(CoordinatorStatusArgs),
     /// Forget the coordinator and its key; polling continues as before.
     Leave,
+    /// Show the coordinator's job statistics and recent placements.
+    Stats(CoordinatorStatusArgs),
 }
 
 #[derive(Debug, Args)]
@@ -2330,6 +2333,7 @@ fn is_decorated_report(command: &Command) -> bool {
         Command::Wsl(WslCommand::List | WslCommand::Detach(_)) => true,
         Command::Coordinator(CoordinatorCommand::Status(args)) => !args.json,
         Command::Coordinator(CoordinatorCommand::Leave) => true,
+        Command::Coordinator(CoordinatorCommand::Stats(args)) => !args.json,
         // `host prepare` asks questions and waits for an elevation prompt, and
         // `host doctor --json` is a document; neither may be buffered or
         // decorated.

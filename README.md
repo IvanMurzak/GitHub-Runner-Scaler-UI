@@ -399,6 +399,7 @@ runner-manager wsl detach --distribution NAME                  # Stop managing i
 runner-manager coordinator join URL --code CODE                # Join an optional coordinator (one-time code)
 runner-manager coordinator status [--json]                     # Show the coordinator link
 runner-manager coordinator leave                               # Forget the coordinator and its key
+runner-manager coordinator stats [--json]                      # Show the coordinator's job statistics and placements
 ```
 
 Host capacity changes take effect on the next allocation without restarting the
@@ -686,7 +687,16 @@ profile of the same target. While the target is `coordinated`, that profile star
 when the coordinator places one on it, and only within its own `max_capacity`, host capacity and
 `host doctor` fitness; in `fallback` or `standalone` it serves its own demand as before.
 
-Deployment, the GitHub App (webhook and sweep), shared pools and administration: [`docs/coordinator.md`](docs/coordinator.md).
+**Job statistics.** A joined host samples the process tree of each native runner every 2 seconds
+(off its reconcile loop) and reports, when the attempt ends, its peak memory and its average and
+peak CPU. The coordinator matches the report to the job GitHub's webhook says that runner took,
+keeps the last 30 samples per `repository/workflow/job` (90 days at most), and places a pool job
+on a host that can hold the heaviest job queued for that pool, preferring a warm workspace, room
+to spare and a host that has run those jobs fast. `runner-manager coordinator stats [--json]`
+shows the heaviest jobs, the samples per host and the last placements with every host's score;
+with no statistics yet, placement is the warm-workspace / free-memory order it always was.
+
+Deployment, the GitHub App (webhook and sweep), shared pools, statistics and administration: [`docs/coordinator.md`](docs/coordinator.md).
 
 ## Customize your setup
 

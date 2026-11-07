@@ -241,6 +241,15 @@ remove_dir_all = "1.0.0"
 #                                Defender's own keys are tamper-protected and go
 #                                through `Add-MpPreference` instead. Also a
 #                                prerequisite of `SHELLEXECUTEINFOW` below.
+#   Win32_System_Diagnostics_ToolHelp
+#                                `CreateToolhelp32Snapshot` and
+#                                `Process32FirstW`/`Process32NextW`: the
+#                                parent links of every process, from which the
+#                                coordinator's job statistics find a native
+#                                runner's process tree (it runs in no Job
+#                                Object, so there is no job accounting).
+#   Win32_System_ProcessStatus   `GetProcessMemoryInfo`, the working set of
+#                                each process of that tree.
 #   Win32_UI_Shell               `ShellExecuteExW` with the `runas` verb, the
 #                                documented way to ask the user for elevation.
 #                                `host prepare` relaunches only its own fix step
@@ -256,6 +265,8 @@ windows = { version = "0.62.2", features = [
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

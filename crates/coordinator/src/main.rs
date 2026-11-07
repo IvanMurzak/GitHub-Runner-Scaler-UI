@@ -12,6 +12,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use runner_manager_coordinator::github_app::{AppKey, GithubApp};
 use runner_manager_coordinator::server::{AppState, Config, serve};
+use runner_manager_coordinator::stats::{self, StatsConfig, Weights};
 use runner_manager_coordinator::store::{HostRecord, Store};
 use runner_manager_coordinator::sweep::{self, Sweeper};
 use runner_manager_coordinator_protocol::CoordinatorUrl;
@@ -35,6 +36,9 @@ struct Cli {
         global = true
     )]
     db: PathBuf,
+    /// Samples kept per job key for the job weight statistics.
+    #[arg(long, env = "COORDINATOR_STATS_SAMPLES", default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=1000), global = true)]
+    stats_samples: u32,
     #[command(subcommand)]
     command: Command,
 }
@@ -67,6 +71,23 @@ enum Command {
         /// The GitHub REST API, for GitHub Enterprise Server.
         #[arg(long, env = "COORDINATOR_GITHUB_API_URL", default_value = runner_manager_github::GITHUB_API_BASE)]
         github_api_url: url::Url,
+        /// The memory a pool job of a repository never measured is assumed
+        /// to need: 2GiB, 512MiB.
+        #[arg(long, env = "COORDINATOR_DEFAULT_JOB_RAM", default_value = "2GiB", value_parser = parse_bytes)]
+        default_job_ram: u64,
+        /// Free memory a host must keep beyond a job's estimate to be placed
+        /// on.
+        #[arg(long, env = "COORDINATOR_RAM_MARGIN", default_value = "512MiB", value_parser = parse_bytes)]
+        ram_margin: u64,
+        /// The placement score's weights:
+        /// cache=4,headroom=2,speed=1,bigfit=1.5 (any subset).
+        #[arg(long, env = "COORDINATOR_PLACEMENT_WEIGHTS", default_value = "", value_parser = parse_weights)]
+        placement_weights: Weights,
+    },
+    /// The job weight statistics: heaviest jobs, hosts, recent placements.
+    Stats {
+        #[arg(long)]
+        json: bool,
     },
     /// Issue a one-time code that enrolls one host.
     Invite {
@@ -128,6 +149,64 @@ fn parse_reconcile_interval(text: &str) -> Result<Duration, String> {
         ));
     }
     Ok(interval)
+}
+
+/// A memory size: `2GiB`, `512MiB`, `1G`, or bytes.
+fn parse_bytes(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: u64 = number
+        .parse()
+        .map_err(|_| format!("`{text}` is not a size; write it as 2GiB or 512MiB"))?;
+    let shift = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kib" | "kb" => 10,
+        "m" | "mib" | "mb" => 20,
+        "g" | "gib" | "gb" => 30,
+        _ => {
+            return Err(format!(
+                "`{text}` is not a size; write it as 2GiB or 512MiB"
+            ));
+        }
+    };
+    number
+        .checked_mul(1 << shift)
+        .ok_or_else(|| format!("`{text}` is too large"))
+}
+
+/// `cache=4,headroom=2,speed=1,bigfit=1.5`: any subset, the rest default.
+fn parse_weights(text: &str) -> Result<Weights, String> {
+    let mut weights = Weights::default();
+    for part in text
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let (name, value) = part
+            .split_once('=')
+            .ok_or_else(|| format!("`{part}` is not name=value"))?;
+        let value: f64 = value
+            .trim()
+            .parse()
+            .ok()
+            .filter(|value: &f64| value.is_finite() && (0.0..=100.0).contains(value))
+            .ok_or_else(|| format!("`{part}`: a weight is a number from 0 to 100"))?;
+        match name.trim() {
+            "cache" => weights.cache = value,
+            "headroom" => weights.headroom = value,
+            "speed" => weights.speed = value,
+            "bigfit" => weights.bigfit = value,
+            other => {
+                return Err(format!(
+                    "`{other}` is not a weight; use cache, headroom, speed or bigfit"
+                ));
+            }
+        }
+    }
+    Ok(weights)
 }
 
 /// The App's private key, from a file or the environment; `None` when
@@ -196,12 +275,22 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             github_app_id,
             reconcile_interval,
             github_api_url,
+            default_job_ram,
+            ram_margin,
+            placement_weights,
         } => {
             let origin = CoordinatorUrl::parse(&public_url)
                 .context("COORDINATOR_PUBLIC_URL is not a usable https URL")?
                 .origin();
             let mut config = Config::new(origin, webhook_secret()?);
             config.trust_forwarded_for = trust_forwarded_for;
+            config.stats = StatsConfig {
+                samples_per_job: cli.stats_samples,
+                default_job_ram,
+                ram_margin,
+                weights: placement_weights,
+                ..StatsConfig::default()
+            };
             let app = github_app(github_app_id, github_api_url)?;
             let store = Store::open(&cli.db)?;
             let runtime = tokio::runtime::Runtime::new()?;
@@ -246,6 +335,34 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 invite.code.expose_secret(),
                 invite.code.expose_secret()
             )?;
+        }
+        Command::Stats { json } => {
+            let store = Store::open(&cli.db)?;
+            let config = StatsConfig {
+                samples_per_job: cli.stats_samples,
+                ..StatsConfig::default()
+            };
+            let report = stats::report(&store, &config, Utc::now())?;
+            if json {
+                #[derive(Serialize)]
+                struct StatsDocument<'a> {
+                    schema_version: u32,
+                    #[serde(flatten)]
+                    report: &'a runner_manager_coordinator_protocol::StatsReport,
+                }
+                serde_json::to_writer_pretty(
+                    &mut out,
+                    &StatsDocument {
+                        schema_version: JSON_SCHEMA_VERSION,
+                        report: &report,
+                    },
+                )?;
+                writeln!(out)?;
+            } else {
+                let mut text = String::new();
+                report.render(&mut text)?;
+                write!(out, "{text}")?;
+            }
         }
         Command::Hosts { command } => {
             let store = Store::open(&cli.db)?;
@@ -346,6 +463,22 @@ mod tests {
         assert!(parse_ttl("5y").is_err());
         assert_eq!(parse_reconcile_interval("2m"), Ok(Duration::from_secs(120)));
         assert!(parse_reconcile_interval("29s").is_err());
+    }
+
+    #[test]
+    fn sizes_and_weights_parse_in_the_forms_an_operator_writes() {
+        assert_eq!(parse_bytes("2GiB"), Ok(2 << 30));
+        assert_eq!(parse_bytes("512MiB"), Ok(512 << 20));
+        assert_eq!(parse_bytes("1g"), Ok(1 << 30));
+        assert_eq!(parse_bytes("4096"), Ok(4096));
+        assert!(parse_bytes("lots").is_err() && parse_bytes("2TiB").is_err());
+        assert_eq!(parse_weights(""), Ok(Weights::default()));
+        let weights = parse_weights("cache=0, bigfit=3").expect("parses");
+        assert_eq!((weights.cache, weights.bigfit), (0.0, 3.0));
+        assert_eq!(weights.headroom, Weights::default().headroom);
+        assert!(parse_weights("gpu=1").is_err());
+        assert!(parse_weights("cache=-1").is_err());
+        assert!(parse_weights("cache").is_err());
     }
 
     #[test]

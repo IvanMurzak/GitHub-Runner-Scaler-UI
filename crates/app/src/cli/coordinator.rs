@@ -70,9 +70,9 @@ use futures::{SinkExt as _, StreamExt as _};
 use runner_manager_coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CoordinatorUrl, EnrollRequest, EnrollResponse,
     HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, HostMessage, HostSigningKey, LAUNCH_VERSION,
-    MIN_PROTOCOL_VERSION, Profile, ServerMessage, Target, TargetRef, TargetScope, Wake,
-    decode_nonce, decode_signing_key, encode_public_key, encode_signing_key, negotiate,
-    sign_challenge, signing_key_from_seed,
+    MIN_PROTOCOL_VERSION, Profile, STATS_VERSION, ServerMessage, SessionPurpose, StatsReport,
+    Target, TargetRef, TargetScope, Wake, decode_nonce, decode_signing_key, encode_public_key,
+    encode_signing_key, negotiate, sign_challenge, signing_key_from_seed,
 };
 use runner_manager_domain::attempt::active_count;
 use runner_manager_domain::model::{OwnerRepo, ScaleTarget, StartMode};
@@ -88,6 +88,7 @@ use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite;
 
 use super::launches::{AttemptReport, AttemptReports, Launches};
+use super::meters::{AttemptMeters, sample_attempts};
 use super::{CliError, Context, CoordinatorCommand, Failure, write_failed};
 
 /// The shortest gap between the start of a target's last poll and a
@@ -119,6 +120,9 @@ const CONFIG_RECHECK: Duration = Duration::from_secs(15);
 /// Version of `coordinator status --json`.
 const STATUS_SCHEMA_VERSION: u32 = 1;
 
+/// Version of `coordinator stats --json`.
+const STATS_SCHEMA_VERSION: u32 = 1;
+
 /// How often the link looks at this host's attempts for its reports.
 const ATTEMPT_WATCH: Duration = Duration::from_secs(2);
 
@@ -140,6 +144,7 @@ pub fn dispatch(
         CoordinatorCommand::Join(args) => join(context, &args.url, &args.code, out),
         CoordinatorCommand::Status(args) => status(context, args.json, out),
         CoordinatorCommand::Leave => leave(context, out),
+        CoordinatorCommand::Stats(args) => stats(context, args.json, out),
     }
 }
 
@@ -323,22 +328,7 @@ fn status(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliE
     let failed = write_failed("the coordinator status");
     let snapshot = CoordinatorSnapshot::read(context.paths(), context.clock().now());
     if json {
-        #[derive(Serialize)]
-        struct Document<'a> {
-            schema_version: u32,
-            #[serde(flatten)]
-            coordinator: &'a CoordinatorSnapshot,
-        }
-        serde_json::to_writer_pretty(
-            &mut *out,
-            &Document {
-                schema_version: STATUS_SCHEMA_VERSION,
-                coordinator: &snapshot,
-            },
-        )
-        .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?;
-        writeln!(out).map_err(failed)?;
-        return Ok(());
+        return write_document(out, STATUS_SCHEMA_VERSION, &snapshot);
     }
     writeln!(out, "Coordinator: {}", snapshot.describe()).map_err(failed)?;
     if let (Some(name), Some(id)) = (&snapshot.name, &snapshot.host_id) {
@@ -357,6 +347,103 @@ fn status(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliE
         writeln!(out, "  sweep         {}", snapshot.describe_sweep()).map_err(failed)?;
     }
     Ok(())
+}
+
+/// `body` as the versioned JSON document `status --json` and `stats --json`
+/// print: its fields beside `schema_version`.
+fn write_document(
+    out: &mut dyn Write,
+    schema_version: u32,
+    body: &impl Serialize,
+) -> Result<(), CliError> {
+    #[derive(Serialize)]
+    struct Document<'a, T: Serialize> {
+        schema_version: u32,
+        #[serde(flatten)]
+        body: &'a T,
+    }
+    serde_json::to_writer_pretty(
+        &mut *out,
+        &Document {
+            schema_version,
+            body,
+        },
+    )
+    .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?;
+    writeln!(out).map_err(write_failed("the JSON document"))
+}
+
+/// `coordinator stats`: asks the coordinator for its statistics on a query
+/// session of its own, signed with this host's key like the daemon's link,
+/// which stays connected meanwhile.
+fn stats(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliError> {
+    let failed = write_failed("the coordinator statistics");
+    let Some(config) = records::configured(context.paths()).map_err(local_state)? else {
+        return Err(CliError::with_remedy(
+            Failure::NotFound,
+            "this host has not joined a coordinator",
+            "runner-manager coordinator join URL --code CODE",
+        ));
+    };
+    let url = CoordinatorUrl::parse(&config.url).map_err(|_| {
+        local_state("the recorded coordinator URL is not a URL; leave and join again")
+    })?;
+    let store = context.store()?;
+    let mode = context.recorded_start_mode(&store)?;
+    let key = load_key(key_store(context, mode)?.as_ref()).ok_or_else(|| {
+        CliError::with_remedy(
+            Failure::SecretStore,
+            format!("this account cannot read the coordinator key in the {mode}-mode secret store"),
+            "run the same command with administrator rights (sudo, or an elevated terminal)",
+        )
+    })?;
+    let report = super::runtime()?
+        .block_on(fetch_stats(&url, &config.host_id, &key, tls_config()))
+        .map_err(|end| match end {
+            SessionEnd::UnsupportedVersion => CliError::with_remedy(
+                Failure::UnsupportedHost,
+                "the coordinator is older than statistics (protocol version 4)",
+                "update the coordinator",
+            ),
+            SessionEnd::Rejected => CliError::with_remedy(
+                Failure::CoordinatorUnavailable,
+                "the coordinator refused this host's key",
+                "ask its operator whether this host was revoked; then leave and join again",
+            ),
+            other => unavailable(format!(
+                "the statistics could not be fetched from {url} ({})",
+                other.as_str()
+            )),
+        })?;
+    if json {
+        return write_document(out, STATS_SCHEMA_VERSION, &report);
+    }
+    let mut text = String::new();
+    report
+        .render(&mut text)
+        .map_err(|_| CliError::new(Failure::LocalState, "the statistics could not be printed"))?;
+    write!(out, "{text}").map_err(failed)?;
+    Ok(())
+}
+
+/// One query session: handshake for [`SessionPurpose::Query`], one request,
+/// one answer.
+async fn fetch_stats(
+    url: &CoordinatorUrl,
+    host_id: &str,
+    key: &HostSigningKey,
+    tls: Option<Arc<rustls::ClientConfig>>,
+) -> Result<StatsReport, SessionEnd> {
+    let mut socket = open_socket(url, tls).await?;
+    handshake(&mut socket, url, host_id, key, Some(SessionPurpose::Query)).await?;
+    send(&mut socket, &HostMessage::StatsRequest).await?;
+    loop {
+        let text = next_text_within(&mut socket).await?;
+        if let Ok(ServerMessage::Stats(report)) = ServerMessage::decode(&text) {
+            let _ = socket.close(None).await;
+            return Ok(report);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -914,8 +1001,21 @@ impl Recorder {
     }
 }
 
-/// Keeps the link up while this host has joined a coordinator. Never returns.
+/// Keeps the link up while this host has joined a coordinator, and samples
+/// what its attempts use meanwhile. Never returns.
 pub async fn maintain_link(ports: LinkPorts) {
+    let meters = Arc::new(AttemptMeters::default());
+    let coordination = Arc::clone(&ports.coordination);
+    let sampling = sample_attempts(
+        Arc::clone(&meters),
+        Arc::clone(&ports.store),
+        ports.host.id,
+        move || coordination.borrow().configured,
+    );
+    tokio::join!(sampling, link(ports, &meters));
+}
+
+async fn link(ports: LinkPorts, meters: &AttemptMeters) {
     let tls = tls_config();
     let mut recorder = Recorder {
         paths: ports.paths.clone(),
@@ -948,7 +1048,7 @@ pub async fn maintain_link(ports: LinkPorts) {
             changed
         });
         let started = tokio::time::Instant::now();
-        let end = session(&ports, &config, tls.clone(), &mut recorder).await;
+        let end = session(&ports, meters, &config, tls.clone(), &mut recorder).await;
         // The coordinator forgets a disconnected host's launches and places
         // their jobs elsewhere; starting them here as well would double up.
         ports.launches.clear();
@@ -1091,26 +1191,19 @@ async fn send(socket: &mut Socket, message: &HostMessage) -> Result<(), SessionE
         .map_err(|_| SessionEnd::Closed)
 }
 
-/// One connection, from handshake to whatever ends it.
-async fn session(
-    ports: &LinkPorts,
-    config: &CoordinatorConfig,
+/// A WebSocket to `url`'s `/connect`, its certificate checked by the
+/// platform verifier.
+async fn open_socket(
+    url: &CoordinatorUrl,
     tls: Option<Arc<rustls::ClientConfig>>,
-    recorder: &mut Recorder,
-) -> SessionEnd {
-    let Ok(url) = CoordinatorUrl::parse(&config.url) else {
-        return SessionEnd::Unreachable;
-    };
-    let Some(key) = load_key(ports.key_store.as_ref()) else {
-        return SessionEnd::NoKey;
-    };
+) -> Result<Socket, SessionEnd> {
     let socket_config = tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(runner_manager_coordinator_protocol::MAX_MESSAGE_BYTES))
         .max_frame_size(Some(runner_manager_coordinator_protocol::MAX_MESSAGE_BYTES));
     // Never let tungstenite fall back to a root-less default for `wss://`.
     let connector = match tls {
         Some(config) => Some(tokio_tungstenite::Connector::Rustls(config)),
-        None if url.connect_url().starts_with("wss://") => return SessionEnd::NoTls,
+        None if url.connect_url().starts_with("wss://") => return Err(SessionEnd::NoTls),
         None => None,
     };
     let connected = tokio::time::timeout(
@@ -1123,10 +1216,31 @@ async fn session(
         ),
     )
     .await;
-    let Ok(Ok((mut socket, _))) = connected else {
+    match connected {
+        Ok(Ok((socket, _))) => Ok(socket),
+        _ => Err(SessionEnd::Unreachable),
+    }
+}
+
+/// One connection, from handshake to whatever ends it.
+async fn session(
+    ports: &LinkPorts,
+    meters: &AttemptMeters,
+    config: &CoordinatorConfig,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    recorder: &mut Recorder,
+) -> SessionEnd {
+    let Ok(url) = CoordinatorUrl::parse(&config.url) else {
         return SessionEnd::Unreachable;
     };
-    match handshake(&mut socket, &url, &config.host_id, &key).await {
+    let Some(key) = load_key(ports.key_store.as_ref()) else {
+        return SessionEnd::NoKey;
+    };
+    let mut socket = match open_socket(&url, tls).await {
+        Ok(socket) => socket,
+        Err(end) => return end,
+    };
+    match handshake(&mut socket, &url, &config.host_id, &key, None).await {
         Ok(handshake) => {
             let version = handshake.version;
             drop(key);
@@ -1144,7 +1258,7 @@ async fn session(
                 }
             });
             tracing::info!(coordinator = %url, version, "connected to the coordinator");
-            serve(&mut socket, ports, config, handshake, recorder).await
+            serve(&mut socket, ports, meters, config, handshake, recorder).await
         }
         Err(end) => end,
     }
@@ -1167,12 +1281,14 @@ fn negotiated(protocol_version: u32, max_protocol_version: Option<u32>) -> Optio
     )
 }
 
-/// Challenge, signature, welcome.
+/// Challenge, signature, welcome. A query session (`purpose`) needs a
+/// version-4 coordinator: against an older one it ends before signing.
 async fn handshake(
     socket: &mut Socket,
     url: &CoordinatorUrl,
     host_id: &str,
     key: &HostSigningKey,
+    purpose: Option<SessionPurpose>,
 ) -> Result<Handshake, SessionEnd> {
     let challenge = next_text_within(socket).await?;
     let Ok(ServerMessage::Challenge {
@@ -1185,6 +1301,9 @@ async fn handshake(
     };
     let version =
         negotiated(protocol_version, max_protocol_version).ok_or(SessionEnd::UnsupportedVersion)?;
+    if purpose.is_some() && version < STATS_VERSION {
+        return Err(SessionEnd::UnsupportedVersion);
+    }
     let nonce = decode_nonce(&nonce).map_err(|_| SessionEnd::Closed)?;
     send(
         socket,
@@ -1192,6 +1311,7 @@ async fn handshake(
             protocol_version: version,
             host_id: host_id.to_string(),
             signature: sign_challenge(key, &nonce, &url.origin()),
+            purpose,
         },
     )
     .await?;
@@ -1211,6 +1331,7 @@ async fn handshake(
 async fn serve(
     socket: &mut Socket,
     ports: &LinkPorts,
+    meters: &AttemptMeters,
     config: &CoordinatorConfig,
     Handshake {
         heartbeat: interval,
@@ -1316,7 +1437,7 @@ async fn serve(
                     .into_iter()
                     .filter(|policy| policy.is_owned_by(ports.host.id))
                     .collect();
-                for report in reports.poll(ports.store.as_ref(), &own, &ports.launches) {
+                for report in reports.poll(ports.store.as_ref(), &own, &ports.launches, meters) {
                     let message = match report {
                         AttemptReport::Started(started) => HostMessage::AttemptStarted(started),
                         AttemptReport::Finished(finished) => HostMessage::AttemptFinished(finished),
@@ -1815,6 +1936,65 @@ mod tests {
         });
         assert!(!launches.is_directed(&policy));
         assert_eq!(launches.directed_demand(&policy), None);
+    }
+
+    /// `coordinator stats` over a real socket: the enrolled key reads the
+    /// statistics on a query session; another key reads nothing.
+    #[tokio::test]
+    async fn statistics_are_read_with_this_hosts_key_and_refused_to_any_other() {
+        use runner_manager_coordinator::server::{AppState, Config, serve};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let state = AppState::new(
+            Config::new(
+                base.clone(),
+                SecretString::from("a-webhook-secret-for-tests"),
+            ),
+            runner_manager_coordinator::store::Store::open_in_memory().expect("store"),
+        );
+        tokio::spawn(serve(listener, Arc::clone(&state), std::future::pending()));
+        let code = state
+            .store
+            .lock()
+            .expect("store")
+            .create_invite("box", Duration::from_secs(900), Utc::now())
+            .expect("invite")
+            .code;
+        let url = CoordinatorUrl::parse(&base).expect("url");
+        let key = signing_key_from_seed(&[6; 32]);
+        let enrolled = enroll(
+            &url,
+            &EnrollRequest {
+                protocol_version: MIN_PROTOCOL_VERSION,
+                code: code.expose_secret().to_string(),
+                hostname: "box".into(),
+                public_key: encode_public_key(&key.verifying_key()),
+            },
+        )
+        .await
+        .expect("enrolled");
+
+        let report = fetch_stats(&url, &enrolled.host_id, &key, None)
+            .await
+            .expect("the statistics");
+        assert_eq!(report.samples_per_job, 30);
+        assert!(report.jobs.is_empty());
+        let mut text = String::new();
+        report.render(&mut text).expect("renders");
+        assert!(text.contains("No job has been measured yet."), "{text}");
+
+        let other = signing_key_from_seed(&[7; 32]);
+        assert_eq!(
+            fetch_stats(&url, &enrolled.host_id, &other, None).await,
+            Err(SessionEnd::Rejected)
+        );
+        assert!(
+            state.registry.host_ids().is_empty(),
+            "a query session is never the host's link"
+        );
     }
 
     #[test]

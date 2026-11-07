@@ -64,6 +64,37 @@ Not released yet: this is the version being prepared.
   before. Hosts report `attempt_started` and `attempt_finished`.
 - The protocol is now version 3. Version-2 hosts and coordinators keep working
   at version 2: such a host is woken for pool jobs and computes its own demand.
+- Coordinator stage 4: job weight statistics. A joined host samples each native
+  runner's process tree every 2 seconds (Linux `/proc`, macOS `proc_pidinfo`,
+  Windows Toolhelp with `GetProcessMemoryInfo`/`GetProcessTimes`), off its
+  reconcile loop, and its `attempt_finished` carries the peak memory and the
+  average and busiest CPU. The coordinator joins that report with the job the
+  `workflow_job` webhook says the runner took and keeps, in SQLite, the last 30
+  samples per `repository/workflow/job` (`COORDINATOR_STATS_SAMPLES`) for at
+  most 90 days: p50 duration, p90 peak memory, p90 CPU, and each host's speed
+  for the same job.
+- Weighted placement for pool jobs: a queue's demand is its heaviest queued job
+  (a job never measured counts as its repository's p90, else
+  `COORDINATOR_DEFAULT_JOB_RAM`, 2 GiB); a host whose free memory, less what its
+  open launches are expected to need, cannot hold it with
+  `COORDINATOR_RAM_MARGIN` (512 MiB) to spare is passed over, and the rest are
+  scored by warm workspace, headroom, historical speed and a penalty for taking
+  the only host a heavier queued job fits (`COORDINATOR_PLACEMENT_WEIGHTS`,
+  default `cache=4,headroom=2,speed=1,bigfit=1.5`). With no statistics for a
+  queue nothing is filtered and the order is stage 3's.
+- `runner-manager coordinator stats [--json]` (over the host's signed link, on a
+  query session that leaves the daemon's link up) and
+  `runner-manager-coordinator stats [--json]` show the heaviest jobs, the
+  samples per host, all-time launches and wakes, and the last placement
+  decisions with each host's score.
+- Heartbeats now report free memory on macOS (free plus inactive pages) and CPU
+  load on Windows (`GetSystemTimes` between two heartbeats).
+- The protocol is now version 4 (`attempt_finished.usage`, query sessions).
+  Version-3 hosts and coordinators keep working at version 3; a version-3
+  host's attempts count towards duration statistics only.
+- The coordinator's database moves to schema 2. Rolling back to a stage-3
+  coordinator needs the pre-upgrade database or
+  `PRAGMA user_version = 1` (see `docs/coordinator.md`).
 
 ### Changed
 

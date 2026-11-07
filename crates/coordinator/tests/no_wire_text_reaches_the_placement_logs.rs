@@ -1,7 +1,9 @@
 //! Placement logs identifiers and counts only: drive a whole placement
 //! (a refusal, a silent host, an acceptance, a claim, a surplus cancel, an
-//! expiry) through a capturing subscriber at TRACE, and scan it for the
-//! repository, the labels and the runner name, which came off the wire.
+//! expiry), weighed by job statistics (stage 4: a job identified by its
+//! webhook, a measured attempt, a scored decision), through a capturing
+//! subscriber at TRACE, and scan it for the repository, the labels, the
+//! workflow and job names and the runner name, which came off the wire.
 //!
 //! Its own binary for the reason `no_secret_reaches_the_logs.rs` gives.
 
@@ -12,9 +14,12 @@ use std::time::{Duration, Instant};
 
 use runner_manager_coordinator::placement::Placement;
 use runner_manager_coordinator::registry::{Coverage, Outbound, Registry};
+use runner_manager_coordinator::stats::{JobIdentity, Statistics, StatsConfig};
+use runner_manager_coordinator::store::Store;
 use runner_manager_coordinator_protocol::{
-    AttemptStarted, Heartbeat, Hello, LAUNCH_VERSION, LaunchAck, Profile, RefusalReason,
-    ServerMessage, Target, TargetRef, TargetScope,
+    AttemptFinished, AttemptOutcomeKind, AttemptStarted, AttemptUsage, Heartbeat, Hello,
+    LAUNCH_VERSION, LaunchAck, Profile, RefusalReason, ServerMessage, Target, TargetRef,
+    TargetScope,
 };
 use runner_manager_domain::model::Label;
 
@@ -22,6 +27,8 @@ const REPOSITORY: &str = "secretive-owner/hush-hush-repo";
 const POOL: &str = "rm-pool-linux";
 const EXTRA: &str = "very-private-label";
 const RUNNER: &str = "runner-manager-wire-runner-name";
+const WORKFLOW: &str = "Confidential Release Pipeline";
+const JOB: &str = "sign-with-hsm (prod, eu)";
 
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -97,11 +104,33 @@ fn no_wire_text_reaches_the_placement_logs() {
                 repositories: BTreeSet::from([REPOSITORY.to_string()]),
                 accounts: BTreeSet::new(),
             });
-            let placement = Arc::new(Placement::with_timings(
-                Arc::clone(&registry),
-                Duration::from_millis(100),
-                Duration::from_secs(60),
+            let stats = Arc::new(Statistics::load(
+                Arc::new(Mutex::new(Store::open_in_memory().expect("store"))),
+                StatsConfig::default(),
             ));
+            let identity = JobIdentity::new(REPOSITORY, Some(WORKFLOW), Some(JOB)).expect("named");
+            stats.job_identified(RUNNER, identity.clone());
+            stats.attempt_finished(
+                "accepts",
+                &AttemptFinished {
+                    lease_id: None,
+                    runner_name: RUNNER.into(),
+                    outcome: AttemptOutcomeKind::CompletedJob,
+                    duration_secs: Some(60),
+                    usage: Some(AttemptUsage {
+                        peak_rss_bytes: 1 << 30,
+                        samples: 5,
+                        ..AttemptUsage::default()
+                    }),
+                }, None);
+            let placement = Arc::new(
+                Placement::with_timings(
+                    Arc::clone(&registry),
+                    Duration::from_millis(100),
+                    Duration::from_secs(60),
+                )
+                .with_statistics(Arc::clone(&stats)),
+            );
             let mut refuses = connect(&registry, "refuses", 64 << 30);
             let _silent = connect(&registry, "silent", 32 << 30);
             let mut accepts = connect(&registry, "accepts", 8 << 30);
@@ -135,8 +164,10 @@ fn no_wire_text_reaches_the_placement_logs() {
                 Label::new(POOL).expect("label"),
                 Label::new(EXTRA).expect("label"),
             ];
-            let key = placement.queued(REPOSITORY, &required, 1).expect("pool job");
-            placement.queued(REPOSITORY, &required, 2);
+            let key = placement
+                .queued_job(REPOSITORY, &required, 1, Some(identity.key()))
+                .expect("pool job");
+            placement.queued_job(REPOSITORY, &required, 2, Some(identity.key()));
             let report = placement.rebalance(&key).await;
             assert_eq!(report.accepted, 2, "{report:?}");
             placement.attempt_started(
@@ -165,10 +196,22 @@ fn no_wire_text_reaches_the_placement_logs() {
         "a host accepted a launch",
         "a launch was cancelled",
         "placement leases expired",
+        "a job sample was recorded",
+        "a pool queue was weighed",
+        "placement score",
     ] {
         assert!(logs.contains(expected), "missing `{expected}`:\n{logs}");
     }
-    for wire in [REPOSITORY, "hush-hush", EXTRA, RUNNER] {
+    for wire in [
+        REPOSITORY,
+        "hush-hush",
+        EXTRA,
+        RUNNER,
+        WORKFLOW,
+        "Confidential",
+        JOB,
+        "sign-with-hsm",
+    ] {
         assert!(!logs.contains(wire), "`{wire}` reached the logs:\n{logs}");
     }
 }

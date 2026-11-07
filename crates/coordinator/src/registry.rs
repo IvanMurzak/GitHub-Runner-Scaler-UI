@@ -103,6 +103,8 @@ pub struct Registry {
     /// Every wake sent, by the webhook or the sweep, so the sweep does not
     /// repeat one.
     wakes: WakeLog,
+    /// Wakes sent since the statistics last took the count.
+    wakes_sent: AtomicU64,
 }
 
 /// When a wake was last sent for a repository and a set of required labels,
@@ -170,6 +172,8 @@ pub struct Candidate {
     pub profile: String,
     /// The profile keeps a persistent workspace there.
     pub warm: bool,
+    /// The host's memory, as its `hello` reported it.
+    pub ram_bytes: Option<u64>,
     pub heartbeat: Heartbeat,
     /// When that heartbeat arrived: launches sent later are not in it.
     pub heartbeat_at: Instant,
@@ -286,6 +290,7 @@ impl Registry {
                         target: reference,
                         profile: profile.name.clone(),
                         warm: profile.warm,
+                        ram_bytes: hello.ram_bytes,
                         heartbeat: heartbeat.clone(),
                         heartbeat_at: connected.heartbeat_at,
                     });
@@ -436,8 +441,23 @@ impl Registry {
         drop(hosts);
         if woken > 0 {
             self.wakes.record(repository, required, Instant::now());
+            self.wakes_sent
+                .fetch_add(u64::try_from(woken).unwrap_or(u64::MAX), Ordering::Relaxed);
         }
         woken
+    }
+
+    /// The memory `host_id` reported in its `hello`.
+    #[must_use]
+    pub fn ram_bytes(&self, host_id: &str) -> Option<u64> {
+        self.lock()
+            .get(host_id)
+            .and_then(|connected| connected.hello.as_ref()?.ram_bytes)
+    }
+
+    /// Wakes sent since the last call, for the statistics' counters.
+    pub fn take_wakes_sent(&self) -> u64 {
+        self.wakes_sent.swap(0, Ordering::Relaxed)
     }
 }
 

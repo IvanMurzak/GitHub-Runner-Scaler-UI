@@ -1,7 +1,7 @@
 // owner: coordinator-stage1
 //
-// `coordinator join | status | leave` through the real binary, against a real
-// coordinator started in this process on loopback.
+// `coordinator join | status | leave | stats` through the real binary, against
+// a real coordinator started in this process on loopback.
 //
 // The secret scan mirrors `no_secret_reaches_command_output.rs`: the host's
 // private key and the one-time invite code must appear in no command's stdout
@@ -283,4 +283,69 @@ fn a_refused_code_and_an_insecure_url_change_nothing() {
 
     let leave = command(data, &["coordinator", "leave"]);
     assert_eq!(leave.code, 0, "leaving when not joined is not an error");
+}
+
+#[test]
+fn stats_are_read_over_the_hosts_signed_link_and_need_a_join() {
+    let coordinator = coordinator();
+    let data = tempfile::tempdir().expect("data root");
+    let data = data.path();
+
+    let unjoined = command(data, &["coordinator", "stats"]);
+    assert_eq!(unjoined.code, 10, "not joined: {}", unjoined.stderr);
+    assert!(
+        unjoined.stderr.contains("coordinator join"),
+        "{}",
+        unjoined.stderr
+    );
+
+    let code = coordinator.invite();
+    let joined = command(
+        data,
+        &["coordinator", "join", &coordinator.base, "--code", &code],
+    );
+    assert_eq!(joined.code, 0, "{}", joined.stderr);
+    let key = stored_key(data).expect("the private key");
+
+    let text = command(data, &["coordinator", "stats"]);
+    assert_eq!(text.code, 0, "{}", text.stderr);
+    assert!(text.stdout.contains("Job statistics"), "{}", text.stdout);
+    assert!(
+        text.stdout.contains("No job has been measured yet."),
+        "{}",
+        text.stdout
+    );
+    let json = command(data, &["coordinator", "stats", "--json"]);
+    assert_eq!(json.code, 0, "{}", json.stderr);
+    let document: Value = serde_json::from_str(&json.stdout).expect("json");
+    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["samples_per_job"], 30);
+    assert_eq!(document["jobs"], Value::Array(Vec::new()));
+
+    // Revoked at the coordinator: the signed query is refused.
+    coordinator.state.revoke("box").expect("revoked");
+    let refused = command(data, &["coordinator", "stats"]);
+    assert_eq!(refused.code, 26, "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("refused this host's key"),
+        "{}",
+        refused.stderr
+    );
+
+    let mut corpus = String::new();
+    for outcome in [&unjoined, &text, &json, &refused] {
+        corpus.push_str(&outcome.stdout);
+        corpus.push_str(&outcome.stderr);
+    }
+    corpus.push_str(&logs(data));
+    assert_eq!(
+        leaks(
+            &corpus,
+            &[
+                ("private key", key.as_str()),
+                ("invite code", code.as_str())
+            ]
+        ),
+        Vec::<String>::new()
+    );
 }
