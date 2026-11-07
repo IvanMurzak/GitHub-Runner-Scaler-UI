@@ -40,7 +40,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.45"
+version = "0.4.46"
 edition = "2024"
 rust-version = "1.94.0"
 license = "MIT"
@@ -53,10 +53,10 @@ homepage = "https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI"
 # --- Workspace members ------------------------------------------------------
 # Each carries a `version` as well as a `path` so the published `runner-manager`
 # crate (D11, `cargo install`) can resolve them from the registry.
-runner-manager-agent = { path = "crates/agent", version = "0.4.45" }
-runner-manager-domain = { path = "crates/domain", version = "0.4.45" }
-runner-manager-github = { path = "crates/github", version = "0.4.45" }
-runner-manager-platform = { path = "crates/platform", version = "0.4.45" }
+runner-manager-agent = { path = "crates/agent", version = "0.4.46" }
+runner-manager-domain = { path = "crates/domain", version = "0.4.46" }
+runner-manager-github = { path = "crates/github", version = "0.4.46" }
+runner-manager-platform = { path = "crates/platform", version = "0.4.46" }
 # The coordinator server is deployed as a container image, never published; it
 # is a dev-dependency of the app's link tests and so carries no `version`.
 runner-manager-coordinator = { path = "crates/coordinator" }
