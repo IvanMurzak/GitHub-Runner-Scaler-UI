@@ -197,8 +197,11 @@ impl Registry {
     /// Records what a host said about itself and, to a version-2 host,
     /// answers with its coverage.
     pub fn set_hello(&self, host_id: &str, connection: u64, hello: Hello) {
+        let mut hosts = self.lock();
+        // Read under the hosts lock: a `set_coverage` that lands after this
+        // read reaches this host in its own pass, which waits for the lock.
         let coverage = self.coverage();
-        if let Some(current) = self.lock().get_mut(host_id)
+        if let Some(current) = hosts.get_mut(host_id)
             && current.connection == connection
         {
             current.hello = Some(hello);
@@ -225,18 +228,16 @@ impl Registry {
     }
 
     /// Replaces the sweep's coverage and tells every version-2 host whose
-    /// answer changed.
+    /// answer differs from the last one it was sent.
+    ///
+    /// Every host is visited even when the coverage is unchanged: an answer
+    /// that met a full outbound queue last time is retried here, and one
+    /// already delivered is not sent again.
     pub fn set_coverage(&self, coverage: Coverage) {
-        {
-            let mut current = self
-                .coverage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *current == coverage {
-                return;
-            }
-            current.clone_from(&coverage);
-        }
+        self.coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone_from(&coverage);
         for (host_id, connected) in self.lock().iter_mut() {
             acknowledge(host_id, connected, &coverage);
         }
@@ -511,8 +512,34 @@ mod tests {
             ack.covered[0].name, "Octo/App",
             "named as the host named it"
         );
-        registry.set_coverage(covering);
+        registry.set_coverage(covering.clone());
         assert!(new_rx.try_recv().is_err(), "unchanged: not sent again");
+
+        // An answer that met a full queue is retried by the next sweep's
+        // unchanged coverage.
+        let (full_tx, mut full_rx) = mpsc::channel(1);
+        let full = registry.register("full", PROTOCOL_VERSION, full_tx);
+        registry.set_hello(
+            "full",
+            full,
+            hello(TargetScope::Repo, "octo/app", &["linux"], true),
+        );
+        assert!(matches!(
+            full_rx.try_recv(),
+            Ok(Outbound::Send(ServerMessage::HelloAck(ack))) if ack.covered.len() == 1
+        ));
+        // This answer fills the queue, so the next one is dropped.
+        registry.set_coverage(Coverage::default());
+        registry.set_coverage(covering.clone());
+        assert!(matches!(
+            full_rx.try_recv(),
+            Ok(Outbound::Send(ServerMessage::HelloAck(ack))) if ack.covered.is_empty()
+        ));
+        registry.set_coverage(covering.clone());
+        assert!(matches!(
+            full_rx.try_recv(),
+            Ok(Outbound::Send(ServerMessage::HelloAck(ack))) if ack.covered.len() == 1
+        ));
         assert!(old_rx.try_recv().is_err());
         assert_eq!(registry.advertised().len(), 1, "the same target once");
     }

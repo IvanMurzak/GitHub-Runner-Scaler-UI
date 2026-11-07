@@ -151,8 +151,9 @@ impl Sweeper {
         }
     }
 
-    /// One sweep: refresh the App's view, publish coverage, read every
-    /// served repository's queue and wake for what no wake was sent for.
+    /// One sweep: refresh the App's view, read every served repository's
+    /// queue, wake for what no wake was sent for, and publish as covered only
+    /// what the sweep could read.
     pub async fn sweep_once(&mut self) -> SweepReport {
         let now = Instant::now();
         let inventory = self
@@ -165,12 +166,14 @@ impl Sweeper {
                 tracing::warn!(%error, "the GitHub App could not be refreshed; sweeping with what is known");
             }
         }
-        let installations = self.reach.installations();
-        self.registry
-            .set_coverage(coverage(&installations, self.interval));
-
+        let mut installations = self.reach.installations();
         let advertised = self.registry.advertised();
         let mut report = SweepReport::default();
+        // What this sweep could not read is not covered: a host relies on the
+        // sweep only where the sweep actually reads its queue (a missing
+        // Actions permission, a rate limit, a refused token).
+        let mut unread = BTreeSet::new();
+        let mut failed = BTreeSet::new();
         for installation in &installations {
             let repositories = served(installation, &advertised);
             for repository in repositories {
@@ -178,11 +181,10 @@ impl Sweeper {
                     Ok(()) => {}
                     Err(InventoryError::RateLimited(_)) => {
                         report.rate_limited += 1;
+                        unread.insert(installation.id);
                         break;
                     }
-                    Err(InventoryError::Github(error))
-                        if error.is_authentication() || error.is_lockout() =>
-                    {
+                    Err(InventoryError::Github(error)) if error.is_authentication() => {
                         tracing::warn!(
                             installation = installation.id,
                             "an installation's token was refused; it is minted again at the next \
@@ -191,6 +193,7 @@ impl Sweeper {
                         self.reach.forget(installation.id);
                         self.inventory_at = None;
                         report.failed += 1;
+                        unread.insert(installation.id);
                         break;
                     }
                     Err(error) => {
@@ -200,10 +203,25 @@ impl Sweeper {
                             "a repository's queue could not be read"
                         );
                         report.failed += 1;
+                        failed.insert(repository);
                     }
                 }
             }
         }
+        installations.retain(|installation| !unread.contains(&installation.id));
+        for installation in &mut installations {
+            let before = installation.repositories.len();
+            installation
+                .repositories
+                .retain(|repository| !failed.contains(repository));
+            // An account is covered whole only when every repository of it
+            // the hosts serve was read.
+            if installation.repositories.len() != before {
+                installation.all_repositories = false;
+            }
+        }
+        self.registry
+            .set_coverage(coverage(&installations, self.interval));
         report
     }
 

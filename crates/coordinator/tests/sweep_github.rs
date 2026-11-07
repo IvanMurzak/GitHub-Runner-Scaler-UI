@@ -144,9 +144,18 @@ async fn a_rate_limited_installation_is_left_alone_until_github_says_so() {
     assert_eq!(second.rate_limited, 1, "still inside GitHub's wait");
     let (runs, _) = requests_to(&server, "/repos/octo/app/actions/runs").await;
     assert_eq!(runs, 1, "no request is sent while GitHub asked to wait");
+    let sent = messages(&mut rx);
     assert!(
-        messages(&mut rx)
-            .iter()
+        sent.iter()
             .all(|message| !matches!(message, ServerMessage::Wake(_)))
     );
+    // A queue the sweep cannot read is not covered: the host keeps polling it.
+    assert!(
+        sent.iter().all(|message| match message {
+            ServerMessage::HelloAck(ack) => ack.covered.is_empty(),
+            _ => true,
+        }),
+        "{sent:?}"
+    );
+    assert!(registry.coverage().accounts.is_empty());
 }

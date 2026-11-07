@@ -121,7 +121,9 @@ What the sweep does, every `COORDINATOR_RECONCILE_INTERVAL` (2 minutes by defaul
 - For each queued job that no wake was sent for within the interval (by the webhook or an
   earlier sweep), it wakes the hosts whose enabled profiles can take it. A job is identified by
   its repository and required labels.
-- It tells every host, in a `hello_ack`, which of its targets the sweep covers.
+- It tells every host, in a `hello_ack`, which of its targets the sweep covers: only the ones
+  whose queues it could read this time. A repository it could not read (a missing Actions
+  permission, a rate limit, a refused token) is not covered, so its hosts poll it themselves.
 
 ## Poll modes
 
