@@ -216,6 +216,8 @@ pub fn close_revoked(state: &AppState) {
                 .registry
                 .close(&host_id, CLOSE_UNAUTHORIZED, "revoked")
         {
+            // Forgotten by the registry, so its own disconnect will not.
+            state.placement.host_gone(&host_id);
             tracing::info!(%host_id, "a revoked host was disconnected");
         }
     }

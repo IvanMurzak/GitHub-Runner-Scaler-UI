@@ -949,6 +949,9 @@ pub async fn maintain_link(ports: LinkPorts) {
         });
         let started = tokio::time::Instant::now();
         let end = session(&ports, &config, tls.clone(), &mut recorder).await;
+        // The coordinator forgets a disconnected host's launches and places
+        // their jobs elsewhere; starting them here as well would double up.
+        ports.launches.clear();
         // Only the first failure after a session changes anything; repeated
         // failed reconnects must not wake every target loop.
         ports.coordination.send_if_modified(|view| {

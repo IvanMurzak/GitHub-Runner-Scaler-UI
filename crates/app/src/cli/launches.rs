@@ -40,10 +40,10 @@ use runner_manager_agent::reconcile::DemandDirector;
 use runner_manager_coordinator_protocol::{
     AttemptFinished, AttemptOutcomeKind, AttemptStarted, Launch, LaunchAck, RefusalReason,
 };
-use runner_manager_domain::attempt::{AttemptOutcome, RunnerAttempt};
+use runner_manager_domain::attempt::{AttemptOutcome, AttemptState, RunnerAttempt};
 use runner_manager_domain::capacity::{HostAllocator, LimitingFactor};
 use runner_manager_domain::model::{AttemptId, Host, PolicyId};
-use runner_manager_domain::policy::ScalePolicy;
+use runner_manager_domain::policy::{ScalePolicy, pool_label};
 use runner_manager_domain::store::Store;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -130,12 +130,25 @@ impl Launches {
     /// whose target is coordinated on a version-3 link.
     #[must_use]
     pub fn is_directed(&self, policy: &ScalePolicy) -> bool {
-        policy.is_owned_by(self.host.id)
-            && policy.pool_label().is_some()
+        self.is_own_pool_profile(policy)
             && self
                 .view
                 .borrow()
                 .launch_mode(&policy.target, Instant::now())
+    }
+
+    /// A profile of this host answering this host's own pool label. A
+    /// stored label for another OS's pool (written before it was refused)
+    /// never makes a profile a pool profile here.
+    fn is_own_pool_profile(&self, policy: &ScalePolicy) -> bool {
+        policy.is_owned_by(self.host.id) && policy.pool_label() == Some(&pool_label(self.host.os))
+    }
+
+    /// Drops every open launch: the link ended, and the coordinator forgets
+    /// a disconnected host's leases and places their jobs elsewhere. A runner
+    /// already started for one stays, as an idle runner of its profile.
+    pub fn clear(&self) {
+        self.book().open.clear();
     }
 
     /// How many launches are open for `policy`.
@@ -151,32 +164,66 @@ impl Launches {
     }
 
     /// Closes every open launch that expired, and every one whose runner is
-    /// no longer waiting for a job.
+    /// no longer waiting for a job. A launch without a runner of its own is
+    /// first given a waiting runner of its profile that no launch holds (one
+    /// left idle, or kept by `min_capacity`): that runner is what serves it,
+    /// so the allocator must not start another, and its claim closes it.
     fn settle(&self, now: Instant) {
-        let started: Vec<(String, AttemptId)> = self
-            .book()
-            .open
-            .iter()
-            .filter_map(|(id, open)| open.attempt.map(|attempt| (id.clone(), attempt)))
-            .collect();
+        let policies: HashSet<PolicyId> =
+            self.book().open.values().map(|open| open.policy).collect();
         // Read without holding the book: the link and the passes use it.
-        let done: Vec<String> = started
+        let waiting: HashMap<PolicyId, Vec<AttemptId>> = policies
             .into_iter()
-            .filter(|(_, attempt)| {
-                !self
+            .map(|policy| {
+                let attempts = self
                     .store
-                    .attempt(*attempt)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|attempt| attempt.state().is_unassigned())
+                    .uncleaned_attempts_for_policy(policy)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|attempt| attempt.state().is_unassigned())
+                    .map(|attempt| attempt.id)
+                    .collect();
+                (policy, attempts)
             })
-            .map(|(lease_id, _)| lease_id)
             .collect();
         let mut book = self.book();
-        for lease_id in done {
-            book.open.remove(&lease_id);
+        book.open.retain(|_, open| open.expires > now);
+        let held: HashSet<AttemptId> = book.open.values().filter_map(|open| open.attempt).collect();
+        let mut free: HashMap<PolicyId, Vec<AttemptId>> = waiting
+            .iter()
+            .map(|(policy, attempts)| {
+                let attempts = attempts
+                    .iter()
+                    .filter(|attempt| !held.contains(attempt))
+                    .copied()
+                    .collect();
+                (*policy, attempts)
+            })
+            .collect();
+        let mut bound = Vec::new();
+        for (lease_id, open) in &mut book.open {
+            match open.attempt {
+                // Its runner took a job or ended.
+                Some(attempt)
+                    if !waiting
+                        .get(&open.policy)
+                        .is_some_and(|attempts| attempts.contains(&attempt)) =>
+                {
+                    open.expires = now;
+                }
+                Some(_) => {}
+                None => {
+                    if let Some(attempt) = free.get_mut(&open.policy).and_then(Vec::pop) {
+                        open.attempt = Some(attempt);
+                        bound.push((attempt, lease_id.clone()));
+                    }
+                }
+            }
         }
         book.open.retain(|_, open| open.expires > now);
+        for (attempt, lease_id) in bound {
+            book.lease_runner(attempt, &lease_id);
+        }
     }
 
     /// The coordinator's `launch`: accepted or refused, and on acceptance
@@ -205,8 +252,7 @@ impl Launches {
         let Some(policy) = policies.iter().find(|policy| {
             same_target(&policy.target, &launch.target)
                 && policy.profile_name().as_str() == launch.profile
-                && policy.is_owned_by(self.host.id)
-                && policy.pool_label().is_some()
+                && self.is_own_pool_profile(policy)
         }) else {
             return refuse(RefusalReason::UnknownProfile);
         };
@@ -304,11 +350,13 @@ impl DemandDirector for Launches {
 struct Watched {
     policy: PolicyId,
     started: bool,
+    finished: bool,
 }
 
 /// Turns this host's attempt states into `attempt_started` (a runner took a
-/// job) and `attempt_finished` reports. Attempts that had already ended when
-/// the link came up are not reported.
+/// job: `busy`) and `attempt_finished` (it reached a terminal state) reports,
+/// each at most once per attempt. Attempts that had already ended when the
+/// link came up are not reported, unless a launch of this host started them.
 #[derive(Debug, Default)]
 pub struct AttemptReports {
     watched: HashMap<AttemptId, Watched>,
@@ -347,17 +395,17 @@ impl AttemptReports {
             };
             for attempt in attempts {
                 present.insert(attempt.id);
-                let concluded = attempt.state().is_concluded();
-                let watched = match self.watched.get_mut(&attempt.id) {
-                    Some(watched) => watched,
-                    // Ended before this link saw it: not news.
-                    None if concluded => continue,
-                    None => self.watched.entry(attempt.id).or_insert(Watched {
-                        policy: policy.id,
-                        started: false,
-                    }),
-                };
-                if !watched.started && !attempt.state().is_unassigned() && !concluded {
+                // Terminal, not just concluded: an isolated attempt passes
+                // through `destroying` and `cleanup_deferred` after it ended.
+                let ended = attempt.state().is_terminal();
+                let watched = self.watched.entry(attempt.id).or_insert(Watched {
+                    policy: policy.id,
+                    started: ended,
+                    // Ended before this link saw it: news only when a launch
+                    // started it, so its lease closes.
+                    finished: ended && launches.lease_of(attempt.id).is_none(),
+                });
+                if !watched.started && attempt.state() == AttemptState::Busy {
                     watched.started = true;
                     reports.push(AttemptReport::Started(AttemptStarted {
                         lease_id: launches.lease_of(attempt.id),
@@ -366,8 +414,8 @@ impl AttemptReports {
                         profile: policy.profile_name().to_string(),
                     }));
                 }
-                if concluded {
-                    self.watched.remove(&attempt.id);
+                if ended && !watched.finished {
+                    watched.finished = true;
                     reports.push(finished(&attempt, launches));
                 }
             }
@@ -380,10 +428,10 @@ impl AttemptReports {
             .copied()
             .collect();
         for id in gone {
-            let watched = self.watched.remove(&id);
-            let still_served = watched
-                .is_some_and(|watched| policies.iter().any(|policy| policy.id == watched.policy));
-            if let (true, Ok(Some(attempt))) = (still_served, store.attempt(id)) {
+            let unreported = self.watched.remove(&id).is_some_and(|watched| {
+                !watched.finished && policies.iter().any(|policy| policy.id == watched.policy)
+            });
+            if let (true, Ok(Some(attempt))) = (unreported, store.attempt(id)) {
                 reports.push(finished(&attempt, launches));
             }
         }
@@ -410,8 +458,6 @@ fn finished(attempt: &RunnerAttempt, launches: &Launches) -> AttemptReport {
 #[cfg(test)]
 mod tests {
     use runner_manager_coordinator_protocol::{HelloAck, LAUNCH_VERSION};
-    use runner_manager_domain::attempt::AttemptState;
-    use runner_manager_domain::policy::pool_label;
     use runner_manager_domain::store::SqliteStore;
     use runner_manager_testkit::fixtures;
 
@@ -604,5 +650,105 @@ mod tests {
         );
         launches.settle(Instant::now() + Duration::from_secs(301));
         assert_eq!(launches.open_for(policy.id), 0);
+    }
+
+    fn attempt_in(policy: &ScalePolicy, id: AttemptId, state: AttemptState) -> RunnerAttempt {
+        let builder = fixtures::attempt().id(id).policy_id(policy.id).state(state);
+        match state {
+            AttemptState::Finished => builder.outcome(AttemptOutcome::CompletedJob).build(),
+            _ => builder.build(),
+        }
+    }
+
+    #[test]
+    fn an_idle_runner_of_the_profile_serves_a_launch_instead_of_a_new_one() {
+        let (store, policy, launches) = setup(LAUNCH_VERSION);
+        let idle = AttemptId::new_random();
+        store
+            .record_attempt(&attempt_in(&policy, idle, AttemptState::Idle))
+            .expect("recorded");
+        assert!(
+            launches
+                .decide(&launch(&policy, "l"), false, false)
+                .accepted
+        );
+        // Bound to the idle runner: still one launch, served by it.
+        assert_eq!(launches.directed_demand(&policy), Some(1));
+        assert_eq!(launches.lease_of(idle).as_deref(), Some("l"));
+        // It takes the job: the launch closes and nothing new is owed.
+        store
+            .record_attempt(&attempt_in(&policy, idle, AttemptState::Busy))
+            .expect("recorded");
+        assert_eq!(launches.directed_demand(&policy), Some(0));
+    }
+
+    #[test]
+    fn a_lost_link_drops_every_open_launch() {
+        let (_store, policy, launches) = setup(LAUNCH_VERSION);
+        assert!(
+            launches
+                .decide(&launch(&policy, "l"), false, false)
+                .accepted
+        );
+        launches.clear();
+        assert_eq!(launches.open_for(policy.id), 0);
+    }
+
+    #[test]
+    fn each_attempt_is_reported_started_and_finished_once_whatever_its_cleanup() {
+        let (store, policy, launches) = setup(LAUNCH_VERSION);
+        let policies = vec![policy.clone()];
+        let mut reports = AttemptReports::default();
+        let id = AttemptId::new_random();
+        store
+            .record_attempt(&attempt_in(&policy, id, AttemptState::Busy))
+            .expect("recorded");
+        assert_eq!(reports.poll(store.as_ref(), &policies, &launches).len(), 1);
+        store
+            .record_attempt(&attempt_in(&policy, id, AttemptState::Finished))
+            .expect("recorded");
+        assert_eq!(reports.poll(store.as_ref(), &policies, &launches).len(), 1);
+        assert!(
+            reports
+                .poll(store.as_ref(), &policies, &launches)
+                .is_empty()
+        );
+        // An isolated attempt still being destroyed when the link comes up
+        // ended long ago: not a start, not news.
+        let destroying = AttemptId::new_random();
+        store
+            .record_attempt(&attempt_in(&policy, destroying, AttemptState::Destroying))
+            .expect("recorded");
+        assert!(
+            reports
+                .poll(store.as_ref(), &policies, &launches)
+                .is_empty()
+        );
+
+        // A launched runner that failed between two looks is still reported,
+        // so its lease closes.
+        assert!(
+            launches
+                .decide(&launch(&policy, "short"), false, false)
+                .accepted
+        );
+        let short = AttemptId::new_random();
+        launches.launched(&policy, short);
+        let failed = fixtures::attempt()
+            .id(short)
+            .policy_id(policy.id)
+            .state(AttemptState::Failed)
+            .build();
+        store.record_attempt(&failed).expect("recorded");
+        let reported = reports.poll(store.as_ref(), &policies, &launches);
+        assert!(matches!(
+            reported.as_slice(),
+            [AttemptReport::Finished(AttemptFinished { lease_id: Some(lease), .. })] if lease == "short"
+        ));
+        assert!(
+            reports
+                .poll(store.as_ref(), &policies, &launches)
+                .is_empty()
+        );
     }
 }

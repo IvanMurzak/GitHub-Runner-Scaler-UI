@@ -243,6 +243,7 @@ impl Sweeper {
         repository: &OwnerRepo,
         report: &mut SweepReport,
     ) -> Result<(), InventoryError> {
+        let read_at = Instant::now();
         let demand = installation
             .demand
             .queued_demand(
@@ -275,7 +276,8 @@ impl Sweeper {
             report.wakes += u32::try_from(woken).unwrap_or(u32::MAX);
         }
         if let Some(placement) = &self.placement {
-            for key in placement.swept(&name, &pool) {
+            let floor = demand.is_truncated(repository);
+            for key in placement.swept(&name, &pool, read_at, floor) {
                 placement.spawn_rebalance(key, Duration::ZERO);
             }
         }

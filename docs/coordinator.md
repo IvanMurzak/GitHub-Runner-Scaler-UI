@@ -210,11 +210,13 @@ waits and is retried every 5 seconds, and whenever a host reports a runner ended
 
 A launch is a **lease** for 5 minutes. GitHub hands a runner *any* queued job its labels cover, so
 the coordinator counts per repository and label set: it never holds more leases than jobs are
-queued. A lease closes when its runner takes a job (the host's `attempt_started`), when its
-attempt ends (`attempt_finished`), when its host disconnects, or when it expires; the job, if still
-queued, is then placed again. When a job leaves the queue another way (cancelled, or taken by a
-runner outside the pool), the surplus lease is cancelled (`cancel_launch`) and its host starts no
-runner for it.
+queued. When a lease's runner takes a job (the host's `attempt_started`) the lease is held until
+the webhook takes that job out of the queue (at most 30 seconds), so the job is not placed twice
+meanwhile. A lease also closes when its attempt ends (`attempt_finished`), when its host
+disconnects (the host drops its open launches too), or when it expires; the job, if still queued,
+is then placed again. When a job leaves the queue another way (cancelled, or taken by a runner
+outside the pool), the surplus lease is cancelled (`cancel_launch`) and its host starts no runner
+for it. The sweep's counts correct lost webhooks; a listing GitHub truncated only ever adds jobs.
 
 ### On the host
 

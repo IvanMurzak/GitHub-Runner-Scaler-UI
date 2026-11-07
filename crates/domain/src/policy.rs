@@ -131,12 +131,23 @@ pub enum PolicyError {
 pub const POOL_LABEL_PREFIX: &str = "rm-pool-";
 
 /// Whether `label` is in the reserved pool namespace, compared the way GitHub
-/// compares labels: case-insensitively.
+/// compares labels: case-insensitively. Only for refusing labels; what
+/// makes a job or a profile a pool one is [`is_pool_label`].
 #[must_use]
-pub fn is_pool_label(label: &str) -> bool {
+pub fn in_pool_namespace(label: &str) -> bool {
     label
         .get(..POOL_LABEL_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(POOL_LABEL_PREFIX))
+}
+
+/// Whether `label` is one of the three shared pool labels, case-insensitively.
+/// An exact match: a host label derived from `--host-label pool`
+/// (`rm-pool-linux-x64`) is that host's own selector, not a pool.
+#[must_use]
+pub fn is_pool_label(label: &str) -> bool {
+    Os::ALL
+        .iter()
+        .any(|os| pool_label(*os).as_str().eq_ignore_ascii_case(label))
 }
 
 /// The one pool label a host running `os` may carry: `rm-pool-windows`,
@@ -153,7 +164,7 @@ pub fn pool_label(os: Os) -> Label {
 /// [`PolicyError::PoolLabelMismatch`].
 pub fn check_pool_label(label: &Label, os: Os) -> Result<(), PolicyError> {
     let expected = pool_label(os);
-    if is_pool_label(label.as_str()) && *label != expected {
+    if in_pool_namespace(label.as_str()) && *label != expected {
         return Err(PolicyError::PoolLabelMismatch {
             label: label.clone(),
             expected,
@@ -1768,6 +1779,9 @@ mod tests {
         assert!(is_pool_label("RM-POOL-linux"));
         assert!(!is_pool_label("rm-home-linux-x64"));
         assert!(!is_pool_label("rm-pool"));
+        // A selector derived from `--host-label pool` is not a pool.
+        assert!(!is_pool_label("rm-pool-linux-x64"));
+        assert!(in_pool_namespace("rm-pool-linux-x64"));
         assert!(check_pool_label(&label("rm-pool-linux"), Os::Linux).is_ok());
         assert!(check_pool_label(&label("self-hosted"), Os::Linux).is_ok());
         assert!(matches!(

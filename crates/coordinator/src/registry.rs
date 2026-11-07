@@ -39,6 +39,8 @@ struct Connected {
     sender: mpsc::Sender<Outbound>,
     hello: Option<Hello>,
     heartbeat: Option<Heartbeat>,
+    /// When `heartbeat` arrived.
+    heartbeat_at: Instant,
     /// The last `hello_ack` sent, so an unchanged one is not sent again.
     acked: Option<HelloAck>,
 }
@@ -169,6 +171,8 @@ pub struct Candidate {
     /// The profile keeps a persistent workspace there.
     pub warm: bool,
     pub heartbeat: Heartbeat,
+    /// When that heartbeat arrived: launches sent later are not in it.
+    pub heartbeat_at: Instant,
 }
 
 /// Whether a job requiring `required` asks for a shared pool.
@@ -204,6 +208,7 @@ impl Registry {
                 sender,
                 hello: None,
                 heartbeat: None,
+                heartbeat_at: Instant::now(),
                 acked: None,
             },
         );
@@ -237,16 +242,14 @@ impl Registry {
             .is_some_and(|connected| connected.sender.try_send(Outbound::Send(message)).is_ok())
     }
 
-    /// Asks `host_id`'s connection to close with `code`; `true` when it was
-    /// connected.
+    /// Closes `host_id`'s connection with `code` and forgets it; `true` when
+    /// it was connected. With its queue full the close frame cannot be
+    /// queued, but forgetting the connection drops its sender, which ends
+    /// the server task all the same.
     pub fn close(&self, host_id: &str, code: u16, reason: &'static str) -> bool {
-        self.lock().get(host_id).is_some_and(|connected| {
-            // A full queue still ends the connection: the server task sees the
-            // closed channel once this sender is dropped below.
-            connected
-                .sender
-                .try_send(Outbound::Close(code, reason))
-                .is_ok()
+        self.lock().remove(host_id).is_some_and(|connected| {
+            let _ = connected.sender.try_send(Outbound::Close(code, reason));
+            true
         })
     }
 
@@ -284,6 +287,7 @@ impl Registry {
                         profile: profile.name.clone(),
                         warm: profile.warm,
                         heartbeat: heartbeat.clone(),
+                        heartbeat_at: connected.heartbeat_at,
                     });
                     break;
                 }
@@ -358,6 +362,7 @@ impl Registry {
             && current.connection == connection
         {
             current.heartbeat = Some(heartbeat);
+            current.heartbeat_at = Instant::now();
         }
     }
 
@@ -648,5 +653,18 @@ mod tests {
         ));
         assert!(old_rx.try_recv().is_err());
         assert_eq!(registry.advertised().len(), 1, "the same target once");
+    }
+
+    #[tokio::test]
+    async fn closing_a_host_with_a_full_queue_still_ends_its_connection() {
+        let registry = Registry::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.register("h", MIN_PROTOCOL_VERSION, tx);
+        assert!(registry.send("h", ServerMessage::Unknown));
+        assert!(registry.close("h", 4401, "revoked"));
+        assert!(registry.connected().is_empty());
+        // The queued message, then the end of the channel.
+        assert!(rx.recv().await.is_some());
+        assert!(rx.recv().await.is_none());
     }
 }

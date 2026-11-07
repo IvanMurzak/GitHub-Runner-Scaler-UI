@@ -2277,7 +2277,8 @@ pub trait DemandDirector: fmt::Debug + Send + Sync {
     /// `None`: its own reading, as without a coordinator.
     fn directed_demand(&self, policy: &ScalePolicy) -> Option<u32>;
 
-    /// A runner was started for `policy` while its demand was directed.
+    /// A runner was started for `policy` (as soon as it exists, whether or
+    /// not its demand was directed).
     fn launched(&self, policy: &ScalePolicy, attempt: AttemptId);
 }
 
@@ -2770,12 +2771,8 @@ impl Reconciler {
             // here are the demand, whatever this host's own reading says (or
             // whether it could read at all).
             if let Some(directed) = self.director.directed_demand(policy) {
-                let before = launched.len();
                 self.start_runners(policy, directed, &mut report, &mut launched)
                     .await;
-                for attempt in &launched[before..] {
-                    self.director.launched(policy, attempt.id);
-                }
                 continue;
             }
             let Some(reading) = readings.get(&policy.target) else {
@@ -3041,6 +3038,10 @@ impl Reconciler {
                     // host-wide total cannot be computed from a set that is
                     // missing it. See `RunnerLauncher::launch`.
                     launched.push(attempt);
+                    // At once, not after the pass: the runner may take a job
+                    // while the next one starts, and its report names the
+                    // launch it was started for.
+                    self.director.launched(policy, id);
                     report.started = report.started.saturating_add(1);
                     budget -= 1;
                     self.events.emit(LifecycleEvent::RunnerStarted {

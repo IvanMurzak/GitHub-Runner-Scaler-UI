@@ -17,7 +17,7 @@ use runner_manager_domain::model::{
 };
 use runner_manager_domain::policy::{
     NamedProfileSpec, PolicyMode, PolicyState, RoutingLabels, ScalePolicy, check_pool_label,
-    pool_label,
+    in_pool_namespace, pool_label,
 };
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::WorkspaceKind;
@@ -483,13 +483,24 @@ fn record_named_policy(
 /// # Errors
 /// A mismatched pool label, or another profile of the target carrying it.
 pub fn check_pool_labels(store: &dyn Store, policy: &ScalePolicy) -> Result<(), CliError> {
-    let (Some(labels), Some(pool)) = (policy.routing_labels(), policy.pool_label()) else {
+    let Some(labels) = policy.routing_labels() else {
         return Ok(());
     };
+    // Every label in the reserved namespace, not only the exact pool ones:
+    // `rm-pool-linux-heavy` is refused too.
+    if !labels
+        .additional()
+        .any(|label| in_pool_namespace(label.as_str()))
+    {
+        return Ok(());
+    }
     let os = host_os(store, policy)?;
     for label in labels.additional() {
         check_pool_label(label, os).map_err(invalid)?;
     }
+    let Some(pool) = labels.pool_label() else {
+        return Ok(());
+    };
     let sibling = store
         .policies()
         .map_err(store_failure)?

@@ -38,7 +38,7 @@
 //! Lease ids, host ids, job ids and counts only: never a repository name, a
 //! label or a runner name, which came off the wire.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,11 @@ pub const LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 /// host whose runner took it to report `attempt_started`, so the lease
 /// cancelled as surplus is not that one.
 pub const CLAIM_GRACE: Duration = Duration::from_secs(3);
+
+/// How long a lease whose runner took a job (`attempt_started`) still counts,
+/// waiting for the webhook that takes that job out of the queue; and how long
+/// a job that left the queue waits for the claim of the runner that took it.
+pub const CLAIM_HOLD: Duration = Duration::from_secs(30);
 
 /// How often leases expire and unplaced jobs are retried.
 pub const TICK: Duration = Duration::from_secs(5);
@@ -116,6 +121,9 @@ enum LeaseState {
     /// Sent; no answer yet.
     Offered,
     Accepted,
+    /// Its runner took a job; held until the webhook takes that job out of
+    /// the queue, so the job is not placed a second time meanwhile.
+    Claimed(Instant),
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +131,7 @@ struct Lease {
     key: JobKey,
     host_id: String,
     state: LeaseState,
-    /// Every lease lives as long, so this also orders them by age.
+    sent: Instant,
     expires: Instant,
 }
 
@@ -131,6 +139,12 @@ struct Lease {
 struct State {
     queues: HashMap<JobKey, Queue>,
     leases: HashMap<String, Lease>,
+    /// When a webhook last changed a key's queue, so a sweep that read
+    /// GitHub before that does not overwrite it.
+    touched: HashMap<JobKey, Instant>,
+    /// Jobs that left the queue before the runner that took them was
+    /// reported: the next claim on that key closes its lease outright.
+    credits: HashMap<JobKey, VecDeque<Instant>>,
 }
 
 impl State {
@@ -141,11 +155,14 @@ impl State {
             .count()
     }
 
-    fn leases_on(&self, host_id: &str) -> u32 {
+    /// Launches on `host_id` its heartbeat at `heartbeat_at` cannot have
+    /// counted yet: sent after it, and not claimed.
+    fn unreported_on(&self, host_id: &str, heartbeat_at: Instant) -> u32 {
         u32::try_from(
             self.leases
                 .values()
-                .filter(|lease| lease.host_id == host_id)
+                .filter(|lease| lease.host_id == host_id && lease.sent > heartbeat_at)
+                .filter(|lease| !matches!(lease.state, LeaseState::Claimed(_)))
                 .count(),
         )
         .unwrap_or(u32::MAX)
@@ -239,12 +256,13 @@ impl Placement {
             tracing::warn!("too many queued pool jobs are remembered; this one is not placed");
             return None;
         }
-        state
-            .queues
-            .entry(key.clone())
-            .or_default()
-            .jobs
-            .insert(job_id, Instant::now());
+        let now = Instant::now();
+        state.touched.insert(key.clone(), now);
+        let queue = state.queues.entry(key.clone()).or_default();
+        if queue.jobs.insert(job_id, now).is_none() && queue.unnamed > 0 {
+            // A late webhook for a job the sweep already counted.
+            queue.unnamed -= 1;
+        }
         Some(key)
     }
 
@@ -255,19 +273,48 @@ impl Placement {
             return None;
         }
         let key = JobKey::new(repository, required);
+        let now = Instant::now();
         let mut state = self.state();
+        state.touched.insert(key.clone(), now);
         if let Some(queue) = state.queues.get_mut(&key) {
             queue.take(job_id);
             if queue.len() == 0 {
                 state.queues.remove(&key);
             }
         }
+        // The runner that took it closes its lease; if it already said so,
+        // that lease goes now, else its claim will.
+        let claimed = state
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.key == key)
+            .filter_map(|(id, lease)| match lease.state {
+                LeaseState::Claimed(at) => Some((id.clone(), at)),
+                _ => None,
+            })
+            .min_by_key(|(_, at)| *at)
+            .map(|(id, _)| id);
+        match claimed {
+            Some(id) => {
+                state.leases.remove(&id);
+            }
+            None => state.credits.entry(key.clone()).or_default().push_back(now),
+        }
         Some(key)
     }
 
     /// The sweep counted `counts` queued pool jobs per required label set in
-    /// `repository`, which it read in full. Returns the keys that changed.
-    pub fn swept(&self, repository: &str, counts: &HashMap<BTreeSet<Label>, u32>) -> Vec<JobKey> {
+    /// `repository`, reading it from `read_at` on. `floor`: the listing was
+    /// truncated, so a count is a minimum and nothing is taken away. A key a
+    /// webhook changed after `read_at` is left alone: the webhook is newer.
+    /// Returns the keys that changed.
+    pub fn swept(
+        &self,
+        repository: &str,
+        counts: &HashMap<BTreeSet<Label>, u32>,
+        read_at: Instant,
+        floor: bool,
+    ) -> Vec<JobKey> {
         let repository = repository.to_ascii_lowercase();
         let mut state = self.state();
         let mut keys: BTreeSet<JobKey> = state
@@ -282,12 +329,21 @@ impl Placement {
         }));
         let mut changed = Vec::new();
         for key in keys {
+            if state.touched.get(&key).is_some_and(|at| *at >= read_at) {
+                continue;
+            }
             let swept = counts.get(&key.labels).copied().unwrap_or(0);
             let queue = state.queues.entry(key.clone()).or_default();
             let before = queue.len();
             let named = u32::try_from(queue.jobs.len()).unwrap_or(u32::MAX);
             if swept >= named {
-                queue.unnamed = swept - named;
+                queue.unnamed = if floor {
+                    queue.unnamed.max(swept - named)
+                } else {
+                    swept - named
+                };
+            } else if floor {
+                // A minimum below what is known says nothing.
             } else {
                 // Some announced jobs left without a webhook saying so: the
                 // oldest are the ones most likely gone.
@@ -328,9 +384,31 @@ impl Placement {
         }
     }
 
-    /// A host's runner took a job. Closes its lease.
+    /// A host's runner took a job. Its lease closes if the job already left
+    /// the queue; otherwise it is held as claimed until the webhook says so.
     pub fn attempt_started(&self, host_id: &str, started: &AttemptStarted) {
-        self.close(host_id, started.lease_id.as_deref());
+        let Some(lease_id) = started.lease_id.as_deref() else {
+            return;
+        };
+        let mut state = self.state();
+        let Some(key) = state
+            .leases
+            .get(lease_id)
+            .filter(|lease| lease.host_id == host_id)
+            .map(|lease| lease.key.clone())
+        else {
+            return;
+        };
+        let credited = state
+            .credits
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+            .is_some();
+        if credited {
+            state.leases.remove(lease_id);
+        } else if let Some(lease) = state.leases.get_mut(lease_id) {
+            lease.state = LeaseState::Claimed(Instant::now());
+        }
     }
 
     /// A host's attempt ended. Closes its lease, if it still had one.
@@ -369,7 +447,18 @@ impl Placement {
     pub fn expire(&self, now: Instant) -> Vec<JobKey> {
         let mut state = self.state();
         let before = state.leases.len();
-        state.leases.retain(|_, lease| lease.expires > now);
+        state.leases.retain(|_, lease| {
+            lease.expires > now
+                && !matches!(lease.state, LeaseState::Claimed(at)
+                    if now.saturating_duration_since(at) >= CLAIM_HOLD)
+        });
+        for credits in state.credits.values_mut() {
+            credits.retain(|at| now.saturating_duration_since(*at) < CLAIM_HOLD);
+        }
+        state.credits.retain(|_, credits| !credits.is_empty());
+        state
+            .touched
+            .retain(|_, at| now.saturating_duration_since(*at) < JOB_MEMORY);
         let expired = before - state.leases.len();
         if expired > 0 {
             tracing::info!(expired, "placement leases expired");
@@ -505,7 +594,8 @@ impl Placement {
                 .filter(|candidate| !tried.contains(&candidate.host_id))
                 .filter(|candidate| !candidate.heartbeat.unfit && !candidate.heartbeat.draining)
                 .filter(|candidate| {
-                    candidate.heartbeat.free_slots > state.leases_on(&candidate.host_id)
+                    candidate.heartbeat.free_slots
+                        > state.unreported_on(&candidate.host_id, candidate.heartbeat_at)
                 })
                 .collect(),
         )
@@ -520,6 +610,7 @@ impl Placement {
                 key: key.clone(),
                 host_id: chosen.host_id.clone(),
                 state: LeaseState::Offered,
+                sent: now,
                 expires: now + ttl + self.ack_timeout,
             },
         );
@@ -556,7 +647,7 @@ impl Placement {
             .leases
             .iter()
             .filter(|(_, lease)| &lease.key == key && lease.state == LeaseState::Accepted)
-            .map(|(id, lease)| (id.clone(), lease.expires))
+            .map(|(id, lease)| (id.clone(), lease.sent))
             .collect();
         accepted.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
         for (lease_id, _) in accepted.into_iter().take(surplus) {
@@ -957,17 +1048,130 @@ mod tests {
         let pool = required(POOL);
         let labels: BTreeSet<Label> = pool.iter().cloned().collect();
         let key = placement.queued("octo/app", &pool, 1).expect("pool");
+        let read_at = Instant::now();
         // Three queued by the sweep's count, one of them announced.
-        let changed = placement.swept("Octo/App", &HashMap::from([(labels.clone(), 3)]));
-        assert_eq!(changed, vec![key.clone()]);
+        let three = HashMap::from([(labels.clone(), 3)]);
+        assert_eq!(
+            placement.swept("Octo/App", &three, read_at, false),
+            vec![key.clone()]
+        );
         assert_eq!(placement.counts(&key).0, 3);
         assert_eq!(placement.rebalance(&key).await.accepted, 3);
-        // The next sweep sees none: the queue empties and the leases are
+        // A late webhook for one the sweep already counted is not a fourth.
+        placement.queued("octo/app", &pool, 2);
+        assert_eq!(placement.counts(&key).0, 3);
+        // A sweep that read before that webhook does not overwrite it.
+        assert!(
+            placement
+                .swept("octo/app", &HashMap::new(), read_at, false)
+                .is_empty()
+        );
+        assert_eq!(placement.counts(&key).0, 3);
+        // A truncated listing is a minimum: it never takes jobs away.
+        let later = Instant::now();
+        let one = HashMap::from([(labels.clone(), 1)]);
+        assert!(placement.swept("octo/app", &one, later, true).is_empty());
+        assert_eq!(placement.counts(&key).0, 3);
+        // The next full sweep sees none: the queue empties and the leases are
         // cancelled.
-        placement.swept("octo/app", &HashMap::new());
+        placement.swept("octo/app", &HashMap::new(), later, false);
         assert_eq!(placement.counts(&key).0, 0);
         assert_eq!(placement.rebalance(&key).await.cancelled, 3);
         drop(host);
+    }
+
+    #[tokio::test]
+    async fn a_claimed_lease_holds_its_job_until_the_webhook_and_either_order_closes_it() {
+        let (registry, placement) = setup();
+        let host = connect(&registry, "h", LAUNCH_VERSION, POOL, 8, 8 << 30);
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let pool = required(POOL);
+        let key = placement.queued("octo/app", &pool, 1).expect("pool");
+        placement.queued("octo/app", &pool, 2);
+        assert_eq!(placement.rebalance(&key).await.accepted, 2);
+        let leases: Vec<String> = placement.state().leases.keys().cloned().collect();
+        let started = |lease: &str| AttemptStarted {
+            lease_id: Some(lease.to_string()),
+            runner_name: "runner-manager-x".into(),
+            target: TargetRef {
+                scope: TargetScope::Repo,
+                name: "octo/app".into(),
+            },
+            profile: "pool".into(),
+        };
+
+        // Claim first: the lease still counts, so nothing is placed twice.
+        placement.attempt_started("h", &started(&leases[0]));
+        assert_eq!(placement.counts(&key), (2, 2));
+        assert_eq!(placement.rebalance(&key).await, Rebalanced::default());
+        placement.dequeued("octo/app", &pool, 1);
+        assert_eq!(placement.counts(&key), (1, 1));
+
+        // Webhook first: the other lease is not cancelled as surplus once
+        // its claim arrives.
+        placement.dequeued("octo/app", &pool, 2);
+        placement.attempt_started("h", &started(&leases[1]));
+        assert_eq!(placement.counts(&key), (0, 0));
+        assert_eq!(placement.rebalance(&key).await, Rebalanced::default());
+        assert_eq!(launches(&host.await.expect("host")), 2);
+    }
+
+    #[tokio::test]
+    async fn a_launch_already_counted_by_the_last_heartbeat_does_not_take_a_second_slot() {
+        let (registry, placement) = setup();
+        let (tx, mut rx) = mpsc::channel(64);
+        let connection = registry.register("h", LAUNCH_VERSION, tx);
+        drop(connect(&registry, "other", 2, POOL, 0, 0));
+        registry.set_hello(
+            "h",
+            connection,
+            Hello {
+                protocol_version: LAUNCH_VERSION,
+                host_id: "h".into(),
+                os: "linux".into(),
+                arch: "x64".into(),
+                cores: 2,
+                ram_bytes: None,
+                disk_free_bytes: None,
+                targets: vec![Target {
+                    scope: TargetScope::Repo,
+                    name: "octo/app".into(),
+                    profiles: vec![Profile {
+                        name: "pool".into(),
+                        labels: vec!["rm-pool-linux".into()],
+                        enabled: true,
+                        warm: false,
+                    }],
+                }],
+            },
+        );
+        let beat = |free| Heartbeat {
+            free_slots: free,
+            ..Heartbeat::default()
+        };
+        registry.set_heartbeat("h", connection, beat(2));
+        let placing = {
+            let placement = Arc::clone(&placement);
+            tokio::spawn(async move {
+                while let Some(message) = rx.recv().await {
+                    if let Outbound::Send(ServerMessage::Launch(launch)) = message {
+                        placement.acknowledged("h", LaunchAck::accepted(&launch.lease_id));
+                    }
+                }
+            })
+        };
+        let pool = required(POOL);
+        let key = placement.queued("octo/app", &pool, 1).expect("pool");
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        // The heartbeat after it counts its runner: one slot left, and the
+        // second job still fits.
+        registry.set_heartbeat("h", connection, beat(1));
+        placement.queued("octo/app", &pool, 2);
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        // Full by its heartbeat and one unreported launch: a third waits.
+        placement.queued("octo/app", &pool, 3);
+        assert_eq!(placement.rebalance(&key).await, Rebalanced::default());
+        placing.abort();
     }
 
     #[tokio::test]
