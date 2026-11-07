@@ -4,13 +4,16 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use runner_manager_coordinator::github_app::{AppKey, GithubApp};
 use runner_manager_coordinator::server::{AppState, Config, serve};
 use runner_manager_coordinator::store::{HostRecord, Store};
+use runner_manager_coordinator::sweep::{self, SweepConfig, Sweeper};
 use runner_manager_coordinator_protocol::CoordinatorUrl;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
@@ -41,7 +44,10 @@ enum Command {
     /// Run the server (plain HTTP; put a TLS proxy in front).
     ///
     /// The webhook secret is read from COORDINATOR_WEBHOOK_SECRET_FILE or
-    /// COORDINATOR_WEBHOOK_SECRET, never from an argument.
+    /// COORDINATOR_WEBHOOK_SECRET, never from an argument. With a GitHub App
+    /// id and its private key (COORDINATOR_GITHUB_APP_PRIVATE_KEY_FILE or
+    /// COORDINATOR_GITHUB_APP_PRIVATE_KEY, never an argument) the server also
+    /// runs the reconciliation sweep.
     Serve {
         #[arg(long, env = "COORDINATOR_LISTEN", default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
@@ -51,6 +57,16 @@ enum Command {
         /// Trust the right-most X-Forwarded-For entry (only behind the proxy).
         #[arg(long, env = "COORDINATOR_TRUST_FORWARDED_FOR")]
         trust_forwarded_for: bool,
+        /// The GitHub App whose installations the reconciliation sweep reads.
+        #[arg(long, env = "COORDINATOR_GITHUB_APP_ID")]
+        github_app_id: Option<u64>,
+        /// How often the sweep reads the hosts' queues: 30s at least, 2m by
+        /// default.
+        #[arg(long, env = "COORDINATOR_RECONCILE_INTERVAL", default_value = "2m", value_parser = parse_reconcile_interval)]
+        reconcile_interval: Duration,
+        /// The GitHub REST API, for GitHub Enterprise Server.
+        #[arg(long, env = "COORDINATOR_GITHUB_API_URL", default_value = runner_manager_github::GITHUB_API_BASE)]
+        github_api_url: url::Url,
     },
     /// Issue a one-time code that enrolls one host.
     Invite {
@@ -102,6 +118,51 @@ fn parse_ttl(text: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(number.saturating_mul(seconds)))
 }
 
+fn parse_reconcile_interval(text: &str) -> Result<Duration, String> {
+    let interval = parse_ttl(text)?;
+    if interval < sweep::MIN_INTERVAL {
+        return Err(format!(
+            "the reconciliation interval must be at least {}s",
+            sweep::MIN_INTERVAL.as_secs()
+        ));
+    }
+    Ok(interval)
+}
+
+/// The App's private key, from a file or the environment; `None` when
+/// neither is set.
+fn github_app_key() -> anyhow::Result<Option<SecretString>> {
+    if let Some(path) = std::env::var_os("COORDINATOR_GITHUB_APP_PRIVATE_KEY_FILE") {
+        return std::fs::read_to_string(&path)
+            .map(|text| Some(SecretString::from(text)))
+            .context("cannot read the file COORDINATOR_GITHUB_APP_PRIVATE_KEY_FILE names");
+    }
+    Ok(std::env::var("COORDINATOR_GITHUB_APP_PRIVATE_KEY")
+        .ok()
+        .map(SecretString::from))
+}
+
+/// The GitHub App, when one is configured.
+fn github_app(id: Option<u64>, api: url::Url) -> anyhow::Result<Option<GithubApp>> {
+    let app = match (id, github_app_key()?) {
+        (None, None) => return Ok(None),
+        (Some(id), Some(pem)) => AppKey::from_pem(id, &pem)?,
+        (Some(_), None) => bail!(
+            "COORDINATOR_GITHUB_APP_ID is set but no private key: set \
+             COORDINATOR_GITHUB_APP_PRIVATE_KEY_FILE (preferred) or COORDINATOR_GITHUB_APP_PRIVATE_KEY"
+        ),
+        (None, Some(_)) => {
+            bail!("a GitHub App private key is set but COORDINATOR_GITHUB_APP_ID is not")
+        }
+    };
+    let web = url::Url::parse(runner_manager_github::GITHUB_WEB_BASE)?;
+    Ok(Some(GithubApp::new(
+        app,
+        runner_manager_github::Endpoints::new(api, web),
+        Arc::new(runner_manager_domain::model::SystemClock),
+    )?))
+}
+
 fn webhook_secret() -> anyhow::Result<SecretString> {
     let secret = if let Some(path) = std::env::var_os("COORDINATOR_WEBHOOK_SECRET_FILE") {
         std::fs::read_to_string(&path)
@@ -131,20 +192,48 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             listen,
             public_url,
             trust_forwarded_for,
+            github_app_id,
+            reconcile_interval,
+            github_api_url,
         } => {
             let origin = CoordinatorUrl::parse(&public_url)
                 .context("COORDINATOR_PUBLIC_URL is not a usable https URL")?
                 .origin();
             let mut config = Config::new(origin, webhook_secret()?);
             config.trust_forwarded_for = trust_forwarded_for;
+            let app = github_app(github_app_id, github_api_url)?;
             let store = Store::open(&cli.db)?;
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(listen)
                     .await
                     .with_context(|| format!("cannot listen on {listen}"))?;
+                let state = AppState::new(config, store);
+                if let Some(app) = app {
+                    tracing::info!(
+                        app_id = github_app_id.unwrap_or_default(),
+                        interval_secs = reconcile_interval.as_secs(),
+                        "the reconciliation sweep runs"
+                    );
+                    tokio::spawn(
+                        Sweeper::new(
+                            SweepConfig {
+                                interval: reconcile_interval,
+                            },
+                            Box::new(app),
+                            Arc::clone(&state.registry),
+                            Arc::clone(&state.wakes),
+                        )
+                        .run(),
+                    );
+                } else {
+                    tracing::info!(
+                        "no GitHub App is configured: webhooks wake hosts, and no reconciliation \
+                         sweep runs"
+                    );
+                }
                 tracing::info!(%listen, "coordinator listening");
-                serve(listener, AppState::new(config, store), shutdown_signal()).await?;
+                serve(listener, state, shutdown_signal()).await?;
                 anyhow::Ok(())
             })?;
         }
@@ -256,6 +345,8 @@ mod tests {
         assert_eq!(parse_ttl("90"), Ok(Duration::from_secs(90)));
         assert!(parse_ttl("soon").is_err());
         assert!(parse_ttl("5y").is_err());
+        assert_eq!(parse_reconcile_interval("2m"), Ok(Duration::from_secs(120)));
+        assert!(parse_reconcile_interval("29s").is_err());
     }
 
     #[test]

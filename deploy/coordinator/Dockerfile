@@ -14,6 +14,10 @@ RUN cargo build --release --locked -p runner-manager-coordinator \
     && cp target/release/runner-manager-coordinator /usr/local/bin/
 
 FROM debian:bookworm-slim
+# The reconciliation sweep calls api.github.com over TLS.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --home-dir /data --create-home coordinator
 COPY --from=build /usr/local/bin/runner-manager-coordinator /usr/local/bin/
 USER coordinator

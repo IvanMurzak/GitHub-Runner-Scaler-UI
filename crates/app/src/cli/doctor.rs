@@ -299,6 +299,9 @@ pub struct HostSetup {
 pub struct PollingFacts {
     pub idle_secs: u16,
     pub active_secs: u16,
+    /// The interval a target in poll mode `coordinated` is polled at.
+    #[serde(default)]
+    pub coordinated_secs: u16,
     /// `state/poll-traffic.toml`, when a daemon has written it.
     pub traffic: Option<runner_manager_platform::polling::PollTraffic>,
     /// Whether `traffic` is older than the daemon would let it get while it
@@ -1336,10 +1339,21 @@ fn probe_polling(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
         )
         .remedy("runner-manager host set-poll-interval --idle 10s (rewrites the file)");
     };
-    let intervals = format!(
-        "idle every {}s, active every {}s",
-        polling.idle_secs, polling.active_secs
-    );
+    let coordinated = setup.coordinator.as_ref().map_or(0, |coordinator| {
+        coordinator.count(super::coordinator::PollMode::Coordinated)
+    });
+    let intervals = if coordinated == 0 {
+        format!(
+            "idle every {}s, active every {}s",
+            polling.idle_secs, polling.active_secs
+        )
+    } else {
+        format!(
+            "idle every {}s, active every {}s; {coordinated} target(s) coordinated, polled every \
+             {}s while the coordinator's sweep reads them",
+            polling.idle_secs, polling.active_secs, polling.coordinated_secs
+        )
+    };
     let Some(traffic) = &polling.traffic else {
         return pass(format!(
             "{intervals}; no service has measured its polling yet"
@@ -1404,9 +1418,12 @@ fn probe_coordinator(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
     let Some(coordinator) = &setup.coordinator else {
         return pass("not configured; this host polls GitHub on its own");
     };
-    let detail = coordinator.describe();
+    let mut detail = coordinator.describe();
     if coordinator.unreadable.is_some() {
         return fail(detail).remedy("runner-manager coordinator leave, then join again");
+    }
+    if coordinator.configured {
+        detail = format!("{detail}; sweep {}", coordinator.describe_sweep());
     }
     match coordinator.link {
         LinkState::NotConfigured | LinkState::Connected => pass(detail),
@@ -2582,15 +2599,16 @@ fn setup_from_parts(
         daemon_unfit: (perspective == Perspective::Operator)
             .then(|| host_fitness::host_unfit_in_force(&service_paths, context.clock().now()))
             .flatten(),
-        polling: runner_manager_platform::polling::idle_interval(&service_paths)
+        polling: runner_manager_platform::polling::intervals(&service_paths)
             .ok()
-            .map(|idle| {
+            .map(|(idle, coordinated)| {
                 let traffic = runner_manager_platform::polling::last_traffic(&service_paths)
                     .ok()
                     .flatten();
                 let now = context.clock().now();
                 PollingFacts {
                     idle_secs: idle.as_secs(),
+                    coordinated_secs: coordinated.as_secs(),
                     active_secs: host.map_or(
                         runner_manager_domain::model::RefreshInterval::DEFAULT_SECS,
                         |host| host.refresh_interval.as_secs(),
@@ -2601,9 +2619,13 @@ fn setup_from_parts(
                     traffic,
                 }
             }),
-        coordinator: Some(super::coordinator::CoordinatorSnapshot::read(
+        coordinator: Some(super::coordinator::CoordinatorSnapshot::read_for(
             &service_paths,
             context.clock().now(),
+            &policies
+                .iter()
+                .map(|policy| policy.target.clone())
+                .collect::<Vec<_>>(),
         )),
         service,
     }
@@ -6071,6 +6093,7 @@ mod tests {
             polling: Some(PollingFacts {
                 idle_secs: 10,
                 active_secs: 60,
+                coordinated_secs: 300,
                 traffic,
                 stale,
             }),

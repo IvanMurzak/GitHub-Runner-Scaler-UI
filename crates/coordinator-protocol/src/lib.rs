@@ -6,15 +6,28 @@
 //! load (`heartbeat`), and are told to poll a target now (`wake`) when GitHub
 //! delivers a queued `workflow_job`. The coordinator advises; the host decides.
 //!
+//! Stage 2 adds the coordinator's own reconciliation sweep: a host that
+//! speaks version 2 is told, in a `hello_ack`, which of its targets the sweep
+//! covers, and polls those rarely while the link is up.
+//!
 //! # Versioning
 //!
-//! Every message is one JSON object tagged by `type`. [`PROTOCOL_VERSION`] is
-//! carried by the server's `challenge`, the host's `auth` and `hello`, and the
-//! enrollment request; a peer refuses a version it does not speak rather than
-//! guessing. Within one version, fields may be **added** but never removed or
-//! retyped: unknown fields are ignored on decode, and an unknown message type
-//! decodes as [`HostMessage::Unknown`] / [`ServerMessage::Unknown`] so that an
-//! older peer skips it instead of dropping the connection.
+//! Every message is one JSON object tagged by `type`. Fields may be **added**
+//! but never removed or retyped: unknown fields are ignored on decode, and an
+//! unknown message type decodes as [`HostMessage::Unknown`] /
+//! [`ServerMessage::Unknown`] so that an older peer skips it instead of
+//! dropping the connection.
+//!
+//! A connection runs at one negotiated version, the highest both sides speak
+//! (see [`negotiate`]). The server's `challenge` names
+//! [`MIN_PROTOCOL_VERSION`] in `protocol_version`, the field a version-1 host
+//! checks for equality, and the newest version it speaks in the additive
+//! `max_protocol_version`. The host answers `auth` and `hello` with the
+//! negotiated version, and the `welcome` repeats it. So a version-1 host and a
+//! version-2 coordinator, or the other way round, settle on version 1 and work
+//! exactly as stage 1 did; only a version-2 pair exchanges `hello_ack`.
+//! Enrollment did not change and is still sent as version 1, which every
+//! coordinator accepts.
 //!
 //! # What never crosses this wire
 //!
@@ -29,8 +42,29 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-/// The protocol this build speaks.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The newest protocol this build speaks.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The oldest protocol this build still speaks: stage 1's.
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
+
+/// The first version with [`ServerMessage::HelloAck`].
+pub const HELLO_ACK_VERSION: u32 = 2;
+
+/// The version a connection runs at, given the newest version the peer
+/// speaks and the oldest it still accepts: the highest both sides speak, or
+/// `None` when the ranges do not overlap.
+#[must_use]
+pub fn negotiate(peer_min: u32, peer_max: u32) -> Option<u32> {
+    let version = peer_max.min(PROTOCOL_VERSION);
+    (version >= peer_min.max(MIN_PROTOCOL_VERSION)).then_some(version)
+}
+
+/// Whether this build accepts `version` from a peer.
+#[must_use]
+pub const fn supported(version: u32) -> bool {
+    version >= MIN_PROTOCOL_VERSION && version <= PROTOCOL_VERSION
+}
 
 /// Domain separation for the connection signature. A signature made for this
 /// purpose can never be replayed as anything else, and vice versa.
@@ -185,6 +219,9 @@ pub struct Heartbeat {
 pub enum WakeReason {
     /// GitHub queued a job the host advertised a matching profile for.
     JobQueued,
+    /// The coordinator's reconciliation sweep found a queued job that no wake
+    /// was sent for recently (a lost webhook, or a job still waiting).
+    Reconcile,
     /// A reason this build does not know. Still a wake.
     #[serde(other)]
     Other,
@@ -199,6 +236,38 @@ pub struct Wake {
     pub reason: WakeReason,
     /// GitHub's `X-GitHub-Delivery`, for correlating logs on both sides.
     pub delivery_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Hello acknowledgement (version 2)
+// ---------------------------------------------------------------------------
+
+/// The coordinator's answer to a `hello`: whether it runs a reconciliation
+/// sweep, and which of the host's targets that sweep covers.
+///
+/// Sent after every `hello` from a version-2 host, and again whenever the
+/// coverage changes (an App installation added or removed). A covered target
+/// may be polled rarely while the link is up, because the coordinator polls
+/// it for the host and wakes it for any queued job it finds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HelloAck {
+    /// How often the sweep runs, or `None` when the coordinator runs none
+    /// (no GitHub App configured): then nothing is covered.
+    pub reconcile_interval_secs: Option<u32>,
+    /// The host's targets the sweep reads, as the host named them.
+    pub covered: Vec<TargetRef>,
+}
+
+impl HelloAck {
+    /// Whether the sweep covers `target`.
+    #[must_use]
+    pub fn covers(&self, target: &TargetRef) -> bool {
+        self.reconcile_interval_secs.is_some()
+            && self.covered.iter().any(|covered| {
+                covered.scope == target.scope && covered.name.eq_ignore_ascii_case(&target.name)
+            })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,16 +297,24 @@ pub enum HostMessage {
 pub enum ServerMessage {
     /// The first message on every connection.
     Challenge {
+        /// The oldest version the coordinator accepts. A version-1 host
+        /// requires this to be 1.
         protocol_version: u32,
         /// Base64 of [`NONCE_LEN`] random bytes.
         nonce: String,
+        /// The newest version the coordinator speaks; absent from a
+        /// version-1 coordinator, which speaks only `protocol_version`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_protocol_version: Option<u32>,
     },
-    /// Authentication succeeded.
+    /// Authentication succeeded, at the negotiated version.
     Welcome {
         protocol_version: u32,
         heartbeat_interval_secs: u32,
     },
     Wake(Wake),
+    /// Version 2: the answer to a `hello`.
+    HelloAck(HelloAck),
     #[serde(other)]
     Unknown,
 }
@@ -532,9 +609,17 @@ mod tests {
         }
         let server = [
             ServerMessage::Challenge {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: MIN_PROTOCOL_VERSION,
                 nonce: encode_nonce(&[7; NONCE_LEN]),
+                max_protocol_version: Some(PROTOCOL_VERSION),
             },
+            ServerMessage::HelloAck(HelloAck {
+                reconcile_interval_secs: Some(120),
+                covered: vec![TargetRef {
+                    scope: TargetScope::Repo,
+                    name: "octo/app".into(),
+                }],
+            }),
             ServerMessage::Welcome {
                 protocol_version: PROTOCOL_VERSION,
                 heartbeat_interval_secs: 15,
@@ -595,6 +680,77 @@ mod tests {
             "a".repeat(MAX_MESSAGE_BYTES)
         );
         assert_eq!(HostMessage::decode(&huge), Err(ProtocolError::Malformed));
+    }
+
+    #[test]
+    fn a_version_one_peer_and_this_one_settle_on_version_one() {
+        // A version-1 coordinator's challenge: no `max_protocol_version`.
+        let old = r#"{"type":"challenge","protocol_version":1,"nonce":"AAAA"}"#;
+        let Ok(ServerMessage::Challenge {
+            protocol_version,
+            max_protocol_version,
+            ..
+        }) = ServerMessage::decode(old)
+        else {
+            panic!("a version-1 challenge decodes");
+        };
+        assert_eq!(
+            negotiate(
+                protocol_version,
+                max_protocol_version.unwrap_or(protocol_version)
+            ),
+            Some(1)
+        );
+        // This coordinator's challenge still says 1 where a version-1 host
+        // looks, so that host proceeds at 1; this host proceeds at 2.
+        let new = ServerMessage::Challenge {
+            protocol_version: MIN_PROTOCOL_VERSION,
+            nonce: "AAAA".into(),
+            max_protocol_version: Some(PROTOCOL_VERSION),
+        }
+        .encode();
+        assert!(new.contains(r#""protocol_version":1"#), "{new}");
+        assert_eq!(negotiate(1, 2), Some(2));
+        // A version-1 host's `auth` is accepted by this coordinator.
+        assert!(supported(1) && supported(2) && !supported(0) && !supported(3));
+        // A future peer that dropped version 2 does not overlap.
+        assert_eq!(negotiate(3, 4), None);
+        assert_eq!(negotiate(1, 9), Some(PROTOCOL_VERSION));
+        // A `hello_ack` is an unknown type to a version-1 host's decoder,
+        // which skips it; here it decodes, and its coverage is case-blind.
+        let ack = r#"{"type":"hello_ack","reconcile_interval_secs":120,"covered":[{"scope":"org","name":"Octo"}],"later":1}"#;
+        let Ok(ServerMessage::HelloAck(ack)) = ServerMessage::decode(ack) else {
+            panic!("decodes");
+        };
+        assert!(ack.covers(&TargetRef {
+            scope: TargetScope::Org,
+            name: "octo".into()
+        }));
+        assert!(!ack.covers(&TargetRef {
+            scope: TargetScope::Repo,
+            name: "octo".into()
+        }));
+        let no_sweep = HelloAck {
+            reconcile_interval_secs: None,
+            ..ack
+        };
+        assert!(!no_sweep.covers(&TargetRef {
+            scope: TargetScope::Org,
+            name: "octo".into()
+        }));
+        // The sweep's own wake reason reaches a version-1 host as `Other`:
+        // still a wake.
+        let wake = ServerMessage::Wake(Wake {
+            target: TargetRef {
+                scope: TargetScope::Repo,
+                name: "a/b".into(),
+            },
+            repository: "a/b".into(),
+            reason: WakeReason::Reconcile,
+            delivery_id: "reconcile".into(),
+        })
+        .encode();
+        assert!(wake.contains(r#""reason":"reconcile""#), "{wake}");
     }
 
     #[test]

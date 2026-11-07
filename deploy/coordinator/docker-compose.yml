@@ -6,6 +6,9 @@
 #   docker compose up -d --build
 #
 # Only Caddy publishes ports. The coordinator is reachable from it alone.
+#
+# The reconciliation sweep (a GitHub App id and private key) is added with a
+# docker-compose.override.yml; see docs/coordinator.md.
 
 name: runner-manager-coordinator
 

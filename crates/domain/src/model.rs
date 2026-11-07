@@ -526,6 +526,71 @@ impl fmt::Display for IdlePollInterval {
     }
 }
 
+/// How often a target is polled while a coordinator's reconciliation sweep
+/// covers it (`host set-poll-interval --coordinated`).
+///
+/// The coordinator then polls the target's queue itself and wakes this host
+/// for any queued job, so this host's own poll is a safety net. The floor is
+/// a minute: a covered target polled more often than an uncovered active
+/// one would defeat the point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u16", into = "u16")]
+pub struct CoordinatedPollInterval(u16);
+
+impl CoordinatedPollInterval {
+    pub const MIN_SECS: u16 = 60;
+    pub const DEFAULT_SECS: u16 = 300;
+
+    /// # Errors
+    /// [`ValidationError::BelowFloor`] under [`Self::MIN_SECS`].
+    pub fn from_secs(secs: u16) -> Result<Self, ValidationError> {
+        if secs < Self::MIN_SECS {
+            return Err(ValidationError::BelowFloor {
+                what: "coordinated poll interval (seconds)",
+                min: Self::MIN_SECS,
+                actual: secs,
+            });
+        }
+        Ok(Self(secs))
+    }
+
+    #[must_use]
+    pub const fn as_secs(self) -> u16 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn as_duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.0 as u64)
+    }
+}
+
+impl Default for CoordinatedPollInterval {
+    fn default() -> Self {
+        Self(Self::DEFAULT_SECS)
+    }
+}
+
+impl TryFrom<u16> for CoordinatedPollInterval {
+    type Error = ValidationError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::from_secs(value)
+    }
+}
+
+impl From<CoordinatedPollInterval> for u16 {
+    fn from(value: CoordinatedPollInterval) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for CoordinatedPollInterval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}s", self.0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Labels
 // ---------------------------------------------------------------------------

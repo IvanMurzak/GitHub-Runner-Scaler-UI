@@ -310,7 +310,7 @@ runner-manager auth logout                                     # Purge the local
 runner-manager host show                                       # Show capacity, secret store and REST budget
 runner-manager host set-capacity N                             # Change the host limit without restarting the service
 runner-manager host set-auto-update BOOL                      # Daily automatic updates (default: true)
-runner-manager host set-poll-interval [--idle 10s] [--active 60s] # How often GitHub is polled, idle and busy
+runner-manager host set-poll-interval [--idle 10s] [--active 60s] [--coordinated 300s] # How often GitHub is polled: idle, busy, and covered by a coordinator
 runner-manager host set-runtime-root --path PATH               # Put disposable runner workspaces under PATH
 runner-manager host reset-runtime-root                         # Return runner placement to the platform default
 runner-manager host isolation status [--json]                  # Report execution provider readiness
@@ -659,7 +659,23 @@ store as the GitHub credential and never leaves the machine. The host connects o
 host polls exactly as before. A woken target is polled at most once every 5 seconds and never
 inside a rate-limit back-off. `coordinator leave` removes the key and the setting.
 
-Deployment, the GitHub App webhook and administration: [`docs/coordinator.md`](docs/coordinator.md).
+Given its own GitHub App's id and private key, the coordinator also runs a **reconciliation
+sweep**: every 2 minutes it reads the queued jobs of every repository its connected hosts serve
+(conditional requests, so an unchanged queue costs nothing against the hourly quota) and wakes
+the hosts for any queued job no wake was sent for, so a lost webhook still starts a runner.
+Each target is then in one of three poll modes, shown per target by `status [--json]`, `host
+doctor` and the TUI:
+
+| Mode | When | Polling |
+|---|---|---|
+| `standalone` | no coordinator joined | idle 10 s / active 60 s, as before |
+| `coordinated` | link up, and the coordinator's sweep covers the target | every 300 s (`host set-poll-interval --coordinated`, at least 60 s); wakes still poll at once |
+| `fallback` | joined, but the link has been down for 30 s or the sweep does not cover the target | idle 10 s / active 60 s, at once |
+
+A covered target that has a runner of this host running keeps the normal intervals, so a slot
+that frees up is reused promptly.
+
+Deployment, the GitHub App (webhook and sweep) and administration: [`docs/coordinator.md`](docs/coordinator.md).
 
 ## Customize your setup
 
@@ -690,7 +706,7 @@ administrator rights:
 | `host.runner_root_responsive` | all | required | none; a runner root that does not answer within 5 s (a hung external disk or network mount) | - |
 | `host.capacity` | all | recommended | none; suggests `host set-capacity N` from memory and cores | - |
 | `host.required_tools` | all | required | none; install the tool or extend PATH | - |
-| `github.polling` | all | info | none; reports the idle and active poll intervals, the share of polls GitHub answered `304`, and whether the service is slowing down for the account's rate limit | - |
+| `github.polling` | all | info | none; reports the idle and active poll intervals (and the coordinated one, while a coordinator's sweep covers targets), the share of polls GitHub answered `304`, and whether the service is slowing down for the account's rate limit | - |
 
 `runner-manager host prepare` applies the fixes. It lists them and asks before changing anything
 (`--yes` skips that question), runs what needs no privilege itself, and asks for administrator
@@ -728,6 +744,11 @@ repository covered by two targets (an organization and a repository inside it) i
 both within the idle interval. An organization target too large to poll every few seconds (about
 a hundred repositories at 10 seconds) stretches its own idle interval so it never costs more than
 300 requests a minute.
+
+With a joined [coordinator](#optional-coordinator) whose sweep covers a target, that target is
+polled every **300 seconds** instead (`--coordinated`, at least 60), because the coordinator reads
+its queue and wakes this host for new work; it returns to the two intervals above as soon as the
+link has been down for 30 seconds.
 
 GitHub's hourly limit belongs to your GitHub user, not to a machine: every host signed in as you,
 and your own `gh`, draw from the same 5,000 requests. When fewer than a fifth are left, every

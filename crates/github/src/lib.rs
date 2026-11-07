@@ -1540,6 +1540,28 @@ impl AuthenticatedClient {
         self
     }
 
+    /// Hand this client a different credential, for the next request on.
+    ///
+    /// For a holder that mints its own short-lived credentials and replaces
+    /// them before they expire -- the coordinator's GitHub App installation
+    /// tokens, which last an hour. Keeping the client (rather than building a
+    /// new one per token) keeps its conditional cache and rate-limit state.
+    /// Returns whether the credential changed.
+    pub fn replace_credential(&self, fresh: UserAccessToken) -> bool {
+        {
+            let mut guard = self
+                .credential
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.secret().expose_secret() == fresh.secret().expose_secret() {
+                return false;
+            }
+            *guard = fresh;
+        }
+        self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
     /// Replace the credential with whatever `produce` finds, once, however many
     /// callers asked at the same moment.
     ///

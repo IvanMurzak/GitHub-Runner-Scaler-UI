@@ -14,6 +14,11 @@
 //!   requests GitHub answers `304 Not Modified`, which "does not count against
 //!   your primary rate limit"
 //!   (<https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#use-conditional-requests-if-appropriate>).
+//! * **Coordinated** — `config/polling.toml`, default 300 s, floor 60 s. A
+//!   target a joined coordinator's reconciliation sweep covers, while the link
+//!   is up and this host runs no runner for it, is polled this rarely: the
+//!   coordinator reads its queue and wakes this host for queued work. See
+//!   [`super::coordinator::PollMode`].
 //!
 //! # The projection is not the cost any more
 //!
@@ -34,7 +39,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use runner_manager_agent::reconcile::{NextPoll, PollPace};
 use runner_manager_domain::model::{
-    Clock, HostId, IdlePollInterval, RefreshInterval, ScaleTarget, TargetScope,
+    Clock, CoordinatedPollInterval, HostId, IdlePollInterval, RefreshInterval, ScaleTarget,
+    TargetScope,
 };
 use runner_manager_domain::store::Store;
 use runner_manager_github::demand::RestDemand;
@@ -108,21 +114,23 @@ pub fn parse_interval(text: &str) -> Result<u16, String> {
 // The intervals in force
 // ---------------------------------------------------------------------------
 
-/// The two intervals, as `host show` and `status` report them.
+/// The intervals, as `host show` and `status` report them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Intervals {
     pub active: RefreshInterval,
     pub idle: IdlePollInterval,
+    pub coordinated: CoordinatedPollInterval,
 }
 
 impl Intervals {
-    /// `active`, with the default idle interval: what a reader that could
-    /// not read `polling.toml` falls back to.
+    /// `active`, with the default idle and coordinated intervals: what a
+    /// reader that could not read `polling.toml` falls back to.
     #[must_use]
     pub fn with_default_idle(active: RefreshInterval) -> Self {
         Self {
             active,
             idle: IdlePollInterval::default(),
+            coordinated: CoordinatedPollInterval::default(),
         }
     }
 
@@ -163,8 +171,15 @@ pub fn configured(
     store: &dyn Store,
 ) -> Result<(Intervals, Option<String>), CliError> {
     let active = local_host(store)?.map_or_else(RefreshInterval::default, |h| h.refresh_interval);
-    Ok(match settings::idle_interval(context.paths()) {
-        Ok(idle) => (Intervals { active, idle }, None),
+    Ok(match settings::intervals(context.paths()) {
+        Ok((idle, coordinated)) => (
+            Intervals {
+                active,
+                idle,
+                coordinated,
+            },
+            None,
+        ),
         Err(error) => (
             Intervals::with_default_idle(active),
             Some(error.to_string()),
@@ -235,6 +250,15 @@ pub fn set_poll_interval(
         })?,
         None => before.idle,
     };
+    let coordinated = match args.coordinated {
+        Some(secs) => CoordinatedPollInterval::from_secs(secs).map_err(|error| {
+            invalid(format!(
+                "the coordinated poll interval cannot be {secs}s: {error}. It applies only while \
+                 a coordinator's sweep reads the target's queue and wakes this host for it"
+            ))
+        })?,
+        None => before.coordinated,
+    };
     if idle.as_secs() > active.as_secs() {
         return Err(invalid(format!(
             "an idle interval of {idle} is longer than the active interval of {active}, which \
@@ -263,12 +287,13 @@ pub fn set_poll_interval(
 
     // An unreadable file is rewritten even when the value is unchanged: that
     // is how this command repairs it.
-    let idle_written = idle != before.idle || unreadable.is_some();
+    let idle_written =
+        idle != before.idle || coordinated != before.coordinated || unreadable.is_some();
     if idle_written {
-        settings::set_idle_interval(context.paths(), idle).map_err(|source| {
+        settings::set_intervals(context.paths(), idle, coordinated).map_err(|source| {
             CliError::new(
                 Failure::LocalState,
-                format!("cannot store the idle poll interval: {source}. Nothing was changed."),
+                format!("cannot store the poll intervals: {source}. Nothing was changed."),
             )
         })?;
     }
@@ -285,7 +310,10 @@ pub fn set_poll_interval(
                 format!(
                     "cannot store the active poll interval: {error}{}",
                     if idle_written {
-                        format!("; the idle interval was already stored as {idle}")
+                        format!(
+                            "; the idle and coordinated intervals were already stored as {idle} \
+                             and {coordinated}"
+                        )
                     } else {
                         String::new()
                     }
@@ -299,7 +327,17 @@ pub fn set_poll_interval(
 
     writeln!(out, "idle poll interval:   {} -> {idle}", before.idle).map_err(failed)?;
     writeln!(out, "active poll interval: {} -> {active}", before.active).map_err(failed)?;
-    let after = Intervals { active, idle };
+    writeln!(
+        out,
+        "coordinated interval: {} -> {coordinated} (a target a coordinator's sweep covers)",
+        before.coordinated
+    )
+    .map_err(failed)?;
+    let after = Intervals {
+        active,
+        idle,
+        coordinated,
+    };
     let (repositories, organizations) = count_targets(&targets);
     writeln!(out).map_err(failed)?;
     write_idle_load(out, after, repositories, organizations).map_err(failed)?;
@@ -382,6 +420,9 @@ pub struct PollingSnapshot {
     /// default idle interval stands in.
     pub idle_interval_unreadable: Option<String>,
     pub active_interval_secs: u16,
+    /// How often a target is polled while a coordinator's sweep covers it
+    /// (poll mode `coordinated`).
+    pub coordinated_interval_secs: u16,
     /// Requests a minute idle polling of this host's repository targets costs,
     /// at the idle interval.
     pub idle_requests_per_minute: u32,
@@ -480,6 +521,7 @@ pub fn snapshot(
             .unwrap_or(u16::MAX),
         idle_interval_unreadable: unreadable,
         active_interval_secs: intervals.active.as_secs(),
+        coordinated_interval_secs: intervals.coordinated.as_secs(),
         idle_requests_per_minute: intervals.idle_requests_per_minute(repositories),
         secondary_limit_points_per_minute: SECONDARY_POINTS_PER_MINUTE,
         // A record that cannot be read is reported as absent rather than
@@ -522,6 +564,12 @@ pub fn write_section(out: &mut dyn Write, polling: &PollingSnapshot) -> io::Resu
         out,
         "  active interval           {}s   (a target with runners up or runs changing)",
         polling.active_interval_secs
+    )?;
+    writeln!(
+        out,
+        "  coordinated interval      {}s  (a target a joined coordinator's sweep covers; see \
+         Coordinator)",
+        polling.coordinated_interval_secs
     )?;
     let Some(measured) = &polling.measured else {
         writeln!(
@@ -685,16 +733,21 @@ impl PollingMonitor {
             Ok(Some(host)) => host.refresh_interval,
             _ => current.active,
         };
-        let idle = settings::idle_interval(&self.paths).unwrap_or_else(|error| {
-            tracing::warn!(%error, "the idle poll interval could not be read; keeping the last one");
-            current.idle
+        let (idle, coordinated) = settings::intervals(&self.paths).unwrap_or_else(|error| {
+            tracing::warn!(%error, "the poll intervals could not be read; keeping the last ones");
+            (current.idle, current.coordinated)
         });
-        let next = Intervals { active, idle };
+        let next = Intervals {
+            active,
+            idle,
+            coordinated,
+        };
         let mut state = self.lock();
         if next != state.intervals {
             tracing::info!(
                 idle_secs = idle.as_secs(),
                 active_secs = active.as_secs(),
+                coordinated_secs = coordinated.as_secs(),
                 "poll intervals changed"
             );
             self.demand.set_shared_window(next.effective_idle());
@@ -863,15 +916,12 @@ mod tests {
 
     #[test]
     fn idle_load_is_two_listings_per_repository_per_idle_interval() {
-        let intervals = Intervals {
-            active: RefreshInterval::default(),
-            idle: IdlePollInterval::default(),
-        };
+        let intervals = Intervals::with_default_idle(RefreshInterval::default());
         // The owner's IVANPC: ten repository targets at 10 s.
         assert_eq!(intervals.idle_requests_per_minute(10), 120);
         let clamped = Intervals {
-            active: RefreshInterval::from_secs(30).expect("the floor"),
             idle: IdlePollInterval::from_secs(60).expect("valid"),
+            ..Intervals::with_default_idle(RefreshInterval::from_secs(30).expect("the floor"))
         };
         assert_eq!(clamped.effective_idle(), Duration::from_secs(30));
     }
@@ -939,6 +989,7 @@ mod tests {
             effective_idle_interval_secs: 10,
             idle_interval_unreadable: None,
             active_interval_secs: 60,
+            coordinated_interval_secs: 300,
             idle_requests_per_minute: 12,
             secondary_limit_points_per_minute: SECONDARY_POINTS_PER_MINUTE,
             measured: Some(MeasuredPolling::of(

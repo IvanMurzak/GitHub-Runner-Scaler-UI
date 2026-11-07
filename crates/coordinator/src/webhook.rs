@@ -119,9 +119,22 @@ pub fn action_name(action: &str) -> &'static str {
 /// be resolved (an expression, no labels at all) matches nothing.
 #[must_use]
 pub fn labels_cover(profile: &[String], job: &[String]) -> bool {
-    let Ok(required) = RunsOn::from_job_labels(job.iter().cloned()).required_labels() else {
-        return false;
-    };
+    required_labels(job).is_some_and(|required| profile_covers(profile, &required))
+}
+
+/// The labels a job labelled `job` requires, or `None` when they cannot be
+/// resolved (an expression, no labels at all).
+#[must_use]
+pub fn required_labels(job: &[String]) -> Option<Vec<Label>> {
+    RunsOn::from_job_labels(job.iter().cloned())
+        .required_labels()
+        .ok()
+}
+
+/// Whether a profile registered with `profile` labels has every label in
+/// `required`.
+#[must_use]
+pub fn profile_covers(profile: &[String], required: &[Label]) -> bool {
     let offered: Vec<Label> = profile
         .iter()
         .filter_map(|label| Label::new(label).ok())

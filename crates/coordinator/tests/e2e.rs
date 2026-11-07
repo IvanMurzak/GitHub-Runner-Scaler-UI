@@ -1,5 +1,8 @@
 //! The coordinator in-process, driven by a fake host over a real socket:
 //! invite → enroll → connect → challenge → hello → signed webhook → wake.
+//!
+//! The fake host speaks either version: version 1 is a stage-1 host, which
+//! must keep working against this coordinator unchanged.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,9 +13,10 @@ use hmac::{Hmac, KeyInit as _, Mac as _};
 use runner_manager_coordinator::server::{AppState, Config, serve};
 use runner_manager_coordinator::store::Store;
 use runner_manager_coordinator_protocol::{
-    CLOSE_UNAUTHORIZED, EnrollRequest, EnrollResponse, Hello, HostMessage, HostSigningKey,
-    PROTOCOL_VERSION, Profile, ServerMessage, Target, TargetScope, Wake, WakeReason, decode_nonce,
-    encode_public_key, sign_challenge, signing_key_from_seed,
+    CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, EnrollRequest, EnrollResponse, Hello, HelloAck,
+    HostMessage, HostSigningKey, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Profile, ServerMessage,
+    Target, TargetScope, Wake, WakeReason, decode_nonce, encode_public_key, sign_challenge,
+    signing_key_from_seed,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use sha2::Sha256;
@@ -65,7 +69,8 @@ impl Coordinator {
         reqwest::Client::new()
             .post(format!("{}/enroll", self.base))
             .json(&EnrollRequest {
-                protocol_version: PROTOCOL_VERSION,
+                // Enrollment is unchanged since version 1, and sent as 1.
+                protocol_version: MIN_PROTOCOL_VERSION,
                 code: code.to_string(),
                 hostname: "test-box".into(),
                 public_key: encode_public_key(&key.verifying_key()),
@@ -93,16 +98,29 @@ impl Coordinator {
     }
 
     async fn connect(&self, host_id: &str, key: &HostSigningKey) -> Socket {
+        self.connect_at(PROTOCOL_VERSION, host_id, key).await
+    }
+
+    /// Connects as a host speaking `version`; a version-1 host checks the
+    /// challenge the way stage 1 did.
+    async fn connect_at(&self, version: u32, host_id: &str, key: &HostSigningKey) -> Socket {
         let url = self.base.replacen("http://", "ws://", 1) + "/connect";
         let (mut socket, _) = tokio_tungstenite::connect_async(url)
             .await
             .expect("connected");
-        let ServerMessage::Challenge { nonce, .. } = next(&mut socket).await else {
+        let ServerMessage::Challenge {
+            protocol_version,
+            nonce,
+            max_protocol_version,
+        } = next(&mut socket).await
+        else {
             panic!("the first message is a challenge");
         };
+        assert_eq!(protocol_version, 1, "what a stage-1 host requires");
+        assert_eq!(max_protocol_version, Some(PROTOCOL_VERSION));
         let nonce = decode_nonce(&nonce).expect("nonce");
         let auth = HostMessage::Auth {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: version,
             host_id: host_id.to_string(),
             signature: sign_challenge(key, &nonce, &self.base),
         };
@@ -141,9 +159,9 @@ async fn closed_with(socket: &mut Socket) -> Option<u16> {
     }
 }
 
-fn hello(host_id: &str) -> HostMessage {
+fn hello(version: u32, host_id: &str) -> HostMessage {
     HostMessage::Hello(Hello {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: version,
         host_id: host_id.to_string(),
         os: "linux".into(),
         arch: "x64".into(),
@@ -197,6 +215,56 @@ async fn wait_for_hello(coordinator: &Coordinator) {
 }
 
 #[tokio::test]
+async fn a_version_two_host_is_told_its_coverage_and_woken() {
+    let coordinator = start().await;
+    let (host_id, key) = enrolled(&coordinator, "linux-new", 7).await;
+    let mut socket = coordinator.connect(&host_id, &key).await;
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerMessage::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            ..
+        }
+    ));
+    socket
+        .send(Message::Text(
+            hello(PROTOCOL_VERSION, &host_id).encode().into(),
+        ))
+        .await
+        .expect("hello");
+    // No GitHub App here: no sweep, so nothing is covered.
+    assert_eq!(
+        next(&mut socket).await,
+        ServerMessage::HelloAck(HelloAck::default())
+    );
+    let body = queued("octo/app", &["self-hosted", "linux"]);
+    assert_eq!(
+        coordinator
+            .webhook("workflow_job", "n-1", &body, true)
+            .await,
+        200
+    );
+    assert!(matches!(next(&mut socket).await, ServerMessage::Wake(_)));
+
+    // A hello at a version other than the negotiated one is refused.
+    socket
+        .send(Message::Text(hello(1, &host_id).encode().into()))
+        .await
+        .expect("hello");
+    assert_eq!(
+        closed_with(&mut socket).await,
+        Some(CLOSE_UNSUPPORTED_VERSION)
+    );
+    let mut socket = coordinator.connect_at(3, &host_id, &key).await;
+    assert_eq!(
+        closed_with(&mut socket).await,
+        Some(CLOSE_UNSUPPORTED_VERSION)
+    );
+}
+
+/// A stage-1 host against this coordinator: version 1 throughout, no
+/// `hello_ack`, and wakes exactly as before.
+#[tokio::test]
 async fn a_queued_job_wakes_the_enrolled_host_that_serves_it() {
     let coordinator = start().await;
     assert_eq!(
@@ -207,13 +275,16 @@ async fn a_queued_job_wakes_the_enrolled_host_that_serves_it() {
         200
     );
     let (host_id, key) = enrolled(&coordinator, "linux-big", 1).await;
-    let mut socket = coordinator.connect(&host_id, &key).await;
+    let mut socket = coordinator.connect_at(1, &host_id, &key).await;
     assert!(matches!(
         next(&mut socket).await,
-        ServerMessage::Welcome { .. }
+        ServerMessage::Welcome {
+            protocol_version: 1,
+            ..
+        }
     ));
     socket
-        .send(Message::Text(hello(&host_id).encode().into()))
+        .send(Message::Text(hello(1, &host_id).encode().into()))
         .await
         .expect("hello");
     wait_for_hello(&coordinator).await;

@@ -644,9 +644,13 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
         },
         polling,
         caches: super::cache::snapshot(context, host.as_ref()),
-        coordinator: super::coordinator::CoordinatorSnapshot::read(
+        coordinator: super::coordinator::CoordinatorSnapshot::read_for(
             context.paths(),
             context.clock().now(),
+            &policies
+                .iter()
+                .map(|policy| policy.target.clone())
+                .collect::<Vec<_>>(),
         ),
         policies: policies
             .iter()
@@ -868,6 +872,33 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
     super::polling::write_section(out, &document.polling)?;
     writeln!(out)?;
     writeln!(out, "Coordinator: {}", document.coordinator.describe())?;
+    if document.coordinator.configured {
+        writeln!(
+            out,
+            "  sweep                     {}",
+            document.coordinator.describe_sweep()
+        )?;
+    }
+    for target in &document.coordinator.targets {
+        let how = match target.mode {
+            super::coordinator::PollMode::Coordinated => format!(
+                "polled every {}s; the coordinator reads its queue and wakes this host",
+                document.polling.coordinated_interval_secs
+            ),
+            super::coordinator::PollMode::Fallback => {
+                "polled at the idle and active intervals; wakes still arrive".to_string()
+            }
+            super::coordinator::PollMode::Standalone => {
+                "polled at the idle and active intervals".to_string()
+            }
+        };
+        writeln!(
+            out,
+            "  {:<25} {} ({how})",
+            target.target,
+            target.mode.as_str()
+        )?;
+    }
     writeln!(out)?;
     writeln!(
         out,
@@ -952,6 +983,7 @@ mod tests {
                 effective_idle_interval_secs: 10,
                 idle_interval_unreadable: None,
                 active_interval_secs: 60,
+                coordinated_interval_secs: 300,
                 idle_requests_per_minute: 12,
                 secondary_limit_points_per_minute: 900,
                 measured: Some(super::super::polling::MeasuredPolling {
@@ -1090,12 +1122,15 @@ mod tests {
             keys(&emitted, "/coordinator"),
             [
                 "configured",
+                "covered",
                 "host_id",
                 "last_wake_at",
                 "link",
                 "name",
                 "reason",
+                "reconcile_interval_secs",
                 "since",
+                "targets",
                 "unreadable",
                 "url",
                 "wakes_received",
@@ -1105,6 +1140,7 @@ mod tests {
             keys(&emitted, "/polling"),
             [
                 "active_interval_secs",
+                "coordinated_interval_secs",
                 "effective_idle_interval_secs",
                 "idle_interval_secs",
                 "idle_interval_unreadable",
@@ -1480,6 +1516,47 @@ mod tests {
             text.contains("  daemon stalled            the service (process 7) has made"),
             "{text}"
         );
+    }
+
+    /// Each target's poll mode is a line of its own, and a field of the JSON.
+    #[test]
+    fn each_targets_poll_mode_is_reported() {
+        use super::super::coordinator::{LinkState, PollMode, TargetPollMode};
+        let mut document = document();
+        let coordinator = &mut document.coordinator;
+        coordinator.configured = true;
+        coordinator.url = Some("https://runners.example.com".into());
+        coordinator.link = LinkState::Connected;
+        coordinator.reconcile_interval_secs = Some(120);
+        coordinator.covered = vec!["acme/app".into()];
+        coordinator.targets = vec![
+            TargetPollMode {
+                target: "acme/app".into(),
+                mode: PollMode::Coordinated,
+            },
+            TargetPollMode {
+                target: "other".into(),
+                mode: PollMode::Fallback,
+            },
+        ];
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            text.contains("every 120s; 1 of 2 target(s) coordinated, 1 in fallback"),
+            "{text}"
+        );
+        assert!(
+            text.contains("acme/app                  coordinated (polled every 300s;"),
+            "{text}"
+        );
+        assert!(
+            text.contains("other                     fallback ("),
+            "{text}"
+        );
+        let json = serde_json::to_value(&document).unwrap();
+        assert_eq!(json["coordinator"]["targets"][0]["mode"], "coordinated");
+        assert_eq!(json["coordinator"]["targets"][1]["target"], "other");
     }
 
     /// Blocked launches name their reason and their remedy, in the text and in

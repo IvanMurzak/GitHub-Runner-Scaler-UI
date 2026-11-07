@@ -1,3 +1,7 @@
 target
 .git
 **/node_modules
+# Coordinator secrets that live beside the compose file: never in an image.
+deploy/coordinator/webhook_secret
+deploy/coordinator/*.pem
+deploy/coordinator/.env

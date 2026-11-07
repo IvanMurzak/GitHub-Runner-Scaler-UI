@@ -1,16 +1,20 @@
-//! The hosts connected right now, what they said about themselves, and which
-//! of them a queued job should wake.
+//! The hosts connected right now, what they said about themselves, which of
+//! them a queued job should wake, and which of their targets the
+//! reconciliation sweep covers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use runner_manager_coordinator_protocol::{
-    CLOSE_REPLACED, Heartbeat, Hello, ServerMessage, TargetRef, Wake, WakeReason,
+    CLOSE_REPLACED, HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, ServerMessage, Target,
+    TargetRef, TargetScope, Wake, WakeReason,
 };
+use runner_manager_domain::model::Label;
 use tokio::sync::mpsc;
 
-use crate::webhook::labels_cover;
+use crate::webhook::{profile_covers, required_labels};
 
 /// How many messages may wait for one host before further ones are dropped.
 pub const OUTBOUND_QUEUE: usize = 64;
@@ -25,9 +29,53 @@ pub enum Outbound {
 #[derive(Debug)]
 struct Connected {
     connection: u64,
+    /// The protocol version this connection negotiated.
+    version: u32,
     sender: mpsc::Sender<Outbound>,
     hello: Option<Hello>,
     heartbeat: Option<Heartbeat>,
+    /// The last `hello_ack` sent, so an unchanged one is not sent again.
+    acked: Option<HelloAck>,
+}
+
+/// What the reconciliation sweep reads: repositories by name, and the
+/// accounts whose every repository it reads (an installation with
+/// `repository_selection: all`). Names are lower-cased.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Coverage {
+    /// `None` when no sweep runs (no GitHub App configured).
+    pub interval: Option<Duration>,
+    pub repositories: BTreeSet<String>,
+    pub accounts: BTreeSet<String>,
+}
+
+impl Coverage {
+    /// Whether the sweep reads everything `target` serves.
+    #[must_use]
+    pub fn covers(&self, target: &TargetRef) -> bool {
+        self.interval.is_some()
+            && match target.scope {
+                TargetScope::Repo => self
+                    .repositories
+                    .contains(&target.name.to_ascii_lowercase()),
+                TargetScope::Org => self.accounts.contains(&target.name.to_ascii_lowercase()),
+            }
+    }
+
+    /// The `hello_ack` for a host that advertised `targets`.
+    #[must_use]
+    pub fn ack(&self, targets: &[Target]) -> HelloAck {
+        HelloAck {
+            reconcile_interval_secs: self
+                .interval
+                .map(|interval| u32::try_from(interval.as_secs()).unwrap_or(u32::MAX)),
+            covered: targets
+                .iter()
+                .map(Target::reference)
+                .filter(|target| self.covers(target))
+                .collect(),
+        }
+    }
 }
 
 /// Every authenticated connection, by host id. At most one per host: a new
@@ -36,6 +84,7 @@ struct Connected {
 pub struct Registry {
     hosts: Mutex<HashMap<String, Connected>>,
     next: AtomicU64,
+    coverage: Mutex<Coverage>,
 }
 
 /// A connected host, as `hosts list` would describe it.
@@ -53,16 +102,19 @@ impl Registry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Registers a connection for `host_id`, returning its token.
-    pub fn register(&self, host_id: &str, sender: mpsc::Sender<Outbound>) -> u64 {
+    /// Registers a connection for `host_id` at protocol `version`,
+    /// returning its token.
+    pub fn register(&self, host_id: &str, version: u32, sender: mpsc::Sender<Outbound>) -> u64 {
         let connection = self.next.fetch_add(1, Ordering::Relaxed);
         let previous = self.lock().insert(
             host_id.to_string(),
             Connected {
                 connection,
+                version,
                 sender,
                 hello: None,
                 heartbeat: None,
+                acked: None,
             },
         );
         if let Some(previous) = previous {
@@ -84,12 +136,58 @@ impl Registry {
         }
     }
 
+    /// Records what a host said about itself and, to a version-2 host,
+    /// answers with its coverage.
     pub fn set_hello(&self, host_id: &str, connection: u64, hello: Hello) {
+        let coverage = self.coverage();
         if let Some(current) = self.lock().get_mut(host_id)
             && current.connection == connection
         {
             current.hello = Some(hello);
+            // Always answered, even when unchanged: the host may have
+            // reconnected and forgotten it.
+            current.acked = None;
+            acknowledge(host_id, current, &coverage);
         }
+    }
+
+    /// What the sweep covers now.
+    #[must_use]
+    pub fn coverage(&self) -> Coverage {
+        self.coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replaces the sweep's coverage and tells every version-2 host whose
+    /// answer changed.
+    pub fn set_coverage(&self, coverage: Coverage) {
+        *self
+            .coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = coverage.clone();
+        for (host_id, connected) in self.lock().iter_mut() {
+            acknowledge(host_id, connected, &coverage);
+        }
+    }
+
+    /// Every target some connected host advertised, once each.
+    #[must_use]
+    pub fn advertised(&self) -> Vec<TargetRef> {
+        let mut targets: Vec<TargetRef> = Vec::new();
+        for connected in self.lock().values() {
+            for target in connected.hello.iter().flat_map(|hello| &hello.targets) {
+                let reference = target.reference();
+                if !targets.iter().any(|known| {
+                    known.scope == reference.scope
+                        && known.name.eq_ignore_ascii_case(&reference.name)
+                }) {
+                    targets.push(reference);
+                }
+            }
+        }
+        targets
     }
 
     pub fn set_heartbeat(&self, host_id: &str, connection: u64, heartbeat: Heartbeat) {
@@ -120,20 +218,33 @@ impl Registry {
     /// `repository` with an enabled profile whose labels cover `labels`.
     /// Returns how many were woken.
     pub fn wake_for_job(&self, repository: &str, labels: &[String], delivery_id: &str) -> usize {
+        required_labels(labels).map_or(0, |required| {
+            self.wake_for(repository, &required, WakeReason::JobQueued, delivery_id)
+        })
+    }
+
+    /// [`Self::wake_for_job`] for a job whose required labels are resolved.
+    pub fn wake_for(
+        &self,
+        repository: &str,
+        required: &[Label],
+        reason: WakeReason,
+        delivery_id: &str,
+    ) -> usize {
         let hosts = self.lock();
         let mut woken = 0;
         for (host_id, connected) in hosts.iter() {
             let Some(target) = connected
                 .hello
                 .as_ref()
-                .and_then(|hello| matching_target(hello, repository, labels))
+                .and_then(|hello| matching_target(hello, repository, required))
             else {
                 continue;
             };
             let wake = Wake {
                 target,
                 repository: repository.to_string(),
-                reason: WakeReason::JobQueued,
+                reason,
                 delivery_id: delivery_id.to_string(),
             };
             match connected
@@ -150,10 +261,34 @@ impl Registry {
     }
 }
 
+/// Sends `connected` its `hello_ack` when it speaks version 2, has said
+/// hello, and the answer differs from the last one sent.
+fn acknowledge(host_id: &str, connected: &mut Connected, coverage: &Coverage) {
+    if connected.version < HELLO_ACK_VERSION {
+        return;
+    }
+    let Some(hello) = &connected.hello else {
+        return;
+    };
+    let ack = coverage.ack(&hello.targets);
+    if connected.acked.as_ref() == Some(&ack) {
+        return;
+    }
+    match connected
+        .sender
+        .try_send(Outbound::Send(ServerMessage::HelloAck(ack.clone())))
+    {
+        Ok(()) => connected.acked = Some(ack),
+        Err(_) => {
+            tracing::warn!(%host_id, "a host's outbound queue is full; its coverage update waits");
+        }
+    }
+}
+
 /// The first of `hello`'s targets that covers `repository` and has an enabled
-/// profile able to take a job labelled `labels`.
+/// profile able to take a job requiring `required`.
 #[must_use]
-pub fn matching_target(hello: &Hello, repository: &str, labels: &[String]) -> Option<TargetRef> {
+pub fn matching_target(hello: &Hello, repository: &str, required: &[Label]) -> Option<TargetRef> {
     hello
         .targets
         .iter()
@@ -162,16 +297,20 @@ pub fn matching_target(hello: &Hello, repository: &str, labels: &[String]) -> Op
                 && target
                     .profiles
                     .iter()
-                    .any(|profile| profile.enabled && labels_cover(&profile.labels, labels))
+                    .any(|profile| profile.enabled && profile_covers(&profile.labels, required))
         })
-        .map(runner_manager_coordinator_protocol::Target::reference)
+        .map(Target::reference)
 }
 
 #[cfg(test)]
 mod tests {
-    use runner_manager_coordinator_protocol::{PROTOCOL_VERSION, Profile, Target, TargetScope};
+    use runner_manager_coordinator_protocol::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Profile};
 
     use super::*;
+
+    fn required(values: &[&str]) -> Vec<Label> {
+        required_labels(&labels(values)).expect("resolvable")
+    }
 
     fn hello(scope: TargetScope, name: &str, labels: &[&str], enabled: bool) -> Hello {
         Hello {
@@ -202,23 +341,23 @@ mod tests {
     fn only_a_host_with_a_covering_enabled_profile_matches() {
         let linux = hello(TargetScope::Org, "Octo", &["self-hosted", "linux"], true);
         assert_eq!(
-            matching_target(&linux, "octo/app", &labels(&["self-hosted", "Linux"])),
+            matching_target(&linux, "octo/app", &required(&["self-hosted", "Linux"])),
             Some(TargetRef {
                 scope: TargetScope::Org,
                 name: "Octo".into()
             })
         );
         assert_eq!(
-            matching_target(&linux, "octo/app", &labels(&["windows"])),
+            matching_target(&linux, "octo/app", &required(&["windows"])),
             None
         );
         assert_eq!(
-            matching_target(&linux, "other/app", &labels(&["linux"])),
+            matching_target(&linux, "other/app", &required(&["linux"])),
             None
         );
         let disabled = hello(TargetScope::Repo, "octo/app", &["linux"], false);
         assert_eq!(
-            matching_target(&disabled, "octo/app", &labels(&["linux"])),
+            matching_target(&disabled, "octo/app", &required(&["linux"])),
             None
         );
     }
@@ -228,8 +367,8 @@ mod tests {
         let registry = Registry::default();
         let (linux_tx, mut linux_rx) = mpsc::channel(4);
         let (mac_tx, mut mac_rx) = mpsc::channel(4);
-        let linux = registry.register("linux", linux_tx);
-        let mac = registry.register("mac", mac_tx);
+        let linux = registry.register("linux", MIN_PROTOCOL_VERSION, linux_tx);
+        let mac = registry.register("mac", MIN_PROTOCOL_VERSION, mac_tx);
         registry.set_hello(
             "linux",
             linux,
@@ -252,7 +391,7 @@ mod tests {
         assert!(mac_rx.try_recv().is_err());
 
         let (again_tx, _again_rx) = mpsc::channel(4);
-        let again = registry.register("linux", again_tx);
+        let again = registry.register("linux", MIN_PROTOCOL_VERSION, again_tx);
         assert_eq!(
             linux_rx.try_recv(),
             Ok(Outbound::Close(CLOSE_REPLACED, "replaced"))
@@ -262,5 +401,50 @@ mod tests {
         assert_eq!(registry.connected().len(), 2);
         registry.unregister("linux", again);
         assert_eq!(registry.connected().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_a_version_two_host_is_told_its_coverage_and_only_when_it_changes() {
+        let registry = Registry::default();
+        let (new_tx, mut new_rx) = mpsc::channel(8);
+        let (old_tx, mut old_rx) = mpsc::channel(8);
+        let new = registry.register("new", PROTOCOL_VERSION, new_tx);
+        let old = registry.register("old", MIN_PROTOCOL_VERSION, old_tx);
+        registry.set_hello(
+            "new",
+            new,
+            hello(TargetScope::Repo, "Octo/App", &["linux"], true),
+        );
+        registry.set_hello(
+            "old",
+            old,
+            hello(TargetScope::Repo, "octo/app", &["linux"], true),
+        );
+        // No sweep yet: the answer says so, and covers nothing.
+        assert_eq!(
+            new_rx.try_recv(),
+            Ok(Outbound::Send(ServerMessage::HelloAck(HelloAck::default())))
+        );
+        assert!(old_rx.try_recv().is_err(), "a version-1 host gets none");
+
+        let covering = Coverage {
+            interval: Some(Duration::from_secs(120)),
+            repositories: BTreeSet::from(["octo/app".to_string()]),
+            accounts: BTreeSet::new(),
+        };
+        registry.set_coverage(covering.clone());
+        let Ok(Outbound::Send(ServerMessage::HelloAck(ack))) = new_rx.try_recv() else {
+            panic!("the new coverage was sent");
+        };
+        assert_eq!(ack.reconcile_interval_secs, Some(120));
+        assert_eq!(ack.covered.len(), 1);
+        assert_eq!(
+            ack.covered[0].name, "Octo/App",
+            "named as the host named it"
+        );
+        registry.set_coverage(covering);
+        assert!(new_rx.try_recv().is_err(), "unchanged: not sent again");
+        assert!(old_rx.try_recv().is_err());
+        assert_eq!(registry.advertised().len(), 1, "the same target once");
     }
 }

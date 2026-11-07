@@ -304,6 +304,9 @@ libc = "0.2.189"
 # client already uses, with the platform verifier `reqwest` already builds.
 # Hosts authenticate with Ed25519 challenge signatures; webhooks with
 # HMAC-SHA256 over the workspace's `sha2` 0.11.
+# RS256 for the coordinator's GitHub App JWT. Already in the resolved graph as
+# `rustls`'s crypto provider, so declaring it adds no package to `Cargo.lock`.
+aws-lc-rs = { version = "1.18.0", default-features = false, features = ["aws-lc-sys"] }
 axum = { version = "0.8.9", default-features = false, features = [
     "http1",
     "json",

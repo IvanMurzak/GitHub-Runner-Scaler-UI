@@ -152,8 +152,11 @@ async fn run_generation(
             &host,
             Arc::clone(&store) as Arc<dyn Store>,
             Arc::new(super::coordinator::WakeRoutes::default()),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            super::coordinator::coordination(),
         );
         let heartbeat_store = Arc::clone(&store) as Arc<dyn Store>;
         let heartbeat_paths = context.paths().clone();
@@ -349,6 +352,9 @@ async fn run_generation(
     // The coordinator's wakes, one signal per target loop. Inert until this
     // host joins a coordinator; see `super::coordinator`.
     let mut routes = super::coordinator::WakeRoutes::new(Some(Arc::clone(&demand_gateway)));
+    // What the link knows, for each loop's poll mode (standalone, coordinated,
+    // fallback).
+    let coordination = super::coordinator::coordination();
     let mut managed_targets = Vec::with_capacity(targets.len());
     for policies in targets {
         let package_target = policies[0].target.clone();
@@ -442,6 +448,7 @@ async fn run_generation(
             cancel,
             polling: Arc::clone(&polling),
             wake: routes.add(package_target.clone()),
+            coordination: coordination.subscribe(),
         });
     }
     let routes = Arc::new(routes);
@@ -452,8 +459,8 @@ async fn run_generation(
         &host,
         Arc::clone(&store) as Arc<dyn Store>,
         routes,
-        Arc::clone(&host_unfit),
-        Arc::clone(&draining),
+        (Arc::clone(&host_unfit), Arc::clone(&draining)),
+        coordination,
     );
 
     let (shutdown, _) = tokio::sync::watch::channel(false);
@@ -637,8 +644,8 @@ fn start_coordinator_link(
     host: &runner_manager_domain::model::Host,
     store: Arc<dyn Store>,
     routes: Arc<super::coordinator::WakeRoutes>,
-    unfit: Arc<AtomicBool>,
-    draining: Arc<AtomicBool>,
+    (unfit, draining): (Arc<AtomicBool>, Arc<AtomicBool>),
+    coordination: Arc<super::coordinator::Coordination>,
 ) -> Option<AbortOnDrop> {
     let key_store = match context.secret_store_for(
         host.service_start_mode,
@@ -666,6 +673,7 @@ fn start_coordinator_link(
             draining,
             host: host.clone(),
             runner_root,
+            coordination,
         }),
     )))
 }
@@ -2060,6 +2068,17 @@ trait TargetReconciler: Send + 'static {
         None
     }
 
+    /// The link's view, for this target's poll mode, and the interval a
+    /// `coordinated` target is polled at. `None` where no link is wired.
+    fn coordination(
+        &self,
+    ) -> Option<(
+        tokio::sync::watch::Receiver<super::coordinator::LinkView>,
+        Duration,
+    )> {
+        None
+    }
+
     fn active_owned(&self, report: &ReconcileReport) -> Option<u16> {
         active_owned(report, self.policies())
     }
@@ -2110,11 +2129,24 @@ struct ManagedTarget {
     store: Arc<dyn Store>,
     polling: Arc<super::polling::PollingMonitor>,
     wake: Arc<tokio::sync::Notify>,
+    coordination: tokio::sync::watch::Receiver<super::coordinator::LinkView>,
 }
 
 impl TargetReconciler for ManagedTarget {
     fn wake(&self) -> Option<Arc<tokio::sync::Notify>> {
         Some(Arc::clone(&self.wake))
+    }
+
+    fn coordination(
+        &self,
+    ) -> Option<(
+        tokio::sync::watch::Receiver<super::coordinator::LinkView>,
+        Duration,
+    )> {
+        Some((
+            self.coordination.clone(),
+            self.polling.intervals().coordinated.as_duration(),
+        ))
     }
 
     fn policies(&self) -> &[ScalePolicy] {
@@ -2311,6 +2343,7 @@ async fn run_target_loop<T: TargetReconciler>(
         target.begin_drain();
     }
     let wake = target.wake();
+    let mut coordination = target.coordination().map(|(view, _)| view);
     loop {
         if drain_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             // Whatever is still running is startup recovery's to adopt.
@@ -2377,14 +2410,44 @@ async fn run_target_loop<T: TargetReconciler>(
                 .delay
                 .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
         });
-        let mut deadline = tokio::time::Instant::now() + delay;
+        let slept_at = tokio::time::Instant::now();
+        let scheduled = slept_at + delay;
+        // Poll mode `coordinated`: the coordinator's sweep reads this target's
+        // queue and wakes it, so its own poll stretches to the coordinated
+        // interval. Never while draining, and never while this host runs a
+        // runner for the target: a finished job frees a slot that queued work
+        // the coordinator already announced may need now.
+        let stretched = target
+            .coordination()
+            .filter(|_| draining.is_none() && target.local_active() == Some(0))
+            .map(|(_, interval)| slept_at + delay.max(interval));
+        let target_name = target
+            .policies()
+            .first()
+            .map(|policy| policy.target.clone());
         // A coordinator's wake brings the next poll forward -- never while
         // draining, never while the schedule is a slowdown GitHub asked for
         // (rate limited, stretched, offline...), and never sooner than
         // `WAKE_MIN_GAP` after this poll began.
         let honour_wakes = draining.is_none() && !report.next_poll.pace.is_throttled();
         let wake = wake.as_deref().filter(|_| honour_wakes);
+        let mut woken: Option<tokio::time::Instant> = None;
         loop {
+            // Re-decided on every turn, so a link that drops or a coverage
+            // that changes re-schedules a loop already asleep.
+            let now = tokio::time::Instant::now();
+            let (planned, fallback_at) = match (&mut coordination, stretched, &target_name) {
+                (Some(view), Some(stretched), Some(name)) => {
+                    let view = view.borrow_and_update();
+                    if view.mode(name, now) == super::coordinator::PollMode::Coordinated {
+                        (stretched, view.fallback_at())
+                    } else {
+                        (scheduled, None)
+                    }
+                }
+                _ => (scheduled, None),
+            };
+            let deadline = woken.map_or(planned, |woken| woken.min(planned));
             tokio::select! {
                 () = tokio::time::sleep_until(deadline) => break,
                 () = async {
@@ -2393,12 +2456,29 @@ async fn run_target_loop<T: TargetReconciler>(
                         None => std::future::pending().await,
                     }
                 } => {
-                    deadline = super::coordinator::woken_deadline(
+                    woken = Some(super::coordinator::woken_deadline(
                         deadline,
                         polled_at,
                         tokio::time::Instant::now(),
-                    );
+                    ));
                 }
+                changed = async {
+                    match coordination.as_mut() {
+                        Some(view) => view.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        // The link is gone with its generation: poll on our own.
+                        coordination = None;
+                    }
+                }
+                () = async {
+                    match fallback_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
                 changed = shutdown.changed(), if draining != Some(DrainKind::Shutdown) => {
                     if changed.is_err() || *shutdown.borrow() {
                         // A shutdown arriving mid-upgrade supersedes it, deadline
@@ -2985,6 +3065,12 @@ mod tests {
         refreshes: Arc<AtomicUsize>,
         /// The coordinator's wake signal, when a test routes one.
         wake: Option<Arc<tokio::sync::Notify>>,
+        /// The link's view and the coordinated interval, when a test wires
+        /// one.
+        coordination: Option<(
+            tokio::sync::watch::Receiver<super::super::coordinator::LinkView>,
+            Duration,
+        )>,
     }
 
     impl FakeTarget {
@@ -3001,6 +3087,7 @@ mod tests {
                     unreadable: false,
                     refreshes: Arc::new(AtomicUsize::new(0)),
                     wake: None,
+                    coordination: None,
                 },
                 calls,
             )
@@ -3017,6 +3104,7 @@ mod tests {
                 unreadable: false,
                 refreshes: Arc::new(AtomicUsize::new(0)),
                 wake: None,
+                coordination: None,
             }
         }
 
@@ -3033,6 +3121,7 @@ mod tests {
                 unreadable: true,
                 refreshes: Arc::new(AtomicUsize::new(0)),
                 wake: None,
+                coordination: None,
             }
         }
     }
@@ -3085,6 +3174,15 @@ mod tests {
 
         fn wake(&self) -> Option<Arc<tokio::sync::Notify>> {
             self.wake.clone()
+        }
+
+        fn coordination(
+            &self,
+        ) -> Option<(
+            tokio::sync::watch::Receiver<super::super::coordinator::LinkView>,
+            Duration,
+        )> {
+            self.coordination.clone()
         }
     }
 
@@ -3795,6 +3893,153 @@ mod tests {
         after(1).await;
         assert_eq!(calls.load(Ordering::SeqCst), 4);
 
+        stop.send(true).unwrap();
+        after(60).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+    }
+
+    /// standalone → coordinated → fallback → coordinated, and the interval
+    /// each one polls at: 60 s on its own, 300 s while the coordinator's
+    /// sweep covers the target, and back to 60 s at once when the link has
+    /// been down for `FALLBACK_AFTER`.
+    #[tokio::test(start_paused = true)]
+    async fn a_target_polls_at_the_interval_its_mode_calls_for() {
+        use super::super::coordinator::{LinkView, PollMode};
+        use runner_manager_coordinator_protocol::{HelloAck, TargetRef, TargetScope};
+
+        let mut report = ReconcileReport::default();
+        report.next_poll.delay = Duration::from_secs(60);
+        report.next_poll.pace = runner_manager_agent::reconcile::PollPace::Nominal;
+        let policy = fixtures::policy()
+            .repository("acme/repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let name = policy.target.clone();
+        let (mut target, calls) = FakeTarget::repeating(policy, report);
+        let (link, view) = tokio::sync::watch::channel(LinkView::default());
+        target.coordination = Some((view, Duration::from_secs(300)));
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            never_upgraded(),
+            Arc::new(CountingContacts::default()) as Arc<dyn ContactRecorder>,
+        ));
+        let polls = || calls.load(Ordering::SeqCst);
+        let mode = |link: &tokio::sync::watch::Sender<LinkView>| {
+            link.borrow().mode(&name, tokio::time::Instant::now())
+        };
+
+        // Standalone: every 60 s.
+        after(0).await;
+        assert_eq!(polls(), 1);
+        assert_eq!(mode(&link), PollMode::Standalone);
+        after(60).await;
+        assert_eq!(polls(), 2);
+
+        // Joined and covered: the next poll moves to 300 s after the last.
+        let covered = HelloAck {
+            reconcile_interval_secs: Some(120),
+            covered: vec![TargetRef {
+                scope: TargetScope::Repo,
+                name: "acme/repo".into(),
+            }],
+        };
+        link.send_replace(LinkView {
+            configured: true,
+            connected: true,
+            down_since: None,
+            ack: Some(covered.clone()),
+        });
+        after(1).await;
+        assert_eq!(mode(&link), PollMode::Coordinated);
+        after(100).await;
+        assert_eq!(polls(), 2, "no poll at 60 s while coordinated");
+        after(199).await;
+        assert_eq!(polls(), 3, "polled at 300 s");
+
+        // The link drops: still coordinated for FALLBACK_AFTER, then
+        // fallback, and the overdue 60 s poll happens at once.
+        after(70).await;
+        link.send_modify(|view| {
+            view.connected = false;
+            view.down_since = Some(tokio::time::Instant::now());
+        });
+        after(29).await;
+        assert_eq!(polls(), 3, "a short outage changes nothing");
+        assert_eq!(mode(&link), PollMode::Coordinated);
+        after(1).await;
+        assert_eq!(mode(&link), PollMode::Fallback);
+        assert_eq!(polls(), 4, "back on its own at once");
+        after(60).await;
+        assert_eq!(polls(), 5, "every 60 s in fallback");
+
+        // Reconnected: coordinated again.
+        link.send_modify(|view| {
+            view.connected = true;
+            view.down_since = None;
+        });
+        after(60).await;
+        assert_eq!(polls(), 5);
+        after(240).await;
+        assert_eq!(polls(), 6);
+
+        // A coordinator that stops covering the target: fallback, so the
+        // poll asleep for 300 s comes at 60 s.
+        link.send_modify(|view| view.ack = Some(HelloAck::default()));
+        after(1).await;
+        assert_eq!(mode(&link), PollMode::Fallback);
+        assert_eq!(polls(), 6);
+        after(59).await;
+        assert_eq!(polls(), 7, "60 s after the last poll, not 300");
+
+        stop.send(true).unwrap();
+        after(60).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+    }
+
+    /// A covered target this host is running a runner for keeps the normal
+    /// intervals: a finished job frees a slot queued work may need now.
+    #[tokio::test(start_paused = true)]
+    async fn a_coordinated_target_with_a_live_runner_keeps_its_normal_interval() {
+        use super::super::coordinator::LinkView;
+        use runner_manager_coordinator_protocol::{HelloAck, TargetRef, TargetScope};
+
+        let mut report = ReconcileReport::default();
+        report.next_poll.delay = Duration::from_secs(60);
+        let (mut target, calls) = FakeTarget::repeating(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+            report,
+        );
+        target.active = 1;
+        let (_link, view) = tokio::sync::watch::channel(LinkView {
+            configured: true,
+            connected: true,
+            down_since: None,
+            ack: Some(HelloAck {
+                reconcile_interval_secs: Some(120),
+                covered: vec![TargetRef {
+                    scope: TargetScope::Repo,
+                    name: "acme/repo".into(),
+                }],
+            }),
+        });
+        target.coordination = Some((view, Duration::from_secs(300)));
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            never_upgraded(),
+            Arc::new(CountingContacts::default()) as Arc<dyn ContactRecorder>,
+        ));
+        after(0).await;
+        after(60).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         stop.send(true).unwrap();
         after(60).await;
         let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
