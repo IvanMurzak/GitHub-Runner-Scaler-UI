@@ -16,11 +16,10 @@ the version being prepared rather than the version in `Cargo.toml`.
   included) that hosts can join to start runners without waiting for their next
   poll. Without a coordinator, or while it is unreachable, a host behaves
   exactly as in 0.4.44.
-- `runner-manager coordinator join URL --code CODE`, `coordinator status [--json]`,
-  `coordinator leave` and `coordinator stats [--json]`. A host authenticates with
-  an Ed25519 key created at `join` and kept in the same secret store as the
-  GitHub credential; enrollment uses a one-time code, and `hosts revoke` on the
-  server closes a host's live connection within a second.
+- `runner-manager coordinator join URL --code CODE`, `coordinator status [--json]`
+  and `coordinator leave`. A host authenticates with an Ed25519 key created at
+  `join` and stored beside the GitHub credential, enrolling with a one-time code;
+  `hosts revoke` on the server closes its live connection within a second.
 - **Webhook wake.** The coordinator receives GitHub's `workflow_job` webhooks
   (HMAC-verified) and wakes the hosts that serve the job's repository and
   labels. A woken target is polled at most once every 5 seconds and never
