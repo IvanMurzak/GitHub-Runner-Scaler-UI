@@ -13,9 +13,10 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 - **An optional coordinator.** `runner-manager-coordinator` is a small
   self-hosted server (container image, Caddy example and `docs/coordinator.md`
-  included) that hosts can join to start runners without waiting for their next
-  poll. Without a coordinator, or while it is unreachable, a host behaves
-  exactly as in 0.4.44.
+  included) that hosts can join so they poll as soon as a job is queued instead
+  of at their next interval. Each host still decides under its own limits and
+  GitHub credential. Without a coordinator, or while it is unreachable, a host
+  behaves exactly as in 0.4.44. Protocol and database notes: `docs/coordinator.md`.
 - `runner-manager coordinator join URL --code CODE`, `coordinator status [--json]`
   and `coordinator leave`. A host authenticates with an Ed25519 key created at
   `join` and stored beside the GitHub credential, enrolling with a one-time code;
@@ -28,10 +29,11 @@ the version being prepared rather than the version in `Cargo.toml`.
   (`COORDINATOR_GITHUB_APP_ID`, `COORDINATOR_GITHUB_APP_PRIVATE_KEY_FILE`), the
   coordinator reads the queues of the repositories its hosts serve every 2
   minutes with conditional requests, and wakes hosts for jobs whose webhook was
-  lost.
+  lost. Without the App, every target stays in `fallback`.
 - **Poll modes per target:** `standalone` (no coordinator), `coordinated` (link
-  up and the target covered by the sweep: polled every 300 s,
-  `host set-poll-interval --coordinated`) and `fallback` (link down for 30 s or
+  up and the target covered by the sweep: polled every 300 s while none of this
+  host's runners runs for it, `host set-poll-interval --coordinated`, at least
+  60 s) and `fallback` (link down for 30 s or
   target not covered: the normal intervals, at once). `status`, `host doctor`
   (`github.polling`, `coordinator.link`), `coordinator status` and the TUI show
   the mode and the link.
@@ -41,7 +43,9 @@ the version being prepared rather than the version in `Cargo.toml`.
   `runs-on: rm-pool-…`, the coordinator sends exactly one host a `launch`; the
   host still applies every local ceiling and may refuse, and the coordinator
   then tries the next one. In `fallback` and `standalone` a pool profile serves
-  its own demand as before.
+  its own demand as before. A second pool profile on one target, another OS's
+  pool label or an unknown `rm-pool-` label is refused; `profile list` and
+  `profile show` print `pool=`.
 - **Job weight statistics and weighted placement.** A joined host samples each
   native runner's process tree (peak memory, CPU, duration) and reports it; the
   coordinator keeps the last 30 samples per `repository/workflow/job` for up to
