@@ -25,8 +25,9 @@ use axum::routing::{get, post};
 use chrono::Utc;
 use runner_manager_coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CONNECT_PATH, ENROLL_PATH, EnrollRequest,
-    EnrollResponse, HEALTH_PATH, HostMessage, MAX_MESSAGE_BYTES, NONCE_LEN, PROTOCOL_VERSION,
-    ServerMessage, WEBHOOK_PATH, decode_public_key, encode_nonce, verify_challenge,
+    EnrollResponse, HEALTH_PATH, HostMessage, MAX_MESSAGE_BYTES, MIN_PROTOCOL_VERSION, NONCE_LEN,
+    PROTOCOL_VERSION, ServerMessage, WEBHOOK_PATH, decode_public_key, encode_nonce, supported,
+    verify_challenge,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use tokio::sync::mpsc;
@@ -83,7 +84,7 @@ impl Config {
 pub struct AppState {
     pub config: Config,
     pub store: Mutex<Store>,
-    pub registry: Registry,
+    pub registry: Arc<Registry>,
     deliveries: Mutex<DeliveryLog>,
     limiter: RateLimiter,
 }
@@ -95,7 +96,7 @@ impl AppState {
             limiter: RateLimiter::new(config.attempts_per_minute),
             config,
             store: Mutex::new(store),
-            registry: Registry::default(),
+            registry: Arc::new(Registry::default()),
             deliveries: Mutex::new(DeliveryLog::new(DELIVERY_MEMORY)),
         })
     }
@@ -243,7 +244,7 @@ async fn enroll(
     let Ok(request) = serde_json::from_slice::<EnrollRequest>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if request.protocol_version != PROTOCOL_VERSION {
+    if !supported(request.protocol_version) {
         return StatusCode::UPGRADE_REQUIRED.into_response();
     }
     if decode_public_key(&request.public_key).is_err() {
@@ -259,7 +260,8 @@ async fn enroll(
         Ok(host) => {
             tracing::info!(host_id = %host.id, "a host enrolled");
             axum::Json(EnrollResponse {
-                protocol_version: PROTOCOL_VERSION,
+                // The host's own version back: enrollment is the same in both.
+                protocol_version: request.protocol_version,
                 host_id: host.id,
                 name: host.name,
             })
@@ -328,9 +330,12 @@ async fn next_text(socket: &mut WebSocket) -> Option<String> {
 /// Challenge, verify, then serve one authenticated host.
 async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
     let nonce: [u8; NONCE_LEN] = rand::random();
+    // `protocol_version` is the oldest accepted, which is what a version-1
+    // host checks; the newest is in the additive field.
     let challenge = ServerMessage::Challenge {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: MIN_PROTOCOL_VERSION,
         nonce: encode_nonce(&nonce),
+        max_protocol_version: Some(PROTOCOL_VERSION),
     };
     if !send(&mut socket, &challenge).await {
         return;
@@ -349,7 +354,7 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         close(&mut socket, CLOSE_UNAUTHORIZED, "unauthorized").await;
         return;
     };
-    if protocol_version != PROTOCOL_VERSION {
+    if !supported(protocol_version) {
         close(
             &mut socket,
             CLOSE_UNSUPPORTED_VERSION,
@@ -372,7 +377,7 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
     };
     let host_id = record.id;
     let welcome = ServerMessage::Welcome {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version,
         heartbeat_interval_secs: u32::try_from(state.config.heartbeat_interval.as_secs())
             .unwrap_or(u32::MAX),
     };
@@ -380,10 +385,17 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
     let (sender, receiver) = mpsc::channel(OUTBOUND_QUEUE);
-    let connection = state.registry.register(&host_id, sender);
-    tracing::info!(%host_id, "a host connected");
+    let connection = state.registry.register(&host_id, protocol_version, sender);
+    tracing::info!(%host_id, version = protocol_version, "a host connected");
     let _ = state.store().touch(&host_id, Utc::now());
-    serve_host(&mut socket, &state, &host_id, connection, receiver).await;
+    serve_host(
+        &mut socket,
+        &state,
+        &host_id,
+        (connection, protocol_version),
+        receiver,
+    )
+    .await;
     state.registry.unregister(&host_id, connection);
     tracing::info!(%host_id, "a host disconnected");
 }
@@ -392,7 +404,7 @@ async fn serve_host(
     socket: &mut WebSocket,
     state: &AppState,
     host_id: &str,
-    connection: u64,
+    (connection, version): (u64, u32),
     mut receiver: mpsc::Receiver<Outbound>,
 ) {
     let silence_limit = state.config.heartbeat_interval.saturating_mul(3);
@@ -415,7 +427,7 @@ async fn serve_host(
                 last_heard = Instant::now();
                 match HostMessage::decode(&text) {
                     Ok(HostMessage::Hello(hello)) => {
-                        if hello.protocol_version != PROTOCOL_VERSION {
+                        if hello.protocol_version != version {
                             close(socket, CLOSE_UNSUPPORTED_VERSION, "unsupported protocol version").await;
                             return;
                         }

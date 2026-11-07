@@ -30,6 +30,24 @@ Not released yet: this is the version being prepared.
   disconnected since when.
 - The coordinator server, its container image, a Caddy example and
   `docs/coordinator.md`.
+- Coordinator stage 2: a reconciliation sweep. Given a GitHub App id and private
+  key (`COORDINATOR_GITHUB_APP_ID`, `COORDINATOR_GITHUB_APP_PRIVATE_KEY_FILE`),
+  the coordinator mints installation tokens (renewed before they expire) and
+  every 2 minutes (`COORDINATOR_RECONCILE_INTERVAL`, at least 30 s) reads the
+  queued jobs of every repository its hosts serve, with conditional requests and
+  GitHub's rate-limit waits honoured, waking the hosts for any queued job that
+  no wake was sent for recently (a lost webhook). The App key, its JWTs and the
+  installation tokens are never logged.
+- Poll modes per target: `standalone` (no coordinator), `coordinated` (the link
+  is up and the coordinator's sweep covers the target: polled every 300 s,
+  `host set-poll-interval --coordinated`, at least 60 s, while no runner of this
+  host runs for it) and `fallback` (the link has been down for 30 s, or the
+  target is not covered: the normal intervals, at once). `status [--json]`
+  (`coordinator.targets`), `host doctor` (`github.polling`, `coordinator.link`),
+  `coordinator status` and the TUI show them.
+- The host-coordinator protocol is now version 2 (the coordinator's `hello_ack`
+  names the covered targets). Version-1 hosts and coordinators keep working:
+  both sides settle on the highest version they share.
 
 ## 0.4.44
 

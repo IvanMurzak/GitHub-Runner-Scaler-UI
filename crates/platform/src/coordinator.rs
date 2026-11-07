@@ -105,6 +105,12 @@ pub struct LinkRecord {
     pub last_wake_at: Option<DateTime<Utc>>,
     /// Wakes received since the daemon started.
     pub wakes_received: u64,
+    /// How often the coordinator's reconciliation sweep runs, as its last
+    /// `hello_ack` said; `None` when it runs none or never said.
+    pub reconcile_interval_secs: Option<u32>,
+    /// The targets that sweep covers, scope included: `repo:owner/name` or
+    /// `org:login`.
+    pub covered: Vec<String>,
 }
 
 impl LinkRecord {

@@ -1540,6 +1540,38 @@ impl AuthenticatedClient {
         self
     }
 
+    /// Hand this client a different credential, for the next request on.
+    ///
+    /// For a holder that mints its own short-lived credentials and replaces
+    /// them before they expire -- the coordinator's GitHub App installation
+    /// tokens, which last an hour. Keeping the client (rather than building a
+    /// new one per token) keeps its conditional cache and rate-limit state.
+    /// Returns whether the credential changed.
+    ///
+    /// Taken under the same gate as a `401`'s renewal, so the two never race.
+    pub async fn replace_credential(&self, fresh: UserAccessToken) -> bool {
+        let _gate = self.revalidation_gate.lock().await;
+        self.swap_in(fresh)
+    }
+
+    /// Installs `fresh` unless it is the credential already held, and bumps
+    /// the generation a queued `401` retry checks. The caller holds
+    /// `revalidation_gate`.
+    fn swap_in(&self, fresh: UserAccessToken) -> bool {
+        {
+            let mut guard = self
+                .credential
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.secret().expose_secret() == fresh.secret().expose_secret() {
+                return false;
+            }
+            *guard = fresh;
+        }
+        self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
     /// Replace the credential with whatever `produce` finds, once, however many
     /// callers asked at the same moment.
     ///
@@ -1579,17 +1611,9 @@ impl AuthenticatedClient {
         let Some(fresh) = produce(self).await else {
             return false;
         };
-        {
-            let mut guard = self
-                .credential
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.secret().expose_secret() == fresh.secret().expose_secret() {
-                return false;
-            }
-            *guard = fresh;
+        if !self.swap_in(fresh) {
+            return false;
         }
-        self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
         tracing::info!("{note}");
         true
     }

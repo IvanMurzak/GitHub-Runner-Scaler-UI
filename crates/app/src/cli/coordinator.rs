@@ -22,6 +22,26 @@
 //! changes how the daemon polls (D1: standalone and fallback are today's
 //! behaviour).
 //!
+//! # Poll modes (stage 2)
+//!
+//! Each target is in one of three [`PollMode`]s:
+//!
+//! * `standalone` — no coordinator joined: today's polling.
+//! * `coordinated` — the link is up (or down for less than
+//!   [`FALLBACK_AFTER`]) and the coordinator's last `hello_ack` says its
+//!   reconciliation sweep covers this target. The coordinator then reads the
+//!   target's queue and wakes this host for any queued job, so the target's
+//!   own poll stretches to the long coordinated interval
+//!   (`host set-poll-interval --coordinated`, 300 s by default) -- except
+//!   while this host runs a runner for it, when freed capacity must be
+//!   reused promptly and the normal intervals apply. Wakes still bring a
+//!   poll forward.
+//! * `fallback` — joined, but the link has been down for
+//!   [`FALLBACK_AFTER`], or the coordinator does not cover the target (no
+//!   GitHub App, an installation that does not reach it, or a version-1
+//!   coordinator). Today's polling, at once: a loop asleep on the long
+//!   interval is re-scheduled the moment its target leaves `coordinated`.
+//!
 //! # Secrets
 //!
 //! The host's Ed25519 private key is generated at `join` and goes straight
@@ -40,9 +60,10 @@ use chrono::{DateTime, Utc};
 use futures::{SinkExt as _, StreamExt as _};
 use runner_manager_coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CoordinatorUrl, EnrollRequest, EnrollResponse,
-    Heartbeat, Hello, HostMessage, HostSigningKey, PROTOCOL_VERSION, Profile, ServerMessage,
-    Target, TargetRef, TargetScope, Wake, decode_nonce, decode_signing_key, encode_public_key,
-    encode_signing_key, sign_challenge, signing_key_from_seed,
+    HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, HostMessage, HostSigningKey,
+    MIN_PROTOCOL_VERSION, Profile, ServerMessage, Target, TargetRef, TargetScope, Wake,
+    decode_nonce, decode_signing_key, encode_public_key, encode_signing_key, negotiate,
+    sign_challenge, signing_key_from_seed,
 };
 use runner_manager_domain::attempt::active_count;
 use runner_manager_domain::model::{OwnerRepo, ScaleTarget, StartMode};
@@ -54,7 +75,7 @@ use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::secrets::{SecretItem, SecretStore};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite;
 
 use super::{CliError, Context, CoordinatorCommand, Failure, write_failed};
@@ -87,6 +108,11 @@ const CONFIG_RECHECK: Duration = Duration::from_secs(15);
 
 /// Version of `coordinator status --json`.
 const STATUS_SCHEMA_VERSION: u32 = 1;
+
+/// How long a lost link keeps covered targets on the coordinated interval:
+/// a reconnect inside it changes nothing, and past it every target polls on
+/// its own again.
+pub const FALLBACK_AFTER: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -157,8 +183,10 @@ fn join(context: &Context, url: &str, code: &str, out: &mut dyn Write) -> Result
     })?;
 
     let key = signing_key_from_seed(&rand::random::<[u8; 32]>());
+    // Enrollment has not changed since version 1, and every coordinator
+    // accepts 1; a stage-1 coordinator accepts nothing else.
     let request = EnrollRequest {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: MIN_PROTOCOL_VERSION,
         code: code.trim().to_string(),
         hostname,
         public_key: encode_public_key(&key.verifying_key()),
@@ -313,6 +341,7 @@ fn status(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliE
             snapshot.wakes_received
         )
         .map_err(failed)?;
+        writeln!(out, "  sweep         {}", snapshot.describe_sweep()).map_err(failed)?;
     }
     Ok(())
 }
@@ -332,6 +361,52 @@ pub enum LinkState {
     Unknown,
 }
 
+/// How one target is polled. See the module documentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollMode {
+    Standalone,
+    Coordinated,
+    Fallback,
+}
+
+impl PollMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Coordinated => "coordinated",
+            Self::Fallback => "fallback",
+        }
+    }
+
+    /// The one rule every reader applies: the daemon's loops, `status`,
+    /// `host doctor` and the TUI.
+    #[must_use]
+    pub fn of(
+        configured: bool,
+        connected: bool,
+        down_for: Option<Duration>,
+        covered: bool,
+    ) -> Self {
+        if !configured {
+            Self::Standalone
+        } else if covered && (connected || down_for.is_some_and(|down| down < FALLBACK_AFTER)) {
+            Self::Coordinated
+        } else {
+            Self::Fallback
+        }
+    }
+}
+
+/// One target and how it is polled, for `status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetPollMode {
+    /// `owner/repo`, or an organization's login.
+    pub target: String,
+    pub mode: PollMode,
+}
+
 /// What this host knows about its coordinator, read from disk only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinatorSnapshot {
@@ -348,6 +423,14 @@ pub struct CoordinatorSnapshot {
     pub wakes_received: u64,
     /// The setting exists and could not be read.
     pub unreadable: Option<String>,
+    /// How often the coordinator's reconciliation sweep runs, as its last
+    /// `hello_ack` said; `null` when it runs none, or never said.
+    pub reconcile_interval_secs: Option<u32>,
+    /// The targets that sweep covers, as `repo:owner/name` or `org:login`.
+    pub covered: Vec<String>,
+    /// Each of this host's targets and its poll mode. Empty where the
+    /// reader did not ask about targets.
+    pub targets: Vec<TargetPollMode>,
 }
 
 impl CoordinatorSnapshot {
@@ -365,6 +448,77 @@ impl CoordinatorSnapshot {
             last_wake_at: None,
             wakes_received: 0,
             unreadable: None,
+            reconcile_interval_secs: None,
+            covered: Vec::new(),
+            targets: Vec::new(),
+        }
+    }
+
+    /// [`Self::read`], with each of `targets`' poll mode.
+    #[must_use]
+    pub fn read_for(paths: &AppPaths, now: DateTime<Utc>, targets: &[ScaleTarget]) -> Self {
+        let mut snapshot = Self::read(paths, now);
+        let mut seen: Vec<&ScaleTarget> = Vec::new();
+        for target in targets {
+            if seen.contains(&target) {
+                continue;
+            }
+            seen.push(target);
+            snapshot.targets.push(TargetPollMode {
+                target: target.slug(),
+                mode: snapshot.mode_for(target, now),
+            });
+        }
+        snapshot
+    }
+
+    /// How `target` is polled, as far as the daemon's record says.
+    #[must_use]
+    pub fn mode_for(&self, target: &ScaleTarget, now: DateTime<Utc>) -> PollMode {
+        // The same rule as `HelloAck::covers`: scope and name, case-blind.
+        let reference = target_ref(target).to_string();
+        let covered = self.reconcile_interval_secs.is_some()
+            && self
+                .covered
+                .iter()
+                .any(|covered| covered.eq_ignore_ascii_case(&reference));
+        let down_for = (self.link == LinkState::Disconnected)
+            .then(|| {
+                self.since
+                    .and_then(|since| now.signed_duration_since(since).to_std().ok())
+            })
+            .flatten();
+        PollMode::of(
+            self.configured,
+            self.link == LinkState::Connected,
+            down_for,
+            covered,
+        )
+    }
+
+    /// How many of [`Self::targets`] are in `mode`.
+    #[must_use]
+    pub fn count(&self, mode: PollMode) -> usize {
+        self.targets
+            .iter()
+            .filter(|target| target.mode == mode)
+            .count()
+    }
+
+    /// One phrase on the coordinator's sweep and what it covers here.
+    #[must_use]
+    pub fn describe_sweep(&self) -> String {
+        match self.reconcile_interval_secs {
+            None => "none reported: every target polls GitHub on its own (fallback)".to_string(),
+            Some(secs) if self.targets.is_empty() => {
+                format!("every {secs}s, covering {} target(s)", self.covered.len())
+            }
+            Some(secs) => format!(
+                "every {secs}s; {} of {} target(s) coordinated, {} in fallback",
+                self.count(PollMode::Coordinated),
+                self.targets.len(),
+                self.count(PollMode::Fallback)
+            ),
         }
     }
 
@@ -389,6 +543,8 @@ impl CoordinatorSnapshot {
         if let Some(link) = link {
             snapshot.last_wake_at = link.last_wake_at;
             snapshot.wakes_received = link.wakes_received;
+            snapshot.reconcile_interval_secs = link.reconcile_interval_secs;
+            snapshot.covered = link.covered;
             if !runner_manager_platform::wsl::fence::elapsed_at_least(
                 link.written_at,
                 now,
@@ -522,6 +678,59 @@ fn target_ref(target: &ScaleTarget) -> TargetRef {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The link's view, shared with the target loops
+// ---------------------------------------------------------------------------
+
+/// What the link knows right now, for the target loops' poll mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkView {
+    /// This host has joined a coordinator.
+    pub configured: bool,
+    pub connected: bool,
+    /// When the link went down, while it is down after having been up.
+    pub down_since: Option<tokio::time::Instant>,
+    /// The coordinator's last `hello_ack`; `None` before one, and from a
+    /// version-1 coordinator.
+    pub ack: Option<HelloAck>,
+}
+
+impl LinkView {
+    /// `target`'s poll mode at `now`.
+    #[must_use]
+    pub fn mode(&self, target: &ScaleTarget, now: tokio::time::Instant) -> PollMode {
+        let covered = self
+            .ack
+            .as_ref()
+            .is_some_and(|ack| ack.covers(&target_ref(target)));
+        PollMode::of(
+            self.configured,
+            self.connected,
+            self.down_since
+                .map(|since| now.saturating_duration_since(since)),
+            covered,
+        )
+    }
+
+    /// When a coordinated target falls back on its own, if the link is down
+    /// and that is still ahead.
+    #[must_use]
+    pub fn fallback_at(&self) -> Option<tokio::time::Instant> {
+        self.down_since
+            .filter(|_| !self.connected)
+            .map(|since| since + FALLBACK_AFTER)
+    }
+}
+
+/// The link's side of [`LinkView`]; every target loop holds a receiver.
+pub type Coordination = watch::Sender<LinkView>;
+
+/// A sender for a daemon that has just started: not joined, not connected.
+#[must_use]
+pub fn coordination() -> Arc<Coordination> {
+    Arc::new(watch::Sender::new(LinkView::default()))
+}
+
 /// The targets and profiles this host advertises: its autoscale policies.
 #[must_use]
 pub fn advertised_targets(policies: &[ScalePolicy]) -> Vec<Target> {
@@ -566,6 +775,8 @@ pub struct LinkPorts {
     pub host: runner_manager_domain::model::Host,
     /// Where runners work, for the free-disk figure.
     pub runner_root: std::path::PathBuf,
+    /// Where the link tells the target loops what it knows.
+    pub coordination: Arc<Coordination>,
 }
 
 /// Why one session ended, as fixed words for the link record.
@@ -624,10 +835,28 @@ impl Recorder {
         }
     }
 
-    fn connected(&mut self) {
+    /// Connected at protocol `version`; a version-1 coordinator sends no
+    /// `hello_ack`, so it covers nothing.
+    fn connected(&mut self, version: u32) {
         self.record.connected = true;
         self.record.since = Some(Utc::now());
         self.record.reason = None;
+        if version < HELLO_ACK_VERSION {
+            self.record.reconcile_interval_secs = None;
+            self.record.covered.clear();
+        }
+        self.write();
+    }
+
+    fn acknowledged(&mut self, ack: &HelloAck) {
+        let covered: Vec<String> = ack.covered.iter().map(ToString::to_string).collect();
+        if self.record.reconcile_interval_secs == ack.reconcile_interval_secs
+            && self.record.covered == covered
+        {
+            return;
+        }
+        self.record.reconcile_interval_secs = ack.reconcile_interval_secs;
+        self.record.covered = covered;
         self.write();
     }
 
@@ -660,6 +889,12 @@ pub async fn maintain_link(ports: LinkPorts) {
         let config = match records::configured(&ports.paths) {
             Ok(Some(config)) => config,
             Ok(None) => {
+                ports.coordination.send_if_modified(|view| {
+                    let left = LinkView::default();
+                    let changed = *view != left;
+                    *view = left;
+                    changed
+                });
                 tokio::time::sleep(CONFIG_RECHECK).await;
                 continue;
             }
@@ -669,8 +904,23 @@ pub async fn maintain_link(ports: LinkPorts) {
                 continue;
             }
         };
+        ports.coordination.send_if_modified(|view| {
+            let changed = !view.configured;
+            view.configured = true;
+            changed
+        });
         let started = tokio::time::Instant::now();
         let end = session(&ports, &config, tls.clone(), &mut recorder).await;
+        // Only the first failure after a session changes anything; repeated
+        // failed reconnects must not wake every target loop.
+        ports.coordination.send_if_modified(|view| {
+            let changed = view.connected || view.down_since.is_none();
+            if changed {
+                view.down_since = Some(tokio::time::Instant::now());
+                view.connected = false;
+            }
+            changed
+        });
         tracing::info!(reason = end.as_str(), "the coordinator link ended");
         if end == SessionEnd::Reconfigured {
             // After `leave` the setting is gone and `leave` already removed
@@ -731,9 +981,9 @@ fn load_key(store: &dyn SecretStore) -> Option<HostSigningKey> {
     decode_signing_key(secret.expose_secret()).ok()
 }
 
-fn hello(ports: &LinkPorts, host_id: &str, policies: &[ScalePolicy]) -> Hello {
+fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy]) -> Hello {
     Hello {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: version,
         host_id: host_id.to_string(),
         os: ports.host.os.to_string(),
         arch: ports.host.architecture.to_string(),
@@ -836,39 +1086,68 @@ async fn session(
         return SessionEnd::Unreachable;
     };
     match handshake(&mut socket, &url, &config.host_id, &key).await {
-        Ok(interval) => {
+        Ok(handshake) => {
+            let version = handshake.version;
             drop(key);
-            recorder.connected();
-            tracing::info!(coordinator = %url, "connected to the coordinator");
-            serve(&mut socket, ports, config, interval, recorder).await
+            recorder.connected(version);
+            ports.coordination.send_modify(|view| {
+                view.connected = true;
+                view.down_since = None;
+                // A version-1 coordinator never sends a `hello_ack`; a
+                // version-2 one sends a fresh one right after `hello`, and
+                // until it does the last one stands, so a reconnect does not
+                // flip every target to fallback for a moment.
+                if version < HELLO_ACK_VERSION {
+                    view.ack = None;
+                }
+            });
+            tracing::info!(coordinator = %url, version, "connected to the coordinator");
+            serve(&mut socket, ports, config, handshake, recorder).await
         }
         Err(end) => end,
     }
 }
 
-/// Challenge, signature, welcome. Returns the heartbeat interval.
+/// What the handshake settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Handshake {
+    heartbeat: Duration,
+    /// The negotiated protocol version.
+    version: u32,
+}
+
+/// The version to speak, from the coordinator's challenge: the highest both
+/// sides speak. A version-1 coordinator names only `protocol_version`.
+fn negotiated(protocol_version: u32, max_protocol_version: Option<u32>) -> Option<u32> {
+    negotiate(
+        protocol_version,
+        max_protocol_version.unwrap_or(protocol_version),
+    )
+}
+
+/// Challenge, signature, welcome.
 async fn handshake(
     socket: &mut Socket,
     url: &CoordinatorUrl,
     host_id: &str,
     key: &HostSigningKey,
-) -> Result<Duration, SessionEnd> {
+) -> Result<Handshake, SessionEnd> {
     let challenge = next_text_within(socket).await?;
     let Ok(ServerMessage::Challenge {
         protocol_version,
         nonce,
+        max_protocol_version,
     }) = ServerMessage::decode(&challenge)
     else {
         return Err(SessionEnd::Closed);
     };
-    if protocol_version != PROTOCOL_VERSION {
-        return Err(SessionEnd::UnsupportedVersion);
-    }
+    let version =
+        negotiated(protocol_version, max_protocol_version).ok_or(SessionEnd::UnsupportedVersion)?;
     let nonce = decode_nonce(&nonce).map_err(|_| SessionEnd::Closed)?;
     send(
         socket,
         &HostMessage::Auth {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: version,
             host_id: host_id.to_string(),
             signature: sign_challenge(key, &nonce, &url.origin()),
         },
@@ -879,9 +1158,10 @@ async fn handshake(
         Ok(ServerMessage::Welcome {
             heartbeat_interval_secs,
             ..
-        }) => Ok(Duration::from_secs(u64::from(
-            heartbeat_interval_secs.clamp(5, 300),
-        ))),
+        }) => Ok(Handshake {
+            heartbeat: Duration::from_secs(u64::from(heartbeat_interval_secs.clamp(5, 300))),
+            version,
+        }),
         _ => Err(SessionEnd::Closed),
     }
 }
@@ -890,14 +1170,17 @@ async fn serve(
     socket: &mut Socket,
     ports: &LinkPorts,
     config: &CoordinatorConfig,
-    interval: Duration,
+    Handshake {
+        heartbeat: interval,
+        version,
+    }: Handshake,
     recorder: &mut Recorder,
 ) -> SessionEnd {
     let policies = ports.store.policies().unwrap_or_default();
     let mut described = advertised_targets(&policies);
     if let Err(end) = send(
         socket,
-        &HostMessage::Hello(hello(ports, &config.host_id, &policies)),
+        &HostMessage::Hello(hello(ports, &config.host_id, version, &policies)),
     )
     .await
     {
@@ -912,10 +1195,26 @@ async fn serve(
                     Ok(text) => text,
                     Err(end) => return end,
                 };
-                if let Ok(ServerMessage::Wake(wake)) = ServerMessage::decode(&text)
-                    && ports.routes.deliver(&wake)
-                {
-                    recorder.woke();
+                match ServerMessage::decode(&text) {
+                    Ok(ServerMessage::Wake(wake)) => {
+                        if ports.routes.deliver(&wake) {
+                            recorder.woke();
+                        }
+                    }
+                    Ok(ServerMessage::HelloAck(ack)) => {
+                        tracing::info!(
+                            covered = ack.covered.len(),
+                            sweep_secs = ack.reconcile_interval_secs.unwrap_or_default(),
+                            "the coordinator said which targets its sweep covers"
+                        );
+                        recorder.acknowledged(&ack);
+                        ports.coordination.send_if_modified(|view| {
+                            let changed = view.ack.as_ref() != Some(&ack);
+                            view.ack = Some(ack);
+                            changed
+                        });
+                    }
+                    _ => {}
                 }
             }
             _ = ticks.tick() => {
@@ -929,7 +1228,8 @@ async fn serve(
                 let current = advertised_targets(&policies);
                 if current != described {
                     described = current;
-                    let message = HostMessage::Hello(hello(ports, &config.host_id, &policies));
+                    let message =
+                        HostMessage::Hello(hello(ports, &config.host_id, version, &policies));
                     if let Err(end) = send(socket, &message).await {
                         return end;
                     }
@@ -1079,7 +1379,7 @@ mod tests {
         let enrolled = enroll(
             &url,
             &EnrollRequest {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: MIN_PROTOCOL_VERSION,
                 code: code.expose_secret().to_string(),
                 hostname: "box".into(),
                 public_key: encode_public_key(&key.verifying_key()),
@@ -1123,6 +1423,8 @@ mod tests {
         let mut routes = WakeRoutes::new(None);
         let woken = routes.add(policy.target.clone());
 
+        let coordination = coordination();
+        let mut view = coordination.subscribe();
         let link = tokio::spawn(maintain_link(LinkPorts {
             paths: paths.clone(),
             key_store,
@@ -1132,6 +1434,7 @@ mod tests {
             draining: Arc::new(AtomicBool::new(false)),
             host,
             runner_root: dir.path().to_path_buf(),
+            coordination: Arc::clone(&coordination),
         }));
 
         // Connected and described.
@@ -1183,7 +1486,99 @@ mod tests {
         let snapshot = CoordinatorSnapshot::read(&paths, Utc::now());
         assert_eq!(snapshot.wakes_received, 1);
 
+        // This coordinator runs no sweep: connected, and still fallback.
+        let mode = |view: &watch::Receiver<LinkView>| {
+            view.borrow()
+                .mode(&policy.target, tokio::time::Instant::now())
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            view.wait_for(|view| view.connected && view.ack.is_some()),
+        )
+        .await
+        .expect("acknowledged in time")
+        .expect("the link is alive");
+        assert_eq!(mode(&view), PollMode::Fallback);
+
+        // Its sweep starts and covers the target: coordinated, recorded for
+        // `status`.
+        state
+            .registry
+            .set_coverage(runner_manager_coordinator::registry::Coverage {
+                interval: Some(Duration::from_secs(120)),
+                repositories: ["octo/app".to_string()].into(),
+                accounts: std::collections::BTreeSet::new(),
+            });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            view.wait_for(|view| view.ack.as_ref().is_some_and(|ack| !ack.covered.is_empty())),
+        )
+        .await
+        .expect("the coverage arrived")
+        .expect("the link is alive");
+        assert_eq!(mode(&view), PollMode::Coordinated);
+        let snapshot =
+            CoordinatorSnapshot::read_for(&paths, Utc::now(), std::slice::from_ref(&policy.target));
+        assert_eq!(snapshot.reconcile_interval_secs, Some(120));
+        assert_eq!(snapshot.targets[0].mode, PollMode::Coordinated);
+
         link.abort();
+    }
+
+    #[test]
+    fn the_host_negotiates_down_to_an_older_coordinator() {
+        // A stage-1 coordinator: version 1 only.
+        assert_eq!(negotiated(1, None), Some(1));
+        // This coordinator.
+        assert_eq!(
+            negotiated(
+                1,
+                Some(runner_manager_coordinator_protocol::PROTOCOL_VERSION)
+            ),
+            Some(runner_manager_coordinator_protocol::PROTOCOL_VERSION)
+        );
+        // A future one that dropped everything this build speaks.
+        assert_eq!(negotiated(7, Some(9)), None);
+    }
+
+    #[test]
+    fn a_target_is_coordinated_only_while_covered_and_linked() {
+        let short = Some(FALLBACK_AFTER - Duration::from_secs(1));
+        assert_eq!(PollMode::of(false, true, None, true), PollMode::Standalone);
+        assert_eq!(PollMode::of(true, true, None, true), PollMode::Coordinated);
+        assert_eq!(
+            PollMode::of(true, false, short, true),
+            PollMode::Coordinated
+        );
+        assert_eq!(
+            PollMode::of(true, false, Some(FALLBACK_AFTER), true),
+            PollMode::Fallback
+        );
+        assert_eq!(PollMode::of(true, false, None, true), PollMode::Fallback);
+        assert_eq!(PollMode::of(true, true, None, false), PollMode::Fallback);
+
+        // `status` reads the same rule off the daemon's record.
+        let now = Utc::now();
+        let mut snapshot = CoordinatorSnapshot::not_configured();
+        let target = ScaleTarget::repository("Octo/App").expect("target");
+        assert_eq!(snapshot.mode_for(&target, now), PollMode::Standalone);
+        snapshot.configured = true;
+        snapshot.link = LinkState::Connected;
+        snapshot.covered = vec!["repo:octo/app".into()];
+        assert_eq!(
+            snapshot.mode_for(&target, now),
+            PollMode::Fallback,
+            "no sweep"
+        );
+        snapshot.reconcile_interval_secs = Some(120);
+        assert_eq!(snapshot.mode_for(&target, now), PollMode::Coordinated);
+        snapshot.link = LinkState::Disconnected;
+        snapshot.since = Some(now - chrono::TimeDelta::seconds(10));
+        assert_eq!(snapshot.mode_for(&target, now), PollMode::Coordinated);
+        snapshot.since = Some(now - chrono::TimeDelta::seconds(31));
+        assert_eq!(snapshot.mode_for(&target, now), PollMode::Fallback);
+        snapshot.link = LinkState::Unknown;
+        assert_eq!(snapshot.mode_for(&target, now), PollMode::Fallback);
     }
 
     #[test]

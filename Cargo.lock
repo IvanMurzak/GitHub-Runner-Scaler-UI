@@ -2808,7 +2808,10 @@ name = "runner-manager-coordinator"
 version = "0.4.44"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "aws-lc-rs",
  "axum",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "futures",
@@ -2818,6 +2821,8 @@ dependencies = [
  "reqwest",
  "runner-manager-coordinator-protocol",
  "runner-manager-domain",
+ "runner-manager-github",
+ "runner-manager-testkit",
  "rusqlite",
  "secrecy",
  "serde",
@@ -2829,7 +2834,9 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

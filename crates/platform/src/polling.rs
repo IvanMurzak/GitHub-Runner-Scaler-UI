@@ -3,7 +3,8 @@
 //! Two small records, one in each direction:
 //!
 //! * **`config/polling.toml`** holds the idle poll interval
-//!   (`host set-poll-interval --idle`). The *active* interval is the existing
+//!   (`host set-poll-interval --idle`) and the coordinated one (`--coordinated`,
+//!   used while a coordinator's sweep covers a target). The *active* interval is the existing
 //!   `hosts.refresh_interval_secs` column. The idle one lives in a file rather
 //!   than a new column on purpose: a schema step makes the database refuse to
 //!   open under an older build, and a polling preference is not worth making a
@@ -17,7 +18,7 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use runner_manager_domain::model::IdlePollInterval;
+use runner_manager_domain::model::{CoordinatedPollInterval, IdlePollInterval};
 use serde::{Deserialize, Serialize};
 
 use crate::paths::AppPaths;
@@ -36,6 +37,17 @@ const TRAFFIC_SCHEMA_VERSION: u32 = 1;
 struct Settings {
     schema_version: u32,
     idle_interval_secs: u16,
+    /// Absent from a file an older build wrote: the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordinated_interval_secs: Option<u16>,
+}
+
+fn record_error(path: PathBuf, detail: String) -> ServiceError {
+    ServiceError::Record {
+        operation: "read",
+        path,
+        detail,
+    }
 }
 
 fn settings_path(paths: &AppPaths) -> PathBuf {
@@ -54,27 +66,63 @@ fn traffic_path(paths: &AppPaths) -> PathBuf {
 /// or holds a value under [`IdlePollInterval::MIN_SECS`]. A hand-edited `1`
 /// is refused rather than obeyed, for the reason the floor exists.
 pub fn idle_interval(paths: &AppPaths) -> Result<IdlePollInterval, ServiceError> {
-    let path = settings_path(paths);
-    let Some(settings) = read_state_record::<Settings>(&path)? else {
-        return Ok(IdlePollInterval::default());
-    };
-    IdlePollInterval::from_secs(settings.idle_interval_secs).map_err(|error| ServiceError::Record {
-        operation: "read",
-        path,
-        detail: error.to_string(),
-    })
+    intervals(paths).map(|(idle, _)| idle)
 }
 
-/// Store the idle interval.
+/// Both intervals the file holds.
+///
+/// # Errors
+/// As [`idle_interval`].
+pub fn intervals(
+    paths: &AppPaths,
+) -> Result<(IdlePollInterval, CoordinatedPollInterval), ServiceError> {
+    let path = settings_path(paths);
+    let Some(settings) = read_state_record::<Settings>(&path)? else {
+        return Ok((
+            IdlePollInterval::default(),
+            CoordinatedPollInterval::default(),
+        ));
+    };
+    let idle = IdlePollInterval::from_secs(settings.idle_interval_secs)
+        .map_err(|error| record_error(path.clone(), error.to_string()))?;
+    let coordinated = settings
+        .coordinated_interval_secs
+        .map_or(Ok(CoordinatedPollInterval::default()), |secs| {
+            CoordinatedPollInterval::from_secs(secs)
+        })
+        .map_err(|error| record_error(path, error.to_string()))?;
+    Ok((idle, coordinated))
+}
+
+/// Store the idle interval, keeping the coordinated one.
 ///
 /// # Errors
 /// [`ServiceError::Record`] when `config/` cannot be written.
 pub fn set_idle_interval(paths: &AppPaths, idle: IdlePollInterval) -> Result<(), ServiceError> {
+    let coordinated = intervals(paths)
+        .map(|(_, coordinated)| coordinated)
+        .unwrap_or_default();
+    set_intervals(paths, idle, coordinated)
+}
+
+/// Store both intervals.
+///
+/// # Errors
+/// [`ServiceError::Record`] when `config/` cannot be written.
+pub fn set_intervals(
+    paths: &AppPaths,
+    idle: IdlePollInterval,
+    coordinated: CoordinatedPollInterval,
+) -> Result<(), ServiceError> {
     write_state_record(
         &settings_path(paths),
         &Settings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             idle_interval_secs: idle.as_secs(),
+            // Written only when it differs from the default, so a file an
+            // older build reads back is the file it wrote.
+            coordinated_interval_secs: (coordinated != CoordinatedPollInterval::default())
+                .then_some(coordinated.as_secs()),
         },
     )
 }
@@ -224,6 +272,39 @@ mod tests {
         let five = IdlePollInterval::from_secs(5).expect("the floor");
         set_idle_interval(&paths, five).expect("written");
         assert_eq!(idle_interval(&paths).expect("read back"), five);
+    }
+
+    #[test]
+    fn the_coordinated_interval_round_trips_beside_the_idle_one() {
+        let (_dir, paths) = paths();
+        let coordinated_interval = |paths: &AppPaths| intervals(paths).map(|(_, c)| c);
+        assert_eq!(
+            coordinated_interval(&paths).expect("a default"),
+            CoordinatedPollInterval::default()
+        );
+        let idle = IdlePollInterval::from_secs(7).expect("valid");
+        let coordinated = CoordinatedPollInterval::from_secs(600).expect("valid");
+        set_intervals(&paths, idle, coordinated).expect("written");
+        assert_eq!(intervals(&paths).expect("read"), (idle, coordinated));
+        // Changing the idle one keeps the coordinated one.
+        set_idle_interval(&paths, IdlePollInterval::default()).expect("written");
+        assert_eq!(coordinated_interval(&paths).expect("read"), coordinated);
+        // A file an older build wrote has no coordinated value: the default.
+        std::fs::write(
+            settings_path(&paths),
+            "schema_version = 1\nidle_interval_secs = 10\n",
+        )
+        .expect("written");
+        assert_eq!(
+            coordinated_interval(&paths).expect("read"),
+            CoordinatedPollInterval::default()
+        );
+        std::fs::write(
+            settings_path(&paths),
+            "schema_version = 1\nidle_interval_secs = 10\ncoordinated_interval_secs = 30\n",
+        )
+        .expect("written");
+        assert!(coordinated_interval(&paths).is_err(), "under the floor");
     }
 
     #[test]

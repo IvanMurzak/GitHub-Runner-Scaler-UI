@@ -1392,8 +1392,23 @@ fn coordinator_line(local: &crate::cli::status::StatusDocument) -> Option<Box<(S
     let coordinator = &local.coordinator;
     // An unreadable setting is not `configured`, and is still worth a line.
     (coordinator.configured || coordinator.unreadable.is_some()).then(|| {
+        let mut line = coordinator.describe();
+        if coordinator.configured {
+            // Each target's poll mode: `coordinated` polls rarely while the
+            // coordinator's sweep reads it, `fallback` polls on its own.
+            let modes: Vec<String> = coordinator
+                .targets
+                .iter()
+                .map(|target| format!("{} {}", target.target, target.mode.as_str()))
+                .collect();
+            line = if modes.is_empty() {
+                format!("{line}; sweep {}", coordinator.describe_sweep())
+            } else {
+                format!("{line}; {}", modes.join(", "))
+            };
+        }
         Box::new((
-            coordinator.describe(),
+            line,
             coordinator.link == crate::cli::coordinator::LinkState::Connected,
         ))
     })

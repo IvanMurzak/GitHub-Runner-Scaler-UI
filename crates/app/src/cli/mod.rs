@@ -1169,13 +1169,13 @@ pub enum HostIsolationCommand {
     Status(StatusArgs),
 }
 
-/// `host set-poll-interval --idle 10s --active 60s`.
+/// `host set-poll-interval --idle 10s --active 60s --coordinated 300s`.
 #[derive(Debug, Args)]
 #[command(group(
     clap::ArgGroup::new("interval")
         .required(true)
         .multiple(true)
-        .args(["idle", "active"])
+        .args(["idle", "active", "coordinated"])
 ))]
 pub struct HostSetPollIntervalArgs {
     /// How often a target with nothing happening is polled, e.g. `10s`. At
@@ -1188,6 +1188,11 @@ pub struct HostSetPollIntervalArgs {
     /// hourly quota every host signed in as you shares.
     #[arg(long, value_name = "DURATION", value_parser = polling::parse_interval)]
     pub active: Option<u16>,
+    /// How often a target is polled while a joined coordinator's sweep covers
+    /// it, e.g. `300s`. At least 60s. The coordinator reads the queue and wakes
+    /// this host for new work meanwhile.
+    #[arg(long, value_name = "DURATION", value_parser = polling::parse_interval)]
+    pub coordinated: Option<u16>,
 }
 
 #[derive(Debug, Args)]

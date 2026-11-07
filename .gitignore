@@ -22,3 +22,9 @@ Thumbs.db
 # These land inside the checkout path; without this entry they surface as
 # untracked paths and read as a leaked isolation boundary.
 /.claude/worktrees/
+
+# Coordinator deployment secrets (docs/coordinator.md).
+deploy/coordinator/webhook_secret
+deploy/coordinator/*.pem
+deploy/coordinator/.env
+deploy/coordinator/docker-compose.override.yml
