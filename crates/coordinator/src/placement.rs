@@ -77,6 +77,11 @@ pub const CLAIM_GRACE: Duration = Duration::from_secs(3);
 /// a job that left the queue waits for the claim of the runner that took it.
 pub const CLAIM_HOLD: Duration = Duration::from_secs(30);
 
+/// How long the memory a job was expected to need stays reserved on its host
+/// after its runner took it: a build reaches its peak minutes in, and until
+/// then the host's heartbeat still shows that memory free.
+pub const RAMP_HOLD: Duration = Duration::from_secs(2 * 60);
+
 /// How often leases expire and unplaced jobs are retried.
 pub const TICK: Duration = Duration::from_secs(5);
 
@@ -158,6 +163,9 @@ struct State {
     /// Jobs that left the queue before the runner that took them was
     /// reported: the next claim on that key closes its lease outright.
     credits: HashMap<JobKey, VecDeque<Instant>>,
+    /// Stage 4: the estimates of leases whose runner took its job, per host,
+    /// held for [`RAMP_HOLD`] from the claim.
+    ramping: Vec<(String, u64, Instant)>,
 }
 
 impl State {
@@ -171,11 +179,33 @@ impl State {
     /// The estimates of `host_id`'s leases whose runner took no job yet:
     /// memory its heartbeat still shows free.
     fn reserved_on(&self, host_id: &str) -> u64 {
-        self.leases
+        let now = Instant::now();
+        let leased = self
+            .leases
             .values()
             .filter(|lease| lease.host_id == host_id)
-            .filter(|lease| !matches!(lease.state, LeaseState::Claimed(_)))
-            .fold(0, |sum, lease| sum.saturating_add(lease.estimate))
+            .filter(|lease| match lease.state {
+                LeaseState::Claimed(at) => now.saturating_duration_since(at) < RAMP_HOLD,
+                _ => true,
+            })
+            .fold(0u64, |sum, lease| sum.saturating_add(lease.estimate));
+        self.ramping
+            .iter()
+            .filter(|(host, _, until)| host == host_id && *until > now)
+            .fold(leased, |sum, (_, estimate, _)| {
+                sum.saturating_add(*estimate)
+            })
+    }
+
+    /// Removes a lease whose runner took its job; its estimate stays
+    /// reserved on its host until [`RAMP_HOLD`] after the claim.
+    fn release_claimed(&mut self, lease_id: &str, claimed_at: Instant) {
+        if let Some(lease) = self.leases.remove(lease_id)
+            && lease.estimate > 0
+        {
+            self.ramping
+                .push((lease.host_id, lease.estimate, claimed_at + RAMP_HOLD));
+        }
     }
 
     fn job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
@@ -350,12 +380,9 @@ impl Placement {
                 LeaseState::Claimed(at) => Some((id.clone(), at)),
                 _ => None,
             })
-            .min_by_key(|(_, at)| *at)
-            .map(|(id, _)| id);
+            .min_by_key(|(_, at)| *at);
         match claimed {
-            Some(id) => {
-                state.leases.remove(&id);
-            }
+            Some((id, at)) => state.release_claimed(&id, at),
             None => state.credits.entry(key.clone()).or_default().push_back(now),
         }
         Some(key)
@@ -463,7 +490,7 @@ impl Placement {
             .and_then(VecDeque::pop_front)
             .is_some();
         if credited {
-            state.leases.remove(lease_id);
+            state.release_claimed(lease_id, Instant::now());
         } else if let Some(lease) = state.leases.get_mut(lease_id) {
             lease.state = LeaseState::Claimed(Instant::now());
         }
@@ -505,11 +532,21 @@ impl Placement {
     pub fn expire(&self, now: Instant) -> Vec<JobKey> {
         let mut state = self.state();
         let before = state.leases.len();
-        state.leases.retain(|_, lease| {
-            lease.expires > now
-                && !matches!(lease.state, LeaseState::Claimed(at)
-                    if now.saturating_duration_since(at) >= CLAIM_HOLD)
-        });
+        let held: Vec<(String, Instant)> = state
+            .leases
+            .iter()
+            .filter_map(|(id, lease)| match lease.state {
+                LeaseState::Claimed(at) if now.saturating_duration_since(at) >= CLAIM_HOLD => {
+                    Some((id.clone(), at))
+                }
+                _ => None,
+            })
+            .collect();
+        for (id, at) in held {
+            state.release_claimed(&id, at);
+        }
+        state.leases.retain(|_, lease| lease.expires > now);
+        state.ramping.retain(|(_, _, until)| *until > now);
         for credits in state.credits.values_mut() {
             credits.retain(|at| now.saturating_duration_since(*at) < CLAIM_HOLD);
         }
@@ -1411,6 +1448,7 @@ mod tests {
                     ..AttemptUsage::default()
                 }),
             },
+            None,
         );
         // The roomiest by free memory now cannot hold it with the margin
         // once the lease it already holds is counted; stage 3 would pick it.
@@ -1428,6 +1466,32 @@ mod tests {
         placement.queued_job("octo/app", &pool, 2, Some(identity.key()));
         assert_eq!(placement.rebalance(&key).await, Rebalanced::default());
         assert_eq!(placement.counts(&key), (2, 1));
+        // Its runner takes job 1: the lease closes, but the memory it will
+        // need stays reserved while the build ramps up.
+        let lease = placement
+            .state()
+            .leases
+            .keys()
+            .next()
+            .cloned()
+            .expect("a lease");
+        placement.attempt_started(
+            "big",
+            &AttemptStarted {
+                lease_id: Some(lease),
+                runner_name: "runner-manager-y".into(),
+                target: TargetRef {
+                    scope: TargetScope::Repo,
+                    name: "octo/app".into(),
+                },
+                profile: "pool".into(),
+            },
+        );
+        placement.dequeued("octo/app", &pool, 1);
+        assert_eq!(placement.counts(&key), (1, 0));
+        assert_eq!(placement.state().reserved_on("big"), 12 << 30);
+        assert_eq!(placement.rebalance(&key).await, Rebalanced::default());
+        assert_eq!(placement.state().reserved_on("small"), 0);
         assert_eq!(launches(&big.await.expect("host")), 1);
         assert_eq!(launches(&small.await.expect("host")), 0);
 

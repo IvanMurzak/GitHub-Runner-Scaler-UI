@@ -1196,8 +1196,18 @@ mod sys {
         }
         // SAFETY: `sysconf` reads a constant.
         let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        let (free, inactive) = (stats.free_count, stats.inactive_count);
-        super::available_pages_bytes(u64::from(free), u64::from(inactive), page)
+        let (free, speculative, inactive) = (
+            stats.free_count,
+            stats.speculative_count,
+            stats.inactive_count,
+        );
+        // The kernel's free count includes the speculative pages, which
+        // `vm_stat` prints apart; free here is what it calls free.
+        super::available_pages_bytes(
+            u64::from(free).saturating_sub(u64::from(speculative)),
+            u64::from(inactive),
+            page,
+        )
     }
 
     #[cfg(not(target_os = "macos"))]

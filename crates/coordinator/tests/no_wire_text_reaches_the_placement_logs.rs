@@ -122,8 +122,7 @@ fn no_wire_text_reaches_the_placement_logs() {
                         samples: 5,
                         ..AttemptUsage::default()
                     }),
-                },
-            );
+                }, None);
             let placement = Arc::new(
                 Placement::with_timings(
                     Arc::clone(&registry),

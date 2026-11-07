@@ -92,6 +92,9 @@ Not released yet: this is the version being prepared.
 - The protocol is now version 4 (`attempt_finished.usage`, query sessions).
   Version-3 hosts and coordinators keep working at version 3; a version-3
   host's attempts count towards duration statistics only.
+- The coordinator's database moves to schema 2. Rolling back to a stage-3
+  coordinator needs the pre-upgrade database or
+  `PRAGMA user_version = 1` (see `docs/coordinator.md`).
 
 ### Changed
 

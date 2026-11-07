@@ -342,8 +342,9 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                 {
                     state.placement.spawn_rebalance(key, CLAIM_GRACE);
                 }
-                // Which job a runner took, for its attempt's statistics.
-                if matches!(action, "in_progress" | "completed")
+                // Which job a runner took, for its attempt's statistics: said
+                // once, when it starts (`completed` repeats it).
+                if action == "in_progress"
                     && let (Some(runner), Some(identity)) =
                         (job.workflow_job.runner_name.as_deref(), identity)
                 {
@@ -574,8 +575,15 @@ async fn answer_query(socket: &mut WebSocket, state: &AppState, host_id: &str) {
     match state.statistics.report(Utc::now()) {
         Ok(report) => {
             tracing::info!(%host_id, jobs = report.jobs.len(), "a host read the statistics");
-            if send(socket, &ServerMessage::Stats(report)).await {
-                close(socket, 1000, "done").await;
+            // A reader that stops reading does not hold the task open.
+            let answered = tokio::time::timeout(state.config.auth_timeout, async {
+                if send(socket, &ServerMessage::Stats(report)).await {
+                    close(socket, 1000, "done").await;
+                }
+            })
+            .await;
+            if answered.is_err() {
+                tracing::info!(%host_id, "a statistics reader did not read in time");
             }
         }
         Err(error) => {
@@ -642,7 +650,11 @@ async fn serve_host(
                     }
                     Ok(HostMessage::AttemptFinished(finished)) if version >= LAUNCH_VERSION => {
                         state.placement.attempt_finished(host_id, &finished);
-                        state.statistics.attempt_finished(host_id, &finished);
+                        state.statistics.attempt_finished(
+                            host_id,
+                            &finished,
+                            state.registry.ram_bytes(host_id),
+                        );
                         state.placement.spawn_retry_all();
                     }
                     // A second `auth`, a message its version does not have, a

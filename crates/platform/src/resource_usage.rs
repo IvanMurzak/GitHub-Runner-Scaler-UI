@@ -9,16 +9,23 @@
 //!   resident pages). A native runner does not get a cgroup of its own, so
 //!   the tree is the unit.
 //! * **macOS** lists every PID (`proc_listallpids`), reads each parent
-//!   (`PROC_PIDTBSDINFO`) and, for the tree, `PROC_PIDTASKINFO` (resident
-//!   size, user and system time in Mach ticks).
+//!   (`PROC_PIDT_SHORTBSDINFO`, which any account may read, so a `sudo` step
+//!   keeps its place in the tree) and, for the tree, `PROC_PIDTASKINFO`
+//!   (resident size, user and system time in Mach ticks).
 //! * **Windows** takes one Toolhelp snapshot for the parent links and, for
 //!   the tree, `GetProcessMemoryInfo` (working set) and `GetProcessTimes`. A
 //!   native runner is not started inside a Job Object, so there is no job
-//!   accounting to read.
+//!   accounting to read. Toolhelp keeps a dead parent's PID, which Windows
+//!   soon hands to another process, so a child created before its supposed
+//!   parent is not counted as its child.
 //!
-//! CPU time of a descendant that exited between two looks is counted only
-//! where the platform folds it into its parent (Linux `cutime`/`cstime`), so
-//! the figure is a floor. A process this account may not inspect is skipped.
+//! The CPU total of a tree drops when a descendant exits (except on Linux,
+//! which folds a reaped child into its parent's `cutime`/`cstime`); the
+//! caller adds up the increases between looks, so at most a look's worth of
+//! an exiting process's time is lost. A process this account may not
+//! inspect counts as using nothing. Work that leaves the tree is not seen:
+//! containers run by `dockerd`, and daemons that detach (a Gradle daemon, a
+//! `nohup` server) and are re-parented to init.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -60,6 +67,7 @@ fn trees(
     roots: &[u32],
     parents: &[(u32, u32)],
     mut facts: impl FnMut(u32) -> Option<Facts>,
+    mut is_child: impl FnMut(u32, u32) -> bool,
 ) -> HashMap<u32, TreeUsage> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for (pid, parent) in parents {
@@ -79,7 +87,8 @@ fn trees(
             usage.cpu_time = usage.cpu_time.saturating_add(cpu);
             usage.processes = usage.processes.saturating_add(1);
             for child in children.get(&pid).into_iter().flatten() {
-                if seen.insert(*child) {
+                if !seen.contains(child) && is_child(*child, pid) {
+                    seen.insert(*child);
                     queue.push_back(*child);
                 }
             }
@@ -161,7 +170,7 @@ mod sys {
                 );
             }
         }
-        trees(roots, &parents, |pid| facts.get(&pid).copied())
+        trees(roots, &parents, |pid| facts.get(&pid).copied(), |_, _| true)
     }
 }
 
@@ -225,19 +234,25 @@ mod sys {
             .into_iter()
             .filter(|pid| *pid > 0)
             .filter_map(|pid| {
-                let bsd: libc::proc_bsdinfo = info(pid, libc::PROC_PIDTBSDINFO)?;
-                Some((u32::try_from(pid).ok()?, bsd.pbi_ppid))
+                let bsd: libc::proc_bsdshortinfo = info(pid, libc::PROC_PIDT_SHORTBSDINFO)?;
+                Some((u32::try_from(pid).ok()?, bsd.pbsi_ppid))
             })
             .collect();
-        trees(roots, &parents, |pid| {
-            let task: libc::proc_taskinfo = info(i32::try_from(pid).ok()?, libc::PROC_PIDTASKINFO)?;
-            Some((
-                task.pti_resident_size,
-                Duration::from_nanos(ticks_to_nanos(
-                    task.pti_total_user.saturating_add(task.pti_total_system),
-                )),
-            ))
-        })
+        trees(
+            roots,
+            &parents,
+            |pid| {
+                let task: libc::proc_taskinfo =
+                    info(i32::try_from(pid).ok()?, libc::PROC_PIDTASKINFO)?;
+                Some((
+                    task.pti_resident_size,
+                    Duration::from_nanos(ticks_to_nanos(
+                        task.pti_total_user.saturating_add(task.pti_total_system),
+                    )),
+                ))
+            },
+            |_, _| true,
+        )
     }
 }
 
@@ -246,14 +261,14 @@ mod sys {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
     use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     use super::{Facts, TreeUsage, trees};
@@ -282,26 +297,21 @@ mod sys {
         pairs
     }
 
+    /// A `FILETIME` in 100 ns units.
+    fn hundreds(time: FILETIME) -> u64 {
+        (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+    }
+
     fn filetime(time: FILETIME) -> Duration {
-        let hundreds = (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
-        Duration::from_nanos(hundreds.saturating_mul(100))
+        Duration::from_nanos(hundreds(time).saturating_mul(100))
     }
 
-    fn open(pid: u32) -> Option<HANDLE> {
-        // SAFETY: plain calls; the handle returned is closed by the caller.
-        unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-                false,
-                pid,
-            )
-        }
-        .or_else(|_| unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
-        .ok()
-    }
-
-    fn facts(pid: u32) -> Option<Facts> {
-        let handle = open(pid)?;
+    /// What one process uses, and when it was created; `None` when this
+    /// account cannot open it.
+    fn facts(pid: u32) -> Option<(Facts, Option<u64>)> {
+        // SAFETY: a plain call; the handle is closed below exactly once.
+        // Querying memory and times needs no more than limited information.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
         let mut memory = PROCESS_MEMORY_COUNTERS {
             cb: u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>()).unwrap_or(0),
             ..PROCESS_MEMORY_COUNTERS::default()
@@ -329,18 +339,33 @@ mod sys {
                 &raw mut user,
             )
         };
-        let cpu = if timed.is_ok() {
-            filetime(kernel).saturating_add(filetime(user))
+        let (cpu, born) = if timed.is_ok() {
+            (
+                filetime(kernel).saturating_add(filetime(user)),
+                Some(hundreds(created)),
+            )
         } else {
-            Duration::ZERO
+            (Duration::ZERO, None)
         };
         // SAFETY: opened above, closed once.
         let _ = unsafe { CloseHandle(handle) };
-        Some((rss, cpu))
+        Some(((rss, cpu), born))
     }
 
     pub(super) fn sample_trees(roots: &[u32]) -> HashMap<u32, TreeUsage> {
-        trees(roots, &parents(), facts)
+        let known = std::cell::RefCell::new(HashMap::<u32, Option<(Facts, Option<u64>)>>::new());
+        let look = |pid: u32| *known.borrow_mut().entry(pid).or_insert_with(|| facts(pid));
+        trees(
+            roots,
+            &parents(),
+            |pid| look(pid).map(|(facts, _)| facts),
+            // A child created before its parent names a dead parent whose
+            // PID was reused: not this tree's.
+            |child, parent| match (look(child), look(parent)) {
+                (Some((_, Some(child))), Some((_, Some(parent)))) => child >= parent,
+                _ => true,
+            },
+        )
     }
 }
 
@@ -390,7 +415,12 @@ mod tests {
         .into_iter()
         .map(|(pid, (rss, secs))| (pid, (rss, Duration::from_secs(secs))))
         .collect();
-        let found = trees(&[10, 99], &parents, |pid| facts.get(&pid).copied());
+        let found = trees(
+            &[10, 99],
+            &parents,
+            |pid| facts.get(&pid).copied(),
+            |_, _| true,
+        );
         assert_eq!(
             found,
             HashMap::from([(
@@ -404,8 +434,16 @@ mod tests {
             "the gone root 99 has no entry"
         );
         // An unreadable process still counts as one of the tree.
-        let unreadable = trees(&[10], &parents, |_| None);
+        let unreadable = trees(&[10], &parents, |_| None, |_, _| true);
         assert_eq!(unreadable[&10].processes, 4);
+        // A link the platform disowns (a stale parent PID) cuts that subtree.
+        let cut = trees(
+            &[10],
+            &parents,
+            |pid| facts.get(&pid).copied(),
+            |child, _| child != 11,
+        );
+        assert_eq!(cut[&10].processes, 1);
     }
 
     /// A real child tree of this process: the measurement on the current OS.

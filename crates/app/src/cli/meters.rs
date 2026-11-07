@@ -34,9 +34,12 @@ const KEEP_AFTER_LAST_SAMPLE: Duration = Duration::from_secs(10 * 60);
 #[derive(Debug, Clone, Copy)]
 struct Meter {
     first_at: Instant,
-    first_cpu: Duration,
     last_at: Instant,
+    /// The tree's CPU total at the last look.
     last_cpu: Duration,
+    /// The increases of that total, added up: a descendant that exits takes
+    /// its time out of the total, and new work after that must still count.
+    used_cpu: Duration,
     peak_rss: u64,
     peak_millicores: u32,
     samples: u32,
@@ -55,7 +58,7 @@ impl Meter {
         AttemptUsage {
             peak_rss_bytes: self.peak_rss,
             cpu_avg_millicores: millicores(
-                self.last_cpu.saturating_sub(self.first_cpu),
+                self.used_cpu,
                 self.last_at.saturating_duration_since(self.first_at),
             )
             .unwrap_or(0),
@@ -83,24 +86,22 @@ impl AttemptMeters {
         let mut meters = self.lock();
         let meter = meters.entry(attempt).or_insert(Meter {
             first_at: at,
-            first_cpu: usage.cpu_time,
             last_at: at,
             last_cpu: usage.cpu_time,
+            used_cpu: Duration::ZERO,
             peak_rss: 0,
             peak_millicores: 0,
             samples: 0,
         });
-        // A descendant that exited unreaped takes its CPU time with it: the
-        // total never goes back.
-        let cpu = usage.cpu_time.max(meter.last_cpu);
-        if let Some(busy) = millicores(
-            cpu.saturating_sub(meter.last_cpu),
-            at.saturating_duration_since(meter.last_at),
-        ) {
+        // A descendant that exited took its CPU time out of the total: only
+        // increases count, from wherever the total now stands.
+        let increase = usage.cpu_time.saturating_sub(meter.last_cpu);
+        if let Some(busy) = millicores(increase, at.saturating_duration_since(meter.last_at)) {
             meter.peak_millicores = meter.peak_millicores.max(busy);
         }
+        meter.used_cpu = meter.used_cpu.saturating_add(increase);
         meter.last_at = at;
-        meter.last_cpu = cpu;
+        meter.last_cpu = usage.cpu_time;
         meter.peak_rss = meter.peak_rss.max(usage.rss_bytes);
         meter.samples = meter.samples.saturating_add(1);
     }
@@ -191,14 +192,15 @@ mod tests {
         meters.record(attempt, at(2), tree(500, 4_000));
         // Idle for two, and a child that exited took 1 s of CPU with it.
         meters.record(attempt, at(4), tree(300, 3_000));
-        // Half a CPU for four.
+        // Three quarters of a CPU for four: counted although the total only
+        // now passes where it stood before the child exited.
         meters.record(attempt, at(8), tree(200, 6_000));
         let usage = meters.take(attempt).expect("measured");
         assert_eq!(
             usage,
             AttemptUsage {
                 peak_rss_bytes: 500,
-                cpu_avg_millicores: 750,
+                cpu_avg_millicores: 875,
                 cpu_peak_millicores: 2000,
                 samples: 4,
             }

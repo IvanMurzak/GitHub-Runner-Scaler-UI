@@ -447,6 +447,14 @@ impl Registry {
         woken
     }
 
+    /// The memory `host_id` reported in its `hello`.
+    #[must_use]
+    pub fn ram_bytes(&self, host_id: &str) -> Option<u64> {
+        self.lock()
+            .get(host_id)
+            .and_then(|connected| connected.hello.as_ref()?.ram_bytes)
+    }
+
     /// Wakes sent since the last call, for the statistics' counters.
     pub fn take_wakes_sent(&self) -> u64 {
         self.wakes_sent.swap(0, Ordering::Relaxed)

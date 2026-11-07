@@ -153,6 +153,12 @@ that is already queued. A link that drops keeps `coordinated` for 30 seconds, so
 changes nothing; after that every target polls on its own again at once. A coordinator without a
 GitHub App covers nothing, so its hosts are in `fallback` and behave as in stage 1.
 
+Upgrading to stage 4 moves the coordinator's database to schema 2 (three new tables). A stage-3
+coordinator refuses to open it (`written by a newer coordinator`): to roll back, restore the
+database from before the upgrade, or stop the service and run
+`sqlite3 coordinator.db 'PRAGMA user_version = 1'` (the stage-3 code never reads the new
+tables, and a later upgrade keeps them).
+
 The protocol is versioned: a stage-1 host and this coordinator, or this host and a stage-1
 coordinator, settle on version 1 and work as stage 1 did (the host is then in `fallback`).
 
@@ -247,26 +253,34 @@ While a host has joined a coordinator, every 2 seconds it looks at the process t
 | OS | How |
 |---|---|
 | Linux | `/proc/<pid>/stat` of every process: parent, CPU ticks (with reaped children's), resident pages |
-| macOS | `proc_listallpids`, then `proc_pidinfo` (`PROC_PIDTBSDINFO` for the parent, `PROC_PIDTASKINFO` for resident size and CPU time) |
-| Windows | one Toolhelp snapshot for the parent links, then `GetProcessMemoryInfo` (working set) and `GetProcessTimes` per process. Native runners run in no Job Object, so there is no job accounting to read. |
+| macOS | `proc_listallpids`, then `proc_pidinfo` (`PROC_PIDT_SHORTBSDINFO` for the parent, readable for any account, so a `sudo` step stays in the tree; `PROC_PIDTASKINFO` for resident size and CPU time) |
+| Windows | one Toolhelp snapshot for the parent links, then `GetProcessMemoryInfo` (working set) and `GetProcessTimes` per process; a process created before its supposed parent names a dead parent whose PID was reused and is not counted. Native runners run in no Job Object, so there is no job accounting to read. |
 
-When the attempt ends, its `attempt_finished` carries `usage`: the tree's peak resident memory,
-its average CPU over the attempt and its busiest 2-second interval (in thousandths of a CPU),
-and how many samples were taken. The wall duration is the attempt's, from its creation to its
-end. A runner in a container, a VM or a WSL distribution has no host process to look at and
-reports no usage; disk growth of the workspace is not measured (walking a checkout every few
-seconds is not cheap). CPU time of a process that exited without being waited for by the tree
-is lost, so CPU is a floor.
+When the attempt ends, its `attempt_finished` carries `usage`: the tree's peak resident memory
+(summed per process, so shared pages count more than once; the coordinator caps it at the
+host's memory), its average CPU over the attempt and its busiest 2-second interval (in
+thousandths of a CPU), and how many samples were taken. CPU is the sum of the increases of the
+tree's CPU time between looks, so a process that exits loses at most its last 2 seconds. Both
+the wall duration and the average CPU are the attempt's, from its creation to its end, idle
+wait for a job included.
+
+What is not seen: a runner in a container, a VM or a WSL distribution (no host process to look
+at, no usage reported); work that leaves the tree, such as `container:` jobs and `docker build`
+run by `dockerd`, or daemons that detach (a Gradle daemon, a `nohup` server); disk growth of the
+workspace (walking a checkout every few seconds is not cheap). The figures are a floor for such
+jobs.
 
 ### How a sample is kept
 
-GitHub's `workflow_job` webhook `in_progress` (and `completed`) names the runner that took the
-job together with the repository, the workflow and the job (matrix values included, as GitHub
-expands them: `build (ubuntu, 3.12)`). The coordinator joins that with the host's report of the
-same runner name, in whichever order they arrive (a report waits up to 15 minutes for its
-webhook), and stores one sample per attempt that ran a job under the key
-`owner/repo/workflow/job`, with the host that ran it. An attempt that exited idle is not a
-sample.
+GitHub's `workflow_job` webhook `in_progress` names the runner that took the job together with
+the repository, the workflow and the job (matrix values included, as GitHub expands them:
+`build (ubuntu, 3.12)`). The coordinator remembers that only for runner names `runner-manager`
+registers (`runner-manager-...`), joins it with the host's report of the same runner name, in
+whichever order they arrive (a report waits up to 15 minutes for its webhook, a webhook 6 hours
+for its report, 10,000 of each at most, the oldest dropped first), and stores one sample per
+attempt that ran a job, completed or failed (an out-of-memory kill is what placement must
+learn), under the key `owner/repo/workflow/job` with the host that ran it. An attempt that
+exited idle is not a sample.
 
 The SQLite database keeps the last 30 samples per key (`COORDINATOR_STATS_SAMPLES`, 1-1000) and
 drops any older than 90 days. From them: p50 duration, p90 peak memory, p90 average CPU, and per
@@ -285,11 +299,15 @@ and labels), not a single job:
    launches whose runner has not taken a job yet cannot hold the demand plus
    `COORDINATOR_RAM_MARGIN` (512 MiB) is passed over. A host that reports no free memory is not
    filtered. When the demand is the global default (nothing measured for that repository),
-   nothing is filtered: a guess never keeps a job waiting.
+   nothing is filtered: a guess never keeps a job waiting. Nor is anything filtered when the
+   demand plus the margin is more than every candidate's total memory: no host could ever hold
+   it, so the job runs where the score says. The estimates of a host's launches stay reserved
+   for 2 minutes after their runner took its job, while the build's memory ramps up.
 3. **Score** = `cache` x warm workspace (0 or 1) + `headroom` x (memory free after the job, as a
    share of the host's memory) + `speed` x (how much faster than usual this host ran these jobs,
-   -1 to 1) - `bigfit` x (1 when a heavier queue waiting elsewhere fits only this host, and this
-   queue fits another).
+   -1 to 1) - `bigfit` x (1 when the heaviest measured queue waiting elsewhere needs at least
+   twice this one's memory and fits only this host of this queue's candidates, and this queue
+   fits another).
 4. **Order**: the best score first, ties in stage 3's order. With no statistics at all for the
    queue, stage 3's order alone: warm workspace, most free memory, fewest busy slots.
 
@@ -338,6 +356,8 @@ Last placements, newest first (scores in points):
 
 - **Heaviest jobs**: the 20 job keys with the largest p90 peak memory, and per host how its
   median compares with the usual duration (below 1x: faster).
+- Names are printed with control, bidirectional and zero-width characters removed: a workflow
+  or job name is whatever a pull request wrote.
 - **Last placements**: what the queue was estimated to need and why (`job`, `repository` or
   `default`), `weighted` or `stage3`, the host chosen (or `no host fits`, shown at most once a
   minute per queue), and every candidate's score parts. A host marked `too full` was passed

@@ -501,7 +501,7 @@ impl StatsReport {
                 writeln!(
                     out,
                     "  {}\n      {}  {}  {}  ({})",
-                    job.job_key,
+                    printable(&job.job_key),
                     bytes(job.p90_peak_rss_bytes),
                     cores(job.p90_cpu_millicores),
                     duration(job.p50_duration_secs),
@@ -546,18 +546,21 @@ impl StatsReport {
                     out,
                     "  {} ago  {} [{}] needs {} ({}), {}: {}",
                     duration(u64::try_from(self.generated_at.saturating_sub(decision.at)).ok()),
-                    decision.repository,
-                    decision.labels,
+                    printable(&decision.repository),
+                    printable(&decision.labels),
                     bytes(Some(decision.estimate_bytes)),
                     decision.estimate_source,
                     decision.method,
-                    decision.chosen.as_deref().unwrap_or("no host fits")
+                    decision
+                        .chosen
+                        .as_deref()
+                        .map_or_else(|| "no host fits".to_string(), printable)
                 )?;
                 for score in &decision.scores {
                     writeln!(
                         out,
                         "      {:<24} {:<8} free after {:<10} cache {} headroom {} speed {} bigfit -{} = {}",
-                        score.host_id,
+                        printable(&score.host_id),
                         if score.fits { "fits" } else { "too full" },
                         bytes(score.free_after_bytes),
                         points(score.cache),
@@ -574,7 +577,8 @@ impl StatsReport {
 }
 
 fn host_label(id: &str, name: Option<&str>) -> String {
-    name.map_or_else(|| id.to_string(), |name| format!("{name} ({id})"))
+    let id = printable(id);
+    name.map_or_else(|| id.clone(), |name| format!("{} ({id})", printable(name)))
 }
 
 fn bytes(value: Option<u64>) -> String {
@@ -615,7 +619,46 @@ fn points(thousandths: i64) -> String {
     format!("{sign}{}.{:02}", value / 1000, value % 1000 / 10)
 }
 
-/// What a connection is for, named in `auth` (version 4).
+/// The prefix of every runner name `runner-manager` registers
+/// (`runner-manager-<attempt id>`): what the coordinator correlates webhooks
+/// with, and the only runner names it remembers.
+pub const RUNNER_NAME_PREFIX: &str = "runner-manager-";
+
+/// The longest runner name the coordinator correlates.
+pub const MAX_RUNNER_NAME: usize = 128;
+
+/// Whether `name` is one `runner-manager` could have registered.
+#[must_use]
+pub fn is_managed_runner_name(name: &str) -> bool {
+    name.len() <= MAX_RUNNER_NAME
+        && name
+            .get(..RUNNER_NAME_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RUNNER_NAME_PREFIX))
+}
+
+/// `text` without the characters that could rewrite a terminal: control
+/// characters (ESC, C1), bidirectional overrides and isolates, zero-width
+/// characters and line or paragraph separators. Names in `stats` come from
+/// webhooks, and a workflow or job name is whatever a pull request wrote.
+#[must_use]
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2060}'..='\u{206F}'
+                        | '\u{FEFF}'
+                )
+        })
+        .collect()
+}
+
+/// What a connection is for, named in `auth` (version 4). Always a plain
+/// string on the wire: a later purpose that needs parameters carries them in
+/// new `auth` fields, so an older coordinator reads it as [`Self::Other`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionPurpose {
@@ -667,8 +710,8 @@ pub struct JobStats {
     pub p90_peak_rss_bytes: Option<u64>,
     pub p90_cpu_millicores: Option<u32>,
     /// Per host: its samples, its median duration and that median over the
-    /// key's median across hosts, in thousandths (1000: as fast as usual,
-    /// 2000: twice as slow).
+    /// usual duration (the mean of every host's median), in thousandths
+    /// (1000: as fast as usual, 2000: twice as slow).
     pub hosts: Vec<HostJobStats>,
 }
 
@@ -1414,6 +1457,25 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing `{expected}`:\n{text}");
         }
+        let hostile = StatsReport {
+            jobs: vec![JobStats {
+                job_key: "a\u{1b}[2Jb\u{202E}c\u{200B}d".into(),
+                ..JobStats::default()
+            }],
+            ..StatsReport::default()
+        };
+        let mut text = String::new();
+        hostile.render(&mut text).expect("renders");
+        assert!(
+            text.contains("a[2Jbcd") && !text.contains('\u{1b}'),
+            "{text:?}"
+        );
+        assert!(is_managed_runner_name("Runner-Manager-0a1b"));
+        assert!(!is_managed_runner_name("GitHub Actions 2"));
+        assert!(!is_managed_runner_name(&format!(
+            "runner-manager-{}",
+            "x".repeat(200)
+        )));
         let mut empty = String::new();
         StatsReport::default().render(&mut empty).expect("renders");
         assert!(empty.contains("No job has been measured yet."));

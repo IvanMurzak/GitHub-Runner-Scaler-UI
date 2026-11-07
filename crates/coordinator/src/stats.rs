@@ -17,7 +17,8 @@
 //! Per job key, the newest [`StatsConfig::samples_per_job`] samples (30), none
 //! older than [`StatsConfig::retention`] (90 days), in SQLite with the host
 //! that ran them. From them: p50 duration, p90 peak memory, p90 average CPU,
-//! and per host the median duration over the key's median across hosts.
+//! and per host the median duration over the usual one (the mean of every
+//! host's median).
 //!
 //! # How placement uses it
 //!
@@ -43,7 +44,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use runner_manager_coordinator_protocol::{
     AttemptFinished, AttemptOutcomeKind, HostJobStats, HostScore, HostStats, JobStats,
-    MAX_MESSAGE_BYTES, PlacementDecision, ServerMessage, StatsReport,
+    MAX_MESSAGE_BYTES, PlacementDecision, ServerMessage, StatsReport, is_managed_runner_name,
+    printable,
 };
 
 use crate::store::{JobSample, Store, StoreError};
@@ -141,8 +143,8 @@ pub struct JobIdentity {
 /// A name off the wire, reduced to something safe to store and print: no
 /// control characters, at most [`MAX_NAME_CHARS`].
 fn clean(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| !c.is_control())
+    printable(raw)
+        .chars()
         .take(MAX_NAME_CHARS)
         .collect::<String>()
         .trim()
@@ -182,6 +184,21 @@ pub struct Correlator {
 /// A host's report, now that its job is known.
 pub type Correlated = (String, JobIdentity, AttemptFinished);
 
+/// Makes room in `map` for one more entry: the oldest goes when it is full.
+fn make_room<V>(map: &mut HashMap<String, V>, at: impl Fn(&V) -> Instant) {
+    if map.len() < MAX_CORRELATIONS {
+        return;
+    }
+    if let Some(oldest) = map
+        .iter()
+        .min_by_key(|(_, value)| at(value))
+        .map(|(key, _)| key.clone())
+    {
+        map.remove(&oldest);
+        tracing::warn!("job statistics correlation is full; the oldest entry was dropped");
+    }
+}
+
 impl Correlator {
     fn forget_old(&mut self, now: Instant) {
         self.identities
@@ -198,40 +215,49 @@ impl Correlator {
         identity: JobIdentity,
         now: Instant,
     ) -> Option<Correlated> {
+        // A runner this tool did not register (GitHub-hosted, another
+        // scaler) never reports an attempt: nothing to remember.
+        if !is_managed_runner_name(runner) {
+            return None;
+        }
         self.forget_old(now);
         let runner = runner.to_ascii_lowercase();
         if let Some((host_id, finished, _)) = self.pending.remove(&runner) {
             return Some((host_id, identity, finished));
         }
-        if self.identities.len() < MAX_CORRELATIONS {
-            self.identities.insert(runner, (identity, now));
-        }
+        make_room(&mut self.identities, |(_, at)| *at);
+        self.identities.insert(runner, (identity, now));
         None
     }
 
     /// A host's attempt ended; returns it with its job if the webhook came
-    /// first. An attempt that took no job is dropped: it has nothing to say
-    /// about a job's weight.
+    /// first. An attempt that took no job (an idle exit) is dropped: it has
+    /// nothing to say about a job's weight. One that failed after taking a
+    /// job (an out-of-memory kill) is exactly what placement must learn.
     pub fn finished(
         &mut self,
         host_id: &str,
         finished: AttemptFinished,
         now: Instant,
     ) -> Option<Correlated> {
-        self.forget_old(now);
-        if finished.outcome != AttemptOutcomeKind::CompletedJob {
-            self.identities
-                .remove(&finished.runner_name.to_ascii_lowercase());
+        if !is_managed_runner_name(&finished.runner_name) {
             return None;
         }
+        self.forget_old(now);
         let runner = finished.runner_name.to_ascii_lowercase();
+        if !matches!(
+            finished.outcome,
+            AttemptOutcomeKind::CompletedJob | AttemptOutcomeKind::Failed
+        ) {
+            self.identities.remove(&runner);
+            return None;
+        }
         if let Some((identity, _)) = self.identities.remove(&runner) {
             return Some((host_id.to_string(), identity, finished));
         }
-        if self.pending.len() < MAX_CORRELATIONS {
-            self.pending
-                .insert(runner, (host_id.to_string(), finished, now));
-        }
+        make_room(&mut self.pending, |(_, _, at)| *at);
+        self.pending
+            .insert(runner, (host_id.to_string(), finished, now));
         None
     }
 }
@@ -301,11 +327,12 @@ pub struct JobFigures {
 }
 
 impl Aggregates {
+    /// `samples`, oldest first, keeping the newest `keep` per key.
     #[must_use]
-    pub fn from_samples(samples: Vec<JobSample>) -> Self {
+    pub fn from_samples(samples: Vec<JobSample>, keep: usize) -> Self {
         let mut aggregates = Self::default();
         for sample in samples {
-            aggregates.add(sample, usize::MAX);
+            aggregates.add(sample, keep);
         }
         aggregates
     }
@@ -557,7 +584,13 @@ pub fn score(
     aggregates: &Aggregates,
 ) -> Vec<(Contender, HostScore)> {
     let weights = config.weights;
-    let filtering = demand.source != EstimateSource::Default;
+    // A measured estimate filters, unless no host could ever hold it: then
+    // waiting would be forever, and the job is better run somewhere.
+    let needed = demand.estimate.saturating_add(config.ram_margin);
+    let filtering = demand.source != EstimateSource::Default
+        && contenders
+            .iter()
+            .any(|contender| contender.total_ram.is_none_or(|total| total >= needed));
     let ratios: Vec<BTreeMap<String, HostRatio>> = demand
         .job_keys
         .iter()
@@ -652,7 +685,10 @@ impl Statistics {
         Self {
             db,
             config,
-            aggregates: Mutex::new(Aggregates::from_samples(samples)),
+            aggregates: Mutex::new(Aggregates::from_samples(
+                samples,
+                config.samples_per_job as usize,
+            )),
             correlator: Mutex::new(Correlator::default()),
             launches: AtomicU64::new(0),
             wakes: AtomicU64::new(0),
@@ -700,9 +736,21 @@ impl Statistics {
         }
     }
 
-    /// `host_id` reported an attempt that ended.
-    pub fn attempt_finished(&self, host_id: &str, finished: &AttemptFinished) {
-        let correlated = lock(&self.correlator).finished(host_id, finished.clone(), Instant::now());
+    /// `host_id`, whose memory is `host_ram` by its `hello`, reported an
+    /// attempt that ended. A peak above the host's memory (shared pages
+    /// counted once per process, or a confused host) is capped at it, so one
+    /// bad sample cannot make a job too heavy for every host.
+    pub fn attempt_finished(
+        &self,
+        host_id: &str,
+        finished: &AttemptFinished,
+        host_ram: Option<u64>,
+    ) {
+        let mut finished = finished.clone();
+        if let (Some(usage), Some(ram)) = (finished.usage.as_mut(), host_ram) {
+            usage.peak_rss_bytes = usage.peak_rss_bytes.min(ram);
+        }
+        let correlated = lock(&self.correlator).finished(host_id, finished, Instant::now());
         if let Some(correlated) = correlated {
             self.record(correlated);
         }
@@ -799,7 +847,7 @@ pub fn report(
         .map(|host| (host.id, host.name))
         .collect();
     let counters = store.counters()?;
-    let aggregates = Aggregates::from_samples(samples);
+    let aggregates = Aggregates::from_samples(samples, config.samples_per_job as usize);
 
     let mut jobs: Vec<JobStats> = aggregates
         .by_key
@@ -988,6 +1036,20 @@ mod tests {
                 .is_none()
         );
         assert!(correlator.identities.is_empty());
+        // A failed attempt that had taken a job (an out-of-memory kill) is a
+        // sample; a runner this tool never registers is not remembered.
+        correlator.identified("runner-manager-e", identity("heavy"), now);
+        assert!(
+            correlator
+                .finished(
+                    "h1",
+                    finished("runner-manager-e", AttemptOutcomeKind::Failed, GIB),
+                    now,
+                )
+                .is_some()
+        );
+        correlator.identified("GitHub Actions 7", identity("hosted"), now);
+        assert!(correlator.identities.is_empty());
         // A report nobody names is forgotten after a while.
         correlator.finished(
             "h1",
@@ -1020,7 +1082,7 @@ mod tests {
             samples.push(sample("octo/app/ci/build", host, secs, rss * GIB));
         }
         samples.push(sample("octo/app/ci/lint", "fast", 10, GIB / 2));
-        let aggregates = Aggregates::from_samples(samples);
+        let aggregates = Aggregates::from_samples(samples, 30);
         let build = aggregates.job("octo/app/ci/build").expect("figures");
         assert_eq!(build.samples, 10);
         assert_eq!(build.p90_peak_rss_bytes, Some(9 * GIB));
@@ -1040,10 +1102,13 @@ mod tests {
 
     #[test]
     fn a_queue_needs_its_heaviest_job_and_falls_back_to_its_repository_then_the_default() {
-        let aggregates = Aggregates::from_samples(vec![
-            sample("octo/app/ci/build", "h", 60, 6 * GIB),
-            sample("octo/app/ci/lint", "h", 60, GIB),
-        ]);
+        let aggregates = Aggregates::from_samples(
+            vec![
+                sample("octo/app/ci/build", "h", 60, 6 * GIB),
+                sample("octo/app/ci/lint", "h", 60, GIB),
+            ],
+            30,
+        );
         let demand = aggregates.demand(
             "octo/app",
             &["octo/app/ci/lint".into(), "octo/app/ci/build".into()],
@@ -1118,11 +1183,14 @@ mod tests {
     #[test]
     fn the_score_prefers_warm_then_headroom_then_speed_and_spares_the_only_big_host() {
         let config = StatsConfig::default();
-        let aggregates = Aggregates::from_samples(vec![
-            sample("k", "fast", 50, GIB),
-            sample("k", "fast", 50, GIB),
-            sample("k", "slow", 150, GIB),
-        ]);
+        let aggregates = Aggregates::from_samples(
+            vec![
+                sample("k", "fast", 50, GIB),
+                sample("k", "fast", 50, GIB),
+                sample("k", "slow", 150, GIB),
+            ],
+            30,
+        );
         let light = Demand {
             estimate: GIB,
             source: EstimateSource::Job,
@@ -1186,6 +1254,40 @@ mod tests {
     }
 
     #[test]
+    fn an_estimate_no_host_could_ever_hold_filters_nothing() {
+        let config = StatsConfig::default();
+        let demand = Demand {
+            estimate: 40 * GIB,
+            source: EstimateSource::Job,
+            job_keys: vec![],
+            measured: true,
+        };
+        let scored = score(
+            &[
+                contender("a", 10 * GIB, 16 * GIB),
+                contender("b", 12 * GIB, 32 * GIB),
+            ],
+            &demand,
+            None,
+            &config,
+            &Aggregates::default(),
+        );
+        assert!(scored.iter().all(|(_, score)| score.fits), "{scored:?}");
+        // One host big enough, though busy now: the queue waits for it.
+        let scored = score(
+            &[
+                contender("a", 10 * GIB, 16 * GIB),
+                contender("big", 12 * GIB, 64 * GIB),
+            ],
+            &demand,
+            None,
+            &config,
+            &Aggregates::default(),
+        );
+        assert!(scored.iter().all(|(_, score)| !score.fits));
+    }
+
+    #[test]
     fn with_no_statistics_nothing_is_filtered_and_the_order_is_stage_threes() {
         let config = StatsConfig::default();
         let demand = Aggregates::default().demand("octo/app", &[], true, config.default_job_ram);
@@ -1235,6 +1337,23 @@ mod tests {
         let db = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
         let stats = Statistics::load(Arc::clone(&db), StatsConfig::default());
         stats.job_identified("runner-manager-1", identity("build"));
+        // A peak above the host's memory is capped at it.
+        stats.job_identified("runner-manager-9", identity("inflated"));
+        stats.attempt_finished(
+            "h1",
+            &finished(
+                "runner-manager-9",
+                AttemptOutcomeKind::CompletedJob,
+                99 * GIB,
+            ),
+            Some(16 * GIB),
+        );
+        assert_eq!(
+            stats.with_aggregates(|a| a
+                .job("octo/app/CI/inflated")
+                .and_then(|j| j.p90_peak_rss_bytes)),
+            Some(16 * GIB)
+        );
         stats.attempt_finished(
             "h1",
             &finished(
@@ -1242,11 +1361,13 @@ mod tests {
                 AttemptOutcomeKind::CompletedJob,
                 3 * GIB,
             ),
+            None,
         );
         // An attempt nobody identified records nothing.
         stats.attempt_finished(
             "h1",
             &finished("runner-manager-2", AttemptOutcomeKind::CompletedJob, GIB),
+            None,
         );
         stats.count_launch();
         stats.count_wakes(4);
@@ -1255,8 +1376,8 @@ mod tests {
             .expect("in memory");
         assert_eq!(figures.p90_peak_rss_bytes, Some(3 * GIB));
         let report = stats.report(Utc::now()).expect("report");
-        assert_eq!((report.launches, report.wakes, report.samples), (1, 4, 1));
-        assert_eq!(report.jobs.len(), 1);
+        assert_eq!((report.launches, report.wakes, report.samples), (1, 4, 2));
+        assert_eq!(report.jobs.len(), 2);
         assert_eq!(report.hosts[0].host_id, "h1");
         // Flushed, the counters survive into a fresh load (the admin CLI).
         stats.flush();

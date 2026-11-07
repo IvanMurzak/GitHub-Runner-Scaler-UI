@@ -120,6 +120,9 @@ const CONFIG_RECHECK: Duration = Duration::from_secs(15);
 /// Version of `coordinator status --json`.
 const STATUS_SCHEMA_VERSION: u32 = 1;
 
+/// Version of `coordinator stats --json`.
+const STATS_SCHEMA_VERSION: u32 = 1;
+
 /// How often the link looks at this host's attempts for its reports.
 const ATTEMPT_WATCH: Duration = Duration::from_secs(2);
 
@@ -325,7 +328,7 @@ fn status(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliE
     let failed = write_failed("the coordinator status");
     let snapshot = CoordinatorSnapshot::read(context.paths(), context.clock().now());
     if json {
-        return write_document(out, &snapshot);
+        return write_document(out, STATUS_SCHEMA_VERSION, &snapshot);
     }
     writeln!(out, "Coordinator: {}", snapshot.describe()).map_err(failed)?;
     if let (Some(name), Some(id)) = (&snapshot.name, &snapshot.host_id) {
@@ -348,7 +351,11 @@ fn status(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliE
 
 /// `body` as the versioned JSON document `status --json` and `stats --json`
 /// print: its fields beside `schema_version`.
-fn write_document(out: &mut dyn Write, body: &impl Serialize) -> Result<(), CliError> {
+fn write_document(
+    out: &mut dyn Write,
+    schema_version: u32,
+    body: &impl Serialize,
+) -> Result<(), CliError> {
     #[derive(Serialize)]
     struct Document<'a, T: Serialize> {
         schema_version: u32,
@@ -358,7 +365,7 @@ fn write_document(out: &mut dyn Write, body: &impl Serialize) -> Result<(), CliE
     serde_json::to_writer_pretty(
         &mut *out,
         &Document {
-            schema_version: STATUS_SCHEMA_VERSION,
+            schema_version,
             body,
         },
     )
@@ -409,7 +416,7 @@ fn stats(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliEr
             )),
         })?;
     if json {
-        return write_document(out, &report);
+        return write_document(out, STATS_SCHEMA_VERSION, &report);
     }
     let mut text = String::new();
     report
