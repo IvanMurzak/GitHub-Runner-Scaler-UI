@@ -692,6 +692,7 @@ fn start_coordinator_link(
             runner_root,
             coordination,
             launches,
+            meters: Arc::default(),
         }),
     )))
 }

@@ -15,8 +15,8 @@ use runner_manager_coordinator::store::Store;
 use runner_manager_coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, EnrollRequest, EnrollResponse, Hello, HelloAck,
     HostMessage, HostSigningKey, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Profile, ServerMessage,
-    Target, TargetScope, Wake, WakeReason, decode_nonce, encode_public_key, sign_challenge,
-    signing_key_from_seed,
+    SessionPurpose, Target, TargetScope, Wake, WakeReason, decode_nonce, encode_public_key,
+    sign_challenge, signing_key_from_seed,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use sha2::Sha256;
@@ -108,6 +108,17 @@ impl Coordinator {
     /// Connects as a host speaking `version`; a version-1 host checks the
     /// challenge the way stage 1 did.
     async fn connect_at(&self, version: u32, host_id: &str, key: &HostSigningKey) -> Socket {
+        self.connect_for(version, host_id, key, None).await
+    }
+
+    /// Connects for `purpose` (a version-4 query session, or the link).
+    async fn connect_for(
+        &self,
+        version: u32,
+        host_id: &str,
+        key: &HostSigningKey,
+        purpose: Option<SessionPurpose>,
+    ) -> Socket {
         let url = self.base.replacen("http://", "ws://", 1) + "/connect";
         let (mut socket, _) = tokio_tungstenite::connect_async(url)
             .await
@@ -127,6 +138,7 @@ impl Coordinator {
             protocol_version: version,
             host_id: host_id.to_string(),
             signature: sign_challenge(key, &nonce, &self.base),
+            purpose,
         };
         socket
             .send(Message::Text(auth.encode().into()))
@@ -525,4 +537,230 @@ async fn a_pool_job_launches_on_one_version_three_host_and_wakes_a_version_two_o
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("the accepted launch was not recorded as a lease");
+}
+
+fn job_event(action: &str, job_id: u64, runner: Option<&str>) -> String {
+    serde_json::json!({
+        "action": action,
+        "workflow_job": {
+            "id": job_id, "run_id": 2, "labels": ["self-hosted", "linux"],
+            "name": "build (linux, 3.12)", "workflow_name": "CI",
+            "runner_name": runner,
+        },
+        "repository": {"full_name": "Octo/App"},
+    })
+    .to_string()
+}
+
+async fn send(socket: &mut Socket, message: &HostMessage) {
+    socket
+        .send(Message::Text(message.encode().into()))
+        .await
+        .expect("sent");
+}
+
+/// A query session: authenticated, answered once, and the host's link
+/// stays up beside it.
+async fn query_stats(
+    coordinator: &Coordinator,
+    host_id: &str,
+    key: &HostSigningKey,
+) -> runner_manager_coordinator_protocol::StatsReport {
+    let mut query = coordinator
+        .connect_for(PROTOCOL_VERSION, host_id, key, Some(SessionPurpose::Query))
+        .await;
+    assert!(matches!(
+        next(&mut query).await,
+        ServerMessage::Welcome { .. }
+    ));
+    send(&mut query, &HostMessage::StatsRequest).await;
+    let ServerMessage::Stats(report) = next(&mut query).await else {
+        panic!("the statistics");
+    };
+    assert_eq!(closed_with(&mut query).await, Some(1000));
+    report
+}
+
+/// Stage 4 end to end: the webhook names the job a runner took, the host
+/// reports what the attempt used, and a query session reads the result
+/// while the host's link stays connected. A version-3 host's report (no
+/// usage) still counts its duration.
+#[tokio::test]
+async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_query() {
+    use runner_manager_coordinator_protocol::{
+        AttemptFinished, AttemptOutcomeKind, AttemptUsage, STATS_VERSION,
+    };
+
+    let coordinator = start().await;
+    let (new_id, new_key) = enrolled(&coordinator, "linux", 21).await;
+    let (old_id, old_key) = enrolled(&coordinator, "older", 22).await;
+    let mut link = coordinator.connect(&new_id, &new_key).await;
+    assert!(matches!(
+        next(&mut link).await,
+        ServerMessage::Welcome {
+            protocol_version: STATS_VERSION,
+            ..
+        }
+    ));
+    send(&mut link, &hello(PROTOCOL_VERSION, &new_id)).await;
+    let mut old = coordinator.connect_at(3, &old_id, &old_key).await;
+    assert!(matches!(
+        next(&mut old).await,
+        ServerMessage::Welcome {
+            protocol_version: 3,
+            ..
+        }
+    ));
+    send(&mut old, &hello(3, &old_id)).await;
+
+    // Queued, then taken by each host's runner (the webhook names it).
+    assert_eq!(
+        coordinator
+            .webhook("workflow_job", "s-1", &job_event("queued", 5, None), true)
+            .await,
+        200
+    );
+    for (delivery, job, runner) in [
+        ("s-2", 5, "runner-manager-new"),
+        ("s-3", 6, "runner-manager-old"),
+    ] {
+        assert_eq!(
+            coordinator
+                .webhook(
+                    "workflow_job",
+                    delivery,
+                    &job_event("in_progress", job, Some(runner)),
+                    true
+                )
+                .await,
+            200
+        );
+    }
+    let finished = |runner: &str, usage| {
+        HostMessage::AttemptFinished(AttemptFinished {
+            lease_id: None,
+            runner_name: runner.into(),
+            outcome: AttemptOutcomeKind::CompletedJob,
+            duration_secs: Some(300),
+            usage,
+        })
+    };
+    send(
+        &mut link,
+        &finished(
+            "runner-manager-new",
+            Some(AttemptUsage {
+                peak_rss_bytes: 3 << 30,
+                cpu_avg_millicores: 2500,
+                cpu_peak_millicores: 7000,
+                samples: 150,
+            }),
+        ),
+    )
+    .await;
+    send(&mut old, &finished("runner-manager-old", None)).await;
+
+    let mut report = None;
+    for _ in 0..100 {
+        let read = query_stats(&coordinator, &new_id, &new_key).await;
+        if read.jobs.first().is_some_and(|job| job.samples == 2) {
+            report = Some(read);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let report = report.expect("both samples recorded");
+    let job = &report.jobs[0];
+    assert_eq!(job.job_key, "octo/app/CI/build (linux, 3.12)");
+    assert_eq!(job.p90_peak_rss_bytes, Some(3 << 30));
+    assert_eq!(job.p50_duration_secs, Some(300));
+    assert_eq!(report.wakes, 2, "the queued job woke both hosts");
+    let names: Vec<Option<&str>> = report
+        .hosts
+        .iter()
+        .map(|h| h.host_name.as_deref())
+        .collect();
+    assert!(
+        names.contains(&Some("linux")) && names.contains(&Some("older")),
+        "{names:?}"
+    );
+
+    // The query did not take the host's link over.
+    assert!(
+        coordinator.state.registry.host_ids().contains(&new_id),
+        "the link is still registered"
+    );
+    send(
+        &mut link,
+        &HostMessage::Heartbeat(runner_manager_coordinator_protocol::Heartbeat::default()),
+    )
+    .await;
+    assert_eq!(
+        coordinator
+            .webhook("workflow_job", "s-4", &job_event("queued", 7, None), true)
+            .await,
+        200
+    );
+    loop {
+        if let ServerMessage::Wake(wake) = next(&mut link).await
+            && wake.delivery_id == "s-4"
+        {
+            break;
+        }
+    }
+}
+
+/// The statistics are behind the same signed challenge as the link: a wrong
+/// key, an unknown or revoked host, and a version-3 query get nothing.
+#[tokio::test]
+async fn statistics_over_the_link_require_an_authenticated_version_four_host() {
+    let coordinator = start().await;
+    let (host_id, key) = enrolled(&coordinator, "mac", 23).await;
+    let impostor = signing_key_from_seed(&[24; 32]);
+    for (id, signer) in [(host_id.as_str(), &impostor), ("no-such-host", &key)] {
+        let mut socket = coordinator
+            .connect_for(PROTOCOL_VERSION, id, signer, Some(SessionPurpose::Query))
+            .await;
+        // Nothing but the close: no welcome, no statistics.
+        assert_eq!(closed_with(&mut socket).await, Some(CLOSE_UNAUTHORIZED));
+    }
+    let mut socket = coordinator
+        .connect_for(3, &host_id, &key, Some(SessionPurpose::Query))
+        .await;
+    assert_eq!(
+        closed_with(&mut socket).await,
+        Some(CLOSE_UNSUPPORTED_VERSION)
+    );
+    // Anything but a stats request on a query session closes it.
+    let mut socket = coordinator
+        .connect_for(
+            PROTOCOL_VERSION,
+            &host_id,
+            &key,
+            Some(SessionPurpose::Query),
+        )
+        .await;
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerMessage::Welcome { .. }
+    ));
+    send(&mut socket, &hello(PROTOCOL_VERSION, &host_id)).await;
+    assert_eq!(closed_with(&mut socket).await, Some(1008));
+    assert!(
+        coordinator.state.registry.host_ids().is_empty(),
+        "never registered"
+    );
+
+    let report = query_stats(&coordinator, &host_id, &key).await;
+    assert!(report.jobs.is_empty());
+    coordinator.state.revoke("mac").expect("revoked");
+    let mut socket = coordinator
+        .connect_for(
+            PROTOCOL_VERSION,
+            &host_id,
+            &key,
+            Some(SessionPurpose::Query),
+        )
+        .await;
+    assert_eq!(closed_with(&mut socket).await, Some(CLOSE_UNAUTHORIZED));
 }

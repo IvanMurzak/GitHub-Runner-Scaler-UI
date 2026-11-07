@@ -23,15 +23,23 @@
 //! runner took it has normally closed that very lease, so a surplus lease
 //! cancelled is one whose runner took nothing.
 //!
-//! # Choosing the host (design 4.5, steps 1-5, without statistics)
+//! # Choosing the host (design 4.5)
 //!
 //! Candidates: connected version-3 hosts whose target serving the repository
 //! is covered by the sweep (launch mode), with an enabled pool profile whose
 //! labels cover the job, not unfit, not draining, and with a free slot by
 //! their last heartbeat once the leases already sent to them are counted.
-//! Ranked by a warm workspace for the repository, then the most free RAM,
-//! then the fewest busy slots. The first is sent a `launch`; a refusal or no
-//! answer within [`ACK_TIMEOUT`] moves on to the next.
+//!
+//! Stage 4: with [`crate::stats::Statistics`] attached, the queue's demand is
+//! its heaviest queued job's p90 peak memory; a host that cannot hold it
+//! (less the estimates of its launches whose runner took no job yet) is
+//! passed over, and the rest are ranked by [`crate::stats::score`]. Each
+//! decision is logged with host ids and scores and kept for `stats`. With no
+//! statistics for the queue, the order is stage 3's: a warm workspace for
+//! the repository, then the most free RAM, then the fewest busy slots.
+//!
+//! The first is sent a `launch`; a refusal or no answer within
+//! [`ACK_TIMEOUT`] moves on to the next.
 //!
 //! # Logging
 //!
@@ -43,12 +51,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use runner_manager_coordinator_protocol::{
-    AttemptFinished, AttemptStarted, CancelLaunch, Launch, LaunchAck, ServerMessage,
+    AttemptFinished, AttemptStarted, CancelLaunch, Launch, LaunchAck, PlacementDecision,
+    ServerMessage,
 };
 use runner_manager_domain::model::Label;
 use tokio::sync::oneshot;
 
 use crate::registry::{Candidate, Registry, is_pool_job};
+use crate::stats::{Aggregates, Contender, Demand, Statistics, score};
 
 /// How long a host has to answer a `launch`.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -97,8 +107,9 @@ impl JobKey {
 
 #[derive(Debug, Default)]
 struct Queue {
-    /// Job ids a webhook announced, and when.
-    jobs: BTreeMap<u64, Instant>,
+    /// Job ids a webhook announced, when, and their statistics key
+    /// (`owner/repo/workflow/job`) when the webhook named it.
+    jobs: BTreeMap<u64, (Instant, Option<String>)>,
     /// Queued jobs the sweep counted beyond `jobs`.
     unnamed: u32,
 }
@@ -133,6 +144,8 @@ struct Lease {
     state: LeaseState,
     sent: Instant,
     expires: Instant,
+    /// The memory its queue was expected to need when it was placed.
+    estimate: u64,
 }
 
 #[derive(Debug, Default)]
@@ -153,6 +166,29 @@ impl State {
             .values()
             .filter(|lease| &lease.key == key)
             .count()
+    }
+
+    /// The estimates of `host_id`'s leases whose runner took no job yet:
+    /// memory its heartbeat still shows free.
+    fn reserved_on(&self, host_id: &str) -> u64 {
+        self.leases
+            .values()
+            .filter(|lease| lease.host_id == host_id)
+            .filter(|lease| !matches!(lease.state, LeaseState::Claimed(_)))
+            .fold(0, |sum, lease| sum.saturating_add(lease.estimate))
+    }
+
+    fn job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
+        self.queues.get(key).map_or((Vec::new(), true), |queue| {
+            (
+                queue
+                    .jobs
+                    .values()
+                    .filter_map(|(_, job_key)| job_key.clone())
+                    .collect(),
+                queue.unnamed > 0 || queue.jobs.values().any(|(_, job_key)| job_key.is_none()),
+            )
+        })
     }
 
     /// Launches on `host_id` its heartbeat at `heartbeat_at` cannot have
@@ -188,6 +224,8 @@ pub struct Placement {
     waiting: Mutex<HashMap<String, (String, oneshot::Sender<LaunchAck>)>>,
     ack_timeout: Duration,
     lease_ttl: Duration,
+    /// Stage 4: weighs placement by what jobs used; `None` places as stage 3.
+    stats: Option<Arc<Statistics>>,
 }
 
 impl Placement {
@@ -209,7 +247,15 @@ impl Placement {
             waiting: Mutex::new(HashMap::new()),
             ack_timeout,
             lease_ttl,
+            stats: None,
         }
+    }
+
+    /// Weighs placement with `stats` (stage 4).
+    #[must_use]
+    pub fn with_statistics(mut self, stats: Arc<Statistics>) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     #[must_use]
@@ -246,6 +292,18 @@ impl Placement {
     /// A webhook announced a queued job; its key, or `None` (nothing
     /// recorded) for a job that asks for no pool.
     pub fn queued(&self, repository: &str, required: &[Label], job_id: u64) -> Option<JobKey> {
+        self.queued_job(repository, required, job_id, None)
+    }
+
+    /// [`Self::queued`] for a job the webhook named: `job_key` is its
+    /// statistics key, which tells placement how heavy it is.
+    pub fn queued_job(
+        &self,
+        repository: &str,
+        required: &[Label],
+        job_id: u64,
+        job_key: Option<String>,
+    ) -> Option<JobKey> {
         if !is_pool_job(required) {
             return None;
         }
@@ -259,7 +317,7 @@ impl Placement {
         let now = Instant::now();
         state.touched.insert(key.clone(), now);
         let queue = state.queues.entry(key.clone()).or_default();
-        if queue.jobs.insert(job_id, now).is_none() && queue.unnamed > 0 {
+        if queue.jobs.insert(job_id, (now, job_key)).is_none() && queue.unnamed > 0 {
             // A late webhook for a job the sweep already counted.
             queue.unnamed -= 1;
         }
@@ -351,7 +409,7 @@ impl Placement {
                 let surplus = (named - swept) as usize;
                 let oldest: Vec<u64> = {
                     let mut by_age: Vec<(u64, Instant)> =
-                        queue.jobs.iter().map(|(id, at)| (*id, *at)).collect();
+                        queue.jobs.iter().map(|(id, (at, _))| (*id, *at)).collect();
                     by_age.sort_by_key(|(_, at)| *at);
                     by_age.into_iter().take(surplus).map(|(id, _)| id).collect()
                 };
@@ -466,7 +524,7 @@ impl Placement {
         for queue in state.queues.values_mut() {
             queue
                 .jobs
-                .retain(|_, at| now.saturating_duration_since(*at) < JOB_MEMORY);
+                .retain(|_, (at, _)| now.saturating_duration_since(*at) < JOB_MEMORY);
         }
         state.queues.retain(|_, queue| queue.len() > 0);
         state
@@ -515,7 +573,12 @@ impl Placement {
         let mut report = Rebalanced::default();
         let mut tried: HashSet<String> = HashSet::new();
         loop {
-            let Some((lease_id, host_id, launch)) = self.offer(key, &tried, &mut report) else {
+            let mut decision = None;
+            let offered = self.offer(key, &tried, &mut report, &mut decision);
+            if let (Some(stats), Some(decision)) = (&self.stats, decision) {
+                stats.decided(&decision);
+            }
+            let Some((lease_id, host_id, launch)) = offered else {
                 return report;
             };
             let (sender, receiver) = oneshot::channel();
@@ -536,6 +599,9 @@ impl Placement {
                         lease.state = LeaseState::Accepted;
                     }
                     report.accepted += 1;
+                    if let Some(stats) = &self.stats {
+                        stats.count_launch();
+                    }
                     tracing::info!(%lease_id, %host_id, "a host accepted a launch");
                     continue;
                 }
@@ -574,6 +640,7 @@ impl Placement {
         key: &JobKey,
         tried: &HashSet<String>,
         report: &mut Rebalanced,
+        decision: &mut Option<PlacementDecision>,
     ) -> Option<(String, String, Launch)> {
         let required: Vec<Label> = key.labels.iter().cloned().collect();
         // Read before the placement lock: the registry has its own.
@@ -588,19 +655,19 @@ impl Placement {
         if open == queued {
             return None;
         }
-        let chosen = rank(
-            candidates
-                .into_iter()
-                .filter(|candidate| !tried.contains(&candidate.host_id))
-                .filter(|candidate| !candidate.heartbeat.unfit && !candidate.heartbeat.draining)
-                .filter(|candidate| {
-                    candidate.heartbeat.free_slots
-                        > state.unreported_on(&candidate.host_id, candidate.heartbeat_at)
-                })
-                .collect(),
-        )
-        .into_iter()
-        .next()?;
+        let eligible: Vec<Candidate> = candidates
+            .into_iter()
+            .filter(|candidate| !tried.contains(&candidate.host_id))
+            .filter(|candidate| !candidate.heartbeat.unfit && !candidate.heartbeat.draining)
+            .filter(|candidate| {
+                candidate.heartbeat.free_slots
+                    > state.unreported_on(&candidate.host_id, candidate.heartbeat_at)
+            })
+            .collect();
+        let (chosen, estimate) = match &self.stats {
+            Some(stats) => Self::weigh(stats, &state, key, eligible, decision)?,
+            None => (rank(eligible).into_iter().next()?, 0),
+        };
         let lease_id = uuid::Uuid::new_v4().simple().to_string();
         let now = Instant::now();
         let ttl = self.lease_ttl;
@@ -612,6 +679,7 @@ impl Placement {
                 state: LeaseState::Offered,
                 sent: now,
                 expires: now + ttl + self.ack_timeout,
+                estimate,
             },
         );
         let job_key = state
@@ -632,6 +700,113 @@ impl Placement {
             ttl_secs,
         };
         Some((lease_id, chosen.host_id, launch))
+    }
+
+    /// Stage 4: the queue's demand, every candidate's score, the decision
+    /// logged and handed back in `decision` (recorded once the placement
+    /// lock is released); the best candidate that fits and the estimate its
+    /// lease reserves, or `None` when none fits.
+    fn weigh(
+        stats: &Statistics,
+        state: &State,
+        key: &JobKey,
+        eligible: Vec<Candidate>,
+        decision: &mut Option<PlacementDecision>,
+    ) -> Option<(Candidate, u64)> {
+        if eligible.is_empty() {
+            return None;
+        }
+        stats.with_aggregates(|aggregates| {
+            Self::weigh_with(stats, aggregates, state, key, eligible, decision)
+        })
+    }
+
+    fn weigh_with(
+        stats: &Statistics,
+        aggregates: &Aggregates,
+        state: &State,
+        key: &JobKey,
+        eligible: Vec<Candidate>,
+        decision: &mut Option<PlacementDecision>,
+    ) -> Option<(Candidate, u64)> {
+        let config = stats.config();
+        let demand_of = |key: &JobKey, aggregates: &Aggregates| -> Demand {
+            let (job_keys, unnamed) = state.job_keys(key);
+            aggregates.demand(&key.repository, &job_keys, unnamed, config.default_job_ram)
+        };
+        let demand = demand_of(key, aggregates);
+        // The heaviest measured demand of every other queue still short of
+        // runners: a host only it fits is spared for it.
+        let heavier = state
+            .queues
+            .iter()
+            .filter(|(other, queue)| *other != key && queue.len() > state.leases_for(other))
+            .map(|(other, _)| demand_of(other, aggregates))
+            .filter(|other| other.source != crate::stats::EstimateSource::Default)
+            .map(|other| other.estimate)
+            .max();
+        let contenders: Vec<Contender> = eligible
+            .iter()
+            .map(|candidate| Contender {
+                host_id: candidate.host_id.clone(),
+                warm: candidate.warm,
+                free_ram: candidate.heartbeat.free_ram_bytes,
+                total_ram: candidate.ram_bytes,
+                busy_slots: candidate.heartbeat.busy_slots,
+                reserved: state.reserved_on(&candidate.host_id),
+            })
+            .collect();
+        let scored = score(&contenders, &demand, heavier, config, aggregates);
+        let chosen = scored
+            .first()
+            .filter(|(_, best)| best.fits)
+            .map(|(contender, _)| contender.host_id.clone());
+        let method = if demand.measured {
+            "weighted"
+        } else {
+            "stage3"
+        };
+        tracing::info!(
+            host_id = chosen.as_deref().unwrap_or("none"),
+            estimate_bytes = demand.estimate,
+            estimate = demand.source.as_str(),
+            method,
+            candidates = scored.len(),
+            fitting = scored.iter().filter(|(_, score)| score.fits).count(),
+            "a pool queue was weighed"
+        );
+        for (_, host) in &scored {
+            tracing::debug!(
+                host_id = %host.host_id,
+                fits = host.fits,
+                cache = host.cache,
+                headroom = host.headroom,
+                speed = host.speed,
+                bigfit = host.bigfit,
+                total = host.total,
+                "placement score"
+            );
+        }
+        *decision = Some(PlacementDecision {
+            at: chrono::Utc::now().timestamp(),
+            repository: key.repository.clone(),
+            labels: key
+                .labels
+                .iter()
+                .map(Label::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
+            estimate_bytes: demand.estimate,
+            estimate_source: demand.source.as_str().to_string(),
+            method: method.to_string(),
+            chosen: chosen.clone(),
+            scores: scored.iter().map(|(_, score)| score.clone()).collect(),
+        });
+        let chosen = chosen?;
+        eligible
+            .into_iter()
+            .find(|candidate| candidate.host_id == chosen)
+            .map(|candidate| (candidate, demand.estimate))
     }
 
     fn cancel_surplus(
@@ -1200,5 +1375,141 @@ mod tests {
         let report = rebalance.await.expect("rebalance");
         assert_eq!(report.accepted, 0);
         assert_eq!(placement.counts(&key), (1, 0));
+    }
+
+    fn measured(
+        placement: Placement,
+        store: crate::store::Store,
+    ) -> (Arc<Placement>, Arc<Statistics>) {
+        let stats = Arc::new(Statistics::load(
+            Arc::new(Mutex::new(store)),
+            crate::stats::StatsConfig::default(),
+        ));
+        (
+            Arc::new(placement.with_statistics(Arc::clone(&stats))),
+            stats,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_measured_heavy_queue_goes_to_the_host_it_fits_and_the_decision_is_kept() {
+        use runner_manager_coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
+
+        let registry = Arc::new(Registry::default());
+        registry.set_coverage(covering());
+        let (placement, stats) = measured(
+            Placement::with_timings(
+                Arc::clone(&registry),
+                Duration::from_millis(150),
+                Duration::from_secs(300),
+            ),
+            crate::store::Store::open_in_memory().expect("store"),
+        );
+        // `build` once peaked at 12 GiB.
+        let identity =
+            crate::stats::JobIdentity::new("octo/app", Some("ci"), Some("build")).expect("named");
+        stats.job_identified("runner-manager-x", identity.clone());
+        stats.attempt_finished(
+            "elsewhere",
+            &AttemptFinished {
+                lease_id: None,
+                runner_name: "runner-manager-x".into(),
+                outcome: AttemptOutcomeKind::CompletedJob,
+                duration_secs: Some(600),
+                usage: Some(AttemptUsage {
+                    peak_rss_bytes: 12 << 30,
+                    samples: 10,
+                    ..AttemptUsage::default()
+                }),
+            },
+        );
+        // The roomiest by free memory now cannot hold it with the margin
+        // once the lease it already holds is counted; stage 3 would pick it.
+        let small = connect(&registry, "small", LAUNCH_VERSION, POOL, 2, 8 << 30);
+        let big = connect(&registry, "big", LAUNCH_VERSION, POOL, 2, 20 << 30);
+        let small = answer(&placement, "small", small, Answer::Accept);
+        let big = answer(&placement, "big", big, Answer::Accept);
+        let pool = required(POOL);
+        let key = placement
+            .queued_job("octo/app", &pool, 1, Some(identity.key()))
+            .expect("pool");
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        // A second build: `big` has 20 GiB free by its heartbeat, but 12 are
+        // spoken for by the first lease, so nothing fits and it waits.
+        placement.queued_job("octo/app", &pool, 2, Some(identity.key()));
+        assert_eq!(placement.rebalance(&key).await, Rebalanced::default());
+        assert_eq!(placement.counts(&key), (2, 1));
+        assert_eq!(launches(&big.await.expect("host")), 1);
+        assert_eq!(launches(&small.await.expect("host")), 0);
+
+        let report = stats.report(chrono::Utc::now()).expect("report");
+        let placed = report
+            .decisions
+            .iter()
+            .find(|decision| decision.chosen.is_some())
+            .expect("the placement was kept");
+        assert_eq!(placed.chosen.as_deref(), Some("big"));
+        assert_eq!(
+            (placed.estimate_bytes, placed.estimate_source.as_str()),
+            (12 << 30, "job")
+        );
+        assert_eq!(placed.method, "weighted");
+        assert!(
+            placed
+                .scores
+                .iter()
+                .any(|score| score.host_id == "small" && !score.fits)
+        );
+        assert!(
+            report
+                .decisions
+                .iter()
+                .any(|decision| decision.chosen.is_none()),
+            "the queue nothing fits is shown too"
+        );
+        assert_eq!(report.launches, 1);
+    }
+
+    #[tokio::test]
+    async fn with_statistics_but_no_data_the_choice_is_stage_threes() {
+        let (registry, plain) = setup();
+        let a = connect(&registry, "a", LAUNCH_VERSION, POOL, 2, 1 << 30);
+        let b = connect(&registry, "b", LAUNCH_VERSION, POOL, 2, 3 << 30);
+        drop((a, b));
+        let candidates = registry.launch_candidates("octo/app", &required(POOL));
+        let stage_three: Vec<String> = rank(candidates)
+            .into_iter()
+            .map(|candidate| candidate.host_id)
+            .collect();
+        drop(plain);
+        let (placement, _stats) = measured(
+            Placement::with_timings(
+                Arc::clone(&registry),
+                Duration::from_millis(150),
+                Duration::from_secs(300),
+            ),
+            crate::store::Store::open_in_memory().expect("store"),
+        );
+        let key = placement
+            .queued_job(
+                "octo/app",
+                &required(POOL),
+                1,
+                Some("octo/app/ci/new".into()),
+            )
+            .expect("pool");
+        let mut decision = None;
+        let offered = placement.offer(
+            &key,
+            &HashSet::new(),
+            &mut Rebalanced::default(),
+            &mut decision,
+        );
+        let (_, host, _) = offered.expect("placed though 1 GiB free is under the default 2 GiB");
+        assert_eq!(host, stage_three[0]);
+        let decision = decision.expect("recorded");
+        assert_eq!(decision.method, "stage3");
+        assert_eq!(decision.estimate_source, "default");
+        assert!(decision.scores.iter().all(|score| score.fits));
     }
 }

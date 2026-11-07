@@ -26,14 +26,16 @@ use chrono::Utc;
 use runner_manager_coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CONNECT_PATH, ENROLL_PATH, EnrollRequest,
     EnrollResponse, HEALTH_PATH, HostMessage, LAUNCH_VERSION, MAX_MESSAGE_BYTES,
-    MIN_PROTOCOL_VERSION, NONCE_LEN, PROTOCOL_VERSION, ServerMessage, WEBHOOK_PATH, WakeReason,
-    decode_public_key, encode_nonce, supported, verify_challenge,
+    MIN_PROTOCOL_VERSION, NONCE_LEN, PROTOCOL_VERSION, STATS_VERSION, ServerMessage,
+    SessionPurpose, WEBHOOK_PATH, WakeReason, decode_public_key, encode_nonce, supported,
+    verify_challenge,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use tokio::sync::mpsc;
 
 use crate::placement::{CLAIM_GRACE, Placement};
 use crate::registry::{OUTBOUND_QUEUE, Outbound, Registry};
+use crate::stats::{JobIdentity, Statistics, StatsConfig};
 use crate::store::{EnrollError, Store};
 use crate::webhook::{
     DELIVERY_MEMORY, DeliveryLog, MAX_BODY_BYTES, WorkflowJobEvent, action_name, required_labels,
@@ -65,6 +67,8 @@ pub struct Config {
     /// Connection and enrollment attempts allowed per client address per
     /// minute.
     pub attempts_per_minute: u32,
+    /// Stage 4: job weight statistics and the placement weights.
+    pub stats: StatsConfig,
 }
 
 impl Config {
@@ -78,6 +82,7 @@ impl Config {
             auth_timeout: Duration::from_secs(10),
             revocation_check: Duration::from_millis(500),
             attempts_per_minute: 20,
+            stats: StatsConfig::default(),
         }
     }
 }
@@ -86,10 +91,12 @@ impl Config {
 #[derive(Debug)]
 pub struct AppState {
     pub config: Config,
-    pub store: Mutex<Store>,
+    pub store: Arc<Mutex<Store>>,
     pub registry: Arc<Registry>,
     /// Stage 3: which host starts a runner for a queued pool job.
     pub placement: Arc<Placement>,
+    /// Stage 4: what jobs used, and the counters `stats` shows.
+    pub statistics: Arc<Statistics>,
     deliveries: Mutex<DeliveryLog>,
     limiter: RateLimiter,
 }
@@ -98,11 +105,16 @@ impl AppState {
     #[must_use]
     pub fn new(config: Config, store: Store) -> Arc<Self> {
         let registry = Arc::new(Registry::default());
+        let store = Arc::new(Mutex::new(store));
+        let statistics = Arc::new(Statistics::load(Arc::clone(&store), config.stats));
         Arc::new(Self {
             limiter: RateLimiter::new(config.attempts_per_minute),
             config,
-            store: Mutex::new(store),
-            placement: Arc::new(Placement::new(Arc::clone(&registry))),
+            store,
+            placement: Arc::new(
+                Placement::new(Arc::clone(&registry)).with_statistics(Arc::clone(&statistics)),
+            ),
+            statistics,
             registry,
             deliveries: Mutex::new(DeliveryLog::new(DELIVERY_MEMORY)),
         })
@@ -170,15 +182,34 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let placement = tokio::spawn(Arc::clone(&state.placement).run());
     let revocations = tokio::spawn(watch_revocations(Arc::clone(&state)));
+    let counters = tokio::spawn(flush_counters(Arc::clone(&state)));
     let served = axum::serve(
         listener,
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        router(Arc::clone(&state)).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
     .await;
     placement.abort();
     revocations.abort();
+    counters.abort();
+    state
+        .statistics
+        .count_wakes(state.registry.take_wakes_sent());
+    state.statistics.flush();
     served
+}
+
+/// Adds the launch and wake counts to the database every minute.
+async fn flush_counters(state: Arc<AppState>) {
+    let mut ticks = tokio::time::interval(Duration::from_secs(60));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        state
+            .statistics
+            .count_wakes(state.registry.take_wakes_sent());
+        state.statistics.flush();
+    }
 }
 
 /// Closes a revoked host's connection as soon as `hosts revoke` commits.
@@ -265,6 +296,11 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             let action = action_name(&job.action);
             let required = required_labels(&job.workflow_job.labels);
             let repository = &job.repository.full_name;
+            let identity = JobIdentity::new(
+                repository,
+                job.workflow_job.workflow_name.as_deref(),
+                job.workflow_job.name.as_deref(),
+            );
             if action == "queued" {
                 let woken = required.as_ref().map_or(0, |required| {
                     state
@@ -273,9 +309,12 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                 });
                 let placed = required
                     .and_then(|required| {
-                        state
-                            .placement
-                            .queued(repository, &required, job.workflow_job.id)
+                        state.placement.queued_job(
+                            repository,
+                            &required,
+                            job.workflow_job.id,
+                            identity.as_ref().map(JobIdentity::key),
+                        )
                     })
                     .map(|key| state.placement.spawn_rebalance(key, Duration::ZERO))
                     .is_some();
@@ -299,6 +338,13 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                     })
                 {
                     state.placement.spawn_rebalance(key, CLAIM_GRACE);
+                }
+                // Which job a runner took, for its attempt's statistics.
+                if matches!(action, "in_progress" | "completed")
+                    && let (Some(runner), Some(identity)) =
+                        (job.workflow_job.runner_name.as_deref(), identity)
+                {
+                    state.statistics.job_identified(runner, identity);
                 }
                 // Recorded for later stages (statistics, lease confirmation).
                 tracing::info!(
@@ -439,12 +485,18 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         protocol_version,
         host_id,
         signature,
+        purpose,
     }) = HostMessage::decode(&text)
     else {
         close(&mut socket, CLOSE_UNAUTHORIZED, "unauthorized").await;
         return;
     };
-    if !supported(protocol_version) {
+    let purpose = purpose.unwrap_or_default();
+    // A query session needs version 4; an unknown purpose is not served.
+    if !supported(protocol_version)
+        || (purpose != SessionPurpose::Link && protocol_version < STATS_VERSION)
+        || purpose == SessionPurpose::Other
+    {
         close(
             &mut socket,
             CLOSE_UNSUPPORTED_VERSION,
@@ -474,6 +526,10 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
     if !send(&mut socket, &welcome).await {
         return;
     }
+    if purpose == SessionPurpose::Query {
+        answer_query(&mut socket, &state, &host_id).await;
+        return;
+    }
     let (sender, receiver) = mpsc::channel(OUTBOUND_QUEUE);
     let connection = state.registry.register(&host_id, protocol_version, sender);
     // A revocation committed between the check above and this registration
@@ -497,6 +553,35 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         state.placement.host_gone(&host_id);
     }
     tracing::info!(%host_id, "a host disconnected");
+}
+
+/// A query session: never registered as the host's link, so the daemon's
+/// connection stays up. One `stats_request` within the auth timeout, one
+/// answer, closed.
+async fn answer_query(socket: &mut WebSocket, state: &AppState, host_id: &str) {
+    let request = tokio::time::timeout(state.config.auth_timeout, next_text(socket)).await;
+    let Ok(Some(text)) = request else {
+        return;
+    };
+    if !matches!(HostMessage::decode(&text), Ok(HostMessage::StatsRequest)) {
+        close(socket, 1008, "unexpected message").await;
+        return;
+    }
+    state
+        .statistics
+        .count_wakes(state.registry.take_wakes_sent());
+    match state.statistics.report(Utc::now()) {
+        Ok(report) => {
+            tracing::info!(%host_id, jobs = report.jobs.len(), "a host read the statistics");
+            if send(socket, &ServerMessage::Stats(report)).await {
+                close(socket, 1000, "done").await;
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, "the statistics could not be read");
+            close(socket, 1011, "statistics unavailable").await;
+        }
+    }
 }
 
 async fn serve_host(
@@ -556,12 +641,14 @@ async fn serve_host(
                     }
                     Ok(HostMessage::AttemptFinished(finished)) if version >= LAUNCH_VERSION => {
                         state.placement.attempt_finished(host_id, &finished);
+                        state.statistics.attempt_finished(host_id, &finished);
                         state.placement.spawn_retry_all();
                     }
                     // A second `auth`, a message its version does not have, a
                     // newer message type, or garbage: skipped.
                     Ok(
                         HostMessage::Auth { .. }
+                        | HostMessage::StatsRequest
                         | HostMessage::Unknown
                         | HostMessage::LaunchAck(_)
                         | HostMessage::AttemptStarted(_)

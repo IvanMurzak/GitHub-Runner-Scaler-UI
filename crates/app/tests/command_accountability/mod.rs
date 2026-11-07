@@ -327,6 +327,18 @@ pub const MANIFEST: &[Classification] = &[
         }),
     },
     Classification {
+        leaf: "coordinator stats",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            COORDINATOR_COMMANDS,
+            "stats_are_read_over_the_hosts_signed_link_and_need_a_join",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::CoordinatorServer,
+            reason: "Signs a query session at a live coordinator with the host's private key; the dedicated test runs a real coordinator on loopback, reads the statistics as text and JSON, and scans the output for the key.",
+        }),
+    },
+    Classification {
         leaf: "coordinator leave",
         coverage: Coverage::Dedicated,
         evidence: &[at(

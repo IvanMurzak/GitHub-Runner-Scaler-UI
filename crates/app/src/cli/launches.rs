@@ -49,6 +49,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::coordinator::{LinkView, same_target, target_ref};
+use super::meters::AttemptMeters;
 
 /// Lease ids remembered so a repeat is refused.
 const SEEN_MEMORY: usize = 1024;
@@ -386,6 +387,7 @@ impl AttemptReports {
         store: &dyn Store,
         policies: &[ScalePolicy],
         launches: &Launches,
+        meters: &AttemptMeters,
     ) -> Vec<AttemptReport> {
         let mut reports = Vec::new();
         let mut present = HashSet::new();
@@ -416,7 +418,7 @@ impl AttemptReports {
                 }
                 if ended && !watched.finished {
                     watched.finished = true;
-                    reports.push(finished(&attempt, launches));
+                    reports.push(finished(&attempt, launches, meters));
                 }
             }
         }
@@ -432,14 +434,14 @@ impl AttemptReports {
                 !watched.finished && policies.iter().any(|policy| policy.id == watched.policy)
             });
             if let (true, Ok(Some(attempt))) = (unreported, store.attempt(id)) {
-                reports.push(finished(&attempt, launches));
+                reports.push(finished(&attempt, launches, meters));
             }
         }
         reports
     }
 }
 
-fn finished(attempt: &RunnerAttempt, launches: &Launches) -> AttemptReport {
+fn finished(attempt: &RunnerAttempt, launches: &Launches, meters: &AttemptMeters) -> AttemptReport {
     let ended = attempt
         .terminal_at()
         .unwrap_or_else(|| attempt.last_state_change_at());
@@ -452,6 +454,7 @@ fn finished(attempt: &RunnerAttempt, launches: &Launches) -> AttemptReport {
             .to_std()
             .ok()
             .map(|duration| duration.as_secs()),
+        usage: meters.take(attempt.id),
     })
 }
 
@@ -553,7 +556,12 @@ mod tests {
         let policies = vec![policy.clone()];
         assert!(
             reports
-                .poll(store.as_ref(), &policies, &launches)
+                .poll(
+                    store.as_ref(),
+                    &policies,
+                    &launches,
+                    &AttemptMeters::default()
+                )
                 .is_empty()
         );
 
@@ -573,7 +581,12 @@ mod tests {
         launches.launched(&policy, id);
         assert!(
             reports
-                .poll(store.as_ref(), &policies, &launches)
+                .poll(
+                    store.as_ref(),
+                    &policies,
+                    &launches,
+                    &AttemptMeters::default()
+                )
                 .is_empty()
         );
         // Still waiting for a job: the launch stays open, and its runner
@@ -586,7 +599,12 @@ mod tests {
             .state(AttemptState::Busy)
             .build();
         store.record_attempt(&busy).expect("recorded");
-        let started = reports.poll(store.as_ref(), &policies, &launches);
+        let started = reports.poll(
+            store.as_ref(),
+            &policies,
+            &launches,
+            &AttemptMeters::default(),
+        );
         assert_eq!(started.len(), 1);
         let AttemptReport::Started(started) = &started[0] else {
             panic!("started");
@@ -606,7 +624,12 @@ mod tests {
             .outcome(AttemptOutcome::CompletedJob)
             .build();
         store.record_attempt(&done).expect("recorded");
-        let finished = reports.poll(store.as_ref(), &policies, &launches);
+        let finished = reports.poll(
+            store.as_ref(),
+            &policies,
+            &launches,
+            &AttemptMeters::default(),
+        );
         assert!(matches!(
             finished.as_slice(),
             [AttemptReport::Finished(AttemptFinished {
@@ -617,7 +640,12 @@ mod tests {
         ));
         assert!(
             reports
-                .poll(store.as_ref(), &policies, &launches)
+                .poll(
+                    store.as_ref(),
+                    &policies,
+                    &launches,
+                    &AttemptMeters::default()
+                )
                 .is_empty()
         );
     }
@@ -703,14 +731,39 @@ mod tests {
         store
             .record_attempt(&attempt_in(&policy, id, AttemptState::Busy))
             .expect("recorded");
-        assert_eq!(reports.poll(store.as_ref(), &policies, &launches).len(), 1);
+        assert_eq!(
+            reports
+                .poll(
+                    store.as_ref(),
+                    &policies,
+                    &launches,
+                    &AttemptMeters::default()
+                )
+                .len(),
+            1
+        );
         store
             .record_attempt(&attempt_in(&policy, id, AttemptState::Finished))
             .expect("recorded");
-        assert_eq!(reports.poll(store.as_ref(), &policies, &launches).len(), 1);
+        assert_eq!(
+            reports
+                .poll(
+                    store.as_ref(),
+                    &policies,
+                    &launches,
+                    &AttemptMeters::default()
+                )
+                .len(),
+            1
+        );
         assert!(
             reports
-                .poll(store.as_ref(), &policies, &launches)
+                .poll(
+                    store.as_ref(),
+                    &policies,
+                    &launches,
+                    &AttemptMeters::default()
+                )
                 .is_empty()
         );
         // An isolated attempt still being destroyed when the link comes up
@@ -721,7 +774,12 @@ mod tests {
             .expect("recorded");
         assert!(
             reports
-                .poll(store.as_ref(), &policies, &launches)
+                .poll(
+                    store.as_ref(),
+                    &policies,
+                    &launches,
+                    &AttemptMeters::default()
+                )
                 .is_empty()
         );
 
@@ -740,15 +798,67 @@ mod tests {
             .state(AttemptState::Failed)
             .build();
         store.record_attempt(&failed).expect("recorded");
-        let reported = reports.poll(store.as_ref(), &policies, &launches);
+        let reported = reports.poll(
+            store.as_ref(),
+            &policies,
+            &launches,
+            &AttemptMeters::default(),
+        );
         assert!(matches!(
             reported.as_slice(),
             [AttemptReport::Finished(AttemptFinished { lease_id: Some(lease), .. })] if lease == "short"
         ));
         assert!(
             reports
-                .poll(store.as_ref(), &policies, &launches)
+                .poll(
+                    store.as_ref(),
+                    &policies,
+                    &launches,
+                    &AttemptMeters::default()
+                )
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_finished_attempt_carries_what_its_meter_measured_once() {
+        let (store, policy, launches) = setup(LAUNCH_VERSION);
+        let policies = vec![policy.clone()];
+        let mut reports = AttemptReports::default();
+        let meters = AttemptMeters::default();
+        let id = AttemptId::new_random();
+        store
+            .record_attempt(&attempt_in(&policy, id, AttemptState::Busy))
+            .expect("recorded");
+        assert_eq!(
+            reports
+                .poll(store.as_ref(), &policies, &launches, &meters)
+                .len(),
+            1
+        );
+        meters.record(
+            id,
+            tokio::time::Instant::now(),
+            runner_manager_platform::resource_usage::TreeUsage {
+                rss_bytes: 7 << 20,
+                cpu_time: Duration::from_secs(1),
+                processes: 3,
+            },
+        );
+        store
+            .record_attempt(&attempt_in(&policy, id, AttemptState::Finished))
+            .expect("recorded");
+        let reported = reports.poll(store.as_ref(), &policies, &launches, &meters);
+        assert!(
+            matches!(
+                reported.as_slice(),
+                [AttemptReport::Finished(AttemptFinished {
+                    usage: Some(usage),
+                    ..
+                })] if usage.peak_rss_bytes == 7 << 20 && usage.samples == 1
+            ),
+            "{reported:?}"
+        );
+        assert_eq!(meters.take(id), None, "taken by the report");
     }
 }

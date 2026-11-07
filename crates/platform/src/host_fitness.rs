@@ -108,8 +108,10 @@ pub fn physical_memory_bytes() -> Option<u64> {
     sys::physical_memory_bytes()
 }
 
-/// Physical memory not in use right now, in bytes, where the platform reports
-/// it cheaply (Windows and Linux). Advisory: a coordinator heartbeat.
+/// Physical memory available to new work right now, in bytes: Windows'
+/// available physical memory, Linux's `MemAvailable`, macOS's free plus
+/// inactive pages (`host_statistics64`, what `vm_stat` prints). Advisory: a
+/// coordinator heartbeat.
 #[must_use]
 pub fn available_memory_bytes() -> Option<u64> {
     sys::available_memory_bytes()
@@ -121,11 +123,36 @@ pub fn free_disk_bytes(path: &Path) -> Option<u64> {
     sys::free_disk_bytes(path)
 }
 
-/// The one-minute load average as a share of the logical CPUs, in whole
-/// percent (Unix only; Windows has no load average). Advisory.
+/// How busy the CPUs are, in whole percent of all logical CPUs. Unix: the
+/// one-minute load average over the CPU count. Windows, which has no load
+/// average: the busy share of `GetSystemTimes` since the previous call, so
+/// the first call answers `None`. Advisory.
 #[must_use]
 pub fn cpu_load_percent() -> Option<u32> {
     sys::cpu_load_percent()
+}
+
+/// The busy share of the CPUs between two `GetSystemTimes` readings of
+/// `(idle, kernel, user)`, where kernel time includes idle time.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn busy_percent(previous: (u64, u64, u64), now: (u64, u64, u64)) -> Option<u32> {
+    let idle = now.0.checked_sub(previous.0)?;
+    let total = now
+        .1
+        .checked_sub(previous.1)?
+        .checked_add(now.2.checked_sub(previous.2)?)?;
+    if total == 0 {
+        return None;
+    }
+    let busy = total.saturating_sub(idle);
+    u32::try_from(busy.saturating_mul(100).saturating_add(total / 2) / total).ok()
+}
+
+/// Free plus inactive pages in bytes: memory macOS hands to new work without
+/// paging anything out (the `available` figure `psutil` reports).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn available_pages_bytes(free: u64, inactive: u64, page: u64) -> Option<u64> {
+    free.checked_add(inactive)?.checked_mul(page)
 }
 
 /// The Windows system directory, from the kernel rather than from the
@@ -765,8 +792,38 @@ mod sys {
         Some(free)
     }
 
-    pub(super) const fn cpu_load_percent() -> Option<u32> {
-        None
+    /// The previous `GetSystemTimes` reading: idle, kernel (idle included)
+    /// and user time, in 100 ns units.
+    static PREVIOUS_TIMES: std::sync::Mutex<Option<(u64, u64, u64)>> = std::sync::Mutex::new(None);
+
+    fn system_times() -> Option<(u64, u64, u64)> {
+        use windows::Win32::Foundation::FILETIME;
+        let (mut idle, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: three live out-parameters owned by this frame.
+        unsafe {
+            windows::Win32::System::Threading::GetSystemTimes(
+                Some(&raw mut idle),
+                Some(&raw mut kernel),
+                Some(&raw mut user),
+            )
+        }
+        .ok()?;
+        let value =
+            |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+        Some((value(idle), value(kernel), value(user)))
+    }
+
+    pub(super) fn cpu_load_percent() -> Option<u32> {
+        let now = system_times()?;
+        let previous = PREVIOUS_TIMES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(now)?;
+        super::busy_percent(previous, now)
     }
 
     pub(super) fn read_dword(subkey: &str, value: &str) -> Result<Option<u32>, RegistryError> {
@@ -1102,9 +1159,45 @@ mod sys {
         kib.checked_mul(1024)
     }
 
+    /// This task's send right to the host port, taken once: every
+    /// `mach_host_self` call adds a user reference to it.
     #[cfg(target_os = "macos")]
-    pub(super) const fn available_memory_bytes() -> Option<u64> {
-        None
+    #[allow(
+        deprecated,
+        reason = "libc marks the mach bindings deprecated in favour of a crate this workspace does not take; the call is stable"
+    )]
+    fn host_port() -> libc::mach_port_t {
+        static PORT: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+        // SAFETY: takes no argument; the right is kept for the process's life.
+        *PORT.get_or_init(|| unsafe { libc::mach_host_self() })
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(
+        deprecated,
+        reason = "libc marks the mach bindings deprecated in favour of a crate this workspace does not take; the call is stable"
+    )]
+    pub(super) fn available_memory_bytes() -> Option<u64> {
+        // SAFETY: `vm_statistics64` is plain old data; zeroed is valid.
+        let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        // SAFETY: `stats` is a live buffer of `count` integers, the size the
+        // flavor names; the kernel writes at most that and updates `count`.
+        let result = unsafe {
+            libc::host_statistics64(
+                host_port(),
+                libc::HOST_VM_INFO64,
+                (&raw mut stats).cast(),
+                &raw mut count,
+            )
+        };
+        if result != libc::KERN_SUCCESS {
+            return None;
+        }
+        // SAFETY: `sysconf` reads a constant.
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+        let (free, inactive) = (stats.free_count, stats.inactive_count);
+        super::available_pages_bytes(u64::from(free), u64::from(inactive), page)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1239,6 +1332,32 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_busy_share_comes_from_the_difference_of_two_readings() {
+        // Kernel time includes idle: 400 kernel + 600 user, 250 idle.
+        assert_eq!(busy_percent((0, 0, 0), (250, 400, 600)), Some(75));
+        assert_eq!(busy_percent((250, 400, 600), (250, 400, 600)), None);
+        assert_eq!(busy_percent((10, 10, 10), (5, 20, 20)), None, "went back");
+        assert_eq!(available_pages_bytes(10, 5, 16_384), Some(15 * 16_384));
+    }
+
+    /// Every OS this ships for reports free memory now (macOS since stage 4).
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn free_memory_is_reported_and_below_the_total() {
+        let free = available_memory_bytes().expect("free memory");
+        let total = physical_memory_bytes().expect("total memory");
+        assert!(free > 0 && free <= total, "{free} of {total}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reports_cpu_load_from_the_second_reading() {
+        let _ = cpu_load_percent();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(cpu_load_percent().is_some_and(|percent| percent <= 100));
+    }
 
     #[test]
     fn windows_arguments_survive_the_command_line_round_trip() {
