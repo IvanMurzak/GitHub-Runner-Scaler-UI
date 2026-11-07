@@ -252,6 +252,39 @@ pub fn percentile<T: Copy + Ord>(values: &[T], p: u32) -> Option<T> {
     sorted.get(rank - 1).copied()
 }
 
+/// The percentile `p` of one optional field over `samples`.
+fn field_percentile<T: Copy + Ord>(
+    samples: &[JobSample],
+    field: impl Fn(&JobSample) -> Option<T>,
+    p: u32,
+) -> Option<T> {
+    percentile(&samples.iter().filter_map(field).collect::<Vec<_>>(), p)
+}
+
+/// One host's figures for one job key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostRatio {
+    /// Its median duration over the usual one, in thousandths.
+    pub ratio: Option<u32>,
+    pub samples: usize,
+    pub median_secs: Option<u64>,
+}
+
+/// How much faster than usual `host` ran the keys whose [`HostRatio`]s are
+/// `ratios`, in [-1, 1]: 0.5 for half the usual time, -1 for twice or more;
+/// `None` with no sample.
+#[must_use]
+pub fn speed(ratios: &[BTreeMap<String, HostRatio>], host: &str) -> Option<f64> {
+    let terms: Vec<f64> = ratios
+        .iter()
+        .filter_map(|by_host| by_host.get(host)?.ratio)
+        .map(|ratio| (1.0 - f64::from(ratio) / 1000.0).clamp(-1.0, 1.0))
+        .collect();
+    #[allow(clippy::cast_precision_loss, reason = "a handful of terms")]
+    let count = terms.len() as f64;
+    (!terms.is_empty()).then(|| terms.iter().sum::<f64>() / count)
+}
+
 /// The samples kept, grouped for the questions placement and `stats` ask.
 #[derive(Debug, Default, Clone)]
 pub struct Aggregates {
@@ -298,27 +331,9 @@ impl Aggregates {
         let samples = self.by_key.get(key)?;
         Some(JobFigures {
             samples: samples.len(),
-            p50_duration_secs: percentile(
-                &samples
-                    .iter()
-                    .filter_map(|s| s.duration_secs)
-                    .collect::<Vec<_>>(),
-                50,
-            ),
-            p90_peak_rss_bytes: percentile(
-                &samples
-                    .iter()
-                    .filter_map(|s| s.peak_rss_bytes)
-                    .collect::<Vec<_>>(),
-                90,
-            ),
-            p90_cpu_millicores: percentile(
-                &samples
-                    .iter()
-                    .filter_map(|s| s.cpu_avg_millicores)
-                    .collect::<Vec<_>>(),
-                90,
-            ),
+            p50_duration_secs: field_percentile(samples, |s| s.duration_secs, 50),
+            p90_peak_rss_bytes: field_percentile(samples, |s| s.peak_rss_bytes, 90),
+            p90_cpu_millicores: field_percentile(samples, |s| s.cpu_avg_millicores, 90),
         })
     }
 
@@ -338,9 +353,9 @@ impl Aggregates {
 
     /// Per host: its median duration for `key` over the usual duration (the
     /// mean of every host's median, so one host's many samples do not make
-    /// it the norm), in thousandths; its sample count; its median.
+    /// it the norm).
     #[must_use]
-    pub fn host_ratios(&self, key: &str) -> BTreeMap<String, (Option<u32>, usize, Option<u64>)> {
+    pub fn host_ratios(&self, key: &str) -> BTreeMap<String, HostRatio> {
         let mut by_host: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for sample in self.by_key.get(key).into_iter().flatten() {
@@ -367,23 +382,16 @@ impl Aggregates {
                     }
                     _ => None,
                 };
-                (host.to_string(), (ratio, count, median))
+                (
+                    host.to_string(),
+                    HostRatio {
+                        ratio,
+                        samples: count,
+                        median_secs: median,
+                    },
+                )
             })
             .collect()
-    }
-
-    /// How much faster than usual `host` runs `keys`, in [-1, 1]: 0.5 for
-    /// half the usual time, -1 for twice or more; `None` with no sample.
-    #[must_use]
-    pub fn speed(&self, keys: &[String], host: &str) -> Option<f64> {
-        let terms: Vec<f64> = keys
-            .iter()
-            .filter_map(|key| self.host_ratios(key).remove(host)?.0)
-            .map(|ratio| (1.0 - f64::from(ratio) / 1000.0).clamp(-1.0, 1.0))
-            .collect();
-        #[allow(clippy::cast_precision_loss, reason = "a handful of terms")]
-        let count = terms.len() as f64;
-        (!terms.is_empty()).then(|| terms.iter().sum::<f64>() / count)
     }
 }
 
@@ -550,6 +558,11 @@ pub fn score(
 ) -> Vec<(Contender, HostScore)> {
     let weights = config.weights;
     let filtering = demand.source != EstimateSource::Default;
+    let ratios: Vec<BTreeMap<String, HostRatio>> = demand
+        .job_keys
+        .iter()
+        .map(|key| aggregates.host_ratios(key))
+        .collect();
     let fits =
         |contender: &Contender| !filtering || contender.fits(demand.estimate, config.ram_margin);
     let mut scored: Vec<(Contender, HostScore)> = contenders
@@ -561,9 +574,7 @@ pub fn score(
                 .map(|available| available.saturating_sub(demand.estimate));
             let whole = contender.total_ram.or(contender.available()).unwrap_or(0);
             let headroom = free_after.map_or(0.0, |free| share(free, whole));
-            let speed = aggregates
-                .speed(&demand.job_keys, &contender.host_id)
-                .unwrap_or(0.0);
+            let speed = speed(&ratios, &contender.host_id).unwrap_or(0.0);
             let cache = if contender.warm { 1.0 } else { 0.0 };
             let others_fit_this = contenders
                 .iter()
@@ -654,12 +665,6 @@ impl Statistics {
         &self.config
     }
 
-    /// A copy of the aggregates.
-    #[must_use]
-    pub fn aggregates(&self) -> Aggregates {
-        lock(&self.aggregates).clone()
-    }
-
     /// Runs `read` over the aggregates without copying them.
     pub fn with_aggregates<T>(&self, read: impl FnOnce(&Aggregates) -> T) -> T {
         read(&lock(&self.aggregates))
@@ -684,16 +689,6 @@ impl Statistics {
             tracing::warn!(%error, "the statistics counters could not be stored");
             self.launches.fetch_add(launches, Ordering::Relaxed);
             self.wakes.fetch_add(wakes, Ordering::Relaxed);
-        }
-    }
-
-    /// Flushes the counters every minute, forever.
-    pub async fn run(self: Arc<Self>) {
-        let mut ticks = tokio::time::interval(Duration::from_secs(60));
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticks.tick().await;
-            self.flush();
         }
     }
 
@@ -804,7 +799,7 @@ pub fn report(
         .map(|host| (host.id, host.name))
         .collect();
     let counters = store.counters()?;
-    let aggregates = Aggregates::from_samples(samples.clone());
+    let aggregates = Aggregates::from_samples(samples);
 
     let mut jobs: Vec<JobStats> = aggregates
         .by_key
@@ -814,12 +809,12 @@ pub fn report(
             let hosts = aggregates
                 .host_ratios(key)
                 .into_iter()
-                .map(|(host_id, (ratio, count, median))| HostJobStats {
+                .map(|(host_id, figures)| HostJobStats {
                     host_name: names.get(&host_id).cloned(),
                     host_id,
-                    samples: u32::try_from(count).unwrap_or(u32::MAX),
-                    p50_duration_secs: median,
-                    duration_ratio_permille: ratio,
+                    samples: u32::try_from(figures.samples).unwrap_or(u32::MAX),
+                    p50_duration_secs: figures.median_secs,
+                    duration_ratio_permille: figures.ratio,
                 })
                 .take(REPORT_HOSTS_PER_JOB)
                 .collect();
@@ -841,7 +836,7 @@ pub fn report(
     jobs.truncate(REPORT_JOBS);
 
     let mut by_host: BTreeMap<&str, (u32, HashSet<&str>, Vec<u64>)> = BTreeMap::new();
-    for sample in &samples {
+    for sample in aggregates.by_key.values().flatten() {
         let entry = by_host.entry(&sample.host_id).or_default();
         entry.0 += 1;
         entry.1.insert(&sample.job_key);
@@ -1032,13 +1027,13 @@ mod tests {
         assert_eq!(build.p50_duration_secs, Some(50));
         let ratios = aggregates.host_ratios("octo/app/ci/build");
         // The usual time is the mean of the two medians, 125 s.
-        assert_eq!(ratios["fast"].0, Some(400));
-        assert_eq!(ratios["slow"].0, Some(1600));
-        let keys = vec!["octo/app/ci/build".to_string()];
+        assert_eq!(ratios["fast"].ratio, Some(400));
+        assert_eq!(ratios["slow"].ratio, Some(1600));
+        let ratios = [ratios];
         let close = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() < 1e-9);
-        assert!(close(aggregates.speed(&keys, "slow"), -0.6));
-        assert!(close(aggregates.speed(&keys, "fast"), 0.6));
-        assert_eq!(aggregates.speed(&keys, "elsewhere"), None);
+        assert!(close(speed(&ratios, "slow"), -0.6));
+        assert!(close(speed(&ratios, "fast"), 0.6));
+        assert_eq!(speed(&ratios, "elsewhere"), None);
         assert_eq!(aggregates.repository_p90_rss("Octo/App"), Some(9 * GIB));
         assert_eq!(aggregates.repository_p90_rss("other/repo"), None);
     }
@@ -1256,8 +1251,7 @@ mod tests {
         stats.count_launch();
         stats.count_wakes(4);
         let figures = stats
-            .aggregates()
-            .job("octo/app/CI/build")
+            .with_aggregates(|aggregates| aggregates.job("octo/app/CI/build"))
             .expect("in memory");
         assert_eq!(figures.p90_peak_rss_bytes, Some(3 * GIB));
         let report = stats.report(Utc::now()).expect("report");
@@ -1269,7 +1263,7 @@ mod tests {
         let again = Statistics::load(db, StatsConfig::default());
         let report = again.report(Utc::now()).expect("report");
         assert_eq!((report.launches, report.wakes), (1, 4));
-        assert!(again.aggregates().job("octo/app/CI/build").is_some());
+        assert!(again.with_aggregates(|aggregates| aggregates.job("octo/app/CI/build").is_some()));
     }
 
     #[test]

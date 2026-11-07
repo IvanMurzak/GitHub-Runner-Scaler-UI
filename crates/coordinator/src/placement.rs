@@ -717,96 +717,85 @@ impl Placement {
             return None;
         }
         stats.with_aggregates(|aggregates| {
-            Self::weigh_with(stats, aggregates, state, key, eligible, decision)
-        })
-    }
-
-    fn weigh_with(
-        stats: &Statistics,
-        aggregates: &Aggregates,
-        state: &State,
-        key: &JobKey,
-        eligible: Vec<Candidate>,
-        decision: &mut Option<PlacementDecision>,
-    ) -> Option<(Candidate, u64)> {
-        let config = stats.config();
-        let demand_of = |key: &JobKey, aggregates: &Aggregates| -> Demand {
-            let (job_keys, unnamed) = state.job_keys(key);
-            aggregates.demand(&key.repository, &job_keys, unnamed, config.default_job_ram)
-        };
-        let demand = demand_of(key, aggregates);
-        // The heaviest measured demand of every other queue still short of
-        // runners: a host only it fits is spared for it.
-        let heavier = state
-            .queues
-            .iter()
-            .filter(|(other, queue)| *other != key && queue.len() > state.leases_for(other))
-            .map(|(other, _)| demand_of(other, aggregates))
-            .filter(|other| other.source != crate::stats::EstimateSource::Default)
-            .map(|other| other.estimate)
-            .max();
-        let contenders: Vec<Contender> = eligible
-            .iter()
-            .map(|candidate| Contender {
-                host_id: candidate.host_id.clone(),
-                warm: candidate.warm,
-                free_ram: candidate.heartbeat.free_ram_bytes,
-                total_ram: candidate.ram_bytes,
-                busy_slots: candidate.heartbeat.busy_slots,
-                reserved: state.reserved_on(&candidate.host_id),
-            })
-            .collect();
-        let scored = score(&contenders, &demand, heavier, config, aggregates);
-        let chosen = scored
-            .first()
-            .filter(|(_, best)| best.fits)
-            .map(|(contender, _)| contender.host_id.clone());
-        let method = if demand.measured {
-            "weighted"
-        } else {
-            "stage3"
-        };
-        tracing::info!(
-            host_id = chosen.as_deref().unwrap_or("none"),
-            estimate_bytes = demand.estimate,
-            estimate = demand.source.as_str(),
-            method,
-            candidates = scored.len(),
-            fitting = scored.iter().filter(|(_, score)| score.fits).count(),
-            "a pool queue was weighed"
-        );
-        for (_, host) in &scored {
-            tracing::debug!(
-                host_id = %host.host_id,
-                fits = host.fits,
-                cache = host.cache,
-                headroom = host.headroom,
-                speed = host.speed,
-                bigfit = host.bigfit,
-                total = host.total,
-                "placement score"
-            );
-        }
-        *decision = Some(PlacementDecision {
-            at: chrono::Utc::now().timestamp(),
-            repository: key.repository.clone(),
-            labels: key
-                .labels
+            let config = stats.config();
+            let demand_of = |key: &JobKey, aggregates: &Aggregates| -> Demand {
+                let (job_keys, unnamed) = state.job_keys(key);
+                aggregates.demand(&key.repository, &job_keys, unnamed, config.default_job_ram)
+            };
+            let demand = demand_of(key, aggregates);
+            // The heaviest measured demand of every other queue still short of
+            // runners: a host only it fits is spared for it.
+            let heavier = state
+                .queues
                 .iter()
-                .map(Label::as_str)
-                .collect::<Vec<_>>()
-                .join(","),
-            estimate_bytes: demand.estimate,
-            estimate_source: demand.source.as_str().to_string(),
-            method: method.to_string(),
-            chosen: chosen.clone(),
-            scores: scored.iter().map(|(_, score)| score.clone()).collect(),
-        });
-        let chosen = chosen?;
-        eligible
-            .into_iter()
-            .find(|candidate| candidate.host_id == chosen)
-            .map(|candidate| (candidate, demand.estimate))
+                .filter(|(other, queue)| *other != key && queue.len() > state.leases_for(other))
+                .map(|(other, _)| demand_of(other, aggregates))
+                .filter(|other| other.source != crate::stats::EstimateSource::Default)
+                .map(|other| other.estimate)
+                .max();
+            let contenders: Vec<Contender> = eligible
+                .iter()
+                .map(|candidate| Contender {
+                    host_id: candidate.host_id.clone(),
+                    warm: candidate.warm,
+                    free_ram: candidate.heartbeat.free_ram_bytes,
+                    total_ram: candidate.ram_bytes,
+                    busy_slots: candidate.heartbeat.busy_slots,
+                    reserved: state.reserved_on(&candidate.host_id),
+                })
+                .collect();
+            let scored = score(&contenders, &demand, heavier, config, aggregates);
+            let chosen = scored
+                .first()
+                .filter(|(_, best)| best.fits)
+                .map(|(contender, _)| contender.host_id.clone());
+            let method = if demand.measured {
+                "weighted"
+            } else {
+                "stage3"
+            };
+            tracing::info!(
+                host_id = chosen.as_deref().unwrap_or("none"),
+                estimate_bytes = demand.estimate,
+                estimate = demand.source.as_str(),
+                method,
+                candidates = scored.len(),
+                fitting = scored.iter().filter(|(_, score)| score.fits).count(),
+                "a pool queue was weighed"
+            );
+            for (_, host) in &scored {
+                tracing::debug!(
+                    host_id = %host.host_id,
+                    fits = host.fits,
+                    cache = host.cache,
+                    headroom = host.headroom,
+                    speed = host.speed,
+                    bigfit = host.bigfit,
+                    total = host.total,
+                    "placement score"
+                );
+            }
+            *decision = Some(PlacementDecision {
+                at: chrono::Utc::now().timestamp(),
+                repository: key.repository.clone(),
+                labels: key
+                    .labels
+                    .iter()
+                    .map(Label::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                estimate_bytes: demand.estimate,
+                estimate_source: demand.source.as_str().to_string(),
+                method: method.to_string(),
+                chosen: chosen.clone(),
+                scores: scored.iter().map(|(_, score)| score.clone()).collect(),
+            });
+            let chosen = chosen?;
+            eligible
+                .into_iter()
+                .find(|candidate| candidate.host_id == chosen)
+                .map(|candidate| (candidate, demand.estimate))
+        })
     }
 
     fn cancel_surplus(

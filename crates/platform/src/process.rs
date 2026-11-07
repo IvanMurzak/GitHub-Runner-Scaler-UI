@@ -1205,10 +1205,7 @@ struct ProcStat<'a> {
     allow(dead_code, reason = "parsed on Linux; unit tested on every platform")
 )]
 fn parse_proc_stat(stat: &str) -> Option<ProcStat<'_>> {
-    // Everything after the last `)` is field 3 onwards, all of it numeric and
-    // whitespace separated.
-    let after_comm = &stat[stat.rfind(')')? + 1..];
-    let mut fields = after_comm.split_whitespace();
+    let mut fields = proc_stat_after_comm(stat)?.split_whitespace();
 
     // `next()` yields field 3; the iterator then stands at field 4, so
     // `nth(k)` yields field `4 + k`.
@@ -1216,6 +1213,14 @@ fn parse_proc_stat(stat: &str) -> Option<ProcStat<'_>> {
     let start_ticks = fields.nth(22 - 4)?;
 
     Some(ProcStat { state, start_ticks })
+}
+
+/// Field 3 onwards of a `/proc/<pid>/stat` line: everything after the
+/// **last** `)`, all of it numeric and whitespace separated (see
+/// [`parse_proc_stat`] for why the last one is the only reliable anchor).
+#[must_use]
+pub(crate) fn proc_stat_after_comm(stat: &str) -> Option<&str> {
+    Some(&stat[stat.rfind(')')? + 1..])
 }
 
 /// Whether a failed start-time probe means the process is *gone*, as opposed to

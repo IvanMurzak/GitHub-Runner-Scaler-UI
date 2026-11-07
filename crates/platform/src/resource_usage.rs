@@ -34,65 +34,70 @@ pub struct TreeUsage {
     pub processes: u32,
 }
 
-/// One process as the tree walk needs it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ProcessFacts {
-    parent: u32,
-    rss_bytes: u64,
-    cpu_time: Duration,
-}
+/// What one process uses: resident memory and CPU time.
+type Facts = (u64, Duration);
 
 /// The tree under `root`, `root` included, or `None` when `root` is gone.
 #[must_use]
 pub fn sample_tree(root: u32) -> Option<TreeUsage> {
-    sys::sample_tree(root)
+    sample_trees(&[root]).remove(&root)
 }
 
-/// The PIDs of `root` and every descendant, from `(pid, parent)` pairs. A
+/// The trees under each of `roots`, from one look at the process table: a
+/// root that is gone has no entry.
+#[must_use]
+pub fn sample_trees(roots: &[u32]) -> HashMap<u32, TreeUsage> {
+    if roots.is_empty() {
+        return HashMap::new();
+    }
+    sys::sample_trees(roots)
+}
+
+/// Sums `facts` over the tree under each of `roots`, given every process's
+/// `(pid, parent)`. A process `facts` cannot read counts as using nothing; a
 /// cycle (a recycled PID naming a descendant as its parent) is walked once.
-fn descendants(root: u32, parents: impl IntoIterator<Item = (u32, u32)>) -> Vec<u32> {
+fn trees(
+    roots: &[u32],
+    parents: &[(u32, u32)],
+    mut facts: impl FnMut(u32) -> Option<Facts>,
+) -> HashMap<u32, TreeUsage> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for (pid, parent) in parents {
         if pid != parent {
-            children.entry(parent).or_default().push(pid);
+            children.entry(*parent).or_default().push(*pid);
         }
     }
-    let mut seen = HashSet::from([root]);
-    let mut order = vec![root];
-    let mut queue = VecDeque::from([root]);
-    while let Some(pid) = queue.pop_front() {
-        for child in children.get(&pid).into_iter().flatten() {
-            if seen.insert(*child) {
-                order.push(*child);
-                queue.push_back(*child);
+    let alive: HashSet<u32> = parents.iter().map(|(pid, _)| *pid).collect();
+    let mut found = HashMap::new();
+    for root in roots.iter().copied().filter(|root| alive.contains(root)) {
+        let mut usage = TreeUsage::default();
+        let mut seen = HashSet::from([root]);
+        let mut queue = VecDeque::from([root]);
+        while let Some(pid) = queue.pop_front() {
+            let (rss, cpu) = facts(pid).unwrap_or_default();
+            usage.rss_bytes = usage.rss_bytes.saturating_add(rss);
+            usage.cpu_time = usage.cpu_time.saturating_add(cpu);
+            usage.processes = usage.processes.saturating_add(1);
+            for child in children.get(&pid).into_iter().flatten() {
+                if seen.insert(*child) {
+                    queue.push_back(*child);
+                }
             }
         }
+        found.insert(root, usage);
     }
-    order
-}
-
-/// Sums `facts` over the tree under `root`; `None` when `root` is not in it.
-fn sum_tree(root: u32, facts: &HashMap<u32, ProcessFacts>) -> Option<TreeUsage> {
-    facts.get(&root)?;
-    let mut usage = TreeUsage::default();
-    for pid in descendants(root, facts.iter().map(|(pid, fact)| (*pid, fact.parent))) {
-        if let Some(fact) = facts.get(&pid) {
-            usage.rss_bytes = usage.rss_bytes.saturating_add(fact.rss_bytes);
-            usage.cpu_time = usage.cpu_time.saturating_add(fact.cpu_time);
-            usage.processes = usage.processes.saturating_add(1);
-        }
-    }
-    Some(usage)
+    found
 }
 
 /// Fields of one `/proc/<pid>/stat` line: the parent, the CPU ticks the
 /// process and its waited-for children used, and its resident pages. The
-/// command name is in parentheses and may hold spaces or parentheses, so the
-/// fields are counted from the last `)`.
+/// command name may hold spaces and parentheses, so the fields are counted
+/// from the last `)` ([`crate::process::proc_stat_after_comm`]).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_proc_stat(line: &str) -> Option<(u32, u64, u64)> {
-    let rest = &line[line.rfind(')')? + 1..];
-    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let fields: Vec<&str> = crate::process::proc_stat_after_comm(line)?
+        .split_whitespace()
+        .collect();
     // After the name: state(3) ppid(4) ... utime(14) stime(15) cutime(16)
     // cstime(17) ... rss(24); index 0 here is field 3.
     let field = |number: usize| fields.get(number - 3).copied();
@@ -112,9 +117,9 @@ mod sys {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use super::{ProcessFacts, TreeUsage, parse_proc_stat, sum_tree};
+    use super::{Facts, TreeUsage, parse_proc_stat, trees};
 
-    pub(super) fn sample_tree(root: u32) -> Option<TreeUsage> {
+    pub(super) fn sample_trees(roots: &[u32]) -> HashMap<u32, TreeUsage> {
         // SAFETY: `sysconf` reads a constant and cannot fail in a way that
         // matters here; a non-positive answer is replaced below.
         let ticks_per_second = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
@@ -126,8 +131,12 @@ mod sys {
             .ok()
             .filter(|page| *page > 0)
             .unwrap_or(4096);
-        let mut facts = HashMap::new();
-        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let mut parents = Vec::new();
+        let mut facts: HashMap<u32, Facts> = HashMap::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return HashMap::new();
+        };
+        for entry in entries.flatten() {
             let Some(pid) = entry
                 .file_name()
                 .to_str()
@@ -140,19 +149,19 @@ mod sys {
                 continue;
             };
             if let Some((parent, ticks, pages)) = parse_proc_stat(&line) {
+                parents.push((pid, parent));
                 facts.insert(
                     pid,
-                    ProcessFacts {
-                        parent,
-                        rss_bytes: pages.saturating_mul(page),
-                        cpu_time: Duration::from_nanos(
+                    (
+                        pages.saturating_mul(page),
+                        Duration::from_nanos(
                             ticks.saturating_mul(1_000_000_000) / ticks_per_second,
                         ),
-                    },
+                    ),
                 );
             }
         }
-        sum_tree(root, &facts)
+        trees(roots, &parents, |pid| facts.get(&pid).copied())
     }
 }
 
@@ -161,7 +170,7 @@ mod sys {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use super::{ProcessFacts, TreeUsage, descendants, sum_tree};
+    use super::{TreeUsage, trees};
 
     fn info<T>(pid: i32, flavor: i32) -> Option<T> {
         let size = i32::try_from(std::mem::size_of::<T>()).ok()?;
@@ -182,14 +191,18 @@ mod sys {
         reason = "libc marks the mach bindings deprecated in favour of a crate this workspace does not take; the call is stable"
     )]
     fn ticks_to_nanos(ticks: u64) -> u64 {
-        let mut base = libc::mach_timebase_info { numer: 0, denom: 0 };
-        // SAFETY: `base` is a live structure owned by this frame.
-        let ok = unsafe { libc::mach_timebase_info(&raw mut base) } == 0;
-        if !ok || base.denom == 0 {
-            return ticks;
-        }
-        u64::try_from(u128::from(ticks) * u128::from(base.numer) / u128::from(base.denom))
-            .unwrap_or(u64::MAX)
+        static BASE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+        let (numer, denom) = *BASE.get_or_init(|| {
+            let mut base = libc::mach_timebase_info { numer: 0, denom: 0 };
+            // SAFETY: `base` is a live structure owned by this frame.
+            let ok = unsafe { libc::mach_timebase_info(&raw mut base) } == 0;
+            if ok && base.denom != 0 {
+                (base.numer, base.denom)
+            } else {
+                (1, 1)
+            }
+        });
+        u64::try_from(u128::from(ticks) * u128::from(numer) / u128::from(denom)).unwrap_or(u64::MAX)
     }
 
     fn all_pids() -> Vec<i32> {
@@ -207,7 +220,7 @@ mod sys {
         pids
     }
 
-    pub(super) fn sample_tree(root: u32) -> Option<TreeUsage> {
+    pub(super) fn sample_trees(roots: &[u32]) -> HashMap<u32, TreeUsage> {
         let parents: Vec<(u32, u32)> = all_pids()
             .into_iter()
             .filter(|pid| *pid > 0)
@@ -216,35 +229,15 @@ mod sys {
                 Some((u32::try_from(pid).ok()?, bsd.pbi_ppid))
             })
             .collect();
-        if !parents.iter().any(|(pid, _)| *pid == root) {
-            return None;
-        }
-        let parent_of: HashMap<u32, u32> = parents.iter().copied().collect();
-        let mut facts = HashMap::new();
-        for pid in descendants(root, parents) {
-            let Some(task) = i32::try_from(pid)
-                .ok()
-                .and_then(|pid| info::<libc::proc_taskinfo>(pid, libc::PROC_PIDTASKINFO))
-            else {
-                continue;
-            };
-            facts.insert(
-                pid,
-                ProcessFacts {
-                    parent: parent_of.get(&pid).copied().unwrap_or(0),
-                    rss_bytes: task.pti_resident_size,
-                    cpu_time: Duration::from_nanos(ticks_to_nanos(
-                        task.pti_total_user.saturating_add(task.pti_total_system),
-                    )),
-                },
-            );
-        }
-        // The root itself may be one this account cannot inspect.
-        facts.entry(root).or_insert(ProcessFacts {
-            parent: parent_of.get(&root).copied().unwrap_or(0),
-            ..ProcessFacts::default()
-        });
-        sum_tree(root, &facts)
+        trees(roots, &parents, |pid| {
+            let task: libc::proc_taskinfo = info(i32::try_from(pid).ok()?, libc::PROC_PIDTASKINFO)?;
+            Some((
+                task.pti_resident_size,
+                Duration::from_nanos(ticks_to_nanos(
+                    task.pti_total_user.saturating_add(task.pti_total_system),
+                )),
+            ))
+        })
     }
 }
 
@@ -263,7 +256,7 @@ mod sys {
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
     };
 
-    use super::{ProcessFacts, TreeUsage, descendants, sum_tree};
+    use super::{Facts, TreeUsage, trees};
 
     fn parents() -> Vec<(u32, u32)> {
         // SAFETY: a process snapshot takes no pointer; the handle is closed
@@ -307,7 +300,7 @@ mod sys {
         .ok()
     }
 
-    fn facts(pid: u32, parent: u32) -> Option<ProcessFacts> {
+    fn facts(pid: u32) -> Option<Facts> {
         let handle = open(pid)?;
         let mut memory = PROCESS_MEMORY_COUNTERS {
             cb: u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>()).unwrap_or(0),
@@ -343,40 +336,22 @@ mod sys {
         };
         // SAFETY: opened above, closed once.
         let _ = unsafe { CloseHandle(handle) };
-        Some(ProcessFacts {
-            parent,
-            rss_bytes: rss,
-            cpu_time: cpu,
-        })
+        Some((rss, cpu))
     }
 
-    pub(super) fn sample_tree(root: u32) -> Option<TreeUsage> {
-        let parents = parents();
-        if !parents.iter().any(|(pid, _)| *pid == root) {
-            return None;
-        }
-        let parent_of: HashMap<u32, u32> = parents.iter().copied().collect();
-        let mut found = HashMap::new();
-        for pid in descendants(root, parents) {
-            let parent = parent_of.get(&pid).copied().unwrap_or(0);
-            if let Some(fact) = facts(pid, parent) {
-                found.insert(pid, fact);
-            }
-        }
-        found.entry(root).or_insert(ProcessFacts {
-            parent: parent_of.get(&root).copied().unwrap_or(0),
-            ..ProcessFacts::default()
-        });
-        sum_tree(root, &found)
+    pub(super) fn sample_trees(roots: &[u32]) -> HashMap<u32, TreeUsage> {
+        trees(roots, &parents(), facts)
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod sys {
+    use std::collections::HashMap;
+
     use super::TreeUsage;
 
-    pub(super) const fn sample_tree(_: u32) -> Option<TreeUsage> {
-        None
+    pub(super) fn sample_trees(_: &[u32]) -> HashMap<u32, TreeUsage> {
+        HashMap::new()
     }
 }
 
@@ -395,31 +370,42 @@ mod tests {
 
     #[test]
     fn a_tree_sums_its_descendants_only_and_survives_a_cycle() {
-        let fact = |parent, rss, secs| ProcessFacts {
-            parent,
-            rss_bytes: rss,
-            cpu_time: Duration::from_secs(secs),
-        };
-        let facts = HashMap::from([
-            (1, fact(0, 1, 1)),
-            (10, fact(1, 100, 10)),
-            (11, fact(10, 20, 2)),
-            (12, fact(11, 30, 3)),
-            (20, fact(1, 999, 99)),
-            // A recycled PID that names a descendant as its parent.
-            (30, fact(12, 5, 1)),
-        ]);
+        let parents = [
+            (1, 0),
+            (10, 1),
+            (11, 10),
+            (12, 11),
+            (20, 1),
+            (30, 12),
+            (12, 30),
+        ];
+        let facts: HashMap<u32, Facts> = [
+            (1, (1, 1)),
+            (10, (100, 10)),
+            (11, (20, 2)),
+            (12, (30, 3)),
+            (20, (999, 99)),
+            (30, (5, 1)),
+        ]
+        .into_iter()
+        .map(|(pid, (rss, secs))| (pid, (rss, Duration::from_secs(secs))))
+        .collect();
+        let found = trees(&[10, 99], &parents, |pid| facts.get(&pid).copied());
         assert_eq!(
-            sum_tree(10, &facts),
-            Some(TreeUsage {
-                rss_bytes: 155,
-                cpu_time: Duration::from_secs(16),
-                processes: 4,
-            })
+            found,
+            HashMap::from([(
+                10,
+                TreeUsage {
+                    rss_bytes: 155,
+                    cpu_time: Duration::from_secs(16),
+                    processes: 4,
+                }
+            )]),
+            "the gone root 99 has no entry"
         );
-        assert_eq!(sum_tree(99, &facts), None);
-        let cycle = descendants(1, [(1, 2), (2, 1), (3, 2)]);
-        assert_eq!(cycle, vec![1, 2, 3]);
+        // An unreadable process still counts as one of the tree.
+        let unreadable = trees(&[10], &parents, |_| None);
+        assert_eq!(unreadable[&10].processes, 4);
     }
 
     /// A real child tree of this process: the measurement on the current OS.

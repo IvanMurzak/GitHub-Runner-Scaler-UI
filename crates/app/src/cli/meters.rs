@@ -4,7 +4,7 @@
 //!
 //! While this host has joined a coordinator, every [`SAMPLE_EVERY`] the link
 //! looks at the process tree of each live native attempt of its own policies
-//! ([`runner_manager_platform::resource_usage::sample_tree`]) on a blocking
+//! ([`runner_manager_platform::resource_usage::sample_trees`]) on a blocking
 //! thread, so a slow `/proc` or process snapshot never holds up the reconcile
 //! loop or the link. When the attempt ends, its `attempt_finished` carries
 //! what the samples saw ([`AttemptUsage`]): the peak resident memory of the
@@ -21,7 +21,7 @@ use std::time::Duration;
 use runner_manager_coordinator_protocol::AttemptUsage;
 use runner_manager_domain::model::{AttemptId, HostId};
 use runner_manager_domain::store::Store;
-use runner_manager_platform::resource_usage::{TreeUsage, sample_tree};
+use runner_manager_platform::resource_usage::{TreeUsage, sample_trees};
 use tokio::time::Instant;
 
 /// How often each live attempt's process tree is sampled.
@@ -124,18 +124,26 @@ impl AttemptMeters {
     pub fn sample_once(&self, store: &dyn Store, host: HostId) {
         let policies = store.policies().unwrap_or_default();
         let mut live = HashSet::new();
+        let mut roots: Vec<(AttemptId, u32)> = Vec::new();
         for policy in policies.iter().filter(|policy| policy.is_owned_by(host)) {
             let Ok(attempts) = store.active_attempts_for_policy(policy.id) else {
                 continue;
             };
             for attempt in attempts {
                 live.insert(attempt.id);
-                if let Some(usage) = attempt.process_id().and_then(sample_tree) {
-                    self.record(attempt.id, Instant::now(), usage);
-                }
+                roots.extend(attempt.process_id().map(|pid| (attempt.id, pid)));
             }
         }
-        self.forget_stale(&live, Instant::now());
+        // One look at the process table for every attempt.
+        let pids: Vec<u32> = roots.iter().map(|(_, pid)| *pid).collect();
+        let trees = sample_trees(&pids);
+        let now = Instant::now();
+        for (attempt, pid) in roots {
+            if let Some(usage) = trees.get(&pid) {
+                self.record(attempt, now, *usage);
+            }
+        }
+        self.forget_stale(&live, now);
     }
 }
 

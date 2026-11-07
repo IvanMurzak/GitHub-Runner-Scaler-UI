@@ -192,11 +192,16 @@ pub async fn serve(
     placement.abort();
     revocations.abort();
     counters.abort();
+    collect_wakes(&state);
+    state.statistics.flush();
+    served
+}
+
+/// Hands the wakes the registry sent since last time to the statistics.
+fn collect_wakes(state: &AppState) {
     state
         .statistics
         .count_wakes(state.registry.take_wakes_sent());
-    state.statistics.flush();
-    served
 }
 
 /// Adds the launch and wake counts to the database every minute.
@@ -205,9 +210,7 @@ async fn flush_counters(state: Arc<AppState>) {
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
-        state
-            .statistics
-            .count_wakes(state.registry.take_wakes_sent());
+        collect_wakes(&state);
         state.statistics.flush();
     }
 }
@@ -567,9 +570,7 @@ async fn answer_query(socket: &mut WebSocket, state: &AppState, host_id: &str) {
         close(socket, 1008, "unexpected message").await;
         return;
     }
-    state
-        .statistics
-        .count_wakes(state.registry.take_wakes_sent());
+    collect_wakes(state);
     match state.statistics.report(Utc::now()) {
         Ok(report) => {
             tracing::info!(%host_id, jobs = report.jobs.len(), "a host read the statistics");

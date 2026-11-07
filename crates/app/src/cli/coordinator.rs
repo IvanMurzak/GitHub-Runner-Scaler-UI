@@ -325,22 +325,7 @@ fn status(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliE
     let failed = write_failed("the coordinator status");
     let snapshot = CoordinatorSnapshot::read(context.paths(), context.clock().now());
     if json {
-        #[derive(Serialize)]
-        struct Document<'a> {
-            schema_version: u32,
-            #[serde(flatten)]
-            coordinator: &'a CoordinatorSnapshot,
-        }
-        serde_json::to_writer_pretty(
-            &mut *out,
-            &Document {
-                schema_version: STATUS_SCHEMA_VERSION,
-                coordinator: &snapshot,
-            },
-        )
-        .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?;
-        writeln!(out).map_err(failed)?;
-        return Ok(());
+        return write_document(out, &snapshot);
     }
     writeln!(out, "Coordinator: {}", snapshot.describe()).map_err(failed)?;
     if let (Some(name), Some(id)) = (&snapshot.name, &snapshot.host_id) {
@@ -359,6 +344,26 @@ fn status(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliE
         writeln!(out, "  sweep         {}", snapshot.describe_sweep()).map_err(failed)?;
     }
     Ok(())
+}
+
+/// `body` as the versioned JSON document `status --json` and `stats --json`
+/// print: its fields beside `schema_version`.
+fn write_document(out: &mut dyn Write, body: &impl Serialize) -> Result<(), CliError> {
+    #[derive(Serialize)]
+    struct Document<'a, T: Serialize> {
+        schema_version: u32,
+        #[serde(flatten)]
+        body: &'a T,
+    }
+    serde_json::to_writer_pretty(
+        &mut *out,
+        &Document {
+            schema_version: STATUS_SCHEMA_VERSION,
+            body,
+        },
+    )
+    .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?;
+    writeln!(out).map_err(write_failed("the JSON document"))
 }
 
 /// `coordinator stats`: asks the coordinator for its statistics on a query
@@ -404,22 +409,7 @@ fn stats(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliEr
             )),
         })?;
     if json {
-        #[derive(Serialize)]
-        struct Document<'a> {
-            schema_version: u32,
-            #[serde(flatten)]
-            report: &'a StatsReport,
-        }
-        serde_json::to_writer_pretty(
-            &mut *out,
-            &Document {
-                schema_version: STATUS_SCHEMA_VERSION,
-                report: &report,
-            },
-        )
-        .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?;
-        writeln!(out).map_err(failed)?;
-        return Ok(());
+        return write_document(out, &report);
     }
     let mut text = String::new();
     report
@@ -905,8 +895,6 @@ pub struct LinkPorts {
     pub coordination: Arc<Coordination>,
     /// The coordinator's launches on this host (stage 3).
     pub launches: Arc<Launches>,
-    /// What this host's attempts use (stage 4).
-    pub meters: Arc<AttemptMeters>,
 }
 
 /// Why one session ended, as fixed words for the link record.
@@ -1009,17 +997,18 @@ impl Recorder {
 /// Keeps the link up while this host has joined a coordinator, and samples
 /// what its attempts use meanwhile. Never returns.
 pub async fn maintain_link(ports: LinkPorts) {
+    let meters = Arc::new(AttemptMeters::default());
     let coordination = Arc::clone(&ports.coordination);
     let sampling = sample_attempts(
-        Arc::clone(&ports.meters),
+        Arc::clone(&meters),
         Arc::clone(&ports.store),
         ports.host.id,
         move || coordination.borrow().configured,
     );
-    tokio::join!(sampling, link(ports));
+    tokio::join!(sampling, link(ports, &meters));
 }
 
-async fn link(ports: LinkPorts) {
+async fn link(ports: LinkPorts, meters: &AttemptMeters) {
     let tls = tls_config();
     let mut recorder = Recorder {
         paths: ports.paths.clone(),
@@ -1052,7 +1041,7 @@ async fn link(ports: LinkPorts) {
             changed
         });
         let started = tokio::time::Instant::now();
-        let end = session(&ports, &config, tls.clone(), &mut recorder).await;
+        let end = session(&ports, meters, &config, tls.clone(), &mut recorder).await;
         // The coordinator forgets a disconnected host's launches and places
         // their jobs elsewhere; starting them here as well would double up.
         ports.launches.clear();
@@ -1229,6 +1218,7 @@ async fn open_socket(
 /// One connection, from handshake to whatever ends it.
 async fn session(
     ports: &LinkPorts,
+    meters: &AttemptMeters,
     config: &CoordinatorConfig,
     tls: Option<Arc<rustls::ClientConfig>>,
     recorder: &mut Recorder,
@@ -1261,7 +1251,7 @@ async fn session(
                 }
             });
             tracing::info!(coordinator = %url, version, "connected to the coordinator");
-            serve(&mut socket, ports, config, handshake, recorder).await
+            serve(&mut socket, ports, meters, config, handshake, recorder).await
         }
         Err(end) => end,
     }
@@ -1334,6 +1324,7 @@ async fn handshake(
 async fn serve(
     socket: &mut Socket,
     ports: &LinkPorts,
+    meters: &AttemptMeters,
     config: &CoordinatorConfig,
     Handshake {
         heartbeat: interval,
@@ -1439,7 +1430,7 @@ async fn serve(
                     .into_iter()
                     .filter(|policy| policy.is_owned_by(ports.host.id))
                     .collect();
-                for report in reports.poll(ports.store.as_ref(), &own, &ports.launches, &ports.meters) {
+                for report in reports.poll(ports.store.as_ref(), &own, &ports.launches, meters) {
                     let message = match report {
                         AttemptReport::Started(started) => HostMessage::AttemptStarted(started),
                         AttemptReport::Finished(finished) => HostMessage::AttemptFinished(finished),
@@ -1651,7 +1642,6 @@ mod tests {
             runner_root: dir.path().to_path_buf(),
             coordination: Arc::clone(&coordination),
             launches,
-            meters: Arc::default(),
         }));
 
         // Connected and described.
@@ -1851,7 +1841,6 @@ mod tests {
             runner_root: dir.path().to_path_buf(),
             coordination: Arc::clone(&coordination),
             launches: Arc::clone(&launches),
-            meters: Arc::default(),
         }));
 
         // Connected at version 3, covered, and its heartbeat in.
