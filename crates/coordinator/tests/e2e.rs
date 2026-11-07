@@ -12,7 +12,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use runner_manager_coordinator::server::{AppState, Config, serve};
 use runner_manager_coordinator::store::Store;
-use runner_manager_coordinator_protocol::{
+use runner_manager_domain::coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, EnrollRequest, EnrollResponse, Hello, HelloAck,
     HostMessage, HostSigningKey, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Profile, ServerMessage,
     SessionPurpose, Target, TargetScope, Wake, WakeReason, decode_nonce, encode_public_key,
@@ -337,7 +337,7 @@ async fn a_queued_job_wakes_the_enrolled_host_that_serves_it() {
     assert_eq!(
         wake,
         Wake {
-            target: runner_manager_coordinator_protocol::TargetRef {
+            target: runner_manager_domain::coordinator_protocol::TargetRef {
                 scope: TargetScope::Org,
                 name: "octo".into()
             },
@@ -449,7 +449,7 @@ async fn a_revocation_by_the_admin_cli_closes_the_connection_within_a_second() {
 #[tokio::test]
 async fn a_pool_job_launches_on_one_version_three_host_and_wakes_a_version_two_one() {
     use runner_manager_coordinator::registry::Coverage;
-    use runner_manager_coordinator_protocol::{Heartbeat, LaunchAck};
+    use runner_manager_domain::coordinator_protocol::{Heartbeat, LaunchAck};
 
     let coordinator = start().await;
     coordinator.state.registry.set_coverage(Coverage {
@@ -565,7 +565,7 @@ async fn query_stats(
     coordinator: &Coordinator,
     host_id: &str,
     key: &HostSigningKey,
-) -> runner_manager_coordinator_protocol::StatsReport {
+) -> runner_manager_domain::coordinator_protocol::StatsReport {
     let mut query = coordinator
         .connect_for(PROTOCOL_VERSION, host_id, key, Some(SessionPurpose::Query))
         .await;
@@ -587,7 +587,7 @@ async fn query_stats(
 /// usage) still counts its duration.
 #[tokio::test]
 async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_query() {
-    use runner_manager_coordinator_protocol::{
+    use runner_manager_domain::coordinator_protocol::{
         AttemptFinished, AttemptOutcomeKind, AttemptUsage, STATS_VERSION,
     };
 
@@ -692,7 +692,7 @@ async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_quer
     );
     send(
         &mut link,
-        &HostMessage::Heartbeat(runner_manager_coordinator_protocol::Heartbeat::default()),
+        &HostMessage::Heartbeat(runner_manager_domain::coordinator_protocol::Heartbeat::default()),
     )
     .await;
     assert_eq!(

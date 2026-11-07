@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use runner_manager_coordinator_protocol::{
+use runner_manager_domain::coordinator_protocol::{
     CLOSE_REPLACED, HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, LAUNCH_VERSION, ServerMessage,
     Target, TargetRef, TargetScope, Wake, WakeReason,
 };
@@ -504,7 +504,9 @@ pub fn matching_target(hello: &Hello, repository: &str, required: &[Label]) -> O
 
 #[cfg(test)]
 mod tests {
-    use runner_manager_coordinator_protocol::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Profile};
+    use runner_manager_domain::coordinator_protocol::{
+        MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Profile,
+    };
 
     use super::*;
 

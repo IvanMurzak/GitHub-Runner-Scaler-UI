@@ -50,7 +50,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use runner_manager_coordinator_protocol::{
+use runner_manager_domain::coordinator_protocol::{
     AttemptFinished, AttemptStarted, CancelLaunch, Launch, LaunchAck, PlacementDecision,
     ServerMessage,
 };
@@ -888,7 +888,7 @@ fn rank(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
 mod tests {
     use std::collections::BTreeSet;
 
-    use runner_manager_coordinator_protocol::{
+    use runner_manager_domain::coordinator_protocol::{
         Heartbeat, Hello, LAUNCH_VERSION, Profile, RefusalReason, Target, TargetRef, TargetScope,
     };
     use tokio::sync::mpsc;
@@ -1419,7 +1419,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_measured_heavy_queue_goes_to_the_host_it_fits_and_the_decision_is_kept() {
-        use runner_manager_coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
+        use runner_manager_domain::coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
 
         let registry = Arc::new(Registry::default());
         registry.set_coverage(covering());

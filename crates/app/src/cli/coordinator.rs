@@ -67,14 +67,14 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::{SinkExt as _, StreamExt as _};
-use runner_manager_coordinator_protocol::{
+use runner_manager_domain::attempt::active_count;
+use runner_manager_domain::coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CoordinatorUrl, EnrollRequest, EnrollResponse,
     HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, HostMessage, HostSigningKey, LAUNCH_VERSION,
     MIN_PROTOCOL_VERSION, Profile, STATS_VERSION, ServerMessage, SessionPurpose, StatsReport,
     Target, TargetRef, TargetScope, Wake, decode_nonce, decode_signing_key, encode_public_key,
     encode_signing_key, negotiate, sign_challenge, signing_key_from_seed,
 };
-use runner_manager_domain::attempt::active_count;
 use runner_manager_domain::model::{OwnerRepo, ScaleTarget, StartMode};
 use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_domain::store::Store;
@@ -1198,8 +1198,12 @@ async fn open_socket(
     tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<Socket, SessionEnd> {
     let socket_config = tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(runner_manager_coordinator_protocol::MAX_MESSAGE_BYTES))
-        .max_frame_size(Some(runner_manager_coordinator_protocol::MAX_MESSAGE_BYTES));
+        .max_message_size(Some(
+            runner_manager_domain::coordinator_protocol::MAX_MESSAGE_BYTES,
+        ))
+        .max_frame_size(Some(
+            runner_manager_domain::coordinator_protocol::MAX_MESSAGE_BYTES,
+        ));
     // Never let tungstenite fall back to a root-less default for `wss://`.
     let connector = match tls {
         Some(config) => Some(tokio_tungstenite::Connector::Rustls(config)),
@@ -1478,7 +1482,7 @@ mod tests {
                 name: name.into(),
             },
             repository: "octo/app".into(),
-            reason: runner_manager_coordinator_protocol::WakeReason::JobQueued,
+            reason: runner_manager_domain::coordinator_protocol::WakeReason::JobQueued,
             delivery_id: "d".into(),
         };
         assert!(routes.deliver(&wake(TargetScope::Repo, "octo/app")));
@@ -1749,7 +1753,7 @@ mod tests {
         use hmac::{Hmac, KeyInit as _, Mac as _};
         use runner_manager_agent::reconcile::DemandDirector as _;
         use runner_manager_coordinator::server::{AppState, Config, serve};
-        use runner_manager_coordinator_protocol::{Launch, RefusalReason};
+        use runner_manager_domain::coordinator_protocol::{Launch, RefusalReason};
         use runner_manager_domain::policy::pool_label;
         use runner_manager_domain::store::SqliteStore;
         use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope};
@@ -2005,9 +2009,9 @@ mod tests {
         assert_eq!(
             negotiated(
                 1,
-                Some(runner_manager_coordinator_protocol::PROTOCOL_VERSION)
+                Some(runner_manager_domain::coordinator_protocol::PROTOCOL_VERSION)
             ),
-            Some(runner_manager_coordinator_protocol::PROTOCOL_VERSION)
+            Some(runner_manager_domain::coordinator_protocol::PROTOCOL_VERSION)
         );
         // A future one that dropped everything this build speaks.
         assert_eq!(negotiated(7, Some(9)), None);

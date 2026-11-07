@@ -19,7 +19,9 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use runner_manager_coordinator::github_app::{AppKey, GithubApp};
 use runner_manager_coordinator::registry::{Outbound, Registry};
 use runner_manager_coordinator::sweep::Sweeper;
-use runner_manager_coordinator_protocol::{Hello, PROTOCOL_VERSION, Profile, Target, TargetScope};
+use runner_manager_domain::coordinator_protocol::{
+    Hello, PROTOCOL_VERSION, Profile, Target, TargetScope,
+};
 use runner_manager_domain::model::SystemClock;
 use runner_manager_github::Endpoints;
 use secrecy::SecretString;

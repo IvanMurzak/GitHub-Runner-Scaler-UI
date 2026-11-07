@@ -32,7 +32,6 @@ members = [
     "crates/agent",
     "crates/app",
     "crates/coordinator",
-    "crates/coordinator-protocol",
     "crates/domain",
     "crates/github",
     "crates/platform",
@@ -55,7 +54,6 @@ homepage = "https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI"
 # Each carries a `version` as well as a `path` so the published `runner-manager`
 # crate (D11, `cargo install`) can resolve them from the registry.
 runner-manager-agent = { path = "crates/agent", version = "0.4.45" }
-runner-manager-coordinator-protocol = { path = "crates/coordinator-protocol", version = "0.4.45" }
 runner-manager-domain = { path = "crates/domain", version = "0.4.45" }
 runner-manager-github = { path = "crates/github", version = "0.4.45" }
 runner-manager-platform = { path = "crates/platform", version = "0.4.45" }

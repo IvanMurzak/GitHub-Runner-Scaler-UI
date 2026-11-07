@@ -163,8 +163,8 @@ fn join_status_and_leave_round_trip_and_no_secret_reaches_their_output() {
         .hosts()
         .expect("hosts");
     assert_eq!(hosts.len(), 1);
-    let public = runner_manager_coordinator_protocol::encode_public_key(
-        &runner_manager_coordinator_protocol::decode_signing_key(&key)
+    let public = runner_manager_domain::coordinator_protocol::encode_public_key(
+        &runner_manager_domain::coordinator_protocol::decode_signing_key(&key)
             .expect("a key")
             .verifying_key(),
     );

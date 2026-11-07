@@ -16,7 +16,7 @@ use runner_manager_coordinator::placement::Placement;
 use runner_manager_coordinator::registry::{Coverage, Outbound, Registry};
 use runner_manager_coordinator::stats::{JobIdentity, Statistics, StatsConfig};
 use runner_manager_coordinator::store::Store;
-use runner_manager_coordinator_protocol::{
+use runner_manager_domain::coordinator_protocol::{
     AttemptFinished, AttemptOutcomeKind, AttemptStarted, AttemptUsage, Heartbeat, Hello,
     LAUNCH_VERSION, LaunchAck, Profile, RefusalReason, ServerMessage, Target, TargetRef,
     TargetScope,

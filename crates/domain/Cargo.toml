@@ -17,12 +17,20 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+# `base64`, `ed25519-dalek` and `url` serve `coordinator_protocol`, the wire
+# contract with the optional coordinator. It lives here rather than in a crate
+# of its own because crates.io Trusted Publishing cannot publish a crate name
+# that does not exist yet, and `runner-manager` must resolve it from the
+# registry. All three are pure: no I/O, no runtime.
+base64 = { workspace = true }
 chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

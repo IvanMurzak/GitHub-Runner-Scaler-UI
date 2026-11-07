@@ -37,11 +37,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use runner_manager_agent::reconcile::DemandDirector;
-use runner_manager_coordinator_protocol::{
-    AttemptFinished, AttemptOutcomeKind, AttemptStarted, Launch, LaunchAck, RefusalReason,
-};
 use runner_manager_domain::attempt::{AttemptOutcome, AttemptState, RunnerAttempt};
 use runner_manager_domain::capacity::{HostAllocator, LimitingFactor};
+use runner_manager_domain::coordinator_protocol::{
+    AttemptFinished, AttemptOutcomeKind, AttemptStarted, Launch, LaunchAck, RefusalReason,
+};
 use runner_manager_domain::model::{AttemptId, Host, PolicyId};
 use runner_manager_domain::policy::{ScalePolicy, pool_label};
 use runner_manager_domain::store::Store;
@@ -460,7 +460,7 @@ fn finished(attempt: &RunnerAttempt, launches: &Launches, meters: &AttemptMeters
 
 #[cfg(test)]
 mod tests {
-    use runner_manager_coordinator_protocol::{HelloAck, LAUNCH_VERSION};
+    use runner_manager_domain::coordinator_protocol::{HelloAck, LAUNCH_VERSION};
     use runner_manager_domain::store::SqliteStore;
     use runner_manager_testkit::fixtures;
 
