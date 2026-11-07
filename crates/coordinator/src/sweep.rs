@@ -24,7 +24,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use runner_manager_coordinator_protocol::{TargetRef, WakeReason};
+use runner_manager_domain::coordinator_protocol::{TargetRef, WakeReason};
 use runner_manager_domain::model::{Label, OwnerRepo};
 use runner_manager_github::demand::DemandGateway;
 use runner_manager_github::rest::{ActivityScope, CancelToken, InventoryError};
@@ -318,7 +318,7 @@ fn served(installation: &Reachable, advertised: &[TargetRef]) -> BTreeSet<OwnerR
 
 #[cfg(test)]
 mod tests {
-    use runner_manager_coordinator_protocol::{
+    use runner_manager_domain::coordinator_protocol::{
         Hello, HelloAck, PROTOCOL_VERSION, Profile, ServerMessage, Target, TargetScope, Wake,
     };
     use runner_manager_domain::model::Label;

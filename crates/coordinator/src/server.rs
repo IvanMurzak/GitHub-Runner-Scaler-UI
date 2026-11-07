@@ -23,7 +23,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
-use runner_manager_coordinator_protocol::{
+use runner_manager_domain::coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CONNECT_PATH, ENROLL_PATH, EnrollRequest,
     EnrollResponse, HEALTH_PATH, HostMessage, LAUNCH_VERSION, MAX_MESSAGE_BYTES,
     MIN_PROTOCOL_VERSION, NONCE_LEN, PROTOCOL_VERSION, STATS_VERSION, ServerMessage,

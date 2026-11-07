@@ -7,6 +7,18 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.46
+
+### Fixed
+
+- 0.4.45's crates.io, npm and Homebrew packages were not published (the GitHub
+  Release and install scripts were); 0.4.46 publishes the same coordinator
+  features to every channel. Nothing else changed: the coordinator protocol and
+  every command behave exactly as in 0.4.45.
+- Internal: the coordinator wire protocol now lives in the already-published
+  `runner-manager-domain` crate, and a test fails any pull request whose crates.io
+  publish list misses a crate `runner-manager` depends on.
+
 ## 0.4.45
 
 ### Added

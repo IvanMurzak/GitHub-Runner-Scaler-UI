@@ -12,7 +12,7 @@ use common::{
     requests_to, sweeper,
 };
 use runner_manager_coordinator::registry::{Outbound, Registry};
-use runner_manager_coordinator_protocol::{ServerMessage, TargetScope, WakeReason};
+use runner_manager_domain::coordinator_protocol::{ServerMessage, TargetScope, WakeReason};
 use serde_json::json;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};

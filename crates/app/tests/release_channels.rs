@@ -2069,3 +2069,118 @@ fn cargo_publish_reads_the_exact_version_from_the_index() {
         "{output}"
     );
 }
+
+/// Crate names that already exist on crates.io. Trusted Publishing, the only
+/// credential the release has, cannot create a crate: a name that is not here
+/// needs a one-time first publish by the owner before a release can depend on
+/// it, or belongs as a module of one of these. Deliberately not
+/// [`PUBLISH_ORDER`]: extending that list does not register a name.
+const REGISTERED_ON_CRATES_IO: [&str; 5] = [
+    "runner-manager",
+    "runner-manager-agent",
+    "runner-manager-domain",
+    "runner-manager-github",
+    "runner-manager-platform",
+];
+
+/// The workspace's non-dev (normal and build) dependency graph among its own
+/// members, read with `cargo metadata --no-deps`, which needs no network. Maps each
+/// member to whether it may be published and the members it depends on.
+fn workspace_publish_graph() -> BTreeMap<String, (bool, BTreeSet<String>)> {
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
+        .current_dir(repository_root())
+        .output()
+        .expect("cargo metadata runs");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let packages = metadata["packages"].as_array().unwrap();
+    let members: BTreeSet<&str> = packages
+        .iter()
+        .map(|package| package["name"].as_str().unwrap())
+        .collect();
+    packages
+        .iter()
+        .map(|package| {
+            // `publish = false` reads back as an empty registry list.
+            let publishable = package["publish"]
+                .as_array()
+                .is_none_or(|registries| !registries.is_empty());
+            let dependencies = package["dependencies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|dependency| dependency["kind"] != "dev")
+                .map(|dependency| dependency["name"].as_str().unwrap())
+                .filter(|name| members.contains(name))
+                .map(str::to_owned)
+                .collect();
+            (
+                package["name"].as_str().unwrap().to_owned(),
+                (publishable, dependencies),
+            )
+        })
+        .collect()
+}
+
+/// 0.4.45's failure: `runner-manager` gained a normal dependency on a new
+/// workspace crate that `cargo-publish` did not publish, so crates.io could
+/// not resolve it and every channel after the GitHub Release stayed behind.
+/// What `cargo-publish` actually publishes must be the whole non-dev closure
+/// of `runner-manager` among the workspace members, none of them
+/// `publish = false` or new to crates.io, each after every member it depends
+/// on.
+#[test]
+fn cargo_publish_covers_the_dependency_closure_of_runner_manager_in_order() {
+    let state = TempDir::new().unwrap();
+    let (ok, output, published) = publish_against_fake_crates_io(&state, 0);
+    assert!(ok, "{output}");
+
+    let graph = workspace_publish_graph();
+    let mut closure = BTreeSet::new();
+    let mut pending = vec!["runner-manager".to_owned()];
+    while let Some(name) = pending.pop() {
+        if closure.insert(name.clone()) {
+            let (_, dependencies) = &graph[&name];
+            pending.extend(dependencies.iter().cloned());
+        }
+    }
+
+    for name in &closure {
+        assert!(
+            graph[name].0,
+            "{name} is a normal dependency of runner-manager but is `publish = false`"
+        );
+        assert!(
+            REGISTERED_ON_CRATES_IO.contains(&name.as_str()),
+            "{name} is a dependency of runner-manager that crates.io has never seen, \
+             and Trusted Publishing cannot create it: fold it into an existing crate, \
+             or have the owner publish its first version by hand"
+        );
+    }
+    assert_eq!(
+        published.iter().cloned().collect::<BTreeSet<_>>(),
+        closure,
+        "channels.sh cargo-publish must publish exactly the workspace crates \
+         runner-manager depends on, itself included"
+    );
+    assert_eq!(published.len(), closure.len(), "{published:?}");
+    for (position, name) in published.iter().enumerate() {
+        for dependency in &graph[name].1 {
+            assert!(
+                published[..position].contains(dependency),
+                "channels.sh publishes {name} before its dependency {dependency}: {published:?}"
+            );
+        }
+    }
+}

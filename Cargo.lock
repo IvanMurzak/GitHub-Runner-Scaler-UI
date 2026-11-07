@@ -2744,7 +2744,6 @@ dependencies = [
  "reqwest",
  "runner-manager-agent",
  "runner-manager-coordinator",
- "runner-manager-coordinator-protocol",
  "runner-manager-domain",
  "runner-manager-github",
  "runner-manager-platform",
@@ -2819,7 +2818,6 @@ dependencies = [
  "hmac",
  "rand 0.10.2",
  "reqwest",
- "runner-manager-coordinator-protocol",
  "runner-manager-domain",
  "runner-manager-github",
  "runner-manager-testkit",
@@ -2840,22 +2838,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "runner-manager-coordinator-protocol"
-version = "0.4.45"
-dependencies = [
- "base64 0.23.1",
- "ed25519-dalek",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "url",
-]
-
-[[package]]
 name = "runner-manager-domain"
 version = "0.4.45"
 dependencies = [
+ "base64 0.23.1",
  "chrono",
+ "ed25519-dalek",
  "insta",
  "runner-manager-testkit",
  "rusqlite",
@@ -2866,6 +2854,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 

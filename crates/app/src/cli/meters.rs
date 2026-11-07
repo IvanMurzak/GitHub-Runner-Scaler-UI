@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use runner_manager_coordinator_protocol::AttemptUsage;
+use runner_manager_domain::coordinator_protocol::AttemptUsage;
 use runner_manager_domain::model::{AttemptId, HostId};
 use runner_manager_domain::store::Store;
 use runner_manager_platform::resource_usage::{TreeUsage, sample_trees};

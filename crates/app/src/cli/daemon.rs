@@ -3912,7 +3912,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_target_polls_at_the_interval_its_mode_calls_for() {
         use super::super::coordinator::{LinkView, PollMode};
-        use runner_manager_coordinator_protocol::{HelloAck, TargetRef, TargetScope};
+        use runner_manager_domain::coordinator_protocol::{HelloAck, TargetRef, TargetScope};
 
         let mut report = ReconcileReport::default();
         report.next_poll.delay = Duration::from_secs(60);
@@ -4012,7 +4012,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_coordinated_target_with_a_live_runner_keeps_its_normal_interval() {
         use super::super::coordinator::LinkView;
-        use runner_manager_coordinator_protocol::{HelloAck, TargetRef, TargetScope};
+        use runner_manager_domain::coordinator_protocol::{HelloAck, TargetRef, TargetScope};
 
         let mut report = ReconcileReport::default();
         report.next_poll.delay = Duration::from_secs(60);

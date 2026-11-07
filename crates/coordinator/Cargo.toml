@@ -27,7 +27,6 @@ futures = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
-runner-manager-coordinator-protocol = { workspace = true }
 runner-manager-domain = { workspace = true }
 runner-manager-github = { workspace = true }
 reqwest = { workspace = true }

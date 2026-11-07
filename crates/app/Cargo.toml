@@ -58,7 +58,6 @@ tar = { workspace = true }
 tempfile = { workspace = true }
 zip = { workspace = true }
 runner-manager-agent = { workspace = true }
-runner-manager-coordinator-protocol = { workspace = true }
 runner-manager-domain = { workspace = true }
 runner-manager-github = { workspace = true }
 runner-manager-platform = { workspace = true }

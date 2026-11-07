@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use runner_manager_coordinator_protocol::{
+use runner_manager_domain::coordinator_protocol::{
     AttemptFinished, AttemptOutcomeKind, HostJobStats, HostScore, HostStats, JobStats,
     MAX_MESSAGE_BYTES, PlacementDecision, ServerMessage, StatsReport, is_managed_runner_name,
     printable,
@@ -937,7 +937,7 @@ pub fn fit_report(mut report: StatsReport) -> StatsReport {
 
 #[cfg(test)]
 mod tests {
-    use runner_manager_coordinator_protocol::AttemptUsage;
+    use runner_manager_domain::coordinator_protocol::AttemptUsage;
 
     use super::*;
 
