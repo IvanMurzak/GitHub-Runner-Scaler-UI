@@ -159,7 +159,7 @@ impl Store {
         if !(MIN_INVITE_TTL..=MAX_INVITE_TTL).contains(&ttl) {
             return Err(StoreError::InvalidTtl);
         }
-        if self.active_name_taken(name)? {
+        if name_taken(&self.connection, name)? {
             return Err(StoreError::NameInUse(name.to_string()));
         }
         let code = SecretString::from(format!(
@@ -194,10 +194,11 @@ impl Store {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(StoreError::from)?;
+        let hash = code_hash(code.trim());
         let invite: Option<(String, DateTime<Utc>)> = transaction
             .query_row(
                 "SELECT name, expires_at FROM invites WHERE code_hash = ?1 AND used_at IS NULL",
-                params![code_hash(code.trim())],
+                params![hash],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
@@ -208,20 +209,13 @@ impl Store {
         else {
             return Err(EnrollError::InvalidCode);
         };
-        let taken: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM hosts WHERE name = ?1 AND revoked_at IS NULL)",
-                params![name],
-                |row| row.get(0),
-            )
-            .map_err(StoreError::from)?;
-        if taken {
+        if name_taken(&transaction, &name)? {
             return Err(StoreError::NameInUse(name).into());
         }
         transaction
             .execute(
                 "UPDATE invites SET used_at = ?2 WHERE code_hash = ?1",
-                params![code_hash(code.trim()), now],
+                params![hash, now],
             )
             .map_err(StoreError::from)?;
         let record = HostRecord {
@@ -310,14 +304,15 @@ impl Store {
         )?;
         Ok(())
     }
+}
 
-    fn active_name_taken(&self, name: &str) -> Result<bool, StoreError> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM hosts WHERE name = ?1 AND revoked_at IS NULL)",
-            params![name],
-            |row| row.get(0),
-        )?)
-    }
+/// Whether an active (not revoked) host already holds `name`.
+fn name_taken(connection: &Connection, name: &str) -> Result<bool, StoreError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM hosts WHERE name = ?1 AND revoked_at IS NULL)",
+        params![name],
+        |row| row.get(0),
+    )?)
 }
 
 const SELECT_HOST: &str =

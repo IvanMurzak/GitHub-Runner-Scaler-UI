@@ -382,11 +382,11 @@ impl CoordinatorSnapshot {
         if let Some(link) = link {
             snapshot.last_wake_at = link.last_wake_at;
             snapshot.wakes_received = link.wakes_received;
-            let fresh = now
-                .signed_duration_since(link.written_at)
-                .to_std()
-                .is_ok_and(|age| age < LINK_STALE_AFTER);
-            if fresh {
+            if !runner_manager_platform::wsl::fence::elapsed_at_least(
+                link.written_at,
+                now,
+                LINK_STALE_AFTER,
+            ) {
                 snapshot.link = if link.connected {
                     LinkState::Connected
                 } else {
@@ -501,21 +501,17 @@ impl WakeRoutes {
 }
 
 fn same_target(local: &ScaleTarget, remote: &TargetRef) -> bool {
-    match (local, remote.scope) {
-        (ScaleTarget::Repository(repository), TargetScope::Repo) => {
-            repository.to_string().eq_ignore_ascii_case(&remote.name)
-        }
-        (ScaleTarget::Organization(org), TargetScope::Org) => {
-            org.to_string().eq_ignore_ascii_case(&remote.name)
-        }
-        _ => false,
-    }
+    let local = target_ref(local);
+    local.scope == remote.scope && local.name.eq_ignore_ascii_case(&remote.name)
 }
 
-fn target_ref(target: &ScaleTarget) -> (TargetScope, String) {
-    match target {
-        ScaleTarget::Repository(repository) => (TargetScope::Repo, repository.to_string()),
-        ScaleTarget::Organization(org) => (TargetScope::Org, org.to_string()),
+fn target_ref(target: &ScaleTarget) -> TargetRef {
+    TargetRef {
+        scope: match target {
+            ScaleTarget::Repository(_) => TargetScope::Repo,
+            ScaleTarget::Organization(_) => TargetScope::Org,
+        },
+        name: target.slug(),
     }
 }
 
@@ -527,7 +523,7 @@ pub fn advertised_targets(policies: &[ScalePolicy]) -> Vec<Target> {
         let Some(labels) = policy.routing_labels() else {
             continue;
         };
-        let (scope, name) = target_ref(&policy.target);
+        let TargetRef { scope, name } = target_ref(&policy.target);
         let profile = Profile {
             name: policy.profile_name().to_string(),
             labels: labels.as_registration_labels(),
@@ -594,10 +590,23 @@ impl SessionEnd {
 struct Recorder {
     paths: AppPaths,
     record: LinkRecord,
+    written: Option<tokio::time::Instant>,
 }
 
+/// How often an unchanged link record is rewritten, well inside
+/// [`LINK_STALE_AFTER`].
+const LINK_KEEPALIVE: Duration = Duration::from_secs(60);
+
 impl Recorder {
+    /// Rewrites the record only when it is about to look stale.
+    fn keep_alive(&mut self) {
+        if self.written.is_none_or(|at| at.elapsed() >= LINK_KEEPALIVE) {
+            self.write();
+        }
+    }
+
     fn write(&mut self) {
+        self.written = Some(tokio::time::Instant::now());
         self.record.written_at = Utc::now();
         if let Err(error) = records::record_link(&self.paths, &self.record) {
             tracing::warn!(%error, "cannot record the coordinator link state");
@@ -633,6 +642,7 @@ pub async fn maintain_link(ports: LinkPorts) {
     let mut recorder = Recorder {
         paths: ports.paths.clone(),
         record: LinkRecord::new(Utc::now()),
+        written: None,
     };
     let mut backoff = RECONNECT_FIRST;
     loop {
@@ -692,14 +702,7 @@ fn load_key(store: &dyn SecretStore) -> Option<HostSigningKey> {
     decode_signing_key(secret.expose_secret()).ok()
 }
 
-fn hello(ports: &LinkPorts, host_id: &str) -> Hello {
-    let policies: Vec<ScalePolicy> = ports
-        .store
-        .policies()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|policy| policy.routing_labels().is_some())
-        .collect();
+fn hello(ports: &LinkPorts, host_id: &str, policies: &[ScalePolicy]) -> Hello {
     Hello {
         protocol_version: PROTOCOL_VERSION,
         host_id: host_id.to_string(),
@@ -711,15 +714,18 @@ fn hello(ports: &LinkPorts, host_id: &str) -> Hello {
             .unwrap_or(1),
         ram_bytes: runner_manager_platform::host_fitness::physical_memory_bytes(),
         disk_free_bytes: runner_manager_platform::host_fitness::free_disk_bytes(&ports.runner_root),
-        targets: advertised_targets(&policies),
+        targets: advertised_targets(policies),
     }
 }
 
-fn heartbeat(ports: &LinkPorts) -> Heartbeat {
-    let busy = ports
-        .store
-        .attempts()
-        .map_or(0, |attempts| active_count(attempts.iter()));
+/// `policies`' live runners, counted per policy rather than by reading every
+/// attempt this host ever ran.
+fn heartbeat(ports: &LinkPorts, policies: &[ScalePolicy]) -> Heartbeat {
+    let busy = policies
+        .iter()
+        .filter_map(|policy| ports.store.active_attempts_for_policy(policy.id).ok())
+        .map(|attempts| active_count(attempts.iter()))
+        .fold(0_u16, u16::saturating_add);
     Heartbeat {
         free_slots: u32::from(ports.host.host_capacity.get().saturating_sub(busy)),
         busy_slots: u32::from(busy),
@@ -853,8 +859,14 @@ async fn serve(
     interval: Duration,
     recorder: &mut Recorder,
 ) -> SessionEnd {
-    let mut described = hello(ports, &config.host_id);
-    if let Err(end) = send(socket, &HostMessage::Hello(described.clone())).await {
+    let policies = ports.store.policies().unwrap_or_default();
+    let mut described = advertised_targets(&policies);
+    if let Err(end) = send(
+        socket,
+        &HostMessage::Hello(hello(ports, &config.host_id, &policies)),
+    )
+    .await
+    {
         return end;
     }
     let mut ticks = tokio::time::interval(interval);
@@ -877,17 +889,22 @@ async fn serve(
                     let _ = socket.close(None).await;
                     return SessionEnd::Reconfigured;
                 }
-                let current = hello(ports, &config.host_id);
+                // Described again only when what it serves changed; the
+                // hardware figures that drift belong to the heartbeat.
+                let policies = ports.store.policies().unwrap_or_default();
+                let current = advertised_targets(&policies);
                 if current != described {
                     described = current;
-                    if let Err(end) = send(socket, &HostMessage::Hello(described.clone())).await {
+                    let message = HostMessage::Hello(hello(ports, &config.host_id, &policies));
+                    if let Err(end) = send(socket, &message).await {
                         return end;
                     }
                 }
-                if let Err(end) = send(socket, &HostMessage::Heartbeat(heartbeat(ports))).await {
+                let beat = HostMessage::Heartbeat(heartbeat(ports, &policies));
+                if let Err(end) = send(socket, &beat).await {
                     return end;
                 }
-                recorder.write();
+                recorder.keep_alive();
             }
         }
     }

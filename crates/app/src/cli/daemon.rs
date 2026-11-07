@@ -2381,7 +2381,12 @@ async fn run_target_loop<T: TargetReconciler>(
         loop {
             tokio::select! {
                 () = tokio::time::sleep_until(deadline) => break,
-                () = async { wake.expect("guarded").notified().await }, if wake.is_some() => {
+                () = async {
+                    match wake {
+                        Some(wake) => wake.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     deadline = super::coordinator::woken_deadline(
                         deadline,
                         polled_at,

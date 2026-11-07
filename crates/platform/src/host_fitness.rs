@@ -725,7 +725,7 @@ mod sys {
         queried.is_ok() && elevation.TokenIsElevated != 0
     }
 
-    pub(super) fn physical_memory_bytes() -> Option<u64> {
+    fn memory_status() -> Option<MEMORYSTATUSEX> {
         let mut status = MEMORYSTATUSEX {
             dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
             ..MEMORYSTATUSEX::default()
@@ -733,17 +733,15 @@ mod sys {
         // SAFETY: `status` is a correctly sized, length-stamped structure
         // owned by this frame.
         unsafe { GlobalMemoryStatusEx(&raw mut status) }.ok()?;
-        Some(status.ullTotalPhys)
+        Some(status)
+    }
+
+    pub(super) fn physical_memory_bytes() -> Option<u64> {
+        memory_status().map(|status| status.ullTotalPhys)
     }
 
     pub(super) fn available_memory_bytes() -> Option<u64> {
-        let mut status = MEMORYSTATUSEX {
-            dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
-            ..MEMORYSTATUSEX::default()
-        };
-        // SAFETY: as in `physical_memory_bytes`.
-        unsafe { GlobalMemoryStatusEx(&raw mut status) }.ok()?;
-        Some(status.ullAvailPhys)
+        memory_status().map(|status| status.ullAvailPhys)
     }
 
     pub(super) fn free_disk_bytes(path: &Path) -> Option<u64> {
@@ -1092,8 +1090,14 @@ mod sys {
 
     #[cfg(not(target_os = "macos"))]
     pub(super) fn physical_memory_bytes() -> Option<u64> {
+        meminfo_bytes("MemTotal:")
+    }
+
+    /// One `/proc/meminfo` field, in bytes.
+    #[cfg(not(target_os = "macos"))]
+    fn meminfo_bytes(field: &str) -> Option<u64> {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text.lines().find(|line| line.starts_with("MemTotal:"))?;
+        let line = text.lines().find(|line| line.starts_with(field))?;
         let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
         kib.checked_mul(1024)
     }
@@ -1105,12 +1109,7 @@ mod sys {
 
     #[cfg(not(target_os = "macos"))]
     pub(super) fn available_memory_bytes() -> Option<u64> {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text
-            .lines()
-            .find(|line| line.starts_with("MemAvailable:"))?;
-        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        kib.checked_mul(1024)
+        meminfo_bytes("MemAvailable:")
     }
 
     pub(super) fn free_disk_bytes(path: &Path) -> Option<u64> {

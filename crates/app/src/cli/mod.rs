@@ -1972,25 +1972,7 @@ impl Context {
     /// [`Failure::SecretStore`] when the platform cannot say where the store
     /// lives.
     pub fn secret_store(&self, start_mode: StartMode) -> Result<Arc<dyn SecretStore>, CliError> {
-        #[cfg(test)]
-        if let Some(double) = &self.secret_store_double {
-            return Ok(Arc::clone(double));
-        }
-
-        let scope = SecretScope::for_start_mode(start_mode);
-        let resolved = match &self.data_root {
-            Some(root) => PlatformSecretStore::rooted_at(scope, root),
-            None => PlatformSecretStore::standard(scope),
-        };
-        resolved
-            .map(|store| Arc::new(store) as Arc<dyn SecretStore>)
-            .map_err(|source| {
-                CliError::with_remedy(
-                    Failure::SecretStore,
-                    format!("cannot reach the {scope}-scoped secret store: {source}"),
-                    "runner-manager host show",
-                )
-            })
+        self.secret_store_for(start_mode, SecretItem::GithubCredential)
     }
 
     /// The same store as [`Self::secret_store`], holding `item` instead of
@@ -2003,9 +1985,14 @@ impl Context {
         start_mode: StartMode,
         item: SecretItem,
     ) -> Result<Arc<dyn SecretStore>, CliError> {
-        if item == SecretItem::GithubCredential {
-            return self.secret_store(start_mode);
+        // The double stands in for the GitHub credential only.
+        #[cfg(test)]
+        if item == SecretItem::GithubCredential
+            && let Some(double) = &self.secret_store_double
+        {
+            return Ok(Arc::clone(double));
         }
+
         let scope = SecretScope::for_start_mode(start_mode);
         let resolved = match &self.data_root {
             Some(root) => PlatformSecretStore::rooted_at(scope, root),

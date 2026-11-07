@@ -476,7 +476,7 @@ pub fn signing_key_from_seed(seed: &[u8; 32]) -> SigningKey {
     SigningKey::from_bytes(seed)
 }
 
-pub use ed25519_dalek::{SigningKey as HostSigningKey, VerifyingKey as HostPublicKey};
+pub use ed25519_dalek::SigningKey as HostSigningKey;
 
 #[cfg(test)]
 mod tests {
