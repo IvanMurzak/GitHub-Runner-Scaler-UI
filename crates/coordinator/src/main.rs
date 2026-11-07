@@ -91,7 +91,8 @@ enum HostsCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Revoke a host by id or name; a live connection is closed within seconds.
+    /// Revoke a host by id or name; a running server closes its live
+    /// connection within a second.
     Revoke { host: String },
 }
 
@@ -221,6 +222,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                             Box::new(app),
                             Arc::clone(&state.registry),
                         )
+                        .with_placement(Arc::clone(&state.placement))
                         .run(),
                     );
                 } else {

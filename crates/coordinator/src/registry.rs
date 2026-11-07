@@ -1,6 +1,10 @@
 //! The hosts connected right now, what they said about themselves, which of
 //! them a queued job should wake, and which of their targets the
 //! reconciliation sweep covers.
+//!
+//! Stage 3: a version-3 host whose target the sweep covers is in **launch
+//! mode** for that target's pool profiles. A queued pool job does not wake it;
+//! [`crate::placement`] sends it a `launch` instead, to exactly one such host.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -8,10 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use runner_manager_coordinator_protocol::{
-    CLOSE_REPLACED, HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, ServerMessage, Target,
-    TargetRef, TargetScope, Wake, WakeReason,
+    CLOSE_REPLACED, HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, LAUNCH_VERSION, ServerMessage,
+    Target, TargetRef, TargetScope, Wake, WakeReason,
 };
 use runner_manager_domain::model::Label;
+use runner_manager_domain::policy::is_pool_label;
 use tokio::sync::mpsc;
 
 use crate::webhook::{profile_covers, required_labels};
@@ -145,6 +150,25 @@ impl WakeLog {
     }
 }
 
+/// A host that may be sent a `launch` for one queued pool job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub host_id: String,
+    /// The host's target that serves the job's repository.
+    pub target: TargetRef,
+    /// The pool profile that would start the runner.
+    pub profile: String,
+    /// The profile keeps a persistent workspace there.
+    pub warm: bool,
+    pub heartbeat: Heartbeat,
+}
+
+/// Whether a job requiring `required` asks for a shared pool.
+#[must_use]
+pub fn is_pool_job(required: &[Label]) -> bool {
+    required.iter().any(|label| is_pool_label(label.as_str()))
+}
+
 /// A connected host, as `hosts list` would describe it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectedHost {
@@ -183,15 +207,84 @@ impl Registry {
         connection
     }
 
-    /// Forgets `connection`, unless a newer one has already replaced it.
-    pub fn unregister(&self, host_id: &str, connection: u64) {
+    /// Forgets `connection`, unless a newer one has already replaced it;
+    /// `true` when it was forgotten.
+    pub fn unregister(&self, host_id: &str, connection: u64) -> bool {
         let mut hosts = self.lock();
         if hosts
             .get(host_id)
             .is_some_and(|current| current.connection == connection)
         {
             hosts.remove(host_id);
+            return true;
         }
+        false
+    }
+
+    /// Queues `message` for `host_id`'s connection; `false` when it is not
+    /// connected or its queue is full.
+    pub fn send(&self, host_id: &str, message: ServerMessage) -> bool {
+        self.lock()
+            .get(host_id)
+            .is_some_and(|connected| connected.sender.try_send(Outbound::Send(message)).is_ok())
+    }
+
+    /// Asks `host_id`'s connection to close with `code`; `true` when it was
+    /// connected.
+    pub fn close(&self, host_id: &str, code: u16, reason: &'static str) -> bool {
+        self.lock().get(host_id).is_some_and(|connected| {
+            // A full queue still ends the connection: the server task sees the
+            // closed channel once this sender is dropped below.
+            connected
+                .sender
+                .try_send(Outbound::Close(code, reason))
+                .is_ok()
+        })
+    }
+
+    /// The ids of every connected host.
+    #[must_use]
+    pub fn host_ids(&self) -> Vec<String> {
+        self.lock().keys().cloned().collect()
+    }
+
+    /// Every connected host in launch mode for `repository` with an enabled
+    /// pool profile whose labels cover `required`, and its last heartbeat. A
+    /// host that has not sent a heartbeat yet is not a candidate.
+    #[must_use]
+    pub fn launch_candidates(&self, repository: &str, required: &[Label]) -> Vec<Candidate> {
+        let coverage = self.coverage();
+        let hosts = self.lock();
+        let mut candidates = Vec::new();
+        for (host_id, connected) in hosts.iter() {
+            if connected.version < LAUNCH_VERSION {
+                continue;
+            }
+            let (Some(hello), Some(heartbeat)) = (&connected.hello, &connected.heartbeat) else {
+                continue;
+            };
+            for target in &hello.targets {
+                let reference = target.reference();
+                if !reference.covers(repository) || !coverage.covers(&reference) {
+                    continue;
+                }
+                if let Some(profile) = target.profiles.iter().find(|profile| {
+                    profile.enabled
+                        && profile.labels.iter().any(|label| is_pool_label(label))
+                        && profile_covers(&profile.labels, required)
+                }) {
+                    candidates.push(Candidate {
+                        host_id: host_id.clone(),
+                        target: reference,
+                        profile: profile.name.clone(),
+                        warm: profile.warm,
+                        heartbeat: heartbeat.clone(),
+                    });
+                    break;
+                }
+            }
+        }
+        candidates
     }
 
     /// Records what a host said about itself and, to a version-2 host,
@@ -297,6 +390,8 @@ impl Registry {
         reason: WakeReason,
         delivery_id: &str,
     ) -> usize {
+        let pool = is_pool_job(required);
+        let coverage = self.coverage();
         let hosts = self.lock();
         let mut woken = 0;
         for (host_id, connected) in hosts.iter() {
@@ -307,6 +402,11 @@ impl Registry {
             else {
                 continue;
             };
+            // A pool job reaches a host in launch mode as a `launch` to one
+            // of them (see `crate::placement`), never as a wake to all.
+            if pool && connected.version >= LAUNCH_VERSION && coverage.covers(&target) {
+                continue;
+            }
             let wake = Wake {
                 target,
                 repository: repository.to_string(),
@@ -398,6 +498,7 @@ mod tests {
                     name: "default".into(),
                     labels: labels.iter().map(ToString::to_string).collect(),
                     enabled,
+                    warm: false,
                 }],
             }],
         }

@@ -1006,6 +1006,12 @@ impl RunnerAttempt {
         self.state
     }
 
+    /// When the attempt was allocated.
+    #[must_use]
+    pub const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+
     #[must_use]
     pub const fn outcome(&self) -> Option<&AttemptOutcome> {
         self.outcome.as_ref()

@@ -42,6 +42,15 @@
 //!   coordinator). Today's polling, at once: a loop asleep on the long
 //!   interval is re-scheduled the moment its target leaves `coordinated`.
 //!
+//! # Placement (stage 3)
+//!
+//! On a version-3 link, a pool profile (one carrying this host's
+//! `rm-pool-<os>` label) of a `coordinated` target starts runners only for
+//! the coordinator's `launch`es this host accepted; see [`super::launches`].
+//! The link answers each `launch` with a `launch_ack`, honours
+//! `cancel_launch`, and reports its attempts (`attempt_started` when a runner
+//! takes a job, `attempt_finished` when it ends).
+//!
 //! # Secrets
 //!
 //! The host's Ed25519 private key is generated at `join` and goes straight
@@ -60,7 +69,7 @@ use chrono::{DateTime, Utc};
 use futures::{SinkExt as _, StreamExt as _};
 use runner_manager_coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CoordinatorUrl, EnrollRequest, EnrollResponse,
-    HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, HostMessage, HostSigningKey,
+    HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, HostMessage, HostSigningKey, LAUNCH_VERSION,
     MIN_PROTOCOL_VERSION, Profile, ServerMessage, Target, TargetRef, TargetScope, Wake,
     decode_nonce, decode_signing_key, encode_public_key, encode_signing_key, negotiate,
     sign_challenge, signing_key_from_seed,
@@ -78,6 +87,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite;
 
+use super::launches::{AttemptReport, AttemptReports, Launches};
 use super::{CliError, Context, CoordinatorCommand, Failure, write_failed};
 
 /// The shortest gap between the start of a target's last poll and a
@@ -108,6 +118,9 @@ const CONFIG_RECHECK: Duration = Duration::from_secs(15);
 
 /// Version of `coordinator status --json`.
 const STATUS_SCHEMA_VERSION: u32 = 1;
+
+/// How often the link looks at this host's attempts for its reports.
+const ATTEMPT_WATCH: Duration = Duration::from_secs(2);
 
 /// How long a lost link keeps covered targets on the coordinated interval:
 /// a reconnect inside it changes nothing, and past it every target polls on
@@ -661,6 +674,20 @@ impl WakeRoutes {
         tracing::info!(target = %route.target, "the coordinator woke a target; polling it now");
         true
     }
+
+    /// Runs `target`'s next pass as soon as a wake may: a launch was
+    /// accepted for it. The shared reading is kept; the pass needs none.
+    pub fn nudge(&self, target: &TargetRef) -> bool {
+        let Some(route) = self
+            .routes
+            .iter()
+            .find(|route| same_target(&route.target, target))
+        else {
+            return false;
+        };
+        route.notify.notify_one();
+        true
+    }
 }
 
 fn same_target(local: &ScaleTarget, remote: &TargetRef) -> bool {
@@ -668,7 +695,7 @@ fn same_target(local: &ScaleTarget, remote: &TargetRef) -> bool {
     local.scope == remote.scope && local.name.eq_ignore_ascii_case(&remote.name)
 }
 
-fn target_ref(target: &ScaleTarget) -> TargetRef {
+pub(super) fn target_ref(target: &ScaleTarget) -> TargetRef {
     TargetRef {
         scope: match target {
             ScaleTarget::Repository(_) => TargetScope::Repo,
@@ -693,6 +720,8 @@ pub struct LinkView {
     /// The coordinator's last `hello_ack`; `None` before one, and from a
     /// version-1 coordinator.
     pub ack: Option<HelloAck>,
+    /// The protocol version of the last connection, kept while it is down.
+    pub version: Option<u32>,
 }
 
 impl LinkView {
@@ -710,6 +739,15 @@ impl LinkView {
                 .map(|since| now.saturating_duration_since(since)),
             covered,
         )
+    }
+
+    /// Whether `target`'s pool profiles start runners only on the
+    /// coordinator's launches: coordinated, on a version-3 link.
+    #[must_use]
+    pub fn launch_mode(&self, target: &ScaleTarget, now: tokio::time::Instant) -> bool {
+        self.version
+            .is_some_and(|version| version >= LAUNCH_VERSION)
+            && self.mode(target, now) == PollMode::Coordinated
     }
 
     /// When a coordinated target falls back on its own, if the link is down
@@ -744,6 +782,7 @@ pub fn advertised_targets(policies: &[ScalePolicy]) -> Vec<Target> {
             name: policy.profile_name().to_string(),
             labels: labels.as_registration_labels(),
             enabled: policy.may_start_runners(),
+            warm: policy.workspace_policy().is_persistent(),
         };
         match targets
             .iter_mut()
@@ -777,6 +816,8 @@ pub struct LinkPorts {
     pub runner_root: std::path::PathBuf,
     /// Where the link tells the target loops what it knows.
     pub coordination: Arc<Coordination>,
+    /// The coordinator's launches on this host (stage 3).
+    pub launches: Arc<Launches>,
 }
 
 /// Why one session ended, as fixed words for the link record.
@@ -1093,6 +1134,7 @@ async fn session(
             ports.coordination.send_modify(|view| {
                 view.connected = true;
                 view.down_since = None;
+                view.version = Some(version);
                 // A version-1 coordinator never sends a `hello_ack`; a
                 // version-2 one sends a fresh one right after `hello`, and
                 // until it does the last one stands, so a reconnect does not
@@ -1188,6 +1230,9 @@ async fn serve(
     }
     let mut ticks = tokio::time::interval(interval);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut watch = tokio::time::interval(ATTEMPT_WATCH);
+    watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut reports = AttemptReports::default();
     loop {
         tokio::select! {
             frame = next_text(socket) => {
@@ -1199,6 +1244,31 @@ async fn serve(
                     Ok(ServerMessage::Wake(wake)) => {
                         if ports.routes.deliver(&wake) {
                             recorder.woke();
+                        }
+                    }
+                    Ok(ServerMessage::Launch(launch)) if version >= LAUNCH_VERSION => {
+                        let ack = ports.launches.decide(
+                            &launch,
+                            ports.unfit.load(Ordering::Relaxed),
+                            ports.draining.load(Ordering::Relaxed),
+                        );
+                        tracing::info!(
+                            lease = %launch.lease_id,
+                            accepted = ack.accepted,
+                            reason = ack.reason.map_or("", |reason| reason.as_str()),
+                            "the coordinator placed a launch here"
+                        );
+                        let accepted = ack.accepted;
+                        if let Err(end) = send(socket, &HostMessage::LaunchAck(ack)).await {
+                            return end;
+                        }
+                        if accepted {
+                            ports.routes.nudge(&launch.target);
+                        }
+                    }
+                    Ok(ServerMessage::CancelLaunch(cancel)) if version >= LAUNCH_VERSION => {
+                        if ports.launches.cancel(&cancel.lease_id) {
+                            tracing::info!(lease = %cancel.lease_id, "the coordinator cancelled a launch");
                         }
                     }
                     Ok(ServerMessage::HelloAck(ack)) => {
@@ -1239,6 +1309,22 @@ async fn serve(
                     return end;
                 }
                 recorder.keep_alive();
+            }
+            _ = watch.tick(), if version >= LAUNCH_VERSION => {
+                let policies = ports.store.policies().unwrap_or_default();
+                let own: Vec<ScalePolicy> = policies
+                    .into_iter()
+                    .filter(|policy| policy.is_owned_by(ports.host.id))
+                    .collect();
+                for report in reports.poll(ports.store.as_ref(), &own, &ports.launches) {
+                    let message = match report {
+                        AttemptReport::Started(started) => HostMessage::AttemptStarted(started),
+                        AttemptReport::Finished(finished) => HostMessage::AttemptFinished(finished),
+                    };
+                    if let Err(end) = send(socket, &message).await {
+                        return end;
+                    }
+                }
             }
         }
     }
@@ -1425,16 +1511,23 @@ mod tests {
 
         let coordination = coordination();
         let mut view = coordination.subscribe();
+        let store: Arc<dyn Store> = Arc::new(store);
+        let launches = Arc::new(Launches::new(
+            Arc::clone(&store),
+            host.clone(),
+            coordination.subscribe(),
+        ));
         let link = tokio::spawn(maintain_link(LinkPorts {
             paths: paths.clone(),
             key_store,
-            store: Arc::new(store),
+            store,
             routes: Arc::new(routes),
             unfit: Arc::new(AtomicBool::new(false)),
             draining: Arc::new(AtomicBool::new(false)),
             host,
             runner_root: dir.path().to_path_buf(),
             coordination: Arc::clone(&coordination),
+            launches,
         }));
 
         // Connected and described.
@@ -1523,6 +1616,205 @@ mod tests {
         assert_eq!(snapshot.targets[0].mode, PollMode::Coordinated);
 
         link.abort();
+    }
+
+    /// Stage 3 end to end, in-process: a queued pool job reaches exactly this
+    /// host as a `launch`, which it accepts through its allocator and turns
+    /// into directed demand; a launch past `max_capacity`, a replayed lease
+    /// and one while draining are refused; and once the link has been down
+    /// past the fallback delay the profile serves its own demand again.
+    #[tokio::test]
+    async fn a_pool_launch_is_accepted_within_the_ceilings_and_fallback_restores_own_demand() {
+        use hmac::{Hmac, KeyInit as _, Mac as _};
+        use runner_manager_agent::reconcile::DemandDirector as _;
+        use runner_manager_coordinator::server::{AppState, Config, serve};
+        use runner_manager_coordinator_protocol::{Launch, RefusalReason};
+        use runner_manager_domain::policy::pool_label;
+        use runner_manager_domain::store::SqliteStore;
+        use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope};
+        use runner_manager_testkit::fixtures;
+
+        const SECRET: &str = "a-webhook-secret-for-tests";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let state = AppState::new(
+            Config::new(base.clone(), SecretString::from(SECRET)),
+            runner_manager_coordinator::store::Store::open_in_memory().expect("store"),
+        );
+        state
+            .registry
+            .set_coverage(runner_manager_coordinator::registry::Coverage {
+                interval: Some(Duration::from_secs(120)),
+                repositories: ["octo/app".to_string()].into(),
+                accounts: std::collections::BTreeSet::new(),
+            });
+        tokio::spawn(serve(listener, Arc::clone(&state), std::future::pending()));
+        let code = state
+            .store
+            .lock()
+            .expect("store")
+            .create_invite("pool-box", Duration::from_secs(900), Utc::now())
+            .expect("invite")
+            .code;
+        let url = CoordinatorUrl::parse(&base).expect("url");
+        let key = signing_key_from_seed(&[6; 32]);
+        let enrolled = enroll(
+            &url,
+            &EnrollRequest {
+                protocol_version: MIN_PROTOCOL_VERSION,
+                code: code.expose_secret().to_string(),
+                hostname: "pool-box".into(),
+                public_key: encode_public_key(&key.verifying_key()),
+            },
+        )
+        .await
+        .expect("enrolled");
+
+        let dir = tempfile::tempdir().expect("dir");
+        let paths = AppPaths::rooted_at(dir.path());
+        records::save(
+            &paths,
+            &CoordinatorConfig::new(
+                url.origin(),
+                enrolled.host_id.clone(),
+                enrolled.name,
+                Utc::now(),
+            ),
+        )
+        .expect("config");
+        let key_store: Arc<dyn SecretStore> = Arc::new(
+            PlatformSecretStore::rooted_at(SecretScope::User, dir.path().join("secrets"))
+                .expect("store")
+                .for_item(SecretItem::CoordinatorKey),
+        );
+        key_store
+            .store(&SecretString::from(encode_signing_key(&key)))
+            .expect("key stored");
+
+        let host = fixtures::host().build();
+        let mut policy = fixtures::policy()
+            .repository("octo/app")
+            .host(host.id)
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let pool = pool_label(host.os);
+        policy.add_routing_label(pool.clone()).expect("pool label");
+        let sqlite = SqliteStore::open_in_memory().expect("store");
+        sqlite.put_host(&host).expect("host");
+        sqlite.insert_policy(&policy).expect("policy");
+        let store: Arc<dyn Store> = Arc::new(sqlite);
+        let mut routes = WakeRoutes::new(None);
+        let nudged = routes.add(policy.target.clone());
+        let coordination = coordination();
+        let launches = Arc::new(Launches::new(
+            Arc::clone(&store),
+            host.clone(),
+            coordination.subscribe(),
+        ));
+        let draining = Arc::new(AtomicBool::new(false));
+        let link = tokio::spawn(maintain_link(LinkPorts {
+            paths,
+            key_store,
+            store,
+            routes: Arc::new(routes),
+            unfit: Arc::new(AtomicBool::new(false)),
+            draining: Arc::clone(&draining),
+            host,
+            runner_root: dir.path().to_path_buf(),
+            coordination: Arc::clone(&coordination),
+            launches: Arc::clone(&launches),
+        }));
+
+        // Connected at version 3, covered, and its heartbeat in.
+        let mut view = coordination.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            view.wait_for(|view| view.ack.as_ref().is_some_and(|ack| !ack.covered.is_empty())),
+        )
+        .await
+        .expect("covered in time")
+        .expect("the link is alive");
+        assert!(launches.is_directed(&policy));
+        assert_eq!(launches.directed_demand(&policy), Some(0));
+        for _ in 0..200 {
+            if state
+                .registry
+                .connected()
+                .iter()
+                .all(|host| host.heartbeat.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let body = serde_json::json!({
+            "action": "queued",
+            "workflow_job": {"id": 41, "run_id": 2, "labels": [pool.as_str()]},
+            "repository": {"full_name": "octo/app"},
+        })
+        .to_string();
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(SECRET.as_bytes()).expect("key");
+        mac.update(body.as_bytes());
+        let status = reqwest::Client::new()
+            .post(format!("{base}/webhook"))
+            .header("x-github-event", "workflow_job")
+            .header("x-github-delivery", "pool-1")
+            .header(
+                "x-hub-signature-256",
+                format!("sha256={}", hex::encode(mac.finalize().into_bytes())),
+            )
+            .body(body)
+            .send()
+            .await
+            .expect("delivered")
+            .status();
+        assert_eq!(status, 200);
+        tokio::time::timeout(Duration::from_secs(5), nudged.notified())
+            .await
+            .expect("the accepted launch nudged the target loop");
+        assert_eq!(launches.open_for(policy.id), 1);
+        assert_eq!(launches.directed_demand(&policy), Some(1));
+
+        // max_capacity is 1 and one launch is open: a second is refused.
+        let launch = |lease: &str| Launch {
+            target: target_ref(&policy.target),
+            profile: policy.profile_name().to_string(),
+            job_key: "octo/app#42".into(),
+            lease_id: lease.into(),
+            expires_at: 0,
+            ttl_secs: 300,
+        };
+        let refused = launches.decide(&launch("second"), false, false);
+        assert_eq!(refused.reason, Some(RefusalReason::MaxCapacity));
+        assert_eq!(
+            launches.decide(&launch("second"), false, false).reason,
+            Some(RefusalReason::Stale),
+            "a lease id is used once"
+        );
+        assert_eq!(
+            launches.decide(&launch("third"), false, true).reason,
+            Some(RefusalReason::Draining)
+        );
+        assert!(
+            !launches.cancel("second"),
+            "a refused launch was never opened"
+        );
+
+        // The link goes down and stays down past the fallback delay: the
+        // profile is no longer directed and serves its own demand.
+        link.abort();
+        coordination.send_modify(|view| {
+            view.connected = false;
+            view.down_since =
+                tokio::time::Instant::now().checked_sub(FALLBACK_AFTER + Duration::from_secs(1));
+        });
+        assert!(!launches.is_directed(&policy));
+        assert_eq!(launches.directed_demand(&policy), None);
     }
 
     #[test]

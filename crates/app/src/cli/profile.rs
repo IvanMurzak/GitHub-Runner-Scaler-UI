@@ -228,6 +228,10 @@ pub fn dispatch(
             }
             show_policy(&policy, out)
         }
+        RepoProfileCommand::SetPool(args) => {
+            let (target, profile) = selected(&args.selection)?;
+            policy::set_pool_selected(context, &target, profile, args.pool.is_on(), out)
+        }
         RepoProfileCommand::Remove(args) => {
             let (target, profile) = selected(&args.selection)?;
             policy::remove_selected(context, target, profile, args.purge, out)
@@ -329,14 +333,19 @@ fn show_policy(
         .workspace_policy()
         .root()
         .map_or("-", |root| root.as_str());
+    let pool = policy
+        .routing_labels()
+        .and_then(|labels| labels.pool_label())
+        .map_or("-", |label| label.as_str());
     writeln!(
         out,
-        "{} profile={} host_label={} selector={} labels={} enabled={} state={} min={} max={} workspace={} workspace_path={} execution={}",
+        "{} profile={} host_label={} selector={} labels={} pool={} enabled={} state={} min={} max={} workspace={} workspace_path={} execution={}",
         policy.target,
         policy.profile_name(),
         policy.requested_host_label,
         selector.unwrap_or("monitor-only"),
         labels,
+        pool,
         policy.enabled(),
         policy.state(),
         policy.min_capacity(),

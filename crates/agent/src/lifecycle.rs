@@ -4791,7 +4791,10 @@ impl RunnerLauncher for LifecycleLauncher {
     }
 }
 
-fn runner_name(attempt: AttemptId) -> String {
+/// The name an attempt's runner registers with GitHub, which a
+/// `workflow_job` webhook's `runner_name` repeats.
+#[must_use]
+pub fn runner_name(attempt: AttemptId) -> String {
     format!("runner-manager-{attempt}")
 }
 

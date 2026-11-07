@@ -48,6 +48,7 @@ pub mod daemon;
 pub mod docker_cleanup;
 pub mod doctor;
 pub mod host;
+pub mod launches;
 pub mod policy;
 pub mod polling;
 pub mod profile;
@@ -1290,6 +1291,8 @@ pub enum RepoProfileCommand {
     RemoveLabel(RepoProfileLabelArgs),
     SetWorkspace(RepoProfileWorkspaceArgs),
     SetExecution(RepoProfileExecutionArgs),
+    /// Answer this host's coordinator pool label (rm-pool-<os>).
+    SetPool(RepoProfilePoolArgs),
     Remove(RepoProfileRemoveArgs),
 }
 
@@ -1396,6 +1399,28 @@ pub struct RepoProfileExecutionArgs {
     #[command(flatten)]
     pub isolation: IsolationArgs,
 }
+#[derive(Debug, Args)]
+pub struct RepoProfilePoolArgs {
+    #[command(flatten)]
+    pub selection: RepoProfileSelectArgs,
+    #[arg(long, value_enum)]
+    pub pool: PoolSwitch,
+}
+
+/// `--pool on|off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PoolSwitch {
+    On,
+    Off,
+}
+
+impl PoolSwitch {
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct RepoProfileRemoveArgs {
     #[command(flatten)]
@@ -1548,6 +1573,8 @@ pub enum OrgCommand {
     AddLabel(OrgLabelArgs),
     /// Stop answering a label. The derived host label cannot be removed.
     RemoveLabel(OrgLabelArgs),
+    /// Answer this host's coordinator pool label (rm-pool-<os>).
+    SetPool(OrgPoolArgs),
     /// Remove a policy, optionally with its cache and diagnostics.
     Remove(OrgRemoveArgs),
     /// Persistent dependency caches for this organization's runners.
@@ -1578,6 +1605,14 @@ pub struct OrgLabelArgs {
     /// The label to add or remove, repeatable.
     #[arg(long = "label", value_name = "LABEL", required = true)]
     pub labels: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct OrgPoolArgs {
+    #[arg(value_name = "ORG")]
+    pub organization: String,
+    #[arg(long, value_enum)]
+    pub pool: PoolSwitch,
 }
 
 #[derive(Debug, Args)]

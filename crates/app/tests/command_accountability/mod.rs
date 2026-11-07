@@ -593,6 +593,10 @@ pub const MANIFEST: &[Classification] = &[
         "profile_commands_mutate_and_remove_only_the_selected_sibling"
     ),
     profile_row!(
+        "repo profile set-pool",
+        "pool_labels_follow_the_host_os_and_belong_to_one_profile_per_target"
+    ),
+    profile_row!(
         "repo profile remove",
         "profile_commands_mutate_and_remove_only_the_selected_sibling"
     ),
@@ -619,6 +623,10 @@ pub const MANIFEST: &[Classification] = &[
     generated("org set-scale"),
     generated("org add-label"),
     generated("org remove-label"),
+    profile_row!(
+        "org set-pool",
+        "pool_labels_follow_the_host_os_and_belong_to_one_profile_per_target"
+    ),
     generated("org remove"),
     cache_row!(
         "org cache show",

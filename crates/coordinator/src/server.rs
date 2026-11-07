@@ -25,18 +25,19 @@ use axum::routing::{get, post};
 use chrono::Utc;
 use runner_manager_coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CONNECT_PATH, ENROLL_PATH, EnrollRequest,
-    EnrollResponse, HEALTH_PATH, HostMessage, MAX_MESSAGE_BYTES, MIN_PROTOCOL_VERSION, NONCE_LEN,
-    PROTOCOL_VERSION, ServerMessage, WEBHOOK_PATH, decode_public_key, encode_nonce, supported,
-    verify_challenge,
+    EnrollResponse, HEALTH_PATH, HostMessage, LAUNCH_VERSION, MAX_MESSAGE_BYTES,
+    MIN_PROTOCOL_VERSION, NONCE_LEN, PROTOCOL_VERSION, ServerMessage, WEBHOOK_PATH,
+    decode_public_key, encode_nonce, supported, verify_challenge,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use tokio::sync::mpsc;
 
+use crate::placement::{CLAIM_GRACE, JobKey, Placement};
 use crate::registry::{OUTBOUND_QUEUE, Outbound, Registry};
 use crate::store::{EnrollError, Store};
 use crate::webhook::{
-    DELIVERY_MEMORY, DeliveryLog, MAX_BODY_BYTES, WorkflowJobEvent, action_name, signature_valid,
-    valid_delivery_id,
+    DELIVERY_MEMORY, DeliveryLog, MAX_BODY_BYTES, WorkflowJobEvent, action_name, required_labels,
+    signature_valid, valid_delivery_id,
 };
 
 /// Largest enrollment request body.
@@ -57,7 +58,10 @@ pub struct Config {
     pub heartbeat_interval: Duration,
     /// How long a new connection has to answer its challenge.
     pub auth_timeout: Duration,
-    /// How often a live connection re-checks that its host is not revoked.
+    /// How often the server checks whether the admin CLI wrote to the
+    /// database (SQLite's `data_version`, no query), and if so closes the
+    /// connections of revoked hosts. Also how often a connection checks that
+    /// its host is still heard from.
     pub revocation_check: Duration,
     /// Connection and enrollment attempts allowed per client address per
     /// minute.
@@ -73,7 +77,7 @@ impl Config {
             trust_forwarded_for: false,
             heartbeat_interval: Duration::from_secs(15),
             auth_timeout: Duration::from_secs(10),
-            revocation_check: Duration::from_secs(10),
+            revocation_check: Duration::from_millis(500),
             attempts_per_minute: 20,
         }
     }
@@ -85,6 +89,8 @@ pub struct AppState {
     pub config: Config,
     pub store: Mutex<Store>,
     pub registry: Arc<Registry>,
+    /// Stage 3: which host starts a runner for a queued pool job.
+    pub placement: Arc<Placement>,
     deliveries: Mutex<DeliveryLog>,
     limiter: RateLimiter,
 }
@@ -92,13 +98,47 @@ pub struct AppState {
 impl AppState {
     #[must_use]
     pub fn new(config: Config, store: Store) -> Arc<Self> {
+        let registry = Arc::new(Registry::default());
         Arc::new(Self {
             limiter: RateLimiter::new(config.attempts_per_minute),
             config,
             store: Mutex::new(store),
-            registry: Arc::new(Registry::default()),
+            placement: Arc::new(Placement::new(Arc::clone(&registry))),
+            registry,
             deliveries: Mutex::new(DeliveryLog::new(DELIVERY_MEMORY)),
         })
+    }
+
+    /// Revokes a host and closes its live connection at once: the in-process
+    /// path. The admin CLI, another process, is noticed by
+    /// `watch_revocations` instead.
+    ///
+    /// # Errors
+    /// The store's: no such active host, an ambiguous name, SQLite.
+    pub fn revoke(&self, host: &str) -> Result<crate::store::HostRecord, crate::store::StoreError> {
+        let record = self.store().revoke(host, Utc::now())?;
+        close_revoked(self);
+        Ok(record)
+    }
+
+    /// Rebalances `key` after `delay`, off the caller's task.
+    fn rebalance_later(&self, key: JobKey, delay: Duration) {
+        let placement = Arc::clone(&self.placement);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            placement.rebalance(&key).await;
+        });
+    }
+
+    /// Retries every unplaced pool job, off the caller's task: a slot was
+    /// freed somewhere.
+    fn retry_placement(&self) {
+        let placement = Arc::clone(&self.placement);
+        tokio::spawn(async move {
+            for key in placement.expire(Instant::now()) {
+                placement.rebalance(&key).await;
+            }
+        });
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
@@ -139,7 +179,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Serves until the listener fails or `shutdown` resolves.
+/// Serves until the listener fails or `shutdown` resolves, with placement's
+/// lease clock and the revocation watcher running beside it.
 ///
 /// # Errors
 /// The listener's.
@@ -148,12 +189,57 @@ pub async fn serve(
     state: Arc<AppState>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(
+    let placement = tokio::spawn(Arc::clone(&state.placement).run());
+    let revocations = tokio::spawn(watch_revocations(Arc::clone(&state)));
+    let served = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
-    .await
+    .await;
+    placement.abort();
+    revocations.abort();
+    served
+}
+
+/// Closes a revoked host's connection as soon as `hosts revoke` commits.
+///
+/// The admin CLI is another process writing the same SQLite file, so there is
+/// nothing to signal across. Every [`Config::revocation_check`] (500 ms) this
+/// reads SQLite's `data_version`, which only another connection's commit
+/// changes and which costs no query; only when it moved does it look up the
+/// connected hosts. Chosen over a loopback admin endpoint, which would be one
+/// more door on a server that faces the internet behind a proxy.
+async fn watch_revocations(state: Arc<AppState>) {
+    let mut ticks = tokio::time::interval(state.config.revocation_check);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut seen = state.store().data_version().ok();
+    loop {
+        ticks.tick().await;
+        let version = state.store().data_version().ok();
+        if version == seen {
+            continue;
+        }
+        seen = version;
+        close_revoked(&state);
+    }
+}
+
+/// Closes the connection of every connected host that is no longer active.
+pub fn close_revoked(state: &AppState) {
+    for host_id in state.registry.host_ids() {
+        let active = state
+            .store()
+            .active_host(&host_id)
+            .map(|record| record.is_some());
+        if matches!(active, Ok(false))
+            && state
+                .registry
+                .close(&host_id, CLOSE_UNAUTHORIZED, "revoked")
+        {
+            tracing::info!(%host_id, "a revoked host was disconnected");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,20 +282,42 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                 return StatusCode::BAD_REQUEST.into_response();
             };
             let action = action_name(&job.action);
+            let required = required_labels(&job.workflow_job.labels);
+            let repository = &job.repository.full_name;
             if action == "queued" {
-                let woken = state.registry.wake_for_job(
-                    &job.repository.full_name,
-                    &job.workflow_job.labels,
-                    delivery,
-                );
+                let woken =
+                    state
+                        .registry
+                        .wake_for_job(repository, &job.workflow_job.labels, delivery);
+                let placed = required
+                    .and_then(|required| {
+                        state
+                            .placement
+                            .queued(repository, &required, job.workflow_job.id)
+                    })
+                    .map(|key| state.rebalance_later(key, Duration::ZERO))
+                    .is_some();
                 tracing::info!(
                     %delivery,
                     job_id = job.workflow_job.id,
                     run_id = job.workflow_job.run_id,
                     woken,
+                    placed,
                     "a queued job woke the hosts that serve it"
                 );
             } else {
+                // A pool job left the queue: its surplus lease, if any, is
+                // cancelled once the host whose runner took it had time to
+                // say so.
+                if matches!(action, "in_progress" | "completed")
+                    && let Some(key) = required.and_then(|required| {
+                        state
+                            .placement
+                            .dequeued(repository, &required, job.workflow_job.id)
+                    })
+                {
+                    state.rebalance_later(key, CLAIM_GRACE);
+                }
                 // Recorded for later stages (statistics, lease confirmation).
                 tracing::info!(
                     %delivery,
@@ -386,6 +494,13 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
     }
     let (sender, receiver) = mpsc::channel(OUTBOUND_QUEUE);
     let connection = state.registry.register(&host_id, protocol_version, sender);
+    // A revocation committed between the check above and this registration
+    // would be missed by the watcher, which looks only at connected hosts.
+    if !matches!(state.store().active_host(&host_id), Ok(Some(_))) {
+        state.registry.unregister(&host_id, connection);
+        close(&mut socket, CLOSE_UNAUTHORIZED, "revoked").await;
+        return;
+    }
     tracing::info!(%host_id, version = protocol_version, "a host connected");
     let _ = state.store().touch(&host_id, Utc::now());
     serve_host(
@@ -396,7 +511,9 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         receiver,
     )
     .await;
-    state.registry.unregister(&host_id, connection);
+    if state.registry.unregister(&host_id, connection) {
+        state.placement.host_gone(&host_id);
+    }
     tracing::info!(%host_id, "a host disconnected");
 }
 
@@ -449,8 +566,26 @@ async fn serve_host(
                             let _ = state.store().touch(host_id, Utc::now());
                         }
                     }
-                    // A second `auth`, a newer message type, or garbage: skipped.
-                    Ok(HostMessage::Auth { .. } | HostMessage::Unknown) | Err(_) => {}
+                    Ok(HostMessage::LaunchAck(ack)) if version >= LAUNCH_VERSION => {
+                        state.placement.acknowledged(host_id, ack);
+                    }
+                    Ok(HostMessage::AttemptStarted(started)) if version >= LAUNCH_VERSION => {
+                        state.placement.attempt_started(host_id, &started);
+                    }
+                    Ok(HostMessage::AttemptFinished(finished)) if version >= LAUNCH_VERSION => {
+                        state.placement.attempt_finished(host_id, &finished);
+                        state.retry_placement();
+                    }
+                    // A second `auth`, a message its version does not have, a
+                    // newer message type, or garbage: skipped.
+                    Ok(
+                        HostMessage::Auth { .. }
+                        | HostMessage::Unknown
+                        | HostMessage::LaunchAck(_)
+                        | HostMessage::AttemptStarted(_)
+                        | HostMessage::AttemptFinished(_),
+                    )
+                    | Err(_) => {}
                 }
             }
             outbound = receiver.recv() => match outbound {
@@ -465,13 +600,9 @@ async fn serve_host(
                 }
                 None => return,
             },
+            // Revocation is the watcher's (`watch_revocations`): it closes
+            // this connection through the registry.
             _ = checks.tick() => {
-                let active = state.store().active_host(host_id).map(|record| record.is_some());
-                if matches!(active, Ok(false)) {
-                    tracing::info!(%host_id, "a revoked host was disconnected");
-                    close(socket, CLOSE_UNAUTHORIZED, "revoked").await;
-                    return;
-                }
                 if last_heard.elapsed() > silence_limit {
                     tracing::info!(%host_id, "a silent host was disconnected");
                     close(socket, 1001, "silent").await;

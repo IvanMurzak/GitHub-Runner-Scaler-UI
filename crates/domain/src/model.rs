@@ -210,6 +210,18 @@ impl Os {
         }
     }
 
+    /// The token this OS contributes to its shared pool label
+    /// (`rm-pool-<token>`, coordinator design D10). Spelled out, unlike
+    /// [`Self::label_token`], because workflow authors write it by hand.
+    #[must_use]
+    pub const fn pool_token(self) -> &'static str {
+        match self {
+            Os::Windows => "windows",
+            Os::MacOs => "macos",
+            Os::Linux => "linux",
+        }
+    }
+
     /// Container actions and service containers require Linux
     /// (`01-current-architecture.md`, edge case 2). `f2` surfaces this on a
     /// macOS or Windows policy.

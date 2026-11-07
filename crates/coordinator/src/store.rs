@@ -293,6 +293,18 @@ impl Store {
         Ok(record)
     }
 
+    /// SQLite's `data_version`: it changes whenever **another** connection
+    /// (the admin CLI's) commits to the file, and costs no query. The server
+    /// watches it to act on a revocation at once.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn data_version(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .connection
+            .pragma_query_value(None, "data_version", |row| row.get(0))?)
+    }
+
     /// Records that the host was heard from.
     ///
     /// # Errors

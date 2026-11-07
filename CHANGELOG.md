@@ -48,6 +48,28 @@ Not released yet: this is the version being prepared.
 - The host-coordinator protocol is now version 2 (the coordinator's `hello_ack`
   names the covered targets). Version-1 hosts and coordinators keep working:
   both sides settle on the highest version they share.
+- Coordinator stage 3: shared pool labels (`rm-pool-windows`, `rm-pool-linux`,
+  `rm-pool-macos`). `repo profile set-pool OWNER/REPO [--profile NAME] --pool on|off`
+  and `org set-pool ORG --pool on|off` give a profile this host's pool label;
+  `profile list`/`show` print `pool=`, and the TUI's profile settings show the
+  `runs-on:` line. Another OS's pool label, an unknown `rm-pool-` label and a
+  second pool profile on the same target are refused.
+- For a queued job that asks for a pool label, the coordinator sends exactly one
+  host a `launch` (ranked by a warm persistent workspace, then free RAM, then
+  fewest busy slots), moves on after a refusal or 10 s without an answer, and
+  never holds more 5-minute leases than jobs are queued; a job that leaves the
+  queue cancels its surplus lease. A pool profile whose target is `coordinated`
+  starts runners only for the launches it accepted, through its own allocator
+  and every ceiling; in `fallback` and `standalone` it serves its own demand as
+  before. Hosts report `attempt_started` and `attempt_finished`.
+- The protocol is now version 3. Version-2 hosts and coordinators keep working
+  at version 2: such a host is woken for pool jobs and computes its own demand.
+
+### Changed
+
+- Revoking a host on the coordinator (`hosts revoke`) now closes its live
+  connection within a second: the server notices the admin command's commit
+  through SQLite's `data_version` instead of re-reading every 10 seconds.
 
 ## 0.4.44
 

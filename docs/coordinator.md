@@ -8,7 +8,9 @@ every host polls GitHub on its own exactly as before.
 Design and owner decisions: [`.taskflow/2026-11-07-coordinator-server/README.md`](../.taskflow/2026-11-07-coordinator-server/README.md).
 Stage 1: the coordinator wakes hosts. Stage 2: with its own GitHub App configured, it also runs a
 **reconciliation sweep** over the hosts' repositories, and hosts it covers poll GitHub rarely (see
-[Poll modes](#poll-modes)). Hosts still compute demand themselves.
+[Poll modes](#poll-modes)). Stage 3: for jobs that ask for a **shared pool label**
+(`runs-on: rm-pool-linux`), the coordinator picks exactly one host to start the runner (see
+[Shared pools](#shared-pools)). Every other job: hosts still compute demand themselves.
 
 ## What it can and cannot do
 
@@ -17,12 +19,18 @@ Stage 1: the coordinator wakes hosts. Stage 2: with its own GitHub App configure
 - With a GitHub App configured, it reads the queued jobs of the repositories its hosts serve with
   the App's own installation tokens (read-only), and tells the hosts which of their targets that
   sweep covers. Nothing else.
+- For a queued pool job it sends one host a `launch` ("start one runner of this pool profile"),
+  which that host checks against its own policy, `max_capacity`, host capacity, `host doctor`
+  fitness and drain state before it starts anything; a host may refuse, and the coordinator then
+  asks the next one.
 - It never sees a host's GitHub token, a JIT configuration, a job log or source code. A host checks
   every wake against nothing: it simply polls, and its own policies, capacity and `host doctor`
   checks decide whether a runner starts.
 - A woken target is polled at most once every 5 seconds, and never while GitHub has asked that
   host to slow down. A compromised coordinator can at worst make hosts poll a little more often,
-  or (by claiming coverage it does not have) poll a covered idle target only every 5 minutes.
+  or (by claiming coverage it does not have) poll a covered idle target only every 5 minutes, or
+  (through launches) fill pool profiles up to the ceilings their owners set, or leave them idle
+  for as long as it holds them in coordinated mode.
 - Hosts connect **out** over `wss://`, so they keep working behind NAT. If the coordinator is
   down, hosts poll on their own; nothing waits for it.
 
@@ -146,6 +154,82 @@ GitHub App covers nothing, so its hosts are in `fallback` and behave as in stage
 The protocol is versioned: a stage-1 host and this coordinator, or this host and a stage-1
 coordinator, settle on version 1 and work as stage 1 did (the host is then in `fallback`).
 
+## Shared pools
+
+Without a coordinator, a job reaches a host through a label that host carries, usually its own
+`rm-<host>-<os>-<arch>` selector. Two hosts carrying the same label both start a runner for the
+same job, and the one that loses exits idle after wasting a slot. A **pool label** lets the
+coordinator choose instead (design decisions D4 and D10):
+
+| Label | Hosts |
+|---|---|
+| `rm-pool-linux` | Linux hosts (and a managed WSL distribution joined as its own host) |
+| `rm-pool-windows` | Windows hosts |
+| `rm-pool-macos` | macOS hosts |
+
+On each host, give the profile that should serve the pool its OS's pool label:
+
+```bash
+runner-manager repo profile set-pool octo/app [--profile NAME] --pool on    # repository target
+runner-manager org set-pool octo --pool on                                   # organization target
+runner-manager repo profile show octo/app --profile NAME                     # pool=rm-pool-linux
+```
+
+`set-pool` adds this host's own pool label; `add-label` with a pool label works the same way. A
+label in the reserved `rm-pool-` namespace that is not this host's (`rm-pool-windows` on Linux, or
+an unknown class such as `rm-pool-linux-heavy`) is refused. At most one profile of a target on a
+host may carry the pool label: a pool job selects its profile by that label alone, and two
+profiles matching one job fall under the existing rule that overlapping profiles start no
+runner, so `set-pool` refuses the second one and names the first. The TUI's profile settings
+show the pool line ready to copy.
+
+Then switch the workflows that may run on any machine of that OS:
+
+```yaml
+jobs:
+  build:
+    runs-on: rm-pool-linux          # any Linux host of the pool; the coordinator picks one
+  release:
+    runs-on: rm-home-linux-x64      # still pinned to one machine by its own selector
+```
+
+Labels can be combined (`runs-on: [rm-pool-linux, gpu]`): only pool profiles carrying every label
+are candidates.
+
+### How a host is chosen
+
+When a pool job is queued (webhook `queued`, or counted by the sweep), the coordinator picks one
+**candidate**: a connected version-3 host whose target serving the repository is covered by the
+sweep, with an enabled pool profile whose labels cover the job, not unfit, not draining, and with
+a free slot by its last heartbeat once the launches already sent to it are counted. It prefers a
+profile with a persistent workspace for that repository (a warm checkout), then the most free
+RAM, then the fewest busy slots. It sends that host a `launch` and waits up to 10 seconds for the
+answer; a refusal (`max_capacity`, `host_capacity`, `unfit`, `draining`, `disabled`,
+`not_coordinated`, ...) or no answer moves on to the next candidate. A job no candidate can take
+waits and is retried every 5 seconds, and whenever a host reports a runner ended.
+
+A launch is a **lease** for 5 minutes. GitHub hands a runner *any* queued job its labels cover, so
+the coordinator counts per repository and label set: it never holds more leases than jobs are
+queued. A lease closes when its runner takes a job (the host's `attempt_started`), when its
+attempt ends (`attempt_finished`), when its host disconnects, or when it expires; the job, if still
+queued, is then placed again. When a job leaves the queue another way (cancelled, or taken by a
+runner outside the pool), the surplus lease is cancelled (`cancel_launch`) and its host starts no
+runner for it.
+
+### On the host
+
+A pool profile is **directed** while its target is `coordinated` on a version-3 link: it starts
+runners only for the launches it accepted, never from its own reading of the queue (which every
+host of the pool sees the same way). It accepts a launch only when its own allocator, over its
+own attempts and ceilings, grants one more runner. In `fallback` and `standalone`, against a
+version-2 coordinator, or without the GitHub App's sweep, a pool profile is an ordinary profile:
+it polls and starts runners from its own demand, and a surplus runner exits idle as before.
+
+Hosts and coordinators of different versions keep working together: a version-2 host serving a
+pool label is woken for pool jobs as in stage 2 and computes its own demand; a version-3 host
+connected to a version-2 coordinator never sees a launch and serves its pool profiles from its
+own demand.
+
 ## Enroll a host
 
 On the coordinator's machine, issue a one-time code (valid 15 minutes by default, usable once;
@@ -179,7 +263,11 @@ docker compose exec coordinator runner-manager-coordinator hosts list [--json]
 docker compose exec coordinator runner-manager-coordinator hosts revoke win-big   # name or id
 ```
 
-A revoked host's live connection is closed within about ten seconds and it cannot reconnect.
+A revoked host's live connection is closed within a second and it cannot reconnect. The admin
+command is another process writing the same SQLite file, so the server watches SQLite's
+`data_version` (changed only by another connection's commit, read without a query) every 500 ms
+and, when it moved, closes the connections of hosts that are no longer active. There is no admin
+endpoint to signal it, on purpose: see the security notes.
 To move a host to a new key, revoke it, issue a new invite, then on the host run
 `runner-manager coordinator leave` and `join` again.
 

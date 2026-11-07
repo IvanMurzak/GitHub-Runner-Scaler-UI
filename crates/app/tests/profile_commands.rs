@@ -631,3 +631,172 @@ fn profile_commands_mutate_and_remove_only_the_selected_sibling() {
     assert_eq!(after[0].id, default_id);
     assert_eq!(after[0].revision(), default_revision);
 }
+
+/// This host's own shared pool label for the coordinator (stage 3, D10).
+fn own_pool_label() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        ("rm-pool-windows", "rm-pool-linux")
+    } else if cfg!(target_os = "macos") {
+        ("rm-pool-macos", "rm-pool-linux")
+    } else {
+        ("rm-pool-linux", "rm-pool-windows")
+    }
+}
+
+#[test]
+fn pool_labels_follow_the_host_os_and_belong_to_one_profile_per_target() {
+    let (pool, foreign) = own_pool_label();
+    let data_dir = tempfile::tempdir().unwrap();
+    signed_in(data_dir.path());
+    let github = FakeGithub::start();
+    github.with_installation(77, "octo", "Organization", "all", &["octo/one"]);
+    for args in [
+        vec![
+            "repo",
+            "add",
+            "octo/one",
+            "--host-label",
+            "home",
+            "--max-capacity",
+            "1",
+        ],
+        vec![
+            "repo",
+            "profile",
+            "add",
+            "octo/one",
+            "--name",
+            "build",
+            "--max-capacity",
+            "2",
+        ],
+        vec![
+            "org",
+            "add",
+            "octo",
+            "--host-label",
+            "home",
+            "--max-capacity",
+            "1",
+        ],
+    ] {
+        let result = run({
+            let mut command = runner_manager_against(data_dir.path(), &github);
+            command.args(args);
+            command
+        });
+        assert_eq!(result.code, 0, "{}", result.both());
+    }
+    let run_command = |args: &[&str]| {
+        run({
+            let mut command = runner_manager(data_dir.path());
+            command.args(args);
+            command
+        })
+    };
+
+    let on = run_command(&[
+        "repo",
+        "profile",
+        "set-pool",
+        "octo/one",
+        "--profile",
+        "build",
+        "--pool",
+        "on",
+    ]);
+    assert_eq!(on.code, 0, "{}", on.both());
+    assert!(
+        on.stdout.contains(&format!("runs-on: {pool}")),
+        "{}",
+        on.both()
+    );
+    let shown = run_command(&["repo", "profile", "show", "octo/one", "--profile", "build"]);
+    assert!(
+        shown.stdout.contains(&format!("pool={pool}")),
+        "{}",
+        shown.both()
+    );
+    let listed = run_command(&["repo", "profile", "list", "octo/one"]);
+    assert!(
+        listed.stdout.contains("profile=default"),
+        "{}",
+        listed.both()
+    );
+    assert!(listed.stdout.contains("pool=-"), "{}", listed.both());
+
+    // A second profile of the same target: a pool job would match both.
+    let second = run_command(&[
+        "repo",
+        "profile",
+        "set-pool",
+        "octo/one",
+        "--profile",
+        "default",
+        "--pool",
+        "on",
+    ]);
+    assert_ne!(second.code, 0, "{}", second.both());
+    assert!(
+        second.both().contains("already answers"),
+        "{}",
+        second.both()
+    );
+    // Another operating system's pool, through the plain label command.
+    let mismatched = run_command(&[
+        "repo",
+        "profile",
+        "add-label",
+        "octo/one",
+        "--profile",
+        "default",
+        "--label",
+        foreign,
+    ]);
+    assert_ne!(mismatched.code, 0, "{}", mismatched.both());
+    assert!(mismatched.both().contains(pool), "{}", mismatched.both());
+    let unknown_class = run_command(&[
+        "repo",
+        "add-label",
+        "octo/one",
+        "--profile",
+        "default",
+        "--label",
+        &format!("{pool}-heavy"),
+    ]);
+    assert_ne!(unknown_class.code, 0, "{}", unknown_class.both());
+    let policies = store(data_dir.path()).policies().unwrap();
+    let default = policies
+        .iter()
+        .find(|policy| {
+            policy.target.slug() == "octo/one" && policy.profile_name().as_str() == "default"
+        })
+        .unwrap();
+    assert_eq!(
+        default
+            .routing_labels()
+            .and_then(|labels| labels.pool_label()),
+        None,
+        "nothing was changed"
+    );
+
+    // An organization target has its own pool profile.
+    let org = run_command(&["org", "set-pool", "octo", "--pool", "on"]);
+    assert_eq!(org.code, 0, "{}", org.both());
+
+    let off = run_command(&[
+        "repo",
+        "profile",
+        "set-pool",
+        "octo/one",
+        "--profile",
+        "build",
+        "--pool",
+        "off",
+    ]);
+    assert_eq!(off.code, 0, "{}", off.both());
+    let shown = run_command(&["repo", "profile", "show", "octo/one", "--profile", "build"]);
+    assert!(shown.stdout.contains("pool=-"), "{}", shown.both());
+    let off = run_command(&["org", "set-pool", "octo", "--pool", "off"]);
+    assert_eq!(off.code, 0, "{}", off.both());
+}
