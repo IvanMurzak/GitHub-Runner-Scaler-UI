@@ -1390,7 +1390,8 @@ async fn production_screen_snapshot(
 /// The dashboard's coordinator line, and whether the link is up.
 fn coordinator_line(local: &crate::cli::status::StatusDocument) -> Option<Box<(String, bool)>> {
     let coordinator = &local.coordinator;
-    coordinator.configured.then(|| {
+    // An unreadable setting is not `configured`, and is still worth a line.
+    (coordinator.configured || coordinator.unreadable.is_some()).then(|| {
         Box::new((
             coordinator.describe(),
             coordinator.link == crate::cli::coordinator::LinkState::Connected,

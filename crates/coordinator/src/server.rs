@@ -41,6 +41,9 @@ use crate::webhook::{
 /// Largest enrollment request body.
 const MAX_ENROLL_BYTES: usize = 16 * 1024;
 
+/// How often a connected host's `last_seen_at` is rewritten.
+const TOUCH_EVERY: Duration = Duration::from_secs(60);
+
 /// The server's settings.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -394,6 +397,8 @@ async fn serve_host(
 ) {
     let silence_limit = state.config.heartbeat_interval.saturating_mul(3);
     let mut last_heard = Instant::now();
+    // `connection` touched the record just before this.
+    let mut last_touched = Instant::now();
     let mut checks = tokio::time::interval(state.config.revocation_check);
     checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -424,7 +429,13 @@ async fn serve_host(
                     }
                     Ok(HostMessage::Heartbeat(heartbeat)) => {
                         state.registry.set_heartbeat(host_id, connection, heartbeat);
-                        let _ = state.store().touch(host_id, Utc::now());
+                        // `last_seen_at` is for `hosts list`; a write per
+                        // heartbeat per host would hold the shared store's
+                        // lock on the runtime for nothing.
+                        if last_touched.elapsed() >= TOUCH_EVERY {
+                            last_touched = Instant::now();
+                            let _ = state.store().touch(host_id, Utc::now());
+                        }
                     }
                     // A second `auth`, a newer message type, or garbage: skipped.
                     Ok(HostMessage::Auth { .. } | HostMessage::Unknown) | Err(_) => {}

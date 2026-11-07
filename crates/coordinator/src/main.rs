@@ -57,7 +57,7 @@ enum Command {
         /// The name the host will have here.
         #[arg(long)]
         name: String,
-        /// How long the code stays usable: 30s, 15m, 2h, 1d.
+        /// How long the code stays usable, 1 minute to 7 days: 15m, 2h, 1d.
         #[arg(long, default_value = "15m", value_parser = parse_ttl)]
         ttl: Duration,
     },
@@ -144,10 +144,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     .with_context(|| format!("cannot listen on {listen}"))?;
                 tracing::info!(%listen, "coordinator listening");
-                serve(listener, AppState::new(config, store), async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await?;
+                serve(listener, AppState::new(config, store), shutdown_signal()).await?;
                 anyhow::Ok(())
             })?;
         }
@@ -204,6 +201,31 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM: what `docker stop` and systemd send. As PID 1 in the
+/// container the process has no default SIGTERM action, so without this a
+/// stop waits out Docker's grace period and ends in SIGKILL.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn main() -> ExitCode {

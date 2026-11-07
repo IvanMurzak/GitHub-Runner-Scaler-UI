@@ -2317,6 +2317,12 @@ async fn run_target_loop<T: TargetReconciler>(
             return Ok(());
         }
         let polled_at = tokio::time::Instant::now();
+        // A wake stored before this pass (one that arrived inside a back-off
+        // or a drain) is answered by this very poll; left in place it would
+        // pull the next poll forward for a job already seen.
+        if let Some(wake) = &wake {
+            let _ = futures::FutureExt::now_or_never(wake.notified());
+        }
         // Before deciding anything, so a policy an operator changed a moment
         // ago governs this pass rather than the next one.
         target.refresh_policies();

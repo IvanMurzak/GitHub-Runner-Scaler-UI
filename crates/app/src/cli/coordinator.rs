@@ -230,6 +230,13 @@ async fn enroll(url: &CoordinatorUrl, request: &EnrollRequest) -> Result<EnrollR
             "the coordinator speaks a different protocol version",
             "update runner-manager, or the coordinator, so both are current",
         )),
+        409 => Err(CliError::with_remedy(
+            Failure::Conflict,
+            "the coordinator could not enroll this host: an active host already holds the \
+             invite's name",
+            "ask the coordinator's operator to revoke that host or issue an invite with another \
+             name",
+        )),
         429 => Err(unavailable(
             "the coordinator is limiting attempts from this address; wait a minute",
         )),
@@ -571,6 +578,9 @@ enum SessionEnd {
     UnsupportedVersion,
     Closed,
     NoKey,
+    /// The platform certificate verifier could not be built, so no `wss://`
+    /// connection can be verified.
+    NoTls,
 }
 
 impl SessionEnd {
@@ -582,6 +592,7 @@ impl SessionEnd {
             Self::UnsupportedVersion => "unsupported_version",
             Self::Closed => "closed",
             Self::NoKey => "no_key",
+            Self::NoTls => "no_tls_verifier",
         }
     }
 }
@@ -660,23 +671,41 @@ pub async fn maintain_link(ports: LinkPorts) {
         };
         let started = tokio::time::Instant::now();
         let end = session(&ports, &config, tls.clone(), &mut recorder).await;
-        recorder.disconnected(end);
         tracing::info!(reason = end.as_str(), "the coordinator link ended");
         if end == SessionEnd::Reconfigured {
+            // After `leave` the setting is gone and `leave` already removed
+            // the link record; writing it again would leave it behind.
+            if matches!(records::configured(&ports.paths), Ok(Some(_))) {
+                recorder.disconnected(end);
+            }
             backoff = RECONNECT_FIRST;
             continue;
         }
+        recorder.disconnected(end);
         if started.elapsed() >= STABLE_SESSION {
             backoff = RECONNECT_FIRST;
         }
         let cap = match end {
-            SessionEnd::Rejected | SessionEnd::UnsupportedVersion | SessionEnd::NoKey => {
-                REJECTED_CAP
-            }
+            SessionEnd::Rejected
+            | SessionEnd::UnsupportedVersion
+            | SessionEnd::NoKey
+            | SessionEnd::NoTls => REJECTED_CAP,
             _ => RECONNECT_CAP,
         };
         backoff = backoff.min(cap);
-        tokio::time::sleep(jittered(backoff)).await;
+        // In steps, so a back-off longer than `LINK_STALE_AFTER` (a refusal
+        // waits up to 7.5 minutes) does not make `status` call a running
+        // service silent.
+        let resume = tokio::time::Instant::now() + jittered(backoff);
+        while tokio::time::Instant::now() < resume {
+            tokio::time::sleep_until(resume.min(tokio::time::Instant::now() + LINK_KEEPALIVE))
+                .await;
+            if !matches!(records::configured(&ports.paths), Ok(Some(_))) {
+                // `leave` ran meanwhile: nothing to report, nothing to wait for.
+                break;
+            }
+            recorder.keep_alive();
+        }
         backoff = backoff.saturating_mul(2).min(cap);
     }
 }
@@ -787,7 +816,12 @@ async fn session(
     let socket_config = tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(runner_manager_coordinator_protocol::MAX_MESSAGE_BYTES))
         .max_frame_size(Some(runner_manager_coordinator_protocol::MAX_MESSAGE_BYTES));
-    let connector = tls.map(tokio_tungstenite::Connector::Rustls);
+    // Never let tungstenite fall back to a root-less default for `wss://`.
+    let connector = match tls {
+        Some(config) => Some(tokio_tungstenite::Connector::Rustls(config)),
+        None if url.connect_url().starts_with("wss://") => return SessionEnd::NoTls,
+        None => None,
+    };
     let connected = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         tokio_tungstenite::connect_async_tls_with_config(
