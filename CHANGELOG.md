@@ -9,98 +9,49 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 ## 0.4.45
 
-Not released yet: this is the version being prepared.
-
 ### Added
 
-- An optional coordinator (stage 1 of `.taskflow/2026-11-07-coordinator-server`).
-  `runner-manager coordinator join URL --code CODE`, `coordinator status [--json]`
-  and `coordinator leave` connect a host to a self-hosted
-  `runner-manager-coordinator` server, which receives GitHub's `workflow_job`
-  webhooks and wakes the hosts that serve the job's repository and labels, so
-  they poll at once instead of at their next interval. The coordinator only
-  wakes hosts: each host still computes its own demand under its own limits and
-  with its own GitHub credential. A woken target is polled at most once every
-  5 seconds and never inside a rate-limit back-off.
-- Hosts authenticate with an Ed25519 key created at `join` and kept in the same
-  secret store as the GitHub credential; enrollment uses a one-time code.
-  Without a coordinator, or while it is unreachable, polling is unchanged.
-- `status`, `host doctor` (the information check `coordinator.link`) and the
-  TUI dashboard show the coordinator link: not configured, connected, or
-  disconnected since when.
-- The coordinator server, its container image, a Caddy example and
-  `docs/coordinator.md`.
-- Coordinator stage 2: a reconciliation sweep. Given a GitHub App id and private
-  key (`COORDINATOR_GITHUB_APP_ID`, `COORDINATOR_GITHUB_APP_PRIVATE_KEY_FILE`),
-  the coordinator mints installation tokens (renewed before they expire) and
-  every 2 minutes (`COORDINATOR_RECONCILE_INTERVAL`, at least 30 s) reads the
-  queued jobs of every repository its hosts serve, with conditional requests and
-  GitHub's rate-limit waits honoured, waking the hosts for any queued job that
-  no wake was sent for recently (a lost webhook). The App key, its JWTs and the
-  installation tokens are never logged.
-- Poll modes per target: `standalone` (no coordinator), `coordinated` (the link
-  is up and the coordinator's sweep covers the target: polled every 300 s,
-  `host set-poll-interval --coordinated`, at least 60 s, while no runner of this
-  host runs for it) and `fallback` (the link has been down for 30 s, or the
-  target is not covered: the normal intervals, at once). `status [--json]`
-  (`coordinator.targets`), `host doctor` (`github.polling`, `coordinator.link`),
-  `coordinator status` and the TUI show them.
-- The host-coordinator protocol is now version 2 (the coordinator's `hello_ack`
-  names the covered targets). Version-1 hosts and coordinators keep working:
-  both sides settle on the highest version they share.
-- Coordinator stage 3: shared pool labels (`rm-pool-windows`, `rm-pool-linux`,
-  `rm-pool-macos`). `repo profile set-pool OWNER/REPO [--profile NAME] --pool on|off`
-  and `org set-pool ORG --pool on|off` give a profile this host's pool label;
-  `profile list`/`show` print `pool=`, and the TUI's profile settings show the
-  `runs-on:` line. Another OS's pool label, an unknown `rm-pool-` label and a
-  second pool profile on the same target are refused.
-- For a queued job that asks for a pool label, the coordinator sends exactly one
-  host a `launch` (ranked by a warm persistent workspace, then free RAM, then
-  fewest busy slots), moves on after a refusal or 10 s without an answer, and
-  never holds more 5-minute leases than jobs are queued; a job that leaves the
-  queue cancels its surplus lease. A pool profile whose target is `coordinated`
-  starts runners only for the launches it accepted, through its own allocator
-  and every ceiling; in `fallback` and `standalone` it serves its own demand as
-  before. Hosts report `attempt_started` and `attempt_finished`.
-- The protocol is now version 3. Version-2 hosts and coordinators keep working
-  at version 2: such a host is woken for pool jobs and computes its own demand.
-- Coordinator stage 4: job weight statistics. A joined host samples each native
-  runner's process tree every 2 seconds (Linux `/proc`, macOS `proc_pidinfo`,
-  Windows Toolhelp with `GetProcessMemoryInfo`/`GetProcessTimes`), off its
-  reconcile loop, and its `attempt_finished` carries the peak memory and the
-  average and busiest CPU. The coordinator joins that report with the job the
-  `workflow_job` webhook says the runner took and keeps, in SQLite, the last 30
-  samples per `repository/workflow/job` (`COORDINATOR_STATS_SAMPLES`) for at
-  most 90 days: p50 duration, p90 peak memory, p90 CPU, and each host's speed
-  for the same job.
-- Weighted placement for pool jobs: a queue's demand is its heaviest queued job
-  (a job never measured counts as its repository's p90, else
-  `COORDINATOR_DEFAULT_JOB_RAM`, 2 GiB); a host whose free memory, less what its
-  open launches are expected to need, cannot hold it with
-  `COORDINATOR_RAM_MARGIN` (512 MiB) to spare is passed over, and the rest are
-  scored by warm workspace, headroom, historical speed and a penalty for taking
-  the only host a heavier queued job fits (`COORDINATOR_PLACEMENT_WEIGHTS`,
-  default `cache=4,headroom=2,speed=1,bigfit=1.5`). With no statistics for a
-  queue nothing is filtered and the order is stage 3's.
-- `runner-manager coordinator stats [--json]` (over the host's signed link, on a
-  query session that leaves the daemon's link up) and
-  `runner-manager-coordinator stats [--json]` show the heaviest jobs, the
-  samples per host, all-time launches and wakes, and the last placement
-  decisions with each host's score.
-- Heartbeats now report free memory on macOS (free plus inactive pages) and CPU
-  load on Windows (`GetSystemTimes` between two heartbeats).
-- The protocol is now version 4 (`attempt_finished.usage`, query sessions).
-  Version-3 hosts and coordinators keep working at version 3; a version-3
-  host's attempts count towards duration statistics only.
-- The coordinator's database moves to schema 2. Rolling back to a stage-3
-  coordinator needs the pre-upgrade database or
-  `PRAGMA user_version = 1` (see `docs/coordinator.md`).
-
-### Changed
-
-- Revoking a host on the coordinator (`hosts revoke`) now closes its live
-  connection within a second: the server notices the admin command's commit
-  through SQLite's `data_version` instead of re-reading every 10 seconds.
+- **An optional coordinator.** `runner-manager-coordinator` is a small
+  self-hosted server (container image, Caddy example and `docs/coordinator.md`
+  included) that hosts can join to start runners without waiting for their next
+  poll. Without a coordinator, or while it is unreachable, a host behaves
+  exactly as in 0.4.44.
+- `runner-manager coordinator join URL --code CODE`, `coordinator status [--json]`,
+  `coordinator leave` and `coordinator stats [--json]`. A host authenticates with
+  an Ed25519 key created at `join` and kept in the same secret store as the
+  GitHub credential; enrollment uses a one-time code, and `hosts revoke` on the
+  server closes a host's live connection within a second.
+- **Webhook wake.** The coordinator receives GitHub's `workflow_job` webhooks
+  (HMAC-verified) and wakes the hosts that serve the job's repository and
+  labels. A woken target is polled at most once every 5 seconds and never
+  inside a rate-limit back-off.
+- **Reconciliation sweep.** Given a personal GitHub App
+  (`COORDINATOR_GITHUB_APP_ID`, `COORDINATOR_GITHUB_APP_PRIVATE_KEY_FILE`), the
+  coordinator reads the queues of the repositories its hosts serve every 2
+  minutes with conditional requests, and wakes hosts for jobs whose webhook was
+  lost.
+- **Poll modes per target:** `standalone` (no coordinator), `coordinated` (link
+  up and the target covered by the sweep: polled every 300 s,
+  `host set-poll-interval --coordinated`) and `fallback` (link down for 30 s or
+  target not covered: the normal intervals, at once). `status`, `host doctor`
+  (`github.polling`, `coordinator.link`), `coordinator status` and the TUI show
+  the mode and the link.
+- **Shared pools.** `repo profile set-pool OWNER/REPO [--profile NAME] --pool on|off`
+  and `org set-pool ORG --pool on|off` give a profile this host's pool label
+  (`rm-pool-windows`, `rm-pool-linux` or `rm-pool-macos`). For a job with
+  `runs-on: rm-pool-…`, the coordinator sends exactly one host a `launch`; the
+  host still applies every local ceiling and may refuse, and the coordinator
+  then tries the next one. In `fallback` and `standalone` a pool profile serves
+  its own demand as before.
+- **Job weight statistics and weighted placement.** A joined host samples each
+  native runner's process tree (peak memory, CPU, duration) and reports it; the
+  coordinator keeps the last 30 samples per `repository/workflow/job` for up to
+  90 days and places pool jobs by memory fit, warm workspace, headroom and each
+  host's past speed (`COORDINATOR_PLACEMENT_WEIGHTS`). With no statistics the
+  order is warm workspace, then free memory, then fewest busy slots.
+  `runner-manager-coordinator stats` and `runner-manager coordinator stats`
+  show the heaviest jobs and the last placement decisions.
+- Heartbeats report free memory on macOS and CPU load on Windows.
 
 ## 0.4.44
 
