@@ -145,6 +145,16 @@ async fn run_generation(
     // healthy service can sit quietly until the six-month refresh half expires
     // and require a person merely because no TUI happened to be open.
     if targets.is_empty() {
+        // Still linked, so the coordinator sees this host; it serves nothing,
+        // so nothing is ever woken.
+        let _link = start_coordinator_link(
+            context,
+            &host,
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::new(super::coordinator::WakeRoutes::default()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
         let heartbeat_store = Arc::clone(&store) as Arc<dyn Store>;
         let heartbeat_paths = context.paths().clone();
         tokio::select! {
@@ -336,6 +346,9 @@ async fn run_generation(
         Arc::clone(&clock),
         intervals,
     ));
+    // The coordinator's wakes, one signal per target loop. Inert until this
+    // host joins a coordinator; see `super::coordinator`.
+    let mut routes = super::coordinator::WakeRoutes::new(Some(Arc::clone(&demand_gateway)));
     let mut managed_targets = Vec::with_capacity(targets.len());
     for policies in targets {
         let package_target = policies[0].target.clone();
@@ -428,8 +441,20 @@ async fn run_generation(
             ),
             cancel,
             polling: Arc::clone(&polling),
+            wake: routes.add(package_target.clone()),
         });
     }
+    let routes = Arc::new(routes);
+
+    let draining = Arc::new(AtomicBool::new(false));
+    let _link = start_coordinator_link(
+        context,
+        &host,
+        Arc::clone(&store) as Arc<dyn Store>,
+        routes,
+        Arc::clone(&host_unfit),
+        Arc::clone(&draining),
+    );
 
     let (shutdown, _) = tokio::sync::watch::channel(false);
     let (upgrade, _) = tokio::sync::watch::channel(false);
@@ -533,6 +558,9 @@ async fn run_generation(
         }
         result = loops.join_next() => result,
     };
+    // Told to the coordinator on the next heartbeat; the link stays up while
+    // the loops drain.
+    draining.store(true, Ordering::Relaxed);
     if upgraded_to.is_some() || restart_reason.is_some() {
         let _ = upgrade.send(true);
         // Not `shutdown`: that one is bounded, and an upgrade must outlast any
@@ -590,6 +618,56 @@ async fn run_generation(
     }
     writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
     Ok(DaemonOutcome::Stopped)
+}
+
+/// Aborts the task it holds when dropped, so the coordinator link ends with
+/// the generation that started it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Starts the coordinator link for this generation. It idles until the host
+/// joins a coordinator, so it is started either way.
+fn start_coordinator_link(
+    context: &Context,
+    host: &runner_manager_domain::model::Host,
+    store: Arc<dyn Store>,
+    routes: Arc<super::coordinator::WakeRoutes>,
+    unfit: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+) -> Option<AbortOnDrop> {
+    let key_store = match context.secret_store_for(
+        host.service_start_mode,
+        runner_manager_platform::secrets::SecretItem::CoordinatorKey,
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(%error, "no coordinator link: the secret store cannot be reached");
+            return None;
+        }
+    };
+    let runner_root = super::workspace::host_root(context.paths(), Some(host))
+        .effective_text()
+        .map_or_else(
+            || context.paths().state_dir().to_path_buf(),
+            std::path::PathBuf::from,
+        );
+    Some(AbortOnDrop(tokio::spawn(
+        super::coordinator::maintain_link(super::coordinator::LinkPorts {
+            paths: context.paths().clone(),
+            key_store,
+            store,
+            routes,
+            unfit,
+            draining,
+            host: host.clone(),
+            runner_root,
+        }),
+    )))
 }
 
 async fn maintain_wsl_recovery_without_local_policies(
@@ -1976,6 +2054,12 @@ trait TargetReconciler: Send + 'static {
     /// Report one pass's pace, for `status` and `host show`.
     fn observe(&self, _report: &ReconcileReport) {}
 
+    /// The coordinator's "poll this target now" signal, when the daemon
+    /// routes one to this loop. See [`super::coordinator`].
+    fn wake(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
+
     fn active_owned(&self, report: &ReconcileReport) -> Option<u16> {
         active_owned(report, self.policies())
     }
@@ -2025,9 +2109,14 @@ struct ManagedTarget {
     cancel: CancelToken,
     store: Arc<dyn Store>,
     polling: Arc<super::polling::PollingMonitor>,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl TargetReconciler for ManagedTarget {
+    fn wake(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(Arc::clone(&self.wake))
+    }
+
     fn policies(&self) -> &[ScalePolicy] {
         &self.policies
     }
@@ -2221,10 +2310,18 @@ async fn run_target_loop<T: TargetReconciler>(
     if draining.is_some() {
         target.begin_drain();
     }
+    let wake = target.wake();
     loop {
         if drain_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             // Whatever is still running is startup recovery's to adopt.
             return Ok(());
+        }
+        let polled_at = tokio::time::Instant::now();
+        // A wake stored before this pass (one that arrived inside a back-off
+        // or a drain) is answered by this very poll; left in place it would
+        // pull the next poll forward for a job already seen.
+        if let Some(wake) = &wake {
+            let _ = futures::FutureExt::now_or_never(wake.notified());
         }
         // Before deciding anything, so a policy an operator changed a moment
         // ago governs this pass rather than the next one.
@@ -2280,22 +2377,45 @@ async fn run_target_loop<T: TargetReconciler>(
                 .delay
                 .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
         });
-        tokio::select! {
-            () = tokio::time::sleep(delay) => {}
-            changed = shutdown.changed(), if draining != Some(DrainKind::Shutdown) => {
-                if changed.is_err() || *shutdown.borrow() {
-                    // A shutdown arriving mid-upgrade supersedes it, deadline
-                    // and all: the machine is going down either way, and the
-                    // upgrade's patience is no longer anybody's benefit.
-                    target.begin_drain();
-                    draining = Some(DrainKind::Shutdown);
-                    drain_deadline = Some(tokio::time::Instant::now() + DRAIN_DEADLINE);
+        let mut deadline = tokio::time::Instant::now() + delay;
+        // A coordinator's wake brings the next poll forward -- never while
+        // draining, never while the schedule is a slowdown GitHub asked for
+        // (rate limited, stretched, offline...), and never sooner than
+        // `WAKE_MIN_GAP` after this poll began.
+        let honour_wakes = draining.is_none() && !report.next_poll.pace.is_throttled();
+        let wake = wake.as_deref().filter(|_| honour_wakes);
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => break,
+                () = async {
+                    match wake {
+                        Some(wake) => wake.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    deadline = super::coordinator::woken_deadline(
+                        deadline,
+                        polled_at,
+                        tokio::time::Instant::now(),
+                    );
                 }
-            }
-            changed = upgrade.changed(), if draining.is_none() => {
-                if changed.is_err() || *upgrade.borrow() {
-                    target.begin_drain();
-                    draining = Some(DrainKind::Upgrade);
+                changed = shutdown.changed(), if draining != Some(DrainKind::Shutdown) => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        // A shutdown arriving mid-upgrade supersedes it, deadline
+                        // and all: the machine is going down either way, and the
+                        // upgrade's patience is no longer anybody's benefit.
+                        target.begin_drain();
+                        draining = Some(DrainKind::Shutdown);
+                        drain_deadline = Some(tokio::time::Instant::now() + DRAIN_DEADLINE);
+                    }
+                    break;
+                }
+                changed = upgrade.changed(), if draining.is_none() => {
+                    if changed.is_err() || *upgrade.borrow() {
+                        target.begin_drain();
+                        draining = Some(DrainKind::Upgrade);
+                    }
+                    break;
                 }
             }
         }
@@ -2863,6 +2983,8 @@ mod tests {
         unreadable: bool,
         /// How many times the loop asked for a fresh policy set.
         refreshes: Arc<AtomicUsize>,
+        /// The coordinator's wake signal, when a test routes one.
+        wake: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl FakeTarget {
@@ -2878,6 +3000,7 @@ mod tests {
                     busy_was_terminated: Arc::new(AtomicUsize::new(0)),
                     unreadable: false,
                     refreshes: Arc::new(AtomicUsize::new(0)),
+                    wake: None,
                 },
                 calls,
             )
@@ -2893,6 +3016,7 @@ mod tests {
                 busy_was_terminated: Arc::new(AtomicUsize::new(0)),
                 unreadable: false,
                 refreshes: Arc::new(AtomicUsize::new(0)),
+                wake: None,
             }
         }
 
@@ -2908,6 +3032,7 @@ mod tests {
                 busy_was_terminated: Arc::new(AtomicUsize::new(0)),
                 unreadable: true,
                 refreshes: Arc::new(AtomicUsize::new(0)),
+                wake: None,
             }
         }
     }
@@ -2956,6 +3081,10 @@ mod tests {
 
         fn local_active(&self) -> Option<u16> {
             Some(self.active)
+        }
+
+        fn wake(&self) -> Option<Arc<tokio::sync::Notify>> {
+            self.wake.clone()
         }
     }
 
@@ -3585,6 +3714,113 @@ mod tests {
             tokio::time::advance(Duration::from_secs(60)).await;
             let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
         }
+    }
+
+    /// A target loop polling every 60 s, with a coordinator wake routed to
+    /// it, and the counter of its polls.
+    type WokenLoop = (
+        tokio::task::JoinHandle<Result<(), CliError>>,
+        Arc<AtomicUsize>,
+        Arc<tokio::sync::Notify>,
+        tokio::sync::watch::Sender<bool>,
+    );
+
+    fn woken_loop(pace: runner_manager_agent::reconcile::PollPace) -> WokenLoop {
+        let mut report = ReconcileReport::default();
+        report.next_poll.delay = Duration::from_secs(60);
+        report.next_poll.pace = pace;
+        let (mut target, calls) = FakeTarget::repeating(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+            report,
+        );
+        let wake = Arc::new(tokio::sync::Notify::new());
+        target.wake = Some(Arc::clone(&wake));
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            never_upgraded(),
+            Arc::new(CountingContacts::default()) as Arc<dyn ContactRecorder>,
+        ));
+        (daemon, calls, wake, stop)
+    }
+
+    async fn after(secs: u64) {
+        tokio::time::advance(Duration::from_secs(secs)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_polls_early_but_never_within_five_seconds_of_the_last_poll() {
+        let (daemon, calls, wake, stop) =
+            woken_loop(runner_manager_agent::reconcile::PollPace::Nominal);
+        after(0).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the first pass");
+
+        // Woken one second after the poll: held until five seconds.
+        after(1).await;
+        wake.notify_one();
+        after(3).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "too soon after the last poll"
+        );
+        after(1).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "polled at five seconds, not sixty"
+        );
+
+        // A burst of wakes right after that poll is one more poll, five
+        // seconds later.
+        wake.notify_one();
+        after(1).await;
+        wake.notify_one();
+        after(3).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        after(1).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // With no wake, the schedule is the schedule.
+        after(59).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        after(1).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        stop.send(true).unwrap();
+        after(60).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_never_shortens_a_slowdown_github_asked_for() {
+        let (daemon, calls, wake, stop) =
+            woken_loop(runner_manager_agent::reconcile::PollPace::RateLimited {
+                kind: runner_manager_github::rest::RateLimitKind::Secondary,
+            });
+        after(0).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        wake.notify_one();
+        after(30).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a rate-limited target waits out its back-off, woken or not"
+        );
+        after(30).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        stop.send(true).unwrap();
+        after(60).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
     }
 
     #[tokio::test(start_paused = true)]

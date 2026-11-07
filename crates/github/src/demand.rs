@@ -830,6 +830,22 @@ impl RestDemand {
         );
     }
 
+    /// Drops `repository`'s shared reading, so the next target to ask for it
+    /// reads GitHub instead of being handed a reading from before.
+    ///
+    /// For a coordinator's wake: GitHub just said this repository's queue
+    /// changed, so a reading shared from a few seconds ago is known stale.
+    /// Nothing else is bypassed — the conditional cache still makes an
+    /// unchanged listing a free `304`, and the rate-limit quiet period still
+    /// withholds every request inside it.
+    pub fn forget_shared_reading(&self, repository: &OwnerRepo) {
+        self.shared
+            .readings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(repository);
+    }
+
     /// The window readings are shared for.
     fn shared_window(&self) -> Duration {
         Duration::from_millis(self.shared.window_ms.load(Ordering::SeqCst))
@@ -2857,6 +2873,34 @@ mod tests {
             .await
             .expect("a later reading");
         assert_eq!(gateway.requests_issued(), 6);
+    }
+
+    /// A coordinator's wake drops the shared reading, so the woken poll reads
+    /// GitHub inside the window instead of being handed the stale one.
+    #[tokio::test]
+    async fn a_forgotten_reading_is_read_again_inside_the_window() {
+        let server = MockServer::start().await;
+        mount_tagged_idle(&server, &repo()).await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock).with_shared_readings(Duration::from_secs(10));
+        let scope = ActivityScope::repository(repo());
+
+        gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a first reading");
+        gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("shared");
+        assert_eq!(gateway.requests_issued(), 2, "the second was shared");
+
+        gateway.forget_shared_reading(&repo());
+        gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("read again");
+        assert_eq!(gateway.requests_issued(), 4);
     }
 
     /// Two loops asking at the same moment make one read between them.

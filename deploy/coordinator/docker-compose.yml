@@ -1,0 +1,53 @@
+# The optional runner-manager coordinator behind Caddy (docs/coordinator.md).
+#
+#   cd deploy/coordinator
+#   echo "COORDINATOR_HOST=runners.example.com" > .env
+#   openssl rand -hex 32 > webhook_secret && chmod 600 webhook_secret
+#   docker compose up -d --build
+#
+# Only Caddy publishes ports. The coordinator is reachable from it alone.
+
+name: runner-manager-coordinator
+
+services:
+  coordinator:
+    build:
+      context: ../..
+      dockerfile: deploy/coordinator/Dockerfile
+    image: runner-manager-coordinator:local
+    restart: unless-stopped
+    environment:
+      COORDINATOR_PUBLIC_URL: https://${COORDINATOR_HOST:?set COORDINATOR_HOST in .env}
+      # Caddy is the only client, and it appends the real client address.
+      COORDINATOR_TRUST_FORWARDED_FOR: "true"
+      COORDINATOR_WEBHOOK_SECRET_FILE: /run/secrets/webhook_secret
+    secrets:
+      - webhook_secret
+    volumes:
+      - coordinator-data:/data
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2.10
+    restart: unless-stopped
+    depends_on:
+      - coordinator
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      COORDINATOR_HOST: ${COORDINATOR_HOST:?set COORDINATOR_HOST in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+secrets:
+  webhook_secret:
+    file: ./webhook_secret
+
+volumes:
+  coordinator-data:
+  caddy-data:
+  caddy-config:

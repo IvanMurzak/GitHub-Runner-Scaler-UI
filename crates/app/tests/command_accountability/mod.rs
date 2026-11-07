@@ -83,6 +83,7 @@ pub enum Boundary {
     HostConfiguration,
     DependencyCacheFile,
     DockerResourceJournal,
+    CoordinatorServer,
 }
 
 impl Boundary {
@@ -121,6 +122,9 @@ impl Boundary {
             Self::HostConfiguration => {
                 "reads or changes machine-wide operating-system settings (registry, Defender, \
                  git's system configuration, Spotlight) outside every scenario's temporary roots"
+            }
+            Self::CoordinatorServer => {
+                "enrolls with or reads the link to an optional coordinator server and keeps its key in the secret store, outside the chain oracle's modelled policy state"
             }
             Self::DependencyCacheFile => {
                 "reads or rewrites the host's caches.toml, or measures the cache root, outside the chain oracle's modelled state; its only effect is on a native runner's environment at launch and on which idle cache directories exist"
@@ -176,6 +180,7 @@ const RUNNER_ENV_COMMANDS: &str = "crates/app/tests/runner_env_commands.rs";
 const HOST_DOCTOR_COMMANDS: &str = "crates/app/tests/host_doctor_commands.rs";
 const DEPENDENCY_CACHE_COMMANDS: &str = "crates/app/tests/dependency_cache_commands.rs";
 const POLL_INTERVAL_COMMANDS: &str = "crates/app/tests/poll_interval_commands.rs";
+const COORDINATOR_COMMANDS: &str = "crates/app/tests/coordinator_commands.rs";
 
 pub const LOCAL_CHAIN_EVIDENCE: &[Evidence] = &[
     at(
@@ -291,6 +296,48 @@ macro_rules! host_doctor_row {
 
 /// The reviewed classification of every published leaf.
 pub const MANIFEST: &[Classification] = &[
+    Classification {
+        leaf: "coordinator join",
+        coverage: Coverage::Dedicated,
+        evidence: &[
+            at(
+                COORDINATOR_COMMANDS,
+                "join_status_and_leave_round_trip_and_no_secret_reaches_their_output",
+            ),
+            at(
+                COORDINATOR_COMMANDS,
+                "a_refused_code_and_an_insecure_url_change_nothing",
+            ),
+        ],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::CoordinatorServer,
+            reason: "Spends a one-time code at a live coordinator and stores a private key; the dedicated test runs a real coordinator on loopback and scans every output and log for the key and the code.",
+        }),
+    },
+    Classification {
+        leaf: "coordinator status",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            COORDINATOR_COMMANDS,
+            "join_status_and_leave_round_trip_and_no_secret_reaches_their_output",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::CoordinatorServer,
+            reason: "Reports the coordinator setting and the daemon's link record, neither of which the policy chain oracle models; the dedicated test checks the versioned JSON before, during and after a join.",
+        }),
+    },
+    Classification {
+        leaf: "coordinator leave",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            COORDINATOR_COMMANDS,
+            "join_status_and_leave_round_trip_and_no_secret_reaches_their_output",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::CoordinatorServer,
+            reason: "Deletes the coordinator key from the secret store and the setting from config; the dedicated test proves the key is gone and that leaving twice is not an error.",
+        }),
+    },
     Classification {
         leaf: "host docker-cleanup show",
         coverage: Coverage::Dedicated,

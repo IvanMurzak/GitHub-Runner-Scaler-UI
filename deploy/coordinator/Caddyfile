@@ -1,0 +1,14 @@
+# TLS for the coordinator, with a certificate Caddy obtains automatically.
+# COORDINATOR_HOST is the public name, e.g. runners.example.com; its DNS
+# record must point at this machine and ports 80/443 must be open.
+{$COORDINATOR_HOST} {
+	# Only the four endpoints exist; everything else is refused here.
+	@coordinator path /webhook /connect /enroll /healthz
+	handle @coordinator {
+		# WebSocket upgrades on /connect are proxied as-is.
+		reverse_proxy coordinator:8080
+	}
+	handle {
+		respond 404
+	}
+}

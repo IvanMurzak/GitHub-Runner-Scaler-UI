@@ -137,6 +137,9 @@ pub struct StatusDocument {
     /// The persistent dependency caches native runners get: the root, the cap
     /// and the daemon's last measurement.
     pub caches: super::cache::CacheSnapshot,
+    /// The optional coordinator: whether this host joined one, and the
+    /// service's link to it as the daemon last reported it.
+    pub coordinator: super::coordinator::CoordinatorSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -641,6 +644,10 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
         },
         polling,
         caches: super::cache::snapshot(context, host.as_ref()),
+        coordinator: super::coordinator::CoordinatorSnapshot::read(
+            context.paths(),
+            context.clock().now(),
+        ),
         policies: policies
             .iter()
             .zip(workspaces.iter())
@@ -860,6 +867,8 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
 
     super::polling::write_section(out, &document.polling)?;
     writeln!(out)?;
+    writeln!(out, "Coordinator: {}", document.coordinator.describe())?;
+    writeln!(out)?;
     writeln!(
         out,
         "Shared REST budget: {} requests/hour projected if no poll were answered 304, of {} \
@@ -998,6 +1007,7 @@ mod tests {
                     cleanup_blocked: false,
                 }],
             }],
+            coordinator: super::super::coordinator::CoordinatorSnapshot::not_configured(),
             doctor: DoctorSummary {
                 checked: 9,
                 failing: vec![super::super::doctor::FindingSummary {
@@ -1064,6 +1074,7 @@ mod tests {
             [
                 "budget",
                 "caches",
+                "coordinator",
                 "credential",
                 "doctor",
                 "generated_at",
@@ -1073,6 +1084,21 @@ mod tests {
                 "polling",
                 "product",
                 "schema_version",
+            ]
+        );
+        assert_eq!(
+            keys(&emitted, "/coordinator"),
+            [
+                "configured",
+                "host_id",
+                "last_wake_at",
+                "link",
+                "name",
+                "reason",
+                "since",
+                "unreadable",
+                "url",
+                "wakes_received",
             ]
         );
         assert_eq!(

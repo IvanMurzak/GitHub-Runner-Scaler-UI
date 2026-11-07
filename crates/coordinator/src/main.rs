@@ -1,0 +1,266 @@
+//! `runner-manager-coordinator`: the server, and its local admin commands.
+
+use std::io::Write as _;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use anyhow::{Context as _, bail};
+use chrono::Utc;
+use clap::{Parser, Subcommand};
+use runner_manager_coordinator::server::{AppState, Config, serve};
+use runner_manager_coordinator::store::{HostRecord, Store};
+use runner_manager_coordinator_protocol::CoordinatorUrl;
+use secrecy::{ExposeSecret as _, SecretString};
+use serde::Serialize;
+
+/// The shortest webhook secret accepted.
+const MIN_SECRET_LEN: usize = 16;
+
+/// Version of every `--json` document this binary prints.
+const JSON_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Parser)]
+#[command(name = "runner-manager-coordinator", version, about)]
+struct Cli {
+    /// The SQLite database the server and the admin commands share.
+    #[arg(
+        long,
+        env = "COORDINATOR_DB",
+        default_value = "coordinator.db",
+        global = true
+    )]
+    db: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run the server (plain HTTP; put a TLS proxy in front).
+    ///
+    /// The webhook secret is read from COORDINATOR_WEBHOOK_SECRET_FILE or
+    /// COORDINATOR_WEBHOOK_SECRET, never from an argument.
+    Serve {
+        #[arg(long, env = "COORDINATOR_LISTEN", default_value = "127.0.0.1:8080")]
+        listen: SocketAddr,
+        /// The public https URL hosts join, e.g. https://runners.example.com.
+        #[arg(long, env = "COORDINATOR_PUBLIC_URL")]
+        public_url: String,
+        /// Trust the right-most X-Forwarded-For entry (only behind the proxy).
+        #[arg(long, env = "COORDINATOR_TRUST_FORWARDED_FOR")]
+        trust_forwarded_for: bool,
+    },
+    /// Issue a one-time code that enrolls one host.
+    Invite {
+        /// The name the host will have here.
+        #[arg(long)]
+        name: String,
+        /// How long the code stays usable, 1 minute to 7 days: 15m, 2h, 1d.
+        #[arg(long, default_value = "15m", value_parser = parse_ttl)]
+        ttl: Duration,
+    },
+    /// Enrolled hosts.
+    Hosts {
+        #[command(subcommand)]
+        command: HostsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HostsCommand {
+    /// Every enrolled host, revoked ones included.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a host by id or name; a live connection is closed within seconds.
+    Revoke { host: String },
+}
+
+fn parse_ttl(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: u64 = number
+        .parse()
+        .map_err(|_| format!("`{text}` is not a duration; write it as 15m, 2h or 1d"))?;
+    let seconds = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => {
+            return Err(format!(
+                "`{text}` is not a duration; write it as 15m, 2h or 1d"
+            ));
+        }
+    };
+    Ok(Duration::from_secs(number.saturating_mul(seconds)))
+}
+
+fn webhook_secret() -> anyhow::Result<SecretString> {
+    let secret = if let Some(path) = std::env::var_os("COORDINATOR_WEBHOOK_SECRET_FILE") {
+        std::fs::read_to_string(&path)
+            .map(|text| text.trim().to_string())
+            .context("cannot read the file COORDINATOR_WEBHOOK_SECRET_FILE names")?
+    } else if let Ok(value) = std::env::var("COORDINATOR_WEBHOOK_SECRET") {
+        value.trim().to_string()
+    } else {
+        bail!("set COORDINATOR_WEBHOOK_SECRET_FILE (preferred) or COORDINATOR_WEBHOOK_SECRET");
+    };
+    if secret.len() < MIN_SECRET_LEN {
+        bail!("the webhook secret must be at least {MIN_SECRET_LEN} characters");
+    }
+    Ok(SecretString::from(secret))
+}
+
+#[derive(Serialize)]
+struct HostsDocument<'a> {
+    schema_version: u32,
+    hosts: &'a [HostRecord],
+}
+
+fn run(cli: Cli) -> anyhow::Result<()> {
+    let mut out = std::io::stdout().lock();
+    match cli.command {
+        Command::Serve {
+            listen,
+            public_url,
+            trust_forwarded_for,
+        } => {
+            let origin = CoordinatorUrl::parse(&public_url)
+                .context("COORDINATOR_PUBLIC_URL is not a usable https URL")?
+                .origin();
+            let mut config = Config::new(origin, webhook_secret()?);
+            config.trust_forwarded_for = trust_forwarded_for;
+            let store = Store::open(&cli.db)?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(listen)
+                    .await
+                    .with_context(|| format!("cannot listen on {listen}"))?;
+                tracing::info!(%listen, "coordinator listening");
+                serve(listener, AppState::new(config, store), shutdown_signal()).await?;
+                anyhow::Ok(())
+            })?;
+        }
+        Command::Invite { name, ttl } => {
+            let invite = Store::open(&cli.db)?.create_invite(&name, ttl, Utc::now())?;
+            writeln!(
+                out,
+                "invite for `{}`, usable once until {}:\n\n  {}\n\non the host:\n\n  runner-manager coordinator join <public URL> --code {}",
+                invite.name,
+                invite.expires_at.to_rfc3339(),
+                invite.code.expose_secret(),
+                invite.code.expose_secret()
+            )?;
+        }
+        Command::Hosts { command } => {
+            let store = Store::open(&cli.db)?;
+            match command {
+                HostsCommand::List { json } => {
+                    let hosts = store.hosts()?;
+                    if json {
+                        serde_json::to_writer_pretty(
+                            &mut out,
+                            &HostsDocument {
+                                schema_version: JSON_SCHEMA_VERSION,
+                                hosts: &hosts,
+                            },
+                        )?;
+                        writeln!(out)?;
+                    } else if hosts.is_empty() {
+                        writeln!(out, "no host has enrolled")?;
+                    } else {
+                        for host in hosts {
+                            let state = if host.is_active() {
+                                "active"
+                            } else {
+                                "revoked"
+                            };
+                            let seen = host
+                                .last_seen_at
+                                .map_or_else(|| "never".to_string(), |at| at.to_rfc3339());
+                            writeln!(
+                                out,
+                                "{}  {:<20} {:<8} host {:<24} last seen {seen}",
+                                host.id, host.name, state, host.hostname
+                            )?;
+                        }
+                    }
+                }
+                HostsCommand::Revoke { host } => {
+                    let record = store.revoke(&host, Utc::now())?;
+                    writeln!(out, "revoked {} ({})", record.name, record.id)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ctrl-C, or SIGTERM: what `docker stop` and systemd send. As PID 1 in the
+/// container the process has no default SIGTERM action, so without this a
+/// stop waits out Docker's grace period and ends in SIGKILL.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifetimes_parse_in_the_forms_an_operator_writes() {
+        assert_eq!(parse_ttl("15m"), Ok(Duration::from_secs(900)));
+        assert_eq!(parse_ttl("2h"), Ok(Duration::from_secs(7200)));
+        assert_eq!(parse_ttl("90"), Ok(Duration::from_secs(90)));
+        assert!(parse_ttl("soon").is_err());
+        assert!(parse_ttl("5y").is_err());
+    }
+
+    #[test]
+    fn the_cli_parses() {
+        use clap::CommandFactory as _;
+        Cli::command().debug_assert();
+    }
+}

@@ -108,6 +108,26 @@ pub fn physical_memory_bytes() -> Option<u64> {
     sys::physical_memory_bytes()
 }
 
+/// Physical memory not in use right now, in bytes, where the platform reports
+/// it cheaply (Windows and Linux). Advisory: a coordinator heartbeat.
+#[must_use]
+pub fn available_memory_bytes() -> Option<u64> {
+    sys::available_memory_bytes()
+}
+
+/// Free space on the volume holding `path`, in bytes, for this account.
+#[must_use]
+pub fn free_disk_bytes(path: &Path) -> Option<u64> {
+    sys::free_disk_bytes(path)
+}
+
+/// The one-minute load average as a share of the logical CPUs, in whole
+/// percent (Unix only; Windows has no load average). Advisory.
+#[must_use]
+pub fn cpu_load_percent() -> Option<u32> {
+    sys::cpu_load_percent()
+}
+
 /// The Windows system directory, from the kernel rather than from the
 /// writable `%SystemRoot%`: an elevated fix starts `powershell.exe` from it.
 ///
@@ -705,7 +725,7 @@ mod sys {
         queried.is_ok() && elevation.TokenIsElevated != 0
     }
 
-    pub(super) fn physical_memory_bytes() -> Option<u64> {
+    fn memory_status() -> Option<MEMORYSTATUSEX> {
         let mut status = MEMORYSTATUSEX {
             dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
             ..MEMORYSTATUSEX::default()
@@ -713,7 +733,40 @@ mod sys {
         // SAFETY: `status` is a correctly sized, length-stamped structure
         // owned by this frame.
         unsafe { GlobalMemoryStatusEx(&raw mut status) }.ok()?;
-        Some(status.ullTotalPhys)
+        Some(status)
+    }
+
+    pub(super) fn physical_memory_bytes() -> Option<u64> {
+        memory_status().map(|status| status.ullTotalPhys)
+    }
+
+    pub(super) fn available_memory_bytes() -> Option<u64> {
+        memory_status().map(|status| status.ullAvailPhys)
+    }
+
+    pub(super) fn free_disk_bytes(path: &Path) -> Option<u64> {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut free = 0u64;
+        // SAFETY: `wide` is NUL-terminated and outlives the call; `free` is a
+        // live `u64` owned by this frame; the other outputs are not requested.
+        unsafe {
+            windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                PCWSTR(wide.as_ptr()),
+                Some(&raw mut free),
+                None,
+                None,
+            )
+        }
+        .ok()?;
+        Some(free)
+    }
+
+    pub(super) const fn cpu_load_percent() -> Option<u32> {
+        None
     }
 
     pub(super) fn read_dword(subkey: &str, value: &str) -> Result<Option<u32>, RegistryError> {
@@ -1037,10 +1090,56 @@ mod sys {
 
     #[cfg(not(target_os = "macos"))]
     pub(super) fn physical_memory_bytes() -> Option<u64> {
+        meminfo_bytes("MemTotal:")
+    }
+
+    /// One `/proc/meminfo` field, in bytes.
+    #[cfg(not(target_os = "macos"))]
+    fn meminfo_bytes(field: &str) -> Option<u64> {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text.lines().find(|line| line.starts_with("MemTotal:"))?;
+        let line = text.lines().find(|line| line.starts_with(field))?;
         let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
         kib.checked_mul(1024)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) const fn available_memory_bytes() -> Option<u64> {
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn available_memory_bytes() -> Option<u64> {
+        meminfo_bytes("MemAvailable:")
+    }
+
+    pub(super) fn free_disk_bytes(path: &Path) -> Option<u64> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `statvfs` is plain old data; zeroed is a valid value.
+        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `name` is NUL-terminated and `stats` is a live, correctly
+        // typed buffer owned by this frame.
+        if unsafe { libc::statvfs(name.as_ptr(), &raw mut stats) } != 0 {
+            return None;
+        }
+        #[allow(clippy::useless_conversion, reason = "the field widths differ per OS")]
+        u64::from(stats.f_bavail).checked_mul(u64::from(stats.f_frsize))
+    }
+
+    pub(super) fn cpu_load_percent() -> Option<u32> {
+        let mut loads = [0f64; 3];
+        // SAFETY: `loads` is a live buffer of the three doubles requested.
+        if unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) } != 1 {
+            return None;
+        }
+        let cores = std::thread::available_parallelism().ok()?.get();
+        let percent = loads[0] * 100.0 / f64::from(u32::try_from(cores).ok()?);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to a small non-negative range first"
+        )]
+        Some(percent.clamp(0.0, 10_000.0).round() as u32)
     }
 
     fn unsupported() -> RegistryError {
