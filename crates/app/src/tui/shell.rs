@@ -1216,6 +1216,7 @@ async fn production_screen_snapshot(
             activity,
             wsl_capability,
             wsl_hosts,
+            coordinator: coordinator_line(local),
             ..Snapshot::default()
         });
     }
@@ -1382,6 +1383,18 @@ async fn production_screen_snapshot(
         readiness_summary: "Host readiness is being combined with this snapshot.".into(),
         wsl_capability,
         wsl_hosts,
+        coordinator: coordinator_line(local),
+    })
+}
+
+/// The dashboard's coordinator line, and whether the link is up.
+fn coordinator_line(local: &crate::cli::status::StatusDocument) -> Option<Box<(String, bool)>> {
+    let coordinator = &local.coordinator;
+    coordinator.configured.then(|| {
+        Box::new((
+            coordinator.describe(),
+            coordinator.link == crate::cli::coordinator::LinkState::Connected,
+        ))
     })
 }
 

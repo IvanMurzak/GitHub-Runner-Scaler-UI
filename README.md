@@ -393,6 +393,10 @@ runner-manager wsl list                                        # Name this machi
 runner-manager wsl install --distribution NAME [--capacity N]  # Make a WSL2 distribution a second runner host
 runner-manager wsl status --distribution NAME [--json]         # Report that host's real state
 runner-manager wsl detach --distribution NAME                  # Stop managing it, deleting no Linux data
+
+runner-manager coordinator join URL --code CODE                # Join an optional coordinator (one-time code)
+runner-manager coordinator status [--json]                     # Show the coordinator link
+runner-manager coordinator leave                               # Forget the coordinator and its key
 ```
 
 Host capacity changes take effect on the next allocation without restarting the
@@ -630,6 +634,32 @@ is deliberately not called `uninstall`: the distribution stays registered with W
 runner-manager, service, credential, policies, workspaces and packages all stay exactly where
 they are. The command prints the explicit Linux commands to run inside the distribution if you
 want to undo that half as well.
+
+## Optional coordinator
+
+By default every host polls GitHub on its own, so a new job in a busy repository can wait up to
+the active poll interval (60 s) before a runner starts. A **coordinator** is a small server you
+host yourself that receives GitHub's `workflow_job` webhooks and tells the hosts that serve the
+job's repository and labels to poll **now**. It only wakes hosts: each host still decides what
+to start, under its own capacity, policies and `host doctor` checks, with its own GitHub
+credential. No token, JIT configuration or job log ever passes through the coordinator.
+
+```bash
+# on the coordinator's machine
+runner-manager-coordinator invite --name win-big          # prints a one-time code
+
+# on the host
+runner-manager coordinator join https://runners.example.com --code rmc_...
+runner-manager coordinator status
+```
+
+`join` creates an Ed25519 key pair for this host; the private key goes into the same secret
+store as the GitHub credential and never leaves the machine. The host connects out over
+`wss://`, so it keeps working behind NAT. Without a coordinator, or while it is unreachable, the
+host polls exactly as before. A woken target is polled at most once every 5 seconds and never
+inside a rate-limit back-off. `coordinator leave` removes the key and the setting.
+
+Deployment, the GitHub App webhook and administration: [`docs/coordinator.md`](docs/coordinator.md).
 
 ## Customize your setup
 

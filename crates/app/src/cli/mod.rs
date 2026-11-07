@@ -43,6 +43,7 @@
 pub mod auth;
 pub mod auto_update;
 pub mod cache;
+pub mod coordinator;
 pub mod daemon;
 pub mod docker_cleanup;
 pub mod doctor;
@@ -70,7 +71,7 @@ use runner_manager_domain::store::{SqliteStore, Store};
 use runner_manager_domain::workspace::WorkspaceKind;
 use runner_manager_github::{AppRegistration, Endpoints};
 use runner_manager_platform::paths::AppPaths;
-use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope, SecretStore};
+use runner_manager_platform::secrets::{PlatformSecretStore, SecretItem, SecretScope, SecretStore};
 
 // ---------------------------------------------------------------------------
 // The published App
@@ -327,6 +328,9 @@ failure_taxonomy! {
     /// whole report, and `host prepare` when a required check still fails
     /// after it ran. Remedy: `host prepare`, or what the report names.
     HostUnfit = 25 => "host_unfit",
+    /// The optional coordinator could not be reached, or answered something
+    /// other than an enrollment. Nothing was changed on this host.
+    CoordinatorUnavailable = 26 => "coordinator_unavailable",
 }
 
 impl Failure {
@@ -620,6 +624,9 @@ pub enum Command {
     /// Manage a WSL2 distribution as a second runner host (Windows).
     #[command(subcommand)]
     Wsl(WslCommand),
+    /// Join, inspect, or leave an optional coordinator that wakes this host.
+    #[command(subcommand)]
+    Coordinator(CoordinatorCommand),
     /// Keep this distribution's service alive. Not for people.
     ///
     /// ------------------------------------------------------------------
@@ -636,6 +643,35 @@ pub enum Command {
     /// that test to keep meaning what it says.
     #[command(subcommand, hide = true)]
     WslHost(WslHostCommand),
+}
+
+// -- the optional coordinator -------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum CoordinatorCommand {
+    /// Enroll this host with a coordinator using a one-time invite code.
+    Join(CoordinatorJoinArgs),
+    /// Show whether this host has joined a coordinator, and its link.
+    Status(CoordinatorStatusArgs),
+    /// Forget the coordinator and its key; polling continues as before.
+    Leave,
+}
+
+#[derive(Debug, Args)]
+pub struct CoordinatorJoinArgs {
+    /// The coordinator's https URL, e.g. https://runners.example.com.
+    #[arg(value_name = "URL")]
+    pub url: String,
+    /// The one-time code from `runner-manager-coordinator invite`.
+    #[arg(long, value_name = "CODE")]
+    pub code: String,
+}
+
+#[derive(Debug, Args)]
+pub struct CoordinatorStatusArgs {
+    /// Emit the versioned JSON document instead of text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 // -- the managed WSL host surface --------------------------------------------
@@ -1957,6 +1993,35 @@ impl Context {
             })
     }
 
+    /// The same store as [`Self::secret_store`], holding `item` instead of
+    /// the GitHub credential.
+    ///
+    /// # Errors
+    /// As [`Self::secret_store`].
+    pub fn secret_store_for(
+        &self,
+        start_mode: StartMode,
+        item: SecretItem,
+    ) -> Result<Arc<dyn SecretStore>, CliError> {
+        if item == SecretItem::GithubCredential {
+            return self.secret_store(start_mode);
+        }
+        let scope = SecretScope::for_start_mode(start_mode);
+        let resolved = match &self.data_root {
+            Some(root) => PlatformSecretStore::rooted_at(scope, root),
+            None => PlatformSecretStore::standard(scope),
+        };
+        resolved
+            .map(|store| Arc::new(store.for_item(item)) as Arc<dyn SecretStore>)
+            .map_err(|source| {
+                CliError::with_remedy(
+                    Failure::SecretStore,
+                    format!("cannot reach the {scope}-scoped secret store: {source}"),
+                    "runner-manager host show",
+                )
+            })
+    }
+
     /// The start mode recorded for this host, or the default when none is.
     ///
     /// # Errors
@@ -2236,6 +2301,8 @@ fn is_decorated_report(command: &Command) -> bool {
         // prompt and a download that an operator waits in front of.
         Command::Wsl(WslCommand::Status(args)) => !args.json,
         Command::Wsl(WslCommand::List | WslCommand::Detach(_)) => true,
+        Command::Coordinator(CoordinatorCommand::Status(args)) => !args.json,
+        Command::Coordinator(CoordinatorCommand::Leave) => true,
         // `host prepare` asks questions and waits for an elevation prompt, and
         // `host doctor --json` is a document; neither may be buffered or
         // decorated.
@@ -2270,6 +2337,7 @@ fn route(
         Command::Service(command) => service::dispatch(context, command, out),
         Command::Update(args) => update::dispatch(context, args, out),
         Command::Wsl(command) => wsl::dispatch(context, command, styling, out),
+        Command::Coordinator(command) => coordinator::dispatch(context, command, out),
         Command::WslHost(command) => wsl::dispatch_wsl_host(context, command, out),
         // `dispatch` returns the terminal UI's own exit code before reaching
         // here, so that `g1` owns what `tui` exits with.

@@ -31,6 +31,8 @@ resolver = "3"
 members = [
     "crates/agent",
     "crates/app",
+    "crates/coordinator",
+    "crates/coordinator-protocol",
     "crates/domain",
     "crates/github",
     "crates/platform",
@@ -53,9 +55,13 @@ homepage = "https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI"
 # Each carries a `version` as well as a `path` so the published `runner-manager`
 # crate (D11, `cargo install`) can resolve them from the registry.
 runner-manager-agent = { path = "crates/agent", version = "0.4.44" }
+runner-manager-coordinator-protocol = { path = "crates/coordinator-protocol", version = "0.4.44" }
 runner-manager-domain = { path = "crates/domain", version = "0.4.44" }
 runner-manager-github = { path = "crates/github", version = "0.4.44" }
 runner-manager-platform = { path = "crates/platform", version = "0.4.44" }
+# The coordinator server is deployed as a container image, never published; it
+# is a dev-dependency of the app's link tests and so carries no `version`.
+runner-manager-coordinator = { path = "crates/coordinator" }
 # `testkit` is never published; it is a dev-dependency everywhere and therefore
 # carries no `version`, which is what lets `cargo publish` strip it.
 runner-manager-testkit = { path = "crates/testkit" }
@@ -289,6 +295,31 @@ core-foundation = "0.10.1"
 # two `unsafe` platform paths in `d1`, both short and both testable against the
 # calling process itself.
 libc = "0.2.189"
+
+# --- Optional coordinator ---------------------------------------------------
+# The coordinator server (`crates/coordinator`) and the daemon's outbound link
+# to it (`.taskflow/2026-11-07-coordinator-server`). `axum` serves the webhook,
+# enrollment and WebSocket endpoints behind a TLS-terminating proxy;
+# `tokio-tungstenite` is the host's client, over the same `rustls` the GitHub
+# client already uses, with the platform verifier `reqwest` already builds.
+# Hosts authenticate with Ed25519 challenge signatures; webhooks with
+# HMAC-SHA256 over the workspace's `sha2` 0.11.
+axum = { version = "0.8.9", default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+    "ws",
+] }
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = [
+    "connect",
+    "handshake",
+    "__rustls-tls",
+] }
+rustls = { version = "0.23.44", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7.0"
+ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
+hmac = "0.13.0"
 
 # --- Test-only --------------------------------------------------------------
 insta = "1.48.0"

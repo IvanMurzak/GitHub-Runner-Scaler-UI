@@ -288,6 +288,10 @@ pub struct HostSetup {
     /// the elevated copy: no fix reads it.
     #[serde(default, skip_serializing)]
     pub polling: Option<PollingFacts>,
+    /// The optional coordinator and the service's link to it. `None` where
+    /// nothing reads it; never sent to the elevated copy.
+    #[serde(default, skip_serializing)]
+    pub coordinator: Option<super::coordinator::CoordinatorSnapshot>,
 }
 
 /// What `github.polling` reads.
@@ -906,6 +910,14 @@ pub const CHECKS: &[CheckSpec] = &[
         probe: probe_polling,
         fix: None,
     },
+    CheckSpec {
+        id: "coordinator.link",
+        title: "Optional coordinator link",
+        platform: CheckPlatform::Any,
+        severity: Severity::Info,
+        probe: probe_coordinator,
+        fix: None,
+    },
     // Recommended, not Required: a Required failure makes the daemon refuse
     // every launch, and this check reports exactly that refusal.
     // The daemon's own: its host checks did not finish, so one is blocked. A
@@ -1379,6 +1391,30 @@ fn probe_polling(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
             };
             fail(format!("{detail}. Throttled: {reason}")).remedy(remedy)
         }
+    }
+}
+
+// -- coordinator.link -----------------------------------------------------------
+
+/// Whether this host joined a coordinator, and how the service's link to it
+/// is. Information only: without a link the service polls GitHub on its own,
+/// exactly as a host that never joined one.
+fn probe_coordinator(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
+    use super::coordinator::LinkState;
+    let Some(coordinator) = &setup.coordinator else {
+        return pass("not configured; this host polls GitHub on its own");
+    };
+    let detail = coordinator.describe();
+    if coordinator.unreadable.is_some() {
+        return fail(detail).remedy("runner-manager coordinator leave, then join again");
+    }
+    match coordinator.link {
+        LinkState::NotConfigured | LinkState::Connected => pass(detail),
+        LinkState::Disconnected => fail(detail).remedy(
+            "nothing is lost: the service reconnects by itself and polls GitHub meanwhile; \
+             runner-manager coordinator status shows why the link is down",
+        ),
+        LinkState::Unknown => unknown(detail).remedy("runner-manager service status"),
     }
 }
 
@@ -2565,6 +2601,10 @@ fn setup_from_parts(
                     traffic,
                 }
             }),
+        coordinator: Some(super::coordinator::CoordinatorSnapshot::read(
+            &service_paths,
+            context.clock().now(),
+        )),
         service,
     }
 }
@@ -4398,6 +4438,7 @@ mod tests {
             service_home: None,
             daemon_unfit: None,
             polling: None,
+            coordinator: None,
         }
     }
 
@@ -5975,6 +6016,51 @@ mod tests {
             ..summary
         };
         assert_eq!(clean.line(), "ok (9 checks)");
+    }
+
+    #[test]
+    fn the_coordinator_check_is_information_and_names_the_link_state() {
+        use super::super::coordinator::{CoordinatorSnapshot, LinkState};
+        let facts = Facts::default();
+        let with = |coordinator: Option<CoordinatorSnapshot>| {
+            evaluate(
+                &HostSetup {
+                    coordinator,
+                    ..windows_setup()
+                },
+                &facts,
+            )
+        };
+        let absent = with(None);
+        let found = finding(&absent, "coordinator.link");
+        assert_eq!(
+            (found.status, found.severity),
+            (Status::Pass, Severity::Info)
+        );
+        assert!(found.detail.contains("not configured"), "{}", found.detail);
+
+        let mut down = CoordinatorSnapshot::not_configured();
+        down.configured = true;
+        down.url = Some("https://runners.example.com".into());
+        down.link = LinkState::Disconnected;
+        down.reason = Some("unreachable".into());
+        let report = with(Some(down.clone()));
+        let found = finding(&report, "coordinator.link");
+        assert_eq!(
+            (found.status, found.severity),
+            (Status::Fail, Severity::Info)
+        );
+        assert!(
+            found
+                .detail
+                .contains("disconnected from https://runners.example.com")
+        );
+
+        down.link = LinkState::Connected;
+        assert_eq!(
+            finding(&with(Some(down)), "coordinator.link").status,
+            Status::Pass
+        );
     }
 
     fn polling_setup(

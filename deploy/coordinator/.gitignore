@@ -1,0 +1,3 @@
+# The webhook secret and the host name never enter the repository.
+webhook_secret
+.env

@@ -368,6 +368,10 @@ pub struct Snapshot {
     pub readiness_summary: String,
     pub wsl_capability: WslCapability,
     pub wsl_hosts: Vec<WslHostRow>,
+    /// The optional coordinator link: one line, and whether it is up.
+    /// `None` when this host has not joined one, and then nothing is drawn.
+    /// Boxed to keep `ScreenAction::Refresh` small.
+    pub coordinator: Option<Box<(String, bool)>>,
 }
 impl Default for Snapshot {
     fn default() -> Self {
@@ -385,6 +389,7 @@ impl Default for Snapshot {
                 WslCapability::NotSupported
             },
             wsl_hosts: vec![],
+            coordinator: None,
         }
     }
 }
@@ -1594,6 +1599,14 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize, width: u16)
     };
     let wsl_tone = wsl_capability_tone(&model.snapshot.wsl_capability);
     head_lines.push(metric("WSL                    : ", capability, wsl_tone));
+    if let Some(coordinator) = &model.snapshot.coordinator {
+        let (line, connected) = coordinator.as_ref();
+        head_lines.push(metric(
+            "Coordinator           : ",
+            line.clone(),
+            if *connected { Tone::Ok } else { Tone::Busy },
+        ));
+    }
     for host in &model.snapshot.wsl_hosts {
         let tone = match host.state {
             WslHostState::Healthy => Tone::Ok,
@@ -2340,6 +2353,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_dashboard_names_the_coordinator_link_only_when_one_is_joined() {
+        let without = render_text(&ScreenModel::new(populated()));
+        assert!(!without.contains("Coordinator"), "{without}");
+        let mut snapshot = populated();
+        snapshot.coordinator = Some(Box::new((
+            "disconnected from https://runners.example.com since 2026-11-07T12:00:00+00:00".into(),
+            false,
+        )));
+        let with = render_text(&ScreenModel::new(snapshot));
+        // The line wraps at this width, so only its words are asserted.
+        assert!(
+            with.contains("Coordinator") && with.contains("disconnected from"),
+            "{with}"
+        );
+    }
+
     fn populated() -> Snapshot {
         Snapshot {
             availability: Availability::Ready,
@@ -2427,6 +2457,7 @@ mod tests {
                 detail: "daemon and lifecycle task are ready".into(),
                 service_version: None,
             }],
+            coordinator: None,
         }
     }
 

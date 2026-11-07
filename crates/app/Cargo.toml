@@ -58,10 +58,16 @@ tar = { workspace = true }
 tempfile = { workspace = true }
 zip = { workspace = true }
 runner-manager-agent = { workspace = true }
+runner-manager-coordinator-protocol = { workspace = true }
 runner-manager-domain = { workspace = true }
 runner-manager-github = { workspace = true }
 runner-manager-platform = { workspace = true }
 remove_dir_all = { workspace = true }
+# The optional coordinator link: an outbound WebSocket over the same `rustls`
+# and platform verifier `reqwest` uses, and a fresh Ed25519 seed at `join`.
+rand = { workspace = true }
+rustls = { workspace = true }
+rustls-platform-verifier = { workspace = true }
 # `f1` hands the user access token to the `d2` secret store, and it must carry
 # it in the redacting wrapper the whole way (`07-security.md`).
 secrecy = { workspace = true }
@@ -69,6 +75,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 unicode-truncate = { workspace = true }
@@ -77,6 +84,8 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
+runner-manager-coordinator = { workspace = true }
+hmac = { workspace = true }
 insta = { workspace = true }
 predicates = { workspace = true }
 runner-manager-testkit = { workspace = true }

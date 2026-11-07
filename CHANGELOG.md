@@ -7,6 +7,30 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.45
+
+Not released yet: this is the version being prepared.
+
+### Added
+
+- An optional coordinator (stage 1 of `.taskflow/2026-11-07-coordinator-server`).
+  `runner-manager coordinator join URL --code CODE`, `coordinator status [--json]`
+  and `coordinator leave` connect a host to a self-hosted
+  `runner-manager-coordinator` server, which receives GitHub's `workflow_job`
+  webhooks and wakes the hosts that serve the job's repository and labels, so
+  they poll at once instead of at their next interval. The coordinator only
+  wakes hosts: each host still computes its own demand under its own limits and
+  with its own GitHub credential. A woken target is polled at most once every
+  5 seconds and never inside a rate-limit back-off.
+- Hosts authenticate with an Ed25519 key created at `join` and kept in the same
+  secret store as the GitHub credential; enrollment uses a one-time code.
+  Without a coordinator, or while it is unreachable, polling is unchanged.
+- `status`, `host doctor` (the information check `coordinator.link`) and the
+  TUI dashboard show the coordinator link: not configured, connected, or
+  disconnected since when.
+- The coordinator server, its container image, a Caddy example and
+  `docs/coordinator.md`.
+
 ## 0.4.44
 
 ### Added

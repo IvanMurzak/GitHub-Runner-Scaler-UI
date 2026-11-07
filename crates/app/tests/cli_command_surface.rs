@@ -46,7 +46,7 @@ use support::{run, runner_manager};
 /// hidden cross-process bridges rather than published commands, and
 /// `the_help_text_lists_the_documented_surface_and_nothing_beyond_it` would
 /// fail on either if the hiding ever stopped working.
-const SURFACE: [(&str, &[&str]); 10] = [
+const SURFACE: [(&str, &[&str]); 11] = [
     ("auth", &["login", "status", "logout"]),
     (
         "host",
@@ -108,6 +108,10 @@ const SURFACE: [(&str, &[&str]); 10] = [
     ("status", &[]),
     ("update", &[]),
     ("wsl", &["list", "install", "status", "detach"]),
+    // Owner decisions D1-D10, 2026-11-07
+    // (`.taskflow/2026-11-07-coordinator-server`): an optional coordinator a
+    // host joins with a one-time code and can leave at any time.
+    ("coordinator", &["join", "status", "leave"]),
 ];
 
 /// Profile and provider leaves added by the runner-sandbox architecture, and

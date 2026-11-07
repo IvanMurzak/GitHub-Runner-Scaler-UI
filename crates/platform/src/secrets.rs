@@ -126,6 +126,30 @@ static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
 /// that use a file. One value, one name, everywhere.
 const ITEM: &str = "user-access-token";
 
+/// Which value a [`PlatformSecretStore`] holds.
+///
+/// Every item lives in the same protected place, with the same per-OS
+/// protection; only its name differs. The GitHub credential is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretItem {
+    /// The GitHub user access token (`auth login`).
+    GithubCredential,
+    /// The Ed25519 private key this host proves itself to a coordinator with
+    /// (`coordinator join`).
+    CoordinatorKey,
+}
+
+impl SecretItem {
+    /// The item's name: the keychain account, or the file stem.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GithubCredential => ITEM,
+            Self::CoordinatorKey => "coordinator-host-key",
+        }
+    }
+}
+
 /// The directory a file-backed store keeps its value in, under whichever root
 /// the scope resolved to. Never `config/` — `05-infrastructure.md` reserves
 /// that for *"non-secret TOML and SQLite"*.
@@ -633,6 +657,15 @@ impl PlatformSecretStore {
                 reason: reason.to_string(),
             })?;
         Ok(Self { scope, site })
+    }
+
+    /// The same store, holding `item` instead of the GitHub credential.
+    #[must_use]
+    pub fn for_item(self, item: SecretItem) -> Self {
+        Self {
+            scope: self.scope,
+            site: sys::with_item(self.site, item.as_str()),
+        }
     }
 
     /// The filesystem object whose access control decides who can read this
@@ -1150,6 +1183,11 @@ mod sys {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(super) struct Site {
         file: PathBuf,
+    }
+
+    pub(super) fn with_item(mut site: Site, item: &'static str) -> Site {
+        site.file.set_file_name(format!("{item}.dpapi"));
+        site
     }
 
     pub(super) fn standard_site(scope: SecretScope) -> Result<Site, String> {
@@ -2057,6 +2095,12 @@ mod sys {
     pub(super) struct Site {
         path: PathBuf,
         kind: Kind,
+        /// The keychain account the value is stored under.
+        item: &'static str,
+    }
+
+    pub(super) fn with_item(site: Site, item: &'static str) -> Site {
+        Site { item, ..site }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2074,6 +2118,7 @@ mod sys {
             SecretScope::Machine => Ok(Site {
                 path: PathBuf::from(SYSTEM_KEYCHAIN),
                 kind: Kind::System,
+                item: ITEM,
             }),
             SecretScope::User => {
                 let home = directories::BaseDirs::new()
@@ -2104,6 +2149,7 @@ mod sys {
                 Ok(Site {
                     path,
                     kind: Kind::Login,
+                    item: ITEM,
                 })
             }
         }
@@ -2120,6 +2166,7 @@ mod sys {
                 .join(scope.as_str())
                 .join("runner-manager.keychain-db"),
             kind: Kind::Rooted,
+            item: ITEM,
         })
     }
 
@@ -2130,9 +2177,10 @@ mod sys {
             Kind::Rooted => "rooted",
         };
         format!(
-            "{kind} keychain {}, item {}/{ITEM}",
+            "{kind} keychain {}, item {}/{}",
             site.path.display(),
-            service()
+            service(),
+            site.item
         )
     }
 
@@ -2249,8 +2297,8 @@ mod sys {
     /// account — and never asks for the data, so the ACL that guards *reading*
     /// does not apply. The value is being replaced either way, which is the
     /// only reason destroying it is the right move here.
-    fn replace_unreadable(keychain: &SecKeychain) -> io::Result<()> {
-        delete_by_query(keychain).map_err(|error| sec_error(&error))
+    fn replace_unreadable(keychain: &SecKeychain, account: &str) -> io::Result<()> {
+        delete_by_query(keychain, account).map_err(|error| sec_error(&error))
     }
 
     /// The delete itself, with the platform error kept intact.
@@ -2258,14 +2306,17 @@ mod sys {
     /// Separate from [`replace_unreadable`] only so that
     /// [`remove_any_existing`] can read the status code rather than the
     /// rendered message.
-    fn delete_by_query(keychain: &SecKeychain) -> Result<(), security_framework::base::Error> {
+    fn delete_by_query(
+        keychain: &SecKeychain,
+        account: &str,
+    ) -> Result<(), security_framework::base::Error> {
         use security_framework::item::{ItemClass, ItemSearchOptions};
 
         ItemSearchOptions::new()
             .class(ItemClass::generic_password())
             .keychains(std::slice::from_ref(keychain))
             .service(service())
-            .account(ITEM)
+            .account(account)
             .delete()
     }
 
@@ -2274,8 +2325,8 @@ mod sys {
     ///
     /// Nothing to delete is the ordinary state of a first `auth login`, and is
     /// success.
-    fn remove_any_existing(keychain: &SecKeychain) -> io::Result<()> {
-        match delete_by_query(keychain) {
+    fn remove_any_existing(keychain: &SecKeychain, account: &str) -> io::Result<()> {
+        match delete_by_query(keychain, account) {
             Ok(()) => Ok(()),
             Err(error) if is_absence(&error) => Ok(()),
             Err(error) => Err(sec_error(&error)),
@@ -2438,19 +2489,19 @@ mod sys {
             // is the whole condition this branch exists to end. Deleting by
             // query needs no permission to *read* the value, so it works even
             // against an item this program is already locked out of.
-            remove_any_existing(&keychain)?;
-            add_granted_to_every_application(&keychain, plaintext)?;
+            remove_any_existing(&keychain, site.item)?;
+            add_granted_to_every_application(&keychain, site.item, plaintext)?;
         } else {
-            match keychain.set_generic_password(service(), ITEM, plaintext) {
+            match keychain.set_generic_password(service(), site.item, plaintext) {
                 Ok(()) => {}
                 // The item is there and this program may not read it, so the
                 // crate's update-or-add could do neither. Take it away and
                 // write a fresh one, which is what replacing a credential means
                 // anyway.
                 Err(error) if is_duplicate(&error) => {
-                    replace_unreadable(&keychain)?;
+                    replace_unreadable(&keychain, site.item)?;
                     keychain
-                        .set_generic_password(service(), ITEM, plaintext)
+                        .set_generic_password(service(), site.item, plaintext)
                         .map_err(|error| sec_error(&error))?;
                 }
                 Err(error) => return Err(sec_error(&error)),
@@ -2539,6 +2590,7 @@ mod sys {
     /// `security add-generic-password -A` does, and for the same reason.
     fn add_granted_to_every_application(
         keychain: &SecKeychain,
+        account: &str,
         plaintext: &[u8],
     ) -> io::Result<()> {
         use core_foundation::base::TCFType as _;
@@ -2549,7 +2601,7 @@ mod sys {
         // outlive the call below, which is the whole of the safety argument for
         // the raw pointers in the attribute list.
         let service_name = service();
-        let account = ITEM;
+
         let mut attributes = [
             ffi::SecKeychainAttribute {
                 tag: ffi::SEC_SERVICE_ITEM_ATTR,
@@ -2819,7 +2871,7 @@ mod sys {
             return Ok(None);
         };
 
-        match keychain.find_generic_password(service(), ITEM) {
+        match keychain.find_generic_password(service(), site.item) {
             Ok((password, _item)) => Ok(Some(password.as_ref().to_vec())),
             Err(error) if is_absence(&error) => Ok(None),
             // The one refusal an operator can act on, and the one they cannot
@@ -2938,7 +2990,7 @@ mod sys {
             return Ok(false);
         };
 
-        match keychain.find_generic_password(service(), ITEM) {
+        match keychain.find_generic_password(service(), site.item) {
             Ok((password, item)) => {
                 // The password buffer holds the value. Drop it before anything
                 // else happens, so it exists for as few instructions as it can.
@@ -2948,7 +3000,7 @@ mod sys {
                 // `auth logout` that reported success without removing anything
                 // would be a lie told during a credential-disclosure response.
                 item.delete();
-                match keychain.find_generic_password(service(), ITEM) {
+                match keychain.find_generic_password(service(), site.item) {
                     Err(error) if is_absence(&error) => Ok(true),
                     Ok(_) => Err(io::Error::other(
                         "the keychain item is still present after being deleted",
@@ -2962,7 +3014,7 @@ mod sys {
             // not read was also an item it could not remove. The query-based
             // delete never asks for the data. See `replace_unreadable`.
             Err(error) if error.code() == ERR_SEC_AUTH_FAILED => {
-                replace_unreadable(&keychain)?;
+                replace_unreadable(&keychain, site.item)?;
                 Ok(true)
             }
             Err(error) if is_absence(&error) => Ok(false),
@@ -3032,6 +3084,17 @@ mod sys {
     pub(super) struct Site {
         file: PathBuf,
         credential: Option<PathBuf>,
+    }
+
+    /// A sibling file in the same protected directory. The systemd
+    /// credential carries the GitHub credential only, so any other item is
+    /// read from its file alone.
+    pub(super) fn with_item(mut site: Site, item: &'static str) -> Site {
+        site.file.set_file_name(item);
+        if item != ITEM {
+            site.credential = None;
+        }
+        site
     }
 
     impl Site {
@@ -3479,6 +3542,27 @@ mod tests {
             exposed(&other_token()),
             "purging one variant must not purge the other; `auth logout` under \
              --start-at boot has no business touching a user-scoped store"
+        );
+    }
+
+    #[test]
+    fn the_coordinator_key_and_the_github_credential_do_not_share_a_value() {
+        let root = TempDir::new().expect("a temporary directory");
+        let github = rooted(SecretScope::Machine, &root);
+        let key = rooted(SecretScope::Machine, &root).for_item(SecretItem::CoordinatorKey);
+
+        github.store(&fixture_token()).expect("stored");
+        key.store(&other_token()).expect("stored");
+        assert_eq!(stored(&github), exposed(&fixture_token()));
+        assert_eq!(stored(&key), exposed(&other_token()));
+        assert_ne!(github.location(), key.location());
+
+        key.delete().expect("purged");
+        assert!(key.load().expect("readable").is_none());
+        assert_eq!(
+            stored(&github),
+            exposed(&fixture_token()),
+            "`coordinator leave` must not sign the host out of GitHub"
         );
     }
 
