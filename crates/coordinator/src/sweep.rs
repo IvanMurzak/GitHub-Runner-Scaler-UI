@@ -20,17 +20,18 @@
 //!
 //! [`RestDemand`]: runner_manager_github::demand::RestDemand
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use runner_manager_coordinator_protocol::{TargetRef, WakeReason};
-use runner_manager_domain::model::OwnerRepo;
+use runner_manager_domain::model::{Label, OwnerRepo};
 use runner_manager_github::demand::DemandGateway;
 use runner_manager_github::rest::{ActivityScope, CancelToken, InventoryError};
 
 use crate::github_app::{AppError, GithubApp};
-use crate::registry::{Coverage, Registry};
+use crate::placement::Placement;
+use crate::registry::{Coverage, Registry, is_pool_job};
 
 /// The shortest sweep interval accepted.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(30);
@@ -117,6 +118,8 @@ pub struct Sweeper {
     reach: Box<dyn Reach>,
     registry: Arc<Registry>,
     inventory_at: Option<Instant>,
+    /// Stage 3: told how many pool jobs each repository read has queued.
+    placement: Option<Arc<Placement>>,
 }
 
 impl Sweeper {
@@ -129,7 +132,16 @@ impl Sweeper {
             reach,
             registry,
             inventory_at: None,
+            placement: None,
         }
+    }
+
+    /// Also counts every read repository's queued pool jobs for `placement`,
+    /// which places a launch for any no lease covers yet.
+    #[must_use]
+    pub fn with_placement(mut self, placement: Arc<Placement>) -> Self {
+        self.placement = Some(placement);
+        self
     }
 
     /// Sweeps every interval, forever.
@@ -231,6 +243,7 @@ impl Sweeper {
         repository: &OwnerRepo,
         report: &mut SweepReport,
     ) -> Result<(), InventoryError> {
+        let read_at = Instant::now();
         let demand = installation
             .demand
             .queued_demand(
@@ -240,11 +253,15 @@ impl Sweeper {
             .await?;
         report.repositories += 1;
         let name = repository.to_string();
+        let mut pool: HashMap<BTreeSet<Label>, u32> = HashMap::new();
         for job in demand.jobs_for(repository) {
             let Ok(required) = job.required_labels() else {
                 continue;
             };
             report.queued += 1;
+            if is_pool_job(&required) {
+                *pool.entry(required.iter().cloned().collect()).or_default() += 1;
+            }
             if self
                 .registry
                 .wakes()
@@ -257,6 +274,12 @@ impl Sweeper {
                 self.registry
                     .wake_for(&name, &required, WakeReason::Reconcile, SWEEP_DELIVERY);
             report.wakes += u32::try_from(woken).unwrap_or(u32::MAX);
+        }
+        if let Some(placement) = &self.placement {
+            let floor = demand.is_truncated(repository);
+            for key in placement.swept(&name, &pool, read_at, floor) {
+                placement.spawn_rebalance(key, Duration::ZERO);
+            }
         }
         Ok(())
     }
@@ -366,6 +389,7 @@ mod tests {
                         name: "default".into(),
                         labels: vec!["self-hosted".into(), "linux".into()],
                         enabled: true,
+                        warm: false,
                     }],
                 }],
             },

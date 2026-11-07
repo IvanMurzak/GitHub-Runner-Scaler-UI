@@ -252,6 +252,7 @@ pub fn host(registry: &Registry) -> mpsc::Receiver<Outbound> {
                     name: "default".into(),
                     labels: vec!["self-hosted".into(), "linux".into()],
                     enabled: true,
+                    warm: false,
                 }],
             }],
         },

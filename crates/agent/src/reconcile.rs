@@ -2262,6 +2262,38 @@ impl EventSink for TeeEvents {
 // The reconciler
 // ---------------------------------------------------------------------------
 
+/// Where a policy's demand comes from when the optional coordinator places
+/// its runners (coordinator stage 3).
+///
+/// A profile carrying a shared pool label (`rm-pool-linux`, ...) on a target
+/// the coordinator covers starts runners only for the launches the
+/// coordinator placed on this host and the host accepted — never from its own
+/// reading of the queue, which every host in the pool sees the same way. This
+/// is a *count*, not a job: a runner still takes whatever matching job GitHub
+/// hands it, nothing here reserves one, and the number still goes through
+/// [`HostAllocator`] and every ceiling, exactly as a polled count does.
+pub trait DemandDirector: fmt::Debug + Send + Sync {
+    /// `Some(n)`: `policy`'s demand this pass is `n`, not its reading.
+    /// `None`: its own reading, as without a coordinator.
+    fn directed_demand(&self, policy: &ScalePolicy) -> Option<u32>;
+
+    /// A runner was started for `policy` (as soon as it exists, whether or
+    /// not its demand was directed).
+    fn launched(&self, policy: &ScalePolicy, attempt: AttemptId);
+}
+
+/// Every policy's demand is its own reading: no coordinator places runners.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OwnDemand;
+
+impl DemandDirector for OwnDemand {
+    fn directed_demand(&self, _policy: &ScalePolicy) -> Option<u32> {
+        None
+    }
+
+    fn launched(&self, _policy: &ScalePolicy, _attempt: AttemptId) {}
+}
+
 /// Everything one reconciler needs, written down at the call site.
 ///
 /// A struct rather than seven positional arguments, for the reason `b1` gives at
@@ -2542,6 +2574,7 @@ pub struct Reconciler {
     events: Arc<dyn EventSink>,
     schedule: PollSchedule,
     clean_backoff: CleanBackoff,
+    director: Arc<dyn DemandDirector>,
 }
 
 impl Reconciler {
@@ -2565,7 +2598,16 @@ impl Reconciler {
             events: ports.events,
             schedule: PollSchedule::new(interval),
             clean_backoff: CleanBackoff::default(),
+            director: Arc::new(OwnDemand),
         }
+    }
+
+    /// Lets `director` replace a policy's polled demand with the launches the
+    /// coordinator placed here. See [`DemandDirector`].
+    #[must_use]
+    pub fn with_director(mut self, director: Arc<dyn DemandDirector>) -> Self {
+        self.director = director;
+        self
     }
 
     #[must_use]
@@ -2723,6 +2765,14 @@ impl Reconciler {
                 continue;
             }
             if supervision_failed.contains(&policy.id) {
+                continue;
+            }
+            // Coordinated placement: the launches the coordinator placed
+            // here are the demand, whatever this host's own reading says (or
+            // whether it could read at all).
+            if let Some(directed) = self.director.directed_demand(policy) {
+                self.start_runners(policy, directed, &mut report, &mut launched)
+                    .await;
                 continue;
             }
             let Some(reading) = readings.get(&policy.target) else {
@@ -2988,6 +3038,10 @@ impl Reconciler {
                     // host-wide total cannot be computed from a set that is
                     // missing it. See `RunnerLauncher::launch`.
                     launched.push(attempt);
+                    // At once, not after the pass: the runner may take a job
+                    // while the next one starts, and its report names the
+                    // launch it was started for.
+                    self.director.launched(policy, id);
                     report.started = report.started.saturating_add(1);
                     budget -= 1;
                     self.events.emit(LifecycleEvent::RunnerStarted {
@@ -7125,5 +7179,109 @@ mod tests {
         assert_eq!(allocation.desired, 5, "max_capacity beats reported demand");
         assert_eq!(allocation.to_start, 2, "host_capacity beats max_capacity");
         assert_eq!(allocation.limiting_factor, LimitingFactor::HostCapacity);
+    }
+
+    /// A director standing in for the coordinator's launches: a fixed count
+    /// per policy, and every attempt it was told about.
+    #[derive(Debug, Default)]
+    struct FixedDirector {
+        directed: Mutex<BTreeMap<PolicyId, u32>>,
+        started: Mutex<Vec<(PolicyId, AttemptId)>>,
+    }
+
+    impl DemandDirector for FixedDirector {
+        fn directed_demand(&self, policy: &ScalePolicy) -> Option<u32> {
+            self.directed.lock().unwrap().get(&policy.id).copied()
+        }
+
+        fn launched(&self, policy: &ScalePolicy, attempt: AttemptId) {
+            self.started.lock().unwrap().push((policy.id, attempt));
+        }
+    }
+
+    /// Coordinated placement: a directed policy starts runners for the
+    /// coordinator's launches only, through every ceiling, whatever its own
+    /// reading says; an undirected one keeps its own demand.
+    #[tokio::test]
+    async fn a_directed_policy_starts_only_what_it_was_directed_to_within_its_ceilings() {
+        let demand = Arc::new(FakeDemand::ready(5, &repo("acme/app")));
+        let launcher = Arc::new(FakeLauncher::new());
+        let director = Arc::new(FixedDirector::default());
+        let mut reconciler = Reconciler::new(
+            host_with(10),
+            ReconcilerPorts {
+                demand: Arc::clone(&demand) as Arc<dyn DemandSource>,
+                launcher: Arc::clone(&launcher) as Arc<dyn RunnerLauncher>,
+                lock: Arc::new(InProcessAllocationLock::new()),
+                directory: Arc::new(FakeDirectory::default()),
+                clock: Arc::new(FakeClock::default()),
+                jitter: Arc::new(NoJitter),
+                events: Arc::new(NoEvents),
+            },
+        )
+        .with_director(Arc::clone(&director) as Arc<dyn DemandDirector>);
+        let pool = policy(1, "acme/app", 2);
+
+        // Five queued jobs on the poll, but no launch placed here: nothing.
+        director.directed.lock().unwrap().insert(pool.id, 0);
+        let report = reconciler.reconcile(std::slice::from_ref(&pool)).await;
+        assert_eq!(report.started, 0);
+
+        // One launch: one runner, reported back to the director.
+        director.directed.lock().unwrap().insert(pool.id, 1);
+        let report = reconciler.reconcile(std::slice::from_ref(&pool)).await;
+        assert_eq!(report.started, 1);
+        assert_eq!(director.started.lock().unwrap().len(), 1);
+
+        // The same launch again is covered by the runner already starting.
+        let report = reconciler.reconcile(std::slice::from_ref(&pool)).await;
+        assert_eq!(report.started, 0);
+
+        // Three launches against max_capacity 2: the ceiling holds.
+        director.directed.lock().unwrap().insert(pool.id, 3);
+        let report = reconciler.reconcile(std::slice::from_ref(&pool)).await;
+        assert_eq!(report.started, 1);
+        assert_eq!(launcher.live_count(), 2);
+
+        // Its own reading failed: a directed policy still starts its launch.
+        let failing = Arc::new(FakeLauncher::new());
+        let mut reconciler = Reconciler::new(
+            host_with(10),
+            ReconcilerPorts {
+                demand: Arc::new(FakeDemand::failing(RefreshState::Offline)),
+                launcher: Arc::clone(&failing) as Arc<dyn RunnerLauncher>,
+                lock: Arc::new(InProcessAllocationLock::new()),
+                directory: Arc::new(FakeDirectory::default()),
+                clock: Arc::new(FakeClock::default()),
+                jitter: Arc::new(NoJitter),
+                events: Arc::new(NoEvents),
+            },
+        )
+        .with_director(Arc::clone(&director) as Arc<dyn DemandDirector>);
+        director.directed.lock().unwrap().insert(pool.id, 1);
+        assert_eq!(reconciler.reconcile(&[pool]).await.started, 1);
+
+        // Undirected (fallback): its own five jobs, clamped to max 2.
+        let own = Arc::new(FakeLauncher::new());
+        let mut reconciler = Reconciler::new(
+            host_with(10),
+            ReconcilerPorts {
+                demand: Arc::new(FakeDemand::ready(5, &repo("acme/app"))),
+                launcher: Arc::clone(&own) as Arc<dyn RunnerLauncher>,
+                lock: Arc::new(InProcessAllocationLock::new()),
+                directory: Arc::new(FakeDirectory::default()),
+                clock: Arc::new(FakeClock::default()),
+                jitter: Arc::new(NoJitter),
+                events: Arc::new(NoEvents),
+            },
+        )
+        .with_director(Arc::new(OwnDemand));
+        assert_eq!(
+            reconciler
+                .reconcile(&[policy(1, "acme/app", 2)])
+                .await
+                .started,
+            2
+        );
     }
 }

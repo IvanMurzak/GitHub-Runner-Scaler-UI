@@ -22,9 +22,9 @@ use runner_manager_agent::package::{
     CachePorts, ExponentialBackoff, GatewayCatalog, HttpFetcher, PackageCache,
 };
 use runner_manager_agent::reconcile::{
-    AllocationLock, FileAllocationLock, FitnessGatedLauncher, GatewayDemand, RandomJitter,
-    ReconcileReport, Reconciler, ReconcilerPorts, RepositoryDirectory, TeeEvents, TracingEvents,
-    WslRecoveryAllocationLock,
+    AllocationLock, DemandDirector, FileAllocationLock, FitnessGatedLauncher, GatewayDemand,
+    RandomJitter, ReconcileReport, Reconciler, ReconcilerPorts, RepositoryDirectory, TeeEvents,
+    TracingEvents, WslRecoveryAllocationLock,
 };
 use runner_manager_domain::attempt::{AttemptState, FailureReason, active_count, active_count_for};
 use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget, StartMode};
@@ -147,6 +147,12 @@ async fn run_generation(
     if targets.is_empty() {
         // Still linked, so the coordinator sees this host; it serves nothing,
         // so nothing is ever woken.
+        let coordination = super::coordinator::coordination();
+        let launches = Arc::new(super::launches::Launches::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            host.clone(),
+            coordination.subscribe(),
+        ));
         let _link = start_coordinator_link(
             context,
             &host,
@@ -156,7 +162,7 @@ async fn run_generation(
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             ),
-            super::coordinator::coordination(),
+            (coordination, launches),
         );
         let heartbeat_store = Arc::clone(&store) as Arc<dyn Store>;
         let heartbeat_paths = context.paths().clone();
@@ -355,6 +361,13 @@ async fn run_generation(
     // What the link knows, for each loop's poll mode (standalone, coordinated,
     // fallback).
     let coordination = super::coordinator::coordination();
+    // The coordinator's launches (stage 3): accepted by the link, started by
+    // the target loops' passes for their pool profiles.
+    let launches = Arc::new(super::launches::Launches::new(
+        Arc::clone(&store) as Arc<dyn Store>,
+        host.clone(),
+        coordination.subscribe(),
+    ));
     let mut managed_targets = Vec::with_capacity(targets.len());
     for policies in targets {
         let package_target = policies[0].target.clone();
@@ -444,7 +457,8 @@ async fn run_generation(
                     jitter: Arc::new(RandomJitter),
                     events: Arc::clone(&events),
                 },
-            ),
+            )
+            .with_director(Arc::clone(&launches) as Arc<dyn DemandDirector>),
             cancel,
             polling: Arc::clone(&polling),
             wake: routes.add(package_target.clone()),
@@ -460,7 +474,7 @@ async fn run_generation(
         Arc::clone(&store) as Arc<dyn Store>,
         routes,
         (Arc::clone(&host_unfit), Arc::clone(&draining)),
-        coordination,
+        (coordination, launches),
     );
 
     let (shutdown, _) = tokio::sync::watch::channel(false);
@@ -645,7 +659,10 @@ fn start_coordinator_link(
     store: Arc<dyn Store>,
     routes: Arc<super::coordinator::WakeRoutes>,
     (unfit, draining): (Arc<AtomicBool>, Arc<AtomicBool>),
-    coordination: Arc<super::coordinator::Coordination>,
+    (coordination, launches): (
+        Arc<super::coordinator::Coordination>,
+        Arc<super::launches::Launches>,
+    ),
 ) -> Option<AbortOnDrop> {
     let key_store = match context.secret_store_for(
         host.service_start_mode,
@@ -674,6 +691,7 @@ fn start_coordinator_link(
             host: host.clone(),
             runner_root,
             coordination,
+            launches,
         }),
     )))
 }
@@ -3940,6 +3958,7 @@ mod tests {
             connected: true,
             down_since: None,
             ack: Some(covered.clone()),
+            version: None,
         });
         after(1).await;
         assert_eq!(mode(&link), PollMode::Coordinated);
@@ -4010,6 +4029,7 @@ mod tests {
             configured: true,
             connected: true,
             down_since: None,
+            version: None,
             ack: Some(HelloAck {
                 reconcile_interval_secs: Some(120),
                 covered: vec![TargetRef {

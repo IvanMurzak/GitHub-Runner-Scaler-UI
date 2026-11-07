@@ -34,13 +34,17 @@ struct Coordinator {
 }
 
 async fn start() -> Coordinator {
+    start_with(Store::open_in_memory().expect("store")).await
+}
+
+async fn start_with(store: Store) -> Coordinator {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let base = format!("http://{}", listener.local_addr().expect("addr"));
     let mut config = Config::new(base.clone(), SecretString::from(SECRET));
     config.revocation_check = Duration::from_millis(100);
-    let state = AppState::new(config, Store::open_in_memory().expect("store"));
+    let state = AppState::new(config, store);
     let (shutdown, stopped) = tokio::sync::oneshot::channel();
     tokio::spawn(serve(listener, Arc::clone(&state), async {
         let _ = stopped.await;
@@ -175,6 +179,7 @@ fn hello(version: u32, host_id: &str) -> HostMessage {
                 name: "default".into(),
                 labels: vec!["self-hosted".into(), "linux".into()],
                 enabled: true,
+                warm: false,
             }],
         }],
     })
@@ -255,7 +260,9 @@ async fn a_version_two_host_is_told_its_coverage_and_woken() {
         closed_with(&mut socket).await,
         Some(CLOSE_UNSUPPORTED_VERSION)
     );
-    let mut socket = coordinator.connect_at(3, &host_id, &key).await;
+    let mut socket = coordinator
+        .connect_at(PROTOCOL_VERSION + 1, &host_id, &key)
+        .await;
     assert_eq!(
         closed_with(&mut socket).await,
         Some(CLOSE_UNSUPPORTED_VERSION)
@@ -368,20 +375,154 @@ async fn a_wrong_key_an_unknown_host_and_a_revoked_host_are_refused() {
     let mut socket = coordinator.connect("no-such-host", &key).await;
     assert_eq!(closed_with(&mut socket).await, Some(CLOSE_UNAUTHORIZED));
 
-    // Connected, then revoked from the admin side: the link is cut.
+    // Connected, then revoked in-process: the link is cut at once.
     let mut socket = coordinator.connect(&host_id, &key).await;
     assert!(matches!(
         next(&mut socket).await,
         ServerMessage::Welcome { .. }
     ));
-    coordinator
-        .state
-        .store
-        .lock()
-        .expect("store")
-        .revoke("win", Utc::now())
-        .expect("revoked");
+    coordinator.state.revoke("win").expect("revoked");
     assert_eq!(closed_with(&mut socket).await, Some(CLOSE_UNAUTHORIZED));
     let mut socket = coordinator.connect(&host_id, &key).await;
     assert_eq!(closed_with(&mut socket).await, Some(CLOSE_UNAUTHORIZED));
+}
+
+/// `hosts revoke` is another process writing the same database: the server
+/// notices the commit and closes the host's live connection within a second.
+#[tokio::test]
+async fn a_revocation_by_the_admin_cli_closes_the_connection_within_a_second() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("coordinator.db");
+    let coordinator = start_with(Store::open(&path).expect("store")).await;
+    let (host_id, key) = enrolled(&coordinator, "mac", 9).await;
+    let mut socket = coordinator.connect(&host_id, &key).await;
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerMessage::Welcome { .. }
+    ));
+    socket
+        .send(Message::Text(
+            hello(PROTOCOL_VERSION, &host_id).encode().into(),
+        ))
+        .await
+        .expect("hello");
+    wait_for_hello(&coordinator).await;
+
+    // What `runner-manager-coordinator hosts revoke mac` does: its own
+    // connection to the file.
+    let admin = Store::open(&path).expect("admin store");
+    let revoked_at = std::time::Instant::now();
+    admin.revoke("mac", Utc::now()).expect("revoked");
+    let code = loop {
+        match tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("closed in time")
+        {
+            Some(Ok(Message::Close(frame))) => break frame.map(|f| u16::from(f.code)),
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => break None,
+        }
+    };
+    assert_eq!(code, Some(CLOSE_UNAUTHORIZED));
+    assert!(
+        revoked_at.elapsed() < Duration::from_secs(1),
+        "closed {:?} after the revocation",
+        revoked_at.elapsed()
+    );
+}
+
+/// A queued pool job over real sockets: the version-3 host in launch mode is
+/// sent one `launch` and no wake; the version-2 host serving the same label
+/// is woken as before.
+#[tokio::test]
+async fn a_pool_job_launches_on_one_version_three_host_and_wakes_a_version_two_one() {
+    use runner_manager_coordinator::registry::Coverage;
+    use runner_manager_coordinator_protocol::{Heartbeat, LaunchAck};
+
+    let coordinator = start().await;
+    coordinator.state.registry.set_coverage(Coverage {
+        interval: Some(Duration::from_secs(120)),
+        repositories: std::collections::BTreeSet::new(),
+        accounts: std::collections::BTreeSet::from(["octo".to_string()]),
+    });
+    let pool_hello = |version: u32, host_id: &str| {
+        let HostMessage::Hello(mut hello) = hello(version, host_id) else {
+            unreachable!()
+        };
+        hello.targets[0].profiles[0]
+            .labels
+            .push("rm-pool-linux".into());
+        HostMessage::Hello(hello)
+    };
+    let mut hosts = Vec::new();
+    for (name, seed, version) in [("new", 11, PROTOCOL_VERSION), ("old", 12, 2)] {
+        let (host_id, key) = enrolled(&coordinator, name, seed).await;
+        let mut socket = coordinator.connect_at(version, &host_id, &key).await;
+        assert!(matches!(
+            next(&mut socket).await,
+            ServerMessage::Welcome { .. }
+        ));
+        for message in [
+            pool_hello(version, &host_id),
+            HostMessage::Heartbeat(Heartbeat {
+                free_slots: 2,
+                ..Heartbeat::default()
+            }),
+        ] {
+            socket
+                .send(Message::Text(message.encode().into()))
+                .await
+                .expect("sent");
+        }
+        assert!(matches!(
+            next(&mut socket).await,
+            ServerMessage::HelloAck(_)
+        ));
+        hosts.push(socket);
+    }
+    // Both heartbeats are in before the job is queued.
+    for _ in 0..100 {
+        if coordinator
+            .state
+            .registry
+            .connected()
+            .iter()
+            .all(|host| host.heartbeat.is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let body = queued("octo/app", &["rm-pool-linux"]);
+    assert_eq!(
+        coordinator
+            .webhook("workflow_job", "pool-1", &body, true)
+            .await,
+        200
+    );
+    let ServerMessage::Launch(launch) = next(&mut hosts[0]).await else {
+        panic!("the version-3 host is sent a launch, not a wake");
+    };
+    assert_eq!(launch.profile, "default");
+    assert_eq!(launch.job_key, "octo/app#1");
+    hosts[0]
+        .send(Message::Text(
+            HostMessage::LaunchAck(LaunchAck::accepted(&launch.lease_id))
+                .encode()
+                .into(),
+        ))
+        .await
+        .expect("ack");
+    assert!(matches!(next(&mut hosts[1]).await, ServerMessage::Wake(_)));
+    let key = runner_manager_coordinator::placement::JobKey::new(
+        "octo/app",
+        &[runner_manager_domain::model::Label::new("rm-pool-linux").expect("label")],
+    );
+    for _ in 0..100 {
+        if coordinator.state.placement.counts(&key) == (1, 1) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the accepted launch was not recorded as a lease");
 }

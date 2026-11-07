@@ -12,11 +12,12 @@ use runner_manager_agent::lifecycle::{
 use runner_manager_domain::attempt::active_count_for;
 use runner_manager_domain::execution::ExecutionPolicy;
 use runner_manager_domain::model::{
-    CachePolicy, Host, HostLabel, Label, PolicyId, ProfileName, RefreshInterval, ScaleTarget,
+    CachePolicy, Host, HostLabel, Label, Os, PolicyId, ProfileName, RefreshInterval, ScaleTarget,
     TargetScope,
 };
 use runner_manager_domain::policy::{
-    NamedProfileSpec, PolicyMode, PolicyState, RoutingLabels, ScalePolicy,
+    NamedProfileSpec, PolicyMode, PolicyState, RoutingLabels, ScalePolicy, check_pool_label,
+    in_pool_namespace, pool_label,
 };
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::WorkspaceKind;
@@ -139,6 +140,13 @@ pub fn dispatch_org(
             &ScaleTarget::organization(&a.organization).map_err(invalid)?,
             &a.labels,
             LabelChange::Remove,
+            out,
+        ),
+        OrgCommand::SetPool(a) => set_pool_selected(
+            context,
+            &ScaleTarget::organization(&a.organization).map_err(invalid)?,
+            None,
+            a.pool.is_on(),
             out,
         ),
         OrgCommand::Remove(a) => remove(
@@ -451,12 +459,134 @@ fn record_named_policy(
         policy.add_routing_label(label).map_err(invalid)?;
     }
     policy.set_execution_policy(execution).map_err(invalid)?;
+    check_pool_labels(store, &policy)?;
     store.insert_policy(&policy).map_err(store_failure)?;
     write_add_result(out, &policy, host)?;
     if let Some(labels) = policy.routing_labels() {
         writeln!(out, "Profile: {} selector={}\nCopy runs-on: {}\nStatic runs-on labels required; selector optional. Overlapping profiles start no runner; matrix expressions are not resolved.",
             policy.profile_name(), labels.host_label(), labels.host_label())
             .map_err(write_failed("this profile result"))?;
+    }
+    Ok(())
+}
+
+/// Shared pool labels (coordinator stage 3, D10).
+///
+/// A label in the reserved `rm-pool-` namespace must be this host's own pool
+/// label: `rm-pool-linux` on Linux, and so on. And at most one profile of a
+/// target on this host may carry it: a job `runs-on: rm-pool-linux` would
+/// match both, and the local ambiguity rule (overlapping profiles start no
+/// runner) would leave it unserved — so the second is refused here instead.
+/// The pool label is an ordinary label to that rule: a pool job selects its
+/// profile by the pool label alone, which is why it must be unique.
+///
+/// # Errors
+/// A mismatched pool label, or another profile of the target carrying it.
+pub fn check_pool_labels(store: &dyn Store, policy: &ScalePolicy) -> Result<(), CliError> {
+    let Some(labels) = policy.routing_labels() else {
+        return Ok(());
+    };
+    // Every label in the reserved namespace, not only the exact pool ones:
+    // `rm-pool-linux-heavy` is refused too.
+    if !labels
+        .additional()
+        .any(|label| in_pool_namespace(label.as_str()))
+    {
+        return Ok(());
+    }
+    let os = host_os(store, policy)?;
+    for label in labels.additional() {
+        check_pool_label(label, os).map_err(invalid)?;
+    }
+    let Some(pool) = labels.pool_label() else {
+        return Ok(());
+    };
+    let sibling = store
+        .policies()
+        .map_err(store_failure)?
+        .into_iter()
+        .find(|other| {
+            other.id != policy.id
+                && other.target == policy.target
+                && other.host_id == policy.host_id
+                && other
+                    .routing_labels()
+                    .is_some_and(|labels| labels.contains(pool))
+        });
+    if let Some(sibling) = sibling {
+        return Err(CliError::with_remedy(
+            Failure::Conflict,
+            format!(
+                "profile {} of {} already answers {pool}; a pool job would match both profiles \
+                 and start no runner. Nothing was changed.",
+                sibling.profile_name(),
+                policy.target
+            ),
+            pool_remedy(&policy.target, sibling.profile_name().as_str()),
+        ));
+    }
+    Ok(())
+}
+
+/// The operating system of the host `policy` belongs to.
+fn host_os(store: &dyn Store, policy: &ScalePolicy) -> Result<Os, CliError> {
+    Ok(store
+        .host(policy.host_id)
+        .map_err(store_failure)?
+        .ok_or_else(|| {
+            CliError::new(
+                Failure::LocalState,
+                "the policy refers to a missing local host",
+            )
+        })?
+        .os)
+}
+
+fn pool_remedy(target: &ScaleTarget, profile: &str) -> String {
+    match target.scope() {
+        TargetScope::Repository => {
+            format!("runner-manager repo profile set-pool {target} --profile {profile} --pool off")
+        }
+        TargetScope::Organization => format!("runner-manager org set-pool {target} --pool off"),
+    }
+}
+
+/// `set-pool --pool on|off`: adds or removes this host's own pool label.
+///
+/// # Errors
+/// As [`mutate_labels_selected`], plus [`check_pool_labels`]'s refusals.
+pub fn set_pool_selected(
+    context: &Context,
+    target: &ScaleTarget,
+    profile: Option<&str>,
+    on: bool,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let store = context.store()?;
+    let policy = find_policy_selected(&store, target, profile)?;
+    let os = host_os(&store, &policy)?;
+    drop(store);
+    let label = pool_label(os).as_str().to_string();
+    mutate_labels_selected(
+        context,
+        target,
+        Some(policy.profile_name().as_str()),
+        std::slice::from_ref(&label),
+        if on {
+            LabelChange::Add
+        } else {
+            LabelChange::Remove
+        },
+        out,
+    )?;
+    if on {
+        writeln!(
+            out,
+            "Workflows can now write `runs-on: {label}`: with a coordinator joined, it picks \
+             one host of the pool for each job; without one, every host carrying the label may \
+             start a runner and the surplus exits idle."
+        )
+        .map_err(write_failed("this pool result"))?;
     }
     Ok(())
 }
@@ -533,6 +663,7 @@ pub fn mutate_labels_selected(
             changed.push(label);
         }
     }
+    check_pool_labels(&store, &policy)?;
 
     if policy.revision() != expected {
         store
@@ -649,6 +780,7 @@ pub fn replace_optional_labels_selected(
     for label in &additions {
         policy.add_routing_label(label.clone()).map_err(invalid)?;
     }
+    check_pool_labels(&store, &policy)?;
 
     if policy.revision() != expected {
         store
@@ -774,6 +906,7 @@ fn record_policy_with_id(
         mode,
         CachePolicy::default(),
     );
+    check_pool_labels(store, &policy)?;
     if let Err(initial_failure) = store.insert_policy(&policy) {
         // A failed write can be ambiguous: the database may have committed the
         // row before reporting an I/O failure. Re-read by the generated id

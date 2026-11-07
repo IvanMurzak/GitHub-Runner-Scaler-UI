@@ -2170,6 +2170,20 @@ Select another profile in Repositories or create one with the CLI.",
                 .copyable(Some(STATIC_SELECTOR_WARNING.to_owned())),
             FormLine::keep(FORK_TRUST_WARNING).copyable(Some(FORK_TRUST_WARNING.to_owned())),
         ];
+        // Coordinator stage 3: a profile answering this host's pool label
+        // says so, with the line a workflow copies.
+        if let Some(pool) = form
+            .extra_labels
+            .iter()
+            .find(|label| runner_manager_domain::policy::is_pool_label(label))
+        {
+            lines.push(
+                FormLine::text(format!(
+                    "Shared pool: runs-on: {pool}  (a joined coordinator picks one host per job)"
+                ))
+                .copyable(Some(format!("runs-on: {pool}"))),
+            );
+        }
         let mut next = 0;
         if form.exposes_scale_toggle() {
             lines.push(
@@ -3393,6 +3407,38 @@ mod tests {
             Some(SettingsCommand::Copy(
                 "rm-home-linux-x64, gpu, trusted".to_owned()
             ))
+        );
+    }
+
+    #[test]
+    fn a_pool_profile_shows_its_shared_pool_line_and_a_mismatched_pool_is_refused() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        // This fixture host runs Linux: Windows' pool is refused, nothing saved.
+        ui.policy_labels.reset_to("rm-pool-windows");
+        ui.execute(&context, SettingsCommand::SaveLabels);
+        let SettingsView::Policy(form) = &ui.view else {
+            panic!("policy remains loaded")
+        };
+        assert!(form.extra_labels.is_empty());
+
+        ui.policy_labels.reset_to("rm-pool-linux");
+        ui.execute(&context, SettingsCommand::SaveLabels);
+        let text: Vec<String> = ui
+            .rows(120, false)
+            .iter()
+            .map(|row| row.text.clone())
+            .collect();
+        assert!(
+            text.iter()
+                .any(|line| line.starts_with("Shared pool: runs-on: rm-pool-linux")),
+            "{text:#?}"
+        );
+        assert!(
+            ui.rows(120, false)
+                .iter()
+                .any(|row| row.copy.as_deref() == Some("runs-on: rm-pool-linux"))
         );
     }
 

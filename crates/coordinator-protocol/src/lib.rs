@@ -10,6 +10,13 @@
 //! speaks version 2 is told, in a `hello_ack`, which of its targets the sweep
 //! covers, and polls those rarely while the link is up.
 //!
+//! Stage 3 (version 3) adds placement for the shared pool labels
+//! (`rm-pool-linux`, ...): the coordinator picks exactly one host for a queued
+//! pool job and sends it a `launch`; the host checks it against its own
+//! policy and ceilings, answers `launch_ack`, and reports its attempts
+//! (`attempt_started`, `attempt_finished`) so the coordinator knows when a
+//! launched runner took a job.
+//!
 //! # Versioning
 //!
 //! Every message is one JSON object tagged by `type`. Fields may be **added**
@@ -43,13 +50,18 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol this build speaks.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The oldest protocol this build still speaks: stage 1's.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 /// The first version with [`ServerMessage::HelloAck`].
 pub const HELLO_ACK_VERSION: u32 = 2;
+
+/// The first version with coordinated placement: [`ServerMessage::Launch`],
+/// [`ServerMessage::CancelLaunch`], [`HostMessage::LaunchAck`] and the
+/// attempt reports. A version-2 peer never sees or sends them.
+pub const LAUNCH_VERSION: u32 = 3;
 
 /// The version a connection runs at, given the newest version the peer
 /// speaks and the oldest it still accepts: the highest both sides speak, or
@@ -125,6 +137,13 @@ pub struct TargetRef {
 }
 
 impl TargetRef {
+    /// Whether `other` names the same target: same scope, and the name
+    /// compared the way GitHub compares names, case-insensitively.
+    #[must_use]
+    pub fn same_as(&self, other: &Self) -> bool {
+        self.scope == other.scope && self.name.eq_ignore_ascii_case(&other.name)
+    }
+
     /// Whether this target covers `repository` (`owner/name`), compared the
     /// way GitHub compares names: case-insensitively.
     #[must_use]
@@ -155,6 +174,10 @@ pub struct Profile {
     pub labels: Vec<String>,
     /// Whether the profile may start runners now.
     pub enabled: bool,
+    /// Version 3: the profile keeps a persistent workspace for the target, so
+    /// a runner it starts finds a warm checkout. A placement hint only.
+    #[serde(default)]
+    pub warm: bool,
 }
 
 /// A target and the profiles that serve it.
@@ -264,10 +287,153 @@ impl HelloAck {
     #[must_use]
     pub fn covers(&self, target: &TargetRef) -> bool {
         self.reconcile_interval_secs.is_some()
-            && self.covered.iter().any(|covered| {
-                covered.scope == target.scope && covered.name.eq_ignore_ascii_case(&target.name)
-            })
+            && self.covered.iter().any(|covered| covered.same_as(target))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Placement (version 3)
+// ---------------------------------------------------------------------------
+
+/// "Start one runner of this pool profile for this target." The host decides:
+/// it starts it through its own allocator and every ceiling it always
+/// applies, or refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Launch {
+    pub target: TargetRef,
+    /// The profile's name, as the host advertised it.
+    pub profile: String,
+    /// What the coordinator placed the runner for (`owner/repo#job-id`, or
+    /// `owner/repo` for a job only the sweep saw). For logs; a runner takes
+    /// whatever matching job GitHub hands it.
+    pub job_key: String,
+    /// Unique per launch; the host refuses a repeat.
+    pub lease_id: String,
+    /// When the coordinator stops counting on this runner, in Unix seconds.
+    pub expires_at: i64,
+    /// The same deadline as a duration from now, which the host uses so a
+    /// skewed clock cannot expire a lease early or keep it late.
+    pub ttl_secs: u32,
+}
+
+/// The job a launch was for is no longer queued: a launch whose runner has
+/// not started yet is dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelLaunch {
+    pub lease_id: String,
+}
+
+/// Why a host refused a launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    /// No profile of that name serves that target here, or it is not a pool
+    /// profile.
+    UnknownProfile,
+    /// The profile is disabled, draining, or not an autoscale profile.
+    Disabled,
+    /// The target is not in coordinated mode here (fallback or standalone):
+    /// the host serves it from its own demand.
+    NotCoordinated,
+    /// The profile's `max_capacity` is reached.
+    MaxCapacity,
+    /// The host's capacity is reached.
+    HostCapacity,
+    /// A required `host doctor` check fails.
+    Unfit,
+    /// The daemon is draining for a shutdown, upgrade or reload.
+    Draining,
+    /// The lease was already seen, or expired before it arrived.
+    Stale,
+    /// A reason this build does not know.
+    #[serde(other)]
+    Other,
+}
+
+impl RefusalReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownProfile => "unknown_profile",
+            Self::Disabled => "disabled",
+            Self::NotCoordinated => "not_coordinated",
+            Self::MaxCapacity => "max_capacity",
+            Self::HostCapacity => "host_capacity",
+            Self::Unfit => "unfit",
+            Self::Draining => "draining",
+            Self::Stale => "stale",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// The host's answer to a [`Launch`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchAck {
+    pub lease_id: String,
+    pub accepted: bool,
+    /// Why, when refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RefusalReason>,
+}
+
+impl LaunchAck {
+    #[must_use]
+    pub fn accepted(lease_id: impl Into<String>) -> Self {
+        Self {
+            lease_id: lease_id.into(),
+            accepted: true,
+            reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn refused(lease_id: impl Into<String>, reason: RefusalReason) -> Self {
+        Self {
+            lease_id: lease_id.into(),
+            accepted: false,
+            reason: Some(reason),
+        }
+    }
+}
+
+/// One of the host's runners took a job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptStarted {
+    /// The launch the runner was started for; `None` for one the host started
+    /// from its own demand.
+    #[serde(default)]
+    pub lease_id: Option<String>,
+    /// The name the runner registered with GitHub, which a `workflow_job`
+    /// webhook's `runner_name` repeats.
+    pub runner_name: String,
+    pub target: TargetRef,
+    pub profile: String,
+}
+
+/// How a runner attempt ended, as fixed words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptOutcomeKind {
+    CompletedJob,
+    /// No job arrived and the runner exited on its idle timeout.
+    IdleExit,
+    Failed,
+    Orphaned,
+    #[serde(other)]
+    Other,
+}
+
+/// One of the host's runner attempts ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptFinished {
+    #[serde(default)]
+    pub lease_id: Option<String>,
+    pub runner_name: String,
+    pub outcome: AttemptOutcomeKind,
+    /// From the attempt's creation to its end.
+    #[serde(default)]
+    pub duration_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +453,12 @@ pub enum HostMessage {
     },
     Hello(Hello),
     Heartbeat(Heartbeat),
+    /// Version 3: the answer to a [`ServerMessage::Launch`].
+    LaunchAck(LaunchAck),
+    /// Version 3.
+    AttemptStarted(AttemptStarted),
+    /// Version 3.
+    AttemptFinished(AttemptFinished),
     #[serde(other)]
     Unknown,
 }
@@ -315,6 +487,10 @@ pub enum ServerMessage {
     Wake(Wake),
     /// Version 2: the answer to a `hello`.
     HelloAck(HelloAck),
+    /// Version 3: start one runner for a queued pool job.
+    Launch(Launch),
+    /// Version 3: drop a launch whose runner has not started.
+    CancelLaunch(CancelLaunch),
     #[serde(other)]
     Unknown,
 }
@@ -579,6 +755,7 @@ mod tests {
                     name: "default".into(),
                     labels: vec!["self-hosted".into(), "linux".into()],
                     enabled: true,
+                    warm: false,
                 }],
             }],
         }
@@ -602,7 +779,26 @@ mod tests {
                 draining: true,
             }),
         ];
-        for message in messages {
+        let attempts = [
+            HostMessage::LaunchAck(LaunchAck::accepted("l1")),
+            HostMessage::LaunchAck(LaunchAck::refused("l2", RefusalReason::HostCapacity)),
+            HostMessage::AttemptStarted(AttemptStarted {
+                lease_id: Some("l1".into()),
+                runner_name: "runner-manager-1".into(),
+                target: TargetRef {
+                    scope: TargetScope::Repo,
+                    name: "octo/app".into(),
+                },
+                profile: "default".into(),
+            }),
+            HostMessage::AttemptFinished(AttemptFinished {
+                lease_id: None,
+                runner_name: "runner-manager-1".into(),
+                outcome: AttemptOutcomeKind::IdleExit,
+                duration_secs: Some(42),
+            }),
+        ];
+        for message in messages.into_iter().chain(attempts) {
             let text = message.encode();
             assert!(text.contains("\"type\":"), "{text}");
             assert_eq!(HostMessage::decode(&text).expect("decodes"), message);
@@ -633,6 +829,20 @@ mod tests {
                 reason: WakeReason::JobQueued,
                 delivery_id: "d-1".into(),
             }),
+            ServerMessage::Launch(Launch {
+                target: TargetRef {
+                    scope: TargetScope::Repo,
+                    name: "octo/app".into(),
+                },
+                profile: "default".into(),
+                job_key: "octo/app#7".into(),
+                lease_id: "l1".into(),
+                expires_at: 1_800_000_000,
+                ttl_secs: 300,
+            }),
+            ServerMessage::CancelLaunch(CancelLaunch {
+                lease_id: "l1".into(),
+            }),
         ];
         for message in server {
             assert_eq!(
@@ -660,7 +870,7 @@ mod tests {
             Ok(HostMessage::Heartbeat(Heartbeat { free_slots: 1, .. }))
         ));
         assert_eq!(
-            ServerMessage::decode(r#"{"type":"launch","lease_id":"l"}"#),
+            ServerMessage::decode(r#"{"type":"rebalance","lease_id":"l"}"#),
             Ok(ServerMessage::Unknown)
         );
         let wake = r#"{"type":"wake","target":{"scope":"repo","name":"a/b"},"repository":"a/b","reason":"rebalance","delivery_id":"d"}"#;
@@ -712,9 +922,11 @@ mod tests {
         assert!(new.contains(r#""protocol_version":1"#), "{new}");
         assert_eq!(negotiate(1, 2), Some(2));
         // A version-1 host's `auth` is accepted by this coordinator.
-        assert!(supported(1) && supported(2) && !supported(0) && !supported(3));
-        // A future peer that dropped version 2 does not overlap.
-        assert_eq!(negotiate(3, 4), None);
+        assert!(supported(1) && supported(2) && supported(3));
+        assert!(!supported(0) && !supported(PROTOCOL_VERSION + 1));
+        // A future peer that dropped every version this one speaks does not
+        // overlap.
+        assert_eq!(negotiate(PROTOCOL_VERSION + 1, PROTOCOL_VERSION + 2), None);
         assert_eq!(negotiate(1, 9), Some(PROTOCOL_VERSION));
         // A `hello_ack` is an unknown type to a version-1 host's decoder,
         // which skips it; here it decodes, and its coverage is case-blind.
@@ -751,6 +963,35 @@ mod tests {
         })
         .encode();
         assert!(wake.contains(r#""reason":"reconcile""#), "{wake}");
+    }
+
+    #[test]
+    fn a_version_two_peer_and_this_one_keep_working() {
+        // A version-2 hello: no `warm` on its profiles.
+        let profile = r#"{"name":"default","labels":["linux"],"enabled":true}"#;
+        let decoded: Profile = serde_json::from_str(profile).expect("decodes");
+        assert!(!decoded.warm);
+        // Both sides settle on 2 with a version-2 peer.
+        assert_eq!(negotiate(1, 2), Some(2));
+        assert!(LAUNCH_VERSION > HELLO_ACK_VERSION && supported(LAUNCH_VERSION));
+        // A refusal reason from a newer host is still a refusal here.
+        let ack = r#"{"type":"launch_ack","lease_id":"l","accepted":false,"reason":"gpu_busy"}"#;
+        assert_eq!(
+            HostMessage::decode(ack),
+            Ok(HostMessage::LaunchAck(LaunchAck::refused(
+                "l",
+                RefusalReason::Other
+            )))
+        );
+        let finished = r#"{"type":"attempt_finished","runner_name":"r","outcome":"preempted"}"#;
+        assert!(matches!(
+            HostMessage::decode(finished),
+            Ok(HostMessage::AttemptFinished(AttemptFinished {
+                outcome: AttemptOutcomeKind::Other,
+                lease_id: None,
+                ..
+            }))
+        ));
     }
 
     #[test]
