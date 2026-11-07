@@ -2724,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "runner-manager"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2772,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "runner-manager-agent"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2805,7 +2805,7 @@ dependencies = [
 
 [[package]]
 name = "runner-manager-coordinator"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "runner-manager-coordinator-protocol"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -2853,7 +2853,7 @@ dependencies = [
 
 [[package]]
 name = "runner-manager-domain"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "chrono",
  "insta",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "runner-manager-e2e"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2898,7 +2898,7 @@ dependencies = [
 
 [[package]]
 name = "runner-manager-github"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2922,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "runner-manager-platform"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2954,7 +2954,7 @@ dependencies = [
 
 [[package]]
 name = "runner-manager-testkit"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "async-trait",
  "chrono",
