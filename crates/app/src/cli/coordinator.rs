@@ -712,18 +712,28 @@ pub fn woken_deadline(
     scheduled.min((last_poll + WAKE_MIN_GAP).max(now))
 }
 
-/// One target's wake signal, shared between the link and its loop.
-#[derive(Debug)]
-pub struct WakeRoute {
-    pub target: ScaleTarget,
-    pub notify: Arc<Notify>,
+/// One target loop's signals, shared between the link and that loop.
+#[derive(Debug, Clone)]
+pub struct RouteSignals {
+    /// Poll now (no sooner than [`WAKE_MIN_GAP`] after the last poll).
+    pub wake: Arc<Notify>,
+    /// Start the runners of the launches accepted for this target, now: no
+    /// poll is needed for that, so no gap applies.
+    pub launch: Arc<Notify>,
 }
 
-/// Every target loop's wake signal, and the gateway whose shared readings a
-/// wake invalidates.
+#[derive(Debug)]
+struct WakeRoute {
+    target: ScaleTarget,
+    signals: RouteSignals,
+}
+
+/// Every target loop's signals, and the gateway whose shared readings a wake
+/// invalidates. Loops come and go while the daemon runs (a repository added
+/// or removed), so the set is behind a lock.
 #[derive(Debug, Default)]
 pub struct WakeRoutes {
-    routes: Vec<WakeRoute>,
+    routes: std::sync::Mutex<Vec<WakeRoute>>,
     demand: Option<Arc<RestDemand>>,
 }
 
@@ -731,28 +741,47 @@ impl WakeRoutes {
     #[must_use]
     pub fn new(demand: Option<Arc<RestDemand>>) -> Self {
         Self {
-            routes: Vec::new(),
+            routes: std::sync::Mutex::new(Vec::new()),
             demand,
         }
     }
 
-    /// Registers `target` and returns its signal.
-    pub fn add(&mut self, target: ScaleTarget) -> Arc<Notify> {
-        let notify = Arc::new(Notify::new());
-        self.routes.push(WakeRoute {
+    fn routes(&self) -> std::sync::MutexGuard<'_, Vec<WakeRoute>> {
+        self.routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn signals(&self, target: &TargetRef) -> Option<(ScaleTarget, RouteSignals)> {
+        self.routes()
+            .iter()
+            .find(|route| same_target(&route.target, target))
+            .map(|route| (route.target.clone(), route.signals.clone()))
+    }
+
+    /// Registers `target`'s loop and returns its signals.
+    pub fn add(&self, target: ScaleTarget) -> RouteSignals {
+        let signals = RouteSignals {
+            wake: Arc::new(Notify::new()),
+            launch: Arc::new(Notify::new()),
+        };
+        let mut routes = self.routes();
+        routes.retain(|route| route.target != target);
+        routes.push(WakeRoute {
             target,
-            notify: Arc::clone(&notify),
+            signals: signals.clone(),
         });
-        notify
+        signals
+    }
+
+    /// Forgets `target`'s loop: it is draining away.
+    pub fn remove(&self, target: &ScaleTarget) {
+        self.routes().retain(|route| &route.target != target);
     }
 
     /// Delivers `wake`; `true` when a local target took it.
     pub fn deliver(&self, wake: &Wake) -> bool {
-        let Some(route) = self
-            .routes
-            .iter()
-            .find(|route| same_target(&route.target, &wake.target))
-        else {
+        let Some((target, signals)) = self.signals(&wake.target) else {
             return false;
         };
         if let (Some(demand), Ok(repository)) = (&self.demand, OwnerRepo::parse(&wake.repository))
@@ -760,20 +789,24 @@ impl WakeRoutes {
         {
             demand.forget_shared_reading(&repository);
         }
-        route.notify.notify_one();
-        tracing::info!(target = %route.target, "the coordinator woke a target; polling it now");
+        signals.wake.notify_one();
+        tracing::info!(target = %target, "the coordinator woke a target; polling it now");
         true
     }
 
-    /// Runs `target`'s next pass as soon as a wake may: a launch was
-    /// accepted for it. The shared reading is kept; the pass needs none.
+    /// Starts `target`'s accepted launches now. Several accepted in a row
+    /// are served together: the signal holds one permit.
     pub fn nudge(&self, target: &TargetRef) {
-        if let Some(route) = self
-            .routes
-            .iter()
-            .find(|route| same_target(&route.target, target))
-        {
-            route.notify.notify_one();
+        if let Some((_, signals)) = self.signals(target) {
+            signals.launch.notify_one();
+        }
+    }
+
+    /// Runs `target`'s next pass as soon as a wake may: one of its runners
+    /// exited and the pass concludes it. The shared reading is kept.
+    pub fn pass_soon(&self, target: &TargetRef) {
+        if let Some((_, signals)) = self.signals(target) {
+            signals.wake.notify_one();
         }
     }
 }
@@ -1019,7 +1052,7 @@ pub async fn maintain_link(ports: LinkPorts) {
         ports.host.id,
         move || coordination.borrow().configured,
         // A runner that exited holds its slot until a pass concludes it.
-        move |target| routes.nudge(&target_ref(target)),
+        move |target| routes.pass_soon(&target_ref(target)),
     );
     tokio::join!(sampling, link(ports, &meters));
 }
@@ -1196,6 +1229,7 @@ fn heartbeat(ports: &LinkPorts, policies: &[ScalePolicy]) -> Heartbeat {
         free_ram_bytes: runner_manager_platform::host_fitness::available_memory_bytes(),
         unfit: ports.unfit.load(Ordering::Relaxed),
         draining: ports.draining.load(Ordering::Relaxed),
+        open_leases: None,
     }
 }
 
@@ -1468,40 +1502,60 @@ async fn serve(
                         return end;
                     }
                 }
-                let beat = HostMessage::Heartbeat(heartbeat(ports, &policies));
-                if let Err(end) = send(socket, &beat).await {
+                if let Err(end) = report_attempts(socket, ports, meters, &mut reports, version, true).await {
                     return end;
                 }
                 recorder.keep_alive();
             }
             _ = watch.tick(), if version >= LAUNCH_VERSION => {
-                let policies = ports.store.policies().unwrap_or_default();
-                let own: Vec<ScalePolicy> = policies
-                    .into_iter()
-                    .filter(|policy| policy.is_owned_by(ports.host.id))
-                    .collect();
-                for report in reports.poll(ports.store.as_ref(), &own, &ports.launches, meters) {
-                    let message = match report {
-                        AttemptReport::Started(started) => HostMessage::AttemptStarted(started),
-                        AttemptReport::Finished(finished) => HostMessage::AttemptFinished(finished),
-                    };
-                    if let Err(end) = send(socket, &message).await {
-                        return end;
-                    }
-                }
-                // The coordinator places by the last heartbeat: a slot just
-                // freed (an attempt ended, or an isolated one was cleaned)
-                // is said at once, not at the next beat.
-                if reports.take_released() {
-                    let policies = ports.store.policies().unwrap_or_default();
-                    let beat = HostMessage::Heartbeat(heartbeat(ports, &policies));
-                    if let Err(end) = send(socket, &beat).await {
-                        return end;
-                    }
+                if let Err(end) = report_attempts(socket, ports, meters, &mut reports, version, false).await {
+                    return end;
                 }
             }
         }
     }
+}
+
+/// Sends what changed in this host's attempts, then a heartbeat when `beat`
+/// says so or a slot may just have freed (an attempt ended, or an isolated
+/// one was cleaned): the coordinator places by the last heartbeat.
+///
+/// The open launches the heartbeat lists are read *before* the attempt
+/// reports: a launch missing from the list was closed because its runner
+/// took a job or ended, and the report saying so then reaches the
+/// coordinator ahead of the heartbeat, so the lease is claimed (or closed)
+/// there, never dropped as one this host no longer holds.
+async fn report_attempts(
+    socket: &mut Socket,
+    ports: &LinkPorts,
+    meters: &AttemptMeters,
+    reports: &mut AttemptReports,
+    version: u32,
+    beat: bool,
+) -> Result<(), SessionEnd> {
+    let directed = version >= LAUNCH_VERSION;
+    let open = directed.then(|| ports.launches.open_leases());
+    let policies = ports.store.policies().unwrap_or_default();
+    if directed {
+        let own: Vec<ScalePolicy> = policies
+            .iter()
+            .filter(|policy| policy.is_owned_by(ports.host.id))
+            .cloned()
+            .collect();
+        for report in reports.poll(ports.store.as_ref(), &own, &ports.launches, meters) {
+            let message = match report {
+                AttemptReport::Started(started) => HostMessage::AttemptStarted(started),
+                AttemptReport::Finished(finished) => HostMessage::AttemptFinished(finished),
+            };
+            send(socket, &message).await?;
+        }
+    }
+    if beat || reports.take_released() {
+        let mut heartbeat = heartbeat(ports, &policies);
+        heartbeat.open_leases = open;
+        send(socket, &HostMessage::Heartbeat(heartbeat)).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1524,9 +1578,13 @@ mod tests {
 
     #[test]
     fn a_wake_reaches_only_the_target_it_names() {
-        let mut routes = WakeRoutes::new(None);
-        let repo = routes.add(ScaleTarget::repository("Octo/App").expect("target"));
-        let org = routes.add(ScaleTarget::organization("acme").expect("target"));
+        let routes = WakeRoutes::new(None);
+        let repo = routes
+            .add(ScaleTarget::repository("Octo/App").expect("target"))
+            .wake;
+        let org = routes
+            .add(ScaleTarget::organization("acme").expect("target"))
+            .wake;
         let wake = |scope, name: &str| Wake {
             target: TargetRef {
                 scope,
@@ -1682,8 +1740,8 @@ mod tests {
         let store = SqliteStore::open_in_memory().expect("store");
         store.put_host(&host).expect("host");
         store.insert_policy(&policy).expect("policy");
-        let mut routes = WakeRoutes::new(None);
-        let woken = routes.add(policy.target.clone());
+        let routes = WakeRoutes::new(None);
+        let woken = routes.add(policy.target.clone()).wake;
 
         let coordination = coordination();
         let mut view = coordination.subscribe();
@@ -1889,8 +1947,8 @@ mod tests {
         sqlite.put_host(&host).expect("host");
         sqlite.insert_policy(&policy).expect("policy");
         let store: Arc<dyn Store> = Arc::clone(&sqlite) as Arc<dyn Store>;
-        let mut routes = WakeRoutes::new(None);
-        let nudged = routes.add(policy.target.clone());
+        let routes = WakeRoutes::new(None);
+        let nudged = routes.add(policy.target.clone()).launch;
         let coordination = coordination();
         let launches = Arc::new(Launches::new(
             Arc::clone(&store),

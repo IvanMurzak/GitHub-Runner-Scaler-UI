@@ -33,6 +33,26 @@ the version being prepared rather than the version in `Cargo.toml`.
   reach 90 s, which added up to minutes), and starts over after a connection
   that stayed up for over a minute. A refused key or version still waits up
   to 5 minutes.
+- **A pool job no longer waits minutes behind a launch that is not coming.**
+  A lease (a launch the coordinator sent to a host) used to count for 5
+  minutes even after its host had dropped it, for example after the link
+  reconnected, or after another runner of that host took the job. The
+  coordinator now closes it, and places the job again at once, when the host
+  connects again, when the host's heartbeat no longer lists it, or when
+  another runner of the same host takes a job of that queue. A lease lasts
+  2 minutes at most by default, set with `COORDINATOR_LEASE_TTL`
+  (`--lease-ttl`, at least 30 s).
+- **Adding or removing a repository on a host no longer interrupts the
+  others.** `repo add`, `repo remove` or enabling or disabling a profile used
+  to make the daemon finish every running job, stop every target and drop its
+  coordinator link and accepted launches before reloading. Now only the
+  changed repository's loop starts or winds down, within 30 seconds. The
+  link, its launches and every other repository keep running.
+- **Accepted launches start together, at once.** Each launch a host accepted
+  used to wait for its own pass, 5 seconds after the previous one (6 launches
+  took 25 s more to start). Now every launch open at that moment is started
+  in one go, without polling GitHub. The runners are still created one after
+  another under the host's allocation lock, so every capacity ceiling holds.
 - A test of the runner process fixture could read its readiness file before
   it was written and fail at random.
 
@@ -42,19 +62,28 @@ the version being prepared rather than the version in `Cargo.toml`.
   to starting on a runner (GitHub's `created_at` to `started_at`), as p50 and
   p90 over all samples and per job: the figure that shows whether jobs wait
   for a free host.
+- **Why a pool job waits.** `coordinator stats` lists the pool queues with
+  fewer runners on their way than jobs queued, the oldest job's wait, and the
+  reason: no host serves it, unfit or draining, no free slot, not enough
+  memory, refused by a host (with the host's reason), or no answer. It also
+  lists the open leases per host with their age. The coordinator logs the
+  same reason, at most once a minute per queue.
 
 ### Upgrade notes
 
 - `coordinator stats --json` (on a host and on the coordinator) is schema
-  version 2: `p50_duration_secs` is the job's run time, and
-  `p50_queue_wait_secs` and `p90_queue_wait_secs` are new, overall and per job.
-- The coordinator's database moves to schema 3 (one new column). To roll back
-  to 0.4.46, stop the service and run
+  version 3: `p50_duration_secs` is the job's run time, and
+  `p50_queue_wait_secs` and `p90_queue_wait_secs` are new, overall and per job,
+  as are `pending`, `leases` and `live_at`.
+- The coordinator's database moves to schema 4 (one new column, one new
+  table). To roll back to 0.4.46, stop the service and run
   `sqlite3 coordinator.db 'PRAGMA user_version = 2'`.
 - The coordinator protocol stays at version 4 and every change is additive:
   0.4.47 hosts and coordinators work with 0.4.45-0.4.46 ones. An older host
   still gets prompt placement once its next heartbeat shows a free slot; an
-  older coordinator ignores the extra heartbeat.
+  older coordinator ignores the extra heartbeat and its lease list. An older
+  host's leases are still closed when it reconnects or another of its runners
+  takes the job, and otherwise expire as before.
 
 ## 0.4.46
 

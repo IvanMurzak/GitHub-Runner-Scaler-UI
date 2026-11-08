@@ -628,6 +628,134 @@ async fn a_freed_slot_places_a_waiting_pool_job_at_once() {
 
 /// A `workflow_job` event: queued at 10:00:00, started at 10:00:04 and, once
 /// `completed`, done at 10:00:18 (a 14-second job).
+/// Accepts the next launch `socket` is sent; its lease.
+async fn accept(socket: &mut Socket) -> String {
+    use runner_manager_domain::coordinator_protocol::LaunchAck;
+    loop {
+        if let ServerMessage::Launch(launch) = next(socket).await {
+            send(
+                socket,
+                &HostMessage::LaunchAck(LaunchAck::accepted(&launch.lease_id)),
+            )
+            .await;
+            return launch.lease_id;
+        }
+    }
+}
+
+/// A lease's host reconnects (its new link starts with no launch) or stops
+/// listing it in its heartbeat: either way the lease closes at once, not at
+/// the end of its lifetime, and its job is placed again.
+#[tokio::test]
+async fn a_lease_its_host_dropped_is_closed_on_reconnect_and_by_its_heartbeat() {
+    use runner_manager_coordinator::placement::JobKey;
+    use runner_manager_coordinator::registry::Coverage;
+    use runner_manager_domain::coordinator_protocol::Heartbeat;
+    use runner_manager_domain::model::Label;
+
+    let coordinator = start_configured(Store::open_in_memory().expect("store"), |config| {
+        config.placement_tick = Duration::from_secs(3600);
+    })
+    .await;
+    coordinator.state.registry.set_coverage(Coverage {
+        interval: Some(Duration::from_secs(120)),
+        repositories: std::collections::BTreeSet::new(),
+        accounts: std::collections::BTreeSet::from(["octo".to_string()]),
+    });
+    let (host_id, key) = enrolled(&coordinator, "pool", 41).await;
+    let key_of = JobKey::new("octo/app", &[Label::new("rm-pool-linux").expect("label")]);
+    // Connects, describes a pool profile with two free slots, and accepts
+    // the next launch; returns the socket and that launch's lease.
+    let link = |held: Option<Vec<String>>| {
+        let coordinator = &coordinator;
+        let host_id = host_id.clone();
+        let key = &key;
+        async move {
+            let mut socket = coordinator.connect(&host_id, key).await;
+            assert!(matches!(
+                next(&mut socket).await,
+                ServerMessage::Welcome { .. }
+            ));
+            let HostMessage::Hello(mut pool_hello) = hello(PROTOCOL_VERSION, &host_id) else {
+                unreachable!()
+            };
+            pool_hello.targets[0].profiles[0]
+                .labels
+                .push("rm-pool-linux".into());
+            send(&mut socket, &HostMessage::Hello(pool_hello)).await;
+            send(
+                &mut socket,
+                &HostMessage::Heartbeat(Heartbeat {
+                    free_slots: 2,
+                    open_leases: held,
+                    ..Heartbeat::default()
+                }),
+            )
+            .await;
+            socket
+        }
+    };
+    let counts = || coordinator.state.placement.counts(&key_of);
+    let settled = |want: (usize, usize)| async move {
+        for _ in 0..250 {
+            if counts() == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("counts {:?}, wanted {want:?}", counts());
+    };
+
+    let mut first = link(Some(Vec::new())).await;
+    assert!(matches!(next(&mut first).await, ServerMessage::HelloAck(_)));
+    let body = queued("octo/app", &["rm-pool-linux"]);
+    assert_eq!(
+        coordinator
+            .webhook("workflow_job", "drop-1", &body, true)
+            .await,
+        200
+    );
+    let lease = accept(&mut first).await;
+    settled((1, 1)).await;
+
+    // A second connection replaces the first, which never closed cleanly:
+    // the old lease goes, and the job is offered on the new link (whose
+    // heartbeat lists nothing, as an older host's).
+    let mut second = link(None).await;
+    let again = tokio::time::timeout(Duration::from_secs(3), accept(&mut second))
+        .await
+        .expect("placed again at once on the new link");
+    assert_ne!(again, lease);
+    settled((1, 1)).await;
+
+    // The host holds it: a heartbeat listing it changes nothing...
+    send(
+        &mut second,
+        &HostMessage::Heartbeat(Heartbeat {
+            free_slots: 1,
+            open_leases: Some(vec![again.clone()]),
+            ..Heartbeat::default()
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(counts(), (1, 1));
+    // ...and one that no longer lists it closes it, and places the job again.
+    send(
+        &mut second,
+        &HostMessage::Heartbeat(Heartbeat {
+            free_slots: 1,
+            open_leases: Some(Vec::new()),
+            ..Heartbeat::default()
+        }),
+    )
+    .await;
+    let third = tokio::time::timeout(Duration::from_secs(3), accept(&mut second))
+        .await
+        .expect("placed again after the heartbeat");
+    assert_ne!(third, again);
+}
+
 fn job_event(action: &str, job_id: u64, runner: Option<&str>) -> String {
     serde_json::json!({
         "action": action,

@@ -51,9 +51,10 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use runner_manager_domain::coordinator_protocol::{
     AttemptFinished, AttemptOutcomeKind, HostJobStats, HostScore, HostStats, JobStats,
-    MAX_MESSAGE_BYTES, PlacementDecision, ServerMessage, StatsReport, is_managed_runner_name,
-    printable,
+    MAX_MESSAGE_BYTES, OpenLease, PendingQueue, PlacementDecision, ServerMessage, StatsReport,
+    is_managed_runner_name, printable,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::store::{JobSample, Store, StoreError};
 
@@ -973,10 +974,38 @@ impl Statistics {
     /// # Errors
     /// SQLite's.
     pub fn report(&self, now: DateTime<Utc>) -> Result<StatsReport, StoreError> {
+        self.report_with(now, None)
+    }
+
+    /// [`Self::report`] with placement's `live` state instead of the copy
+    /// last saved.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn report_with(
+        &self,
+        now: DateTime<Utc>,
+        live: Option<LiveState>,
+    ) -> Result<StatsReport, StoreError> {
         let mut report = report(&lock(&self.db), &self.config, now)?;
         report.launches += self.launches.load(Ordering::Relaxed);
         report.wakes += self.wakes.load(Ordering::Relaxed);
+        if let Some(live) = live {
+            report.pending = live.pending;
+            report.leases = live.leases;
+            report.live_at = Some(now.timestamp());
+        }
         Ok(fit_report(report))
+    }
+
+    /// Saves placement's `live` state for the admin CLI's `stats`.
+    pub fn save_live(&self, live: &LiveState) {
+        let Ok(json) = serde_json::to_string(live) else {
+            return;
+        };
+        if let Err(error) = lock(&self.db).save_live_state(&json, Utc::now()) {
+            tracing::warn!(%error, "the placement state could not be saved for stats");
+        }
     }
 }
 
@@ -1070,6 +1099,14 @@ pub fn report(
         .iter()
         .filter_map(|json| serde_json::from_str(json).ok())
         .collect();
+    let (pending, leases, live_at) = store
+        .live_state()?
+        .and_then(|(json, at)| {
+            serde_json::from_str::<LiveState>(&json)
+                .ok()
+                .map(|live| (live.pending, live.leases, Some(at.timestamp())))
+        })
+        .unwrap_or_default();
     Ok(StatsReport {
         generated_at: now.timestamp(),
         samples_per_job: config.samples_per_job,
@@ -1082,7 +1119,18 @@ pub fn report(
         jobs,
         hosts,
         decisions,
+        pending,
+        leases,
+        live_at,
     })
+}
+
+/// Placement's pending queues and open leases, as the server saves them for
+/// the admin CLI.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct LiveState {
+    pub pending: Vec<PendingQueue>,
+    pub leases: Vec<OpenLease>,
 }
 
 /// Trims a report until its message fits one WebSocket frame: decisions
@@ -1091,7 +1139,11 @@ pub fn report(
 pub fn fit_report(mut report: StatsReport) -> StatsReport {
     let budget = MAX_MESSAGE_BYTES - 1024;
     while ServerMessage::Stats(report.clone()).encode().len() > budget {
-        if report.decisions.pop().is_some() || report.jobs.pop().is_some() {
+        if report.decisions.pop().is_some()
+            || report.leases.pop().is_some()
+            || report.pending.pop().is_some()
+            || report.jobs.pop().is_some()
+        {
             continue;
         }
         if report.hosts.pop().is_none() {
@@ -1674,6 +1726,32 @@ mod tests {
         let report = again.report(Utc::now()).expect("report");
         assert_eq!((report.launches, report.wakes), (1, 4));
         assert!(again.with_aggregates(|aggregates| aggregates.job("octo/app/CI/build").is_some()));
+
+        // Placement's live state: the server's own report shows it as of now;
+        // the admin CLI reads the copy the server saved.
+        let live = || LiveState {
+            pending: vec![PendingQueue {
+                repository: "octo/app".into(),
+                queued: 2,
+                reason: Some("no_free_slot".into()),
+                ..PendingQueue::default()
+            }],
+            leases: Vec::new(),
+        };
+        let now = Utc::now();
+        let report = again.report_with(now, Some(live())).expect("report");
+        assert_eq!(
+            (report.pending.len(), report.live_at),
+            (1, Some(now.timestamp()))
+        );
+        assert!(
+            again.report(now).expect("report").pending.is_empty(),
+            "nothing saved yet"
+        );
+        again.save_live(&live());
+        let saved = again.report(now).expect("report");
+        assert_eq!(saved.pending[0].queued, 2);
+        assert!(saved.live_at.is_some());
     }
 
     #[test]

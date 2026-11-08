@@ -40,7 +40,8 @@ use runner_manager_agent::reconcile::DemandDirector;
 use runner_manager_domain::attempt::{AttemptOutcome, AttemptState, RunnerAttempt};
 use runner_manager_domain::capacity::{HostAllocator, LimitingFactor};
 use runner_manager_domain::coordinator_protocol::{
-    AttemptFinished, AttemptOutcomeKind, AttemptStarted, Launch, LaunchAck, RefusalReason,
+    AttemptFinished, AttemptOutcomeKind, AttemptStarted, Launch, LaunchAck, MAX_OPEN_LEASES,
+    RefusalReason,
 };
 use runner_manager_domain::model::{AttemptId, Host, PolicyId};
 use runner_manager_domain::policy::{ScalePolicy, pool_label};
@@ -164,14 +165,26 @@ impl Launches {
         u32::try_from(count).unwrap_or(u32::MAX)
     }
 
-    /// Closes every open launch that expired, and every one whose runner is
-    /// no longer waiting for a job. A launch without a runner of its own is
+    /// Closes every open launch that expired, whose profile is gone, and
+    /// whose runner is no longer waiting for a job. A launch without a runner of its own is
     /// first given a waiting runner of its profile that no launch holds (one
     /// left idle, or kept by `min_capacity`): that runner is what serves it,
     /// so the allocator must not start another, and its claim closes it.
     fn settle(&self, now: Instant) {
         let policies: HashSet<PolicyId> =
             self.book().open.values().map(|open| open.policy).collect();
+        // A launch whose profile was removed, or stopped being this host's
+        // pool profile, starts nothing any more; every other one survives a
+        // policy change. `Err` (unreadable) keeps them all.
+        let gone: HashSet<PolicyId> = policies
+            .iter()
+            .copied()
+            .filter(|policy| {
+                self.store
+                    .policy(*policy)
+                    .is_ok_and(|found| found.is_none_or(|found| !self.is_own_pool_profile(&found)))
+            })
+            .collect();
         // Read without holding the book: the link and the passes use it.
         let waiting: HashMap<PolicyId, Vec<AttemptId>> = policies
             .into_iter()
@@ -188,7 +201,8 @@ impl Launches {
             })
             .collect();
         let mut book = self.book();
-        book.open.retain(|_, open| open.expires > now);
+        book.open
+            .retain(|_, open| open.expires > now && !gone.contains(&open.policy));
         let held: HashSet<AttemptId> = book.open.values().filter_map(|open| open.attempt).collect();
         let mut free: HashMap<PolicyId, Vec<AttemptId>> = waiting
             .iter()
@@ -310,6 +324,19 @@ impl Launches {
         let mut book = self.book();
         book.remember(lease_id);
         book.open.remove(lease_id).is_some()
+    }
+
+    /// The launches still open, for the heartbeat: the coordinator closes
+    /// any accepted lease of this host not among them.
+    #[must_use]
+    pub fn open_leases(&self) -> Vec<String> {
+        self.settle(Instant::now());
+        self.book()
+            .open
+            .keys()
+            .take(MAX_OPEN_LEASES)
+            .cloned()
+            .collect()
     }
 
     /// The lease `attempt`'s runner was started for, if any.
@@ -550,6 +577,43 @@ mod tests {
             launches.decide(&launch(&policy, "l3"), true, false).reason,
             Some(RefusalReason::Unfit)
         );
+    }
+
+    /// The heartbeat lists the launches still open: accepted ones until
+    /// cancelled; a policy change keeps them while their profile exists,
+    /// and drops them once it is gone.
+    #[test]
+    fn the_open_launches_survive_a_policy_change_but_not_their_profile() {
+        let (store, policy, launches) = setup(LAUNCH_VERSION);
+        for lease in ["a", "b"] {
+            assert!(
+                launches
+                    .decide(&launch(&policy, lease), false, false)
+                    .accepted
+            );
+        }
+        assert_eq!(
+            launches.open_leases(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(launches.cancel("a"));
+        assert_eq!(launches.open_leases(), vec!["b".to_string()]);
+        // Another repository added: the launch stays.
+        let other = fixtures::policy()
+            .id(PolicyId::new_random())
+            .repository("octo/other")
+            .host(policy.host_id)
+            .autoscale("home", 1)
+            .active()
+            .build();
+        store.insert_policy(&other).expect("added");
+        assert_eq!(launches.open_leases(), vec!["b".to_string()]);
+        // Its own profile removed: nothing to start it with.
+        store
+            .remove_policy(policy.id, policy.revision())
+            .expect("removed");
+        assert!(launches.open_leases().is_empty());
+        assert_eq!(launches.open_for(policy.id), 0);
     }
 
     /// A slot may free when an attempt ends and again when it is cleaned

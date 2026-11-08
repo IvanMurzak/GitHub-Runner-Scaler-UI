@@ -11,6 +11,7 @@ use anyhow::{Context as _, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use runner_manager_coordinator::github_app::{AppKey, GithubApp};
+use runner_manager_coordinator::placement;
 use runner_manager_coordinator::server::{AppState, Config, serve};
 use runner_manager_coordinator::stats::{self, StatsConfig, Weights};
 use runner_manager_coordinator::store::{HostRecord, Store};
@@ -46,6 +47,10 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "parsed once at start; boxing the server's settings buys nothing"
+)]
 enum Command {
     /// Run the server (plain HTTP; put a TLS proxy in front).
     ///
@@ -85,6 +90,10 @@ enum Command {
         /// cache=4,headroom=2,speed=1,bigfit=1.5 (any subset).
         #[arg(long, env = "COORDINATOR_PLACEMENT_WEIGHTS", default_value = "", value_parser = parse_weights)]
         placement_weights: Weights,
+        /// How long an accepted launch counts while its runner has taken no
+        /// job: 30s at least, 2m by default.
+        #[arg(long, env = "COORDINATOR_LEASE_TTL", default_value = "2m", value_parser = parse_lease_ttl)]
+        lease_ttl: Duration,
     },
     /// The job weight statistics: heaviest jobs, hosts, recent placements.
     Stats {
@@ -140,6 +149,17 @@ fn parse_ttl(text: &str) -> Result<Duration, String> {
         }
     };
     Ok(Duration::from_secs(number.saturating_mul(seconds)))
+}
+
+fn parse_lease_ttl(text: &str) -> Result<Duration, String> {
+    let ttl = parse_ttl(text)?;
+    if ttl < placement::MIN_LEASE_TTL {
+        return Err(format!(
+            "the lease lifetime must be at least {}s",
+            placement::MIN_LEASE_TTL.as_secs()
+        ));
+    }
+    Ok(ttl)
 }
 
 fn parse_reconcile_interval(text: &str) -> Result<Duration, String> {
@@ -280,12 +300,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             default_job_ram,
             ram_margin,
             placement_weights,
+            lease_ttl,
         } => {
             let origin = CoordinatorUrl::parse(&public_url)
                 .context("COORDINATOR_PUBLIC_URL is not a usable https URL")?
                 .origin();
             let mut config = Config::new(origin, webhook_secret()?);
             config.trust_forwarded_for = trust_forwarded_for;
+            config.lease_ttl = lease_ttl;
             config.stats = StatsConfig {
                 samples_per_job: cli.stats_samples,
                 default_job_ram,
@@ -465,6 +487,9 @@ mod tests {
         assert!(parse_ttl("5y").is_err());
         assert_eq!(parse_reconcile_interval("2m"), Ok(Duration::from_secs(120)));
         assert!(parse_reconcile_interval("29s").is_err());
+        assert_eq!(parse_lease_ttl("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_lease_ttl("30s"), Ok(Duration::from_secs(30)));
+        assert!(parse_lease_ttl("29s").is_err());
     }
 
     #[test]

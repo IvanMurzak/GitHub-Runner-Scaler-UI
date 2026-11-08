@@ -243,7 +243,16 @@ pub struct Heartbeat {
     pub unfit: bool,
     /// The daemon is draining for a shutdown, upgrade or reload.
     pub draining: bool,
+    /// Version 3 and later, from 0.4.47: the launches this host accepted and
+    /// still holds open (no runner of theirs has taken a job yet). The
+    /// coordinator closes any accepted lease of this host that is not here.
+    /// `None` from an older host, which is then trusted as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_leases: Option<Vec<String>>,
 }
+
+/// The most lease ids a heartbeat names.
+pub const MAX_OPEN_LEASES: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Wake
@@ -549,6 +558,45 @@ impl StatsReport {
                 )?;
             }
         }
+        let live = self
+            .live_at
+            .map(|at| u64::try_from(self.generated_at.saturating_sub(at)).unwrap_or(0));
+        if !self.pending.is_empty() {
+            writeln!(out, "\nPool queues waiting for a runner{}:", as_of(live))?;
+            for queue in &self.pending {
+                let reason = match (queue.reason.as_deref(), queue.refusal.as_deref()) {
+                    (Some("refused"), Some(refusal)) => {
+                        format!("host refused ({})", printable(refusal))
+                    }
+                    (Some(reason), _) => reason.replace('_', " "),
+                    (None, _) => "being placed".to_string(),
+                };
+                writeln!(
+                    out,
+                    "  {} [{}]  {} queued, {} on the way, oldest {}  {}",
+                    printable(&queue.repository),
+                    printable(&queue.labels),
+                    queue.queued,
+                    queue.leases,
+                    duration(queue.oldest_wait_secs),
+                    reason
+                )?;
+            }
+        }
+        if !self.leases.is_empty() {
+            writeln!(out, "\nOpen leases{}:", as_of(live))?;
+            for lease in &self.leases {
+                writeln!(
+                    out,
+                    "  {:<24} {:<9} {:>7} old  {}  {}",
+                    printable(&lease.host_id),
+                    printable(&lease.state),
+                    duration(Some(lease.age_secs)),
+                    printable(&lease.repository),
+                    printable(&lease.lease_id)
+                )?;
+            }
+        }
         if !self.decisions.is_empty() {
             writeln!(out, "\nLast placements, newest first (scores in points):")?;
             for decision in &self.decisions {
@@ -583,6 +631,14 @@ impl StatsReport {
             }
         }
         Ok(())
+    }
+}
+
+/// ` (as of 40s ago)` for a saved copy; nothing for a live one.
+fn as_of(age: Option<u64>) -> String {
+    match age {
+        Some(age) if age > 0 => format!(" (as of {} ago)", duration(Some(age))),
+        _ => String::new(),
     }
 }
 
@@ -686,8 +742,9 @@ pub enum SessionPurpose {
 
 /// Version of the `stats --json` document, on a host and on the coordinator.
 /// 2 (0.4.47): `p50_duration_secs` is the job's own run time by GitHub's
-/// webhooks, and the queue wait percentiles are added.
-pub const STATS_JSON_SCHEMA_VERSION: u32 = 2;
+/// webhooks, and the queue wait percentiles are added. 3: `pending` pool
+/// queues and open `leases`.
+pub const STATS_JSON_SCHEMA_VERSION: u32 = 3;
 
 /// The coordinator's job weight statistics, as `stats` prints them.
 ///
@@ -719,6 +776,47 @@ pub struct StatsReport {
     pub hosts: Vec<HostStats>,
     /// The last placement decisions, newest first.
     pub decisions: Vec<PlacementDecision>,
+    /// Pool queues with fewer runners on their way than jobs queued, and why
+    /// the rest are not placed. Absent from a coordinator older than 0.4.47.
+    pub pending: Vec<PendingQueue>,
+    /// Launches sent to hosts and not yet closed.
+    pub leases: Vec<OpenLease>,
+    /// Unix seconds: when `pending` and `leases` were read. The server's
+    /// live state, or for the admin CLI the copy the server last saved
+    /// (within a minute).
+    pub live_at: Option<i64>,
+}
+
+/// A pool queue (repository and labels) short of runners.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PendingQueue {
+    pub repository: String,
+    /// Comma-separated.
+    pub labels: String,
+    pub queued: u32,
+    /// Open leases: runners on their way.
+    pub leases: u32,
+    /// How long its oldest announced job has waited.
+    pub oldest_wait_secs: Option<u64>,
+    /// Why no more is placed: `no_candidate`, `unfit_or_draining`,
+    /// `no_free_slot`, `no_memory_fit`, `refused`, `unanswered`, or `None`
+    /// while a placement is under way.
+    pub reason: Option<String>,
+    /// For `refused`: the host's reason (`max_capacity`, ...).
+    pub refusal: Option<String>,
+}
+
+/// One open lease.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenLease {
+    pub host_id: String,
+    pub lease_id: String,
+    /// `offered`, `accepted` or `claimed` (its runner took a job).
+    pub state: String,
+    pub age_secs: u64,
+    pub repository: String,
 }
 
 /// One job key (`owner/repo/workflow/job`) and its aggregates.
@@ -1155,6 +1253,7 @@ mod tests {
                 free_ram_bytes: None,
                 unfit: false,
                 draining: true,
+                open_leases: Some(vec!["l1".into()]),
             }),
         ];
         let attempts = [
@@ -1285,6 +1384,23 @@ mod tests {
                         total: 1750,
                     }],
                 }],
+                pending: vec![PendingQueue {
+                    repository: "octo/app".into(),
+                    labels: "rm-pool-linux".into(),
+                    queued: 3,
+                    leases: 1,
+                    oldest_wait_secs: Some(40),
+                    reason: Some("refused".into()),
+                    refusal: Some("max_capacity".into()),
+                }],
+                leases: vec![OpenLease {
+                    host_id: "h1".into(),
+                    lease_id: "l1".into(),
+                    state: "accepted".into(),
+                    age_secs: 12,
+                    repository: "octo/app".into(),
+                }],
+                live_at: Some(1_800_000_000),
             }),
         ];
         for message in server {
@@ -1300,7 +1416,17 @@ mod tests {
         let text = HostMessage::Heartbeat(Heartbeat::default()).encode();
         assert_eq!(
             text,
-            r#"{"type":"heartbeat","free_slots":0,"busy_slots":0,"cpu_load_percent":null,"free_ram_bytes":null,"unfit":false,"draining":false}"#
+            r#"{"type":"heartbeat","free_slots":0,"busy_slots":0,"cpu_load_percent":null,"free_ram_bytes":null,"unfit":false,"draining":false}"#,
+            "an older host's heartbeat, unchanged: no lease list"
+        );
+        let listed = HostMessage::Heartbeat(Heartbeat {
+            open_leases: Some(vec!["l1".into()]),
+            ..Heartbeat::default()
+        })
+        .encode();
+        assert!(
+            listed.ends_with(r#""draining":false,"open_leases":["l1"]}"#),
+            "{listed}"
         );
     }
 
@@ -1511,10 +1637,53 @@ mod tests {
             "runner-manager-{}",
             "x".repeat(200)
         )));
+        let live = StatsReport {
+            generated_at: 1_000,
+            live_at: Some(960),
+            pending: vec![
+                PendingQueue {
+                    repository: "octo/app".into(),
+                    labels: "rm-pool-linux".into(),
+                    queued: 3,
+                    leases: 1,
+                    oldest_wait_secs: Some(95),
+                    reason: Some("refused".into()),
+                    refusal: Some("max_capacity".into()),
+                },
+                PendingQueue {
+                    repository: "octo/lib".into(),
+                    labels: "rm-pool-macos".into(),
+                    queued: 1,
+                    reason: Some("no_free_slot".into()),
+                    ..PendingQueue::default()
+                },
+            ],
+            leases: vec![OpenLease {
+                host_id: "h1".into(),
+                lease_id: "l1".into(),
+                state: "accepted".into(),
+                age_secs: 12,
+                repository: "octo/app".into(),
+            }],
+            ..StatsReport::default()
+        };
+        let mut text = String::new();
+        live.render(&mut text).expect("renders");
+        for expected in [
+            "Pool queues waiting for a runner (as of 40s ago):",
+            "octo/app [rm-pool-linux]  3 queued, 1 on the way, oldest 1m 35s  host refused (max_capacity)",
+            "octo/lib [rm-pool-macos]  1 queued, 0 on the way, oldest -  no free slot",
+            "Open leases (as of 40s ago):",
+            "accepted",
+            "12s old  octo/app  l1",
+        ] {
+            assert!(text.contains(expected), "missing `{expected}`:\n{text}");
+        }
         let mut empty = String::new();
         StatsReport::default().render(&mut empty).expect("renders");
         assert!(empty.contains("No job has been measured yet."));
         assert!(!empty.contains("queue wait"), "nothing measured: no line");
+        assert!(!empty.contains("Pool queues") && !empty.contains("Open leases"));
         // A 0.4.46 coordinator's report has no queue wait: it still decodes.
         let older: StatsReport =
             serde_json::from_str(r#"{"jobs":[{"job_key":"k","p50_duration_secs":63}]}"#)
