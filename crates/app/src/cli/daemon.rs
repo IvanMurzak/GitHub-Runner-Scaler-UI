@@ -2262,6 +2262,12 @@ trait TargetReconciler: Send + 'static {
         None
     }
 
+    /// The least time between this target's charged polls while it is not
+    /// coordinated. See `super::host::pacing_floor`.
+    fn pacing_floor(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// The link's "start the accepted launches now" signal, when the daemon
     /// routes one to this loop.
     fn launch_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
@@ -2349,6 +2355,14 @@ impl TargetReconciler for ManagedTarget {
 
     fn launch_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
         Some(Arc::clone(&self.launch))
+    }
+
+    fn pacing_floor(&self) -> Duration {
+        let Ok(policies) = self.store.policies() else {
+            return Duration::ZERO;
+        };
+        let targets: Vec<ScaleTarget> = policies.into_iter().map(|policy| policy.target).collect();
+        super::host::pacing_floor(&targets)
     }
 
     fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -2647,6 +2661,16 @@ async fn run_target_loop<T: TargetReconciler>(
         });
         let slept_at = tokio::time::Instant::now();
         let scheduled = slept_at + delay;
+        // A set of targets admitted on the coordinated budget does not fit it
+        // when each polls on its own: charged polls stretch to what does.
+        // Idle polls are answered 304, which is free, and a drain is bounded.
+        let paced = if draining.is_some()
+            || report.next_poll.pace == runner_manager_agent::reconcile::PollPace::Idle
+        {
+            scheduled
+        } else {
+            slept_at + delay.max(target.pacing_floor())
+        };
         // Poll mode `coordinated`: the coordinator's sweep reads this target's
         // queue and wakes it, so its own poll stretches to the coordinated
         // interval. Never while draining, and never while this host runs a
@@ -2666,16 +2690,18 @@ async fn run_target_loop<T: TargetReconciler>(
             // Re-decided on every turn, so a link that drops or a coverage
             // that changes re-schedules a loop already asleep.
             let now = tokio::time::Instant::now();
-            let (planned, fallback_at) = match (&mut coordination, stretched, &target_name) {
-                (Some(view), Some(stretched), Some(name)) => {
+            let (planned, fallback_at) = match (&mut coordination, &target_name) {
+                (Some(view), Some(name)) => {
                     let view = view.borrow_and_update();
-                    if view.mode(name, now) == super::coordinator::PollMode::Coordinated {
+                    if view.mode(name, now) != super::coordinator::PollMode::Coordinated {
+                        (paced, None)
+                    } else if let Some(stretched) = stretched {
                         (stretched, view.fallback_at())
                     } else {
                         (scheduled, None)
                     }
                 }
-                _ => (scheduled, None),
+                _ => (paced, None),
             };
             let deadline = woken.map_or(planned, |woken| woken.min(planned));
             tokio::select! {
@@ -3313,6 +3339,8 @@ mod tests {
         /// The link's launch signal, and how often accepted launches were
         /// started, when a test wires one.
         launch: Option<(Arc<tokio::sync::Notify>, Arc<AtomicUsize>)>,
+        /// What the budget says about this target's charged polls.
+        pacing_floor: Duration,
     }
 
     impl FakeTarget {
@@ -3331,6 +3359,7 @@ mod tests {
                     wake: None,
                     coordination: None,
                     launch: None,
+                    pacing_floor: Duration::ZERO,
                 },
                 calls,
             )
@@ -3349,6 +3378,7 @@ mod tests {
                 wake: None,
                 coordination: None,
                 launch: None,
+                pacing_floor: Duration::ZERO,
             }
         }
 
@@ -3367,6 +3397,7 @@ mod tests {
                 wake: None,
                 coordination: None,
                 launch: None,
+                pacing_floor: Duration::ZERO,
             }
         }
     }
@@ -3429,6 +3460,10 @@ mod tests {
 
         fn launch_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
             self.launch.as_ref().map(|(signal, _)| Arc::clone(signal))
+        }
+
+        fn pacing_floor(&self) -> Duration {
+            self.pacing_floor
         }
 
         fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -4149,6 +4184,44 @@ mod tests {
         stop.send(true).unwrap();
         after(60).await;
         let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+    }
+
+    /// A target set over the allowance stretches its charged polls while it
+    /// polls on its own; idle polls, answered 304 and free, keep their pace.
+    #[tokio::test(start_paused = true)]
+    async fn charged_polls_stretch_to_the_budget_and_idle_ones_do_not() {
+        use runner_manager_agent::reconcile::PollPace;
+
+        for (pace, delay, expected) in [(PollPace::Nominal, 60, 90), (PollPace::Idle, 10, 10)] {
+            let mut report = ReconcileReport::default();
+            report.next_poll.delay = Duration::from_secs(delay);
+            report.next_poll.pace = pace;
+            let (mut target, calls) = FakeTarget::repeating(
+                fixtures::policy()
+                    .repository("acme/repo")
+                    .autoscale("home", 1)
+                    .active()
+                    .build(),
+                report,
+            );
+            target.pacing_floor = Duration::from_secs(90);
+            let (stop, _) = tokio::sync::watch::channel(false);
+            let daemon = tokio::spawn(run_target_loop(
+                target,
+                stop.subscribe(),
+                never_upgraded(),
+                Arc::new(CountingContacts::default()) as Arc<dyn ContactRecorder>,
+            ));
+            after(0).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "the first pass");
+            after(expected - 1).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{pace:?}: not yet");
+            after(1).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{pace:?}: at {expected} s");
+            stop.send(true).unwrap();
+            after(120).await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+        }
     }
 
     /// Accepted launches start their runners at once, however recently the

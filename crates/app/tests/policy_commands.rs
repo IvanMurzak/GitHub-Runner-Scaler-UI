@@ -53,6 +53,79 @@ fn add_with_label(scope: &str, target: &str, label: &str) -> (String, Vec<String
     (outcome.stdout, github.seen())
 }
 
+/// The eleventh repository: refused on a host polling each target itself, and
+/// admitted, with a note, on one whose connected coordinator runs a sweep. The
+/// exact live refusal this replaces: "would take the host to 2640 requests/hour".
+#[test]
+fn the_budget_guard_counts_a_coordinators_sweep() {
+    use runner_manager_platform::coordinator::{self as records, CoordinatorConfig, LinkRecord};
+    use runner_manager_platform::paths::AppPaths;
+
+    let data_dir = tempfile::tempdir().unwrap();
+    signed_in(data_dir.path());
+    let github = FakeGithub::start();
+    let names: Vec<String> = (0..11).map(|index| format!("octo/r{index}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    github.with_installation(77, "octo", "Organization", "selected", &refs);
+    let add = |name: &str| {
+        run({
+            let mut command = runner_manager_against(data_dir.path(), &github);
+            command.args([
+                "repo",
+                "add",
+                name,
+                "--host-label",
+                "home",
+                "--max-capacity",
+                "1",
+            ]);
+            command
+        })
+    };
+    for name in &names[..10] {
+        let outcome = add(name);
+        assert_eq!(outcome.code, 0, "{}", outcome.both());
+    }
+    let refused = add(&names[10]);
+    assert_eq!(refused.code, 12, "budget refused: {}", refused.both());
+    assert!(
+        refused.both().contains("requests/hour"),
+        "{}",
+        refused.both()
+    );
+    assert_eq!(database(data_dir.path()).policies().unwrap().len(), 10);
+
+    // Joined, the link up, and a sweep running that has not covered these yet.
+    let paths = AppPaths::rooted_at(data_dir.path());
+    let now = chrono::Utc::now();
+    records::save(
+        &paths,
+        &CoordinatorConfig::new(
+            "https://runners.example.com".into(),
+            "h".into(),
+            "n".into(),
+            now,
+        ),
+    )
+    .unwrap();
+    let mut link = LinkRecord::new(now);
+    link.connected = true;
+    link.since = Some(now);
+    link.reconcile_interval_secs = Some(120);
+    records::record_link(&paths, &link).unwrap();
+
+    let admitted = add(&names[10]);
+    assert_eq!(admitted.code, 0, "{}", admitted.both());
+    assert!(
+        admitted
+            .stdout
+            .contains("admitted on the coordinated budget"),
+        "{}",
+        admitted.both()
+    );
+    assert_eq!(database(data_dir.path()).policies().unwrap().len(), 11);
+}
+
 #[test]
 fn repository_and_organization_add_share_the_gateway_path_and_emit_label_specific_routing() {
     for (scope, target) in [("repo", "octo/one"), ("org", "octo")] {

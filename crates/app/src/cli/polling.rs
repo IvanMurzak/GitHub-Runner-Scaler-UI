@@ -266,7 +266,8 @@ pub fn set_poll_interval(
     // for a shorter one: lengthening never adds load. Active polls are
     // charged, so the projection is the right yardstick for them.
     if active < before.active {
-        let budget = super::host::HostBudget::of(active, &targets);
+        let coordination = super::host::CoordinatedPricing::read(context, &store)?;
+        let budget = super::host::HostBudget::priced(active, &targets, Some(&coordination));
         if budget.exceeds_allowance() {
             return Err(CliError::with_remedy(
                 Failure::BudgetRefused,

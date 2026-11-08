@@ -166,6 +166,125 @@ pub struct HostBudget {
     organization_targets: usize,
     /// Distinct targets priced, whatever their policies' states.
     priced_targets: usize,
+    /// Of those, the ones priced at the coordinated interval.
+    coordinated_targets: usize,
+}
+
+/// How a coordinator changes what this host's targets cost.
+///
+/// A `coordinated` target is polled at the coordinated interval, because the
+/// coordinator's sweep reads its queue: pricing it at the refresh interval
+/// refuses a repository the host has plenty of budget for. A target about to
+/// be added has no coverage yet, since a coordinator reports only on what a
+/// host advertised; [`Self::may_presume`] says when it is admitted as if it
+/// were covered.
+#[derive(Debug, Clone)]
+pub struct CoordinatedPricing {
+    snapshot: super::coordinator::CoordinatorSnapshot,
+    now: chrono::DateTime<chrono::Utc>,
+    interval_secs: u16,
+}
+
+/// The same records and interval, whenever they were read.
+impl PartialEq for CoordinatedPricing {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot == other.snapshot && self.interval_secs == other.interval_secs
+    }
+}
+
+impl Eq for CoordinatedPricing {}
+
+impl CoordinatedPricing {
+    /// What this host's records say now, at its configured coordinated
+    /// interval.
+    ///
+    /// # Errors
+    /// The store's.
+    pub fn read(context: &Context, store: &dyn Store) -> Result<Self, CliError> {
+        let (intervals, _) = super::polling::configured(context, store)?;
+        let now = chrono::Utc::now();
+        Ok(Self {
+            snapshot: super::coordinator::CoordinatorSnapshot::read(context.paths(), now),
+            now,
+            interval_secs: intervals.coordinated.as_secs(),
+        })
+    }
+
+    /// Whether `target` is polled at the coordinated interval right now.
+    #[must_use]
+    pub fn covers(&self, target: &ScaleTarget) -> bool {
+        self.snapshot.mode_for(target, self.now) == super::coordinator::PollMode::Coordinated
+    }
+
+    /// Whether a target not covered yet may be priced as if it were: the link
+    /// is up and the coordinator's sweep runs. It is then normally covered
+    /// within seconds of being advertised; if not, [`pacing_floor`] keeps the
+    /// host inside its budget.
+    #[must_use]
+    pub fn may_presume(&self) -> bool {
+        self.snapshot.link == super::coordinator::LinkState::Connected
+            && self.snapshot.reconcile_interval_secs.is_some()
+    }
+
+    #[must_use]
+    pub const fn interval_secs(&self) -> u16 {
+        self.interval_secs
+    }
+
+    /// `cost`, priced at the coordinated interval when `target` is covered.
+    #[must_use]
+    pub fn price(&self, target: &ScaleTarget, cost: TargetCost) -> TargetCost {
+        if self.covers(target) {
+            cost.polled_every(self.interval_secs)
+        } else {
+            cost
+        }
+    }
+
+    /// `candidate`, a target about to be added to `existing`, priced for the
+    /// budget guard, and whether pricing it on the coordinated budget before
+    /// the coordinator covers it is what admits it.
+    #[must_use]
+    pub fn price_addition(
+        &self,
+        target: &ScaleTarget,
+        candidate: TargetCost,
+        existing: &[TargetCost],
+    ) -> (TargetCost, bool) {
+        if self.covers(target) || !self.may_presume() {
+            return (self.price(target, candidate), false);
+        }
+        let decided = !BudgetProjection::new(RefreshInterval::default(), existing.to_vec())
+            .admit(candidate)
+            .is_admitted();
+        (candidate.polled_every(self.interval_secs), decided)
+    }
+}
+
+/// The least time between charged polls of one target that keeps `targets`
+/// inside this host's allowance when each polls on its own.
+///
+/// A set the budget guard admitted on the coordinated budget can exceed the
+/// allowance once coordination is lost. A target loop that is not coordinated
+/// then stretches its charged polls to this instead of overspending a quota
+/// every host of the account shares. Priced as `repo add` prices a target, so
+/// any set the guard admits at the default interval is left untouched.
+#[must_use]
+pub fn pacing_floor(targets: &[ScaleTarget]) -> std::time::Duration {
+    let unique: BTreeSet<&ScaleTarget> = targets.iter().collect();
+    let per_round: u64 = unique
+        .into_iter()
+        .map(|target| {
+            u64::from(
+                match target {
+                    ScaleTarget::Repository(_) => TargetCost::repository(),
+                    ScaleTarget::Organization(_) => TargetCost::organization(1),
+                }
+                .requests_per_refresh(),
+            )
+        })
+        .sum();
+    std::time::Duration::from_secs((per_round * 3600).div_ceil(u64::from(budget_allowance())))
 }
 
 impl HostBudget {
@@ -192,17 +311,36 @@ impl HostBudget {
     /// shortfall sayable instead of silent.
     #[must_use]
     pub fn of(interval: RefreshInterval, targets: &[ScaleTarget]) -> Self {
+        Self::priced(interval, targets, None)
+    }
+
+    /// [`Self::of`], with the targets `coordination` covers priced at the
+    /// coordinated interval.
+    #[must_use]
+    pub fn priced(
+        interval: RefreshInterval,
+        targets: &[ScaleTarget],
+        coordination: Option<&CoordinatedPricing>,
+    ) -> Self {
         let unique: BTreeSet<&ScaleTarget> = targets.iter().collect();
         let mut costs = Vec::with_capacity(unique.len());
         let mut organization_targets = 0;
+        let mut coordinated_targets = 0;
         for target in unique {
-            costs.push(measured(match target {
+            let cost = measured(match target {
                 ScaleTarget::Repository(_) => TargetCost::repository(),
                 ScaleTarget::Organization(_) => {
                     organization_targets += 1;
                     TargetCost::organization(1)
                 }
-            }));
+            });
+            costs.push(match coordination {
+                Some(coordination) if coordination.covers(target) => {
+                    coordinated_targets += 1;
+                    coordination.price(target, cost)
+                }
+                _ => cost,
+            });
         }
         let priced_targets = costs.len();
         Self {
@@ -210,6 +348,7 @@ impl HostBudget {
             projection: BudgetProjection::new(interval, costs),
             organization_targets,
             priced_targets,
+            coordinated_targets,
         }
     }
 
@@ -279,6 +418,13 @@ impl HostBudget {
         )?;
         writeln!(out, "  headroom                  {}", self.headroom())?;
         writeln!(out, "  targets priced            {}", self.priced_targets)?;
+        if self.coordinated_targets > 0 {
+            writeln!(
+                out,
+                "  of those, coordinated     {} (priced at the coordinated interval)",
+                self.coordinated_targets
+            )?;
+        }
         writeln!(
             out,
             "  repository targets that fit at this interval: about {}",
@@ -1069,15 +1215,134 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     )
     .map_err(failed)?;
     writeln!(out).map_err(failed)?;
-    HostBudget::of(interval, &targets)
-        .write(out)
-        .map_err(failed)?;
+    HostBudget::priced(
+        interval,
+        &targets,
+        CoordinatedPricing::read(context, &store).ok().as_ref(),
+    )
+    .write(out)
+    .map_err(failed)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pricing(connected: bool, sweep: bool, covered: &[&str]) -> CoordinatedPricing {
+        use super::super::coordinator::{CoordinatorSnapshot, LinkState};
+        let mut snapshot = CoordinatorSnapshot::not_configured();
+        snapshot.configured = true;
+        snapshot.link = if connected {
+            LinkState::Connected
+        } else {
+            LinkState::Disconnected
+        };
+        snapshot.since = Some(chrono::Utc::now() - chrono::TimeDelta::minutes(5));
+        snapshot.reconcile_interval_secs = sweep.then_some(120);
+        snapshot.covered = covered.iter().map(ToString::to_string).collect();
+        CoordinatedPricing {
+            snapshot,
+            now: chrono::Utc::now(),
+            interval_secs: 300,
+        }
+    }
+
+    /// The live refusal: eleven targets at 60 s are over the allowance, but
+    /// the ten that are coordinated poll every 300 s, so the eleventh fits.
+    #[test]
+    fn a_coordinated_host_is_priced_at_the_coordinated_interval_and_admits_more() {
+        let names: Vec<String> = (0..10).map(|index| format!("o/r{index}")).collect();
+        let targets: Vec<ScaleTarget> = names.iter().map(|name| repository(name)).collect();
+        let covered: Vec<String> = names.iter().map(|name| format!("repo:{name}")).collect();
+        let covered: Vec<&str> = covered.iter().map(String::as_str).collect();
+        // As `repo add` prices it.
+        let cost = TargetCost::repository();
+        let at_60 = RefreshInterval::default();
+        let new = repository("o/new");
+
+        // Connected with a sweep: covered ones are cheap; the new one is
+        // priced the same way, and that is not what decided it.
+        let on = pricing(true, true, &covered);
+        let existing: Vec<TargetCost> = targets.iter().map(|t| on.price(t, cost)).collect();
+        assert_eq!(
+            BudgetProjection::new(at_60, existing.clone()).requests_per_hour(),
+            10 * cost.requests_per_hour(at_60) / 5
+        );
+        let (candidate, decided) = on.price_addition(&new, cost, &existing);
+        assert_eq!(
+            candidate.requests_per_hour(at_60),
+            cost.requests_per_hour(at_60) / 5
+        );
+        assert!(!decided, "it fits at 60 s too");
+        assert!(
+            BudgetProjection::new(at_60, existing)
+                .admit(candidate)
+                .is_admitted()
+        );
+
+        // Enough uncovered targets that only the presumption admits it.
+        let full = vec![cost; 10];
+        let (candidate, decided) = on.price_addition(&new, cost, &full);
+        assert!(decided, "said in the note");
+        assert!(
+            BudgetProjection::new(at_60, full.clone())
+                .admit(candidate)
+                .is_admitted()
+        );
+
+        // No sweep, or a link down past the grace: every target at 60 s, and
+        // the eleventh is refused as ever.
+        for off in [
+            pricing(true, false, &covered),
+            pricing(false, true, &covered),
+        ] {
+            let existing: Vec<TargetCost> = targets.iter().map(|t| off.price(t, cost)).collect();
+            let (candidate, decided) = off.price_addition(&new, cost, &existing);
+            assert!(!decided);
+            assert!(
+                !BudgetProjection::new(at_60, existing)
+                    .admit(candidate)
+                    .is_admitted()
+            );
+        }
+
+        // `host show` says the same.
+        let budget = HostBudget::priced(at_60, &targets, Some(&on));
+        assert_eq!(
+            budget.requests_per_hour(),
+            10 * measured(cost).requests_per_hour(at_60) / 5
+        );
+        let mut text = Vec::new();
+        budget.write(&mut text).expect("written");
+        let text = String::from_utf8(text).expect("text");
+        assert!(text.contains("of those, coordinated     10"), "{text}");
+    }
+
+    /// Without coordination, polling stretches just enough to fit the
+    /// allowance, and a set that fits at the default is not touched.
+    #[test]
+    fn a_set_over_the_allowance_is_paced_to_fit_and_one_inside_it_is_not() {
+        let set = |count: usize| -> Vec<ScaleTarget> {
+            (0..count)
+                .map(|index| repository(&format!("o/r{index}")))
+                .collect()
+        };
+        let default =
+            std::time::Duration::from_secs(u64::from(RefreshInterval::default().as_secs()));
+        // Exactly what the guard admits at the default interval.
+        let max = BudgetProjection::max_repository_targets(RefreshInterval::default()) as usize;
+        assert!(pacing_floor(&set(max)) <= default, "fits: no stretching");
+        assert!(pacing_floor(&set(max + 1)) > default, "one more does");
+        let over = pacing_floor(&set(max * 2));
+        let per_round =
+            u64::from(TargetCost::repository().requests_per_refresh()) * (max as u64 * 2);
+        assert!(
+            per_round * 3600 / over.as_secs() <= u64::from(budget_allowance()),
+            "{over:?} keeps it within the allowance"
+        );
+        assert_eq!(pacing_floor(&[]), std::time::Duration::ZERO);
+    }
 
     use runner_manager_domain::model::{Org, OwnerRepo};
     use runner_manager_github::demand::{self, max_demand_requests_per_repository_per_poll};

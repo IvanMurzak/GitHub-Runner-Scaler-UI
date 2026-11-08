@@ -330,7 +330,7 @@ fn add(
     let (installation_id, installed_repositories) = installation_for(&target, reachable)?;
 
     let host = super::host::local_host_or_create(context, &store)?;
-    let candidate = match target.scope() {
+    let own_candidate = match target.scope() {
         TargetScope::Repository => TargetCost::repository(),
         TargetScope::Organization => TargetCost::organization(installed_repositories),
     };
@@ -340,10 +340,17 @@ fn add(
         .into_iter()
         .map(|policy| policy.target)
         .collect();
-    let costs = existing_targets
+    // A coordinated target is polled at the coordinated interval, and one a
+    // connected coordinator's sweep is about to cover is admitted the same
+    // way. The note says so only where that decided it.
+    let coordination = super::host::CoordinatedPricing::read(context, &store)?;
+    let costs: Vec<TargetCost> = existing_targets
         .iter()
-        .map(|target| cost_for(target, reachable))
+        .map(|target| coordination.price(target, cost_for(target, reachable)))
         .collect();
+    let (candidate, presumption_decided) =
+        coordination.price_addition(&target, own_candidate, &costs);
+    let admitted_by_presuming = presumption_decided && !existing_targets.contains(&target);
     let armed = target.clone();
     if let Some(name) = profile_name.as_ref() {
         record_named_policy(
@@ -373,6 +380,16 @@ fn add(
             costs,
             out,
         )?;
+    }
+    if admitted_by_presuming {
+        writeln!(
+            out,
+            "note: admitted on the coordinated budget: {armed} is counted at one poll every {}s, \
+             because this host's coordinator is expected to cover it. If it does not, or the \
+             link is lost, this host stretches its polling to stay within its budget.",
+            coordination.interval_secs()
+        )
+        .map_err(write_failed("the budget note"))?;
     }
     // Arming is still a separate decision; `--enable` is the operator making it
     // here rather than in a second command. It runs *after* the policy exists,

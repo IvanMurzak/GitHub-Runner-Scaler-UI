@@ -106,6 +106,7 @@ pub struct HostSettings {
     /// preview the refusal before the operator types a path.
     pub affected: AffectedAttempts,
     targets: Vec<ScaleTarget>,
+    coordination: Box<cli::host::CoordinatedPricing>,
 }
 
 impl HostSettings {
@@ -120,7 +121,9 @@ impl HostSettings {
             .into_iter()
             .map(|policy| policy.target)
             .collect::<Vec<_>>();
-        let budget = cli::host::HostBudget::of(host.refresh_interval, &targets);
+        let coordination = cli::host::CoordinatedPricing::read(context, &store)?;
+        let budget =
+            cli::host::HostBudget::priced(host.refresh_interval, &targets, Some(&coordination));
         Ok(Self {
             current_capacity: host.host_capacity(),
             current_in_use,
@@ -132,6 +135,7 @@ impl HostSettings {
             runner_root: cli::workspace::host_root(context.paths(), Some(&host)),
             affected: cli::workspace::host_affected_attempts(&store)?,
             targets,
+            coordination: Box::new(coordination),
         })
     }
 
@@ -186,7 +190,11 @@ impl HostSettings {
 
     pub fn preview_interval(&self, seconds: u16) -> Result<HostIntervalPreview, CliError> {
         let interval = RefreshInterval::from_secs(seconds).map_err(invalid)?;
-        let budget = cli::host::HostBudget::of(interval, &self.targets);
+        let budget = cli::host::HostBudget::priced(
+            interval,
+            &self.targets,
+            Some(self.coordination.as_ref()),
+        );
         Ok(HostIntervalPreview {
             interval,
             projected_requests_per_hour: budget.requests_per_hour(),

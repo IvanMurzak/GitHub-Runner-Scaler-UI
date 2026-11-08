@@ -385,6 +385,9 @@ const _: () = assert!(
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueuedDemand {
     per_repository: BTreeMap<OwnerRepo, Vec<RunsOn>>,
+    /// Which job each entry of `per_repository` is, in the same order, where
+    /// the reading came from GitHub's job listing.
+    identities: BTreeMap<OwnerRepo, Vec<QueuedJobIdentity>>,
     unavailable: Vec<UnavailableRepository>,
     /// Repositories whose count is a floor rather than a total.
     truncated: BTreeSet<OwnerRepo>,
@@ -400,11 +403,39 @@ impl QueuedDemand {
     pub fn new(per_repository: BTreeMap<OwnerRepo, Vec<RunsOn>>) -> Self {
         Self {
             per_repository,
+            identities: BTreeMap::new(),
             unavailable: Vec::new(),
             truncated: BTreeSet::new(),
             busy: BTreeSet::new(),
             rate_limit: None,
         }
+    }
+
+    /// `repository`'s queued jobs with their identities, where the reading
+    /// has them.
+    pub fn identified_jobs_for(
+        &self,
+        repository: &OwnerRepo,
+    ) -> impl Iterator<Item = (&RunsOn, Option<&QueuedJobIdentity>)> {
+        let identities = self
+            .identities
+            .get(repository)
+            .map_or(&[][..], Vec::as_slice);
+        self.jobs_for(repository)
+            .iter()
+            .enumerate()
+            .map(move |(index, job)| (job, identities.get(index)))
+    }
+
+    /// Says which job each of `repository`'s entries is, in the same order.
+    #[must_use]
+    pub fn with_identities(
+        mut self,
+        repository: OwnerRepo,
+        identities: Vec<QueuedJobIdentity>,
+    ) -> Self {
+        self.identities.insert(repository, identities);
+        self
     }
 
     /// One repository's queued jobs, for the repository-target case and for
@@ -1083,7 +1114,7 @@ impl RestDemand {
         repository: &OwnerRepo,
         cancel: &CancelToken,
     ) -> Result<RepositoryDemand, InventoryError> {
-        let mut jobs: Vec<RunsOn> = Vec::new();
+        let mut jobs: Vec<(RunsOn, QueuedJobIdentity)> = Vec::new();
         let mut exact = true;
         let mut changed = false;
         let mut resolved: BTreeSet<u64> = BTreeSet::new();
@@ -1116,8 +1147,10 @@ impl RestDemand {
         if !changed {
             self.stats.unchanged_reads.fetch_add(1, Ordering::SeqCst);
         }
+        let (jobs, identities) = jobs.into_iter().unzip();
         Ok(RepositoryDemand {
             jobs,
+            identities,
             exact,
             busy: changed && !resolved.is_empty(),
         })
@@ -1324,7 +1357,16 @@ impl RestDemand {
                 page.jobs
                     .into_iter()
                     .filter(|job| job.status == QUEUED_JOB_STATUS)
-                    .map(|job| RunsOn::from_job_labels(job.labels)),
+                    .map(|job| {
+                        (
+                            RunsOn::from_job_labels(job.labels),
+                            QueuedJobIdentity {
+                                id: job.id,
+                                workflow: job.workflow_name,
+                                name: job.name,
+                            },
+                        )
+                    }),
             );
 
             request = following;
@@ -1382,6 +1424,9 @@ impl DemandGateway for RestDemand {
                     demand
                         .per_repository
                         .insert(repository.clone(), reading.jobs);
+                    demand
+                        .identities
+                        .insert(repository.clone(), reading.identities);
                     if !reading.exact {
                         // A floor travels with the aggregate rather than being
                         // flattened into it: one truncated repository makes the
@@ -1419,11 +1464,23 @@ impl DemandGateway for RestDemand {
 // Wire shapes
 // ---------------------------------------------------------------------------
 
+/// Which job a queued entry is, as GitHub's job listing names it: the same id
+/// and names a `workflow_job` webhook carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedJobIdentity {
+    pub id: u64,
+    pub workflow: Option<String>,
+    /// The job's name, matrix values expanded.
+    pub name: Option<String>,
+}
+
 /// One repository's queued jobs, and whether that set is the whole truth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RepositoryDemand {
     /// The `runs-on` of every job still waiting for a runner.
     jobs: Vec<RunsOn>,
+    /// Which job each of `jobs` is, in the same order.
+    identities: Vec<QueuedJobIdentity>,
     /// `false` when `jobs` is a **floor**: a run cap or a job page budget
     /// stopped the walk before the whole queue had been seen.
     exact: bool,
@@ -1444,7 +1501,7 @@ struct RunListing {
 /// One run's queued jobs, and whether the page budget saw all of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunJobs {
-    jobs: Vec<RunsOn>,
+    jobs: Vec<(RunsOn, QueuedJobIdentity)>,
     complete: bool,
     /// `false` when every page was answered `304`.
     changed: bool,
@@ -1486,9 +1543,15 @@ struct RunJobsPage {
 #[derive(Debug, Deserialize)]
 struct RunJob {
     #[serde(default)]
+    id: u64,
+    #[serde(default)]
     status: String,
     #[serde(default)]
     labels: Vec<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
 }
 
 // The unit tests below are inline rather than in a `src/demand/tests.rs`, and
@@ -1908,6 +1971,53 @@ mod tests {
             3,
             "and the duplicate costs no second job listing either"
         );
+    }
+
+    /// The job listing's id and names travel with each queued job: they are
+    /// what a `workflow_job` webhook calls the same job.
+    #[tokio::test]
+    async fn each_queued_job_keeps_its_id_and_names() {
+        let server = MockServer::start().await;
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, runs_body(&[200])).await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, no_runs()).await;
+        mount_jobs(
+            &server,
+            &repo(),
+            200,
+            json!({"total_count": 3, "jobs": [
+                {"id": 7, "status": "in_progress", "name": "running",
+                 "workflow_name": "CI", "labels": ["rm-pool-linux"]},
+                {"id": 8, "status": "queued", "name": "build (linux, 3.12)",
+                 "workflow_name": "CI", "labels": ["rm-pool-linux"]},
+                {"id": 9, "status": "queued", "name": "older", "workflow_name": null,
+                 "labels": ["rm-pool-linux"]},
+            ]}),
+        )
+        .await;
+        let demand = gateway(&server)
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a reading");
+        let identities: Vec<QueuedJobIdentity> = demand
+            .identified_jobs_for(&repo())
+            .filter_map(|(_, identity)| identity.cloned())
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                QueuedJobIdentity {
+                    id: 8,
+                    workflow: Some("CI".into()),
+                    name: Some("build (linux, 3.12)".into()),
+                },
+                QueuedJobIdentity {
+                    id: 9,
+                    workflow: None,
+                    name: Some("older".into()),
+                },
+            ]
+        );
+        assert_eq!(demand.total(), 2);
     }
 
     /// A `needs:`-gated job whose run has already started is still demand.

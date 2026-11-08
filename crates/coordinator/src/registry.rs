@@ -17,7 +17,7 @@ use runner_manager_domain::coordinator_protocol::{
 };
 use runner_manager_domain::model::Label;
 use runner_manager_domain::policy::is_pool_label;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::webhook::{profile_covers, required_labels};
 
@@ -105,6 +105,9 @@ pub struct Registry {
     wakes: WakeLog,
     /// Wakes sent since the statistics last took the count.
     wakes_sent: AtomicU64,
+    /// The sweep's inventory may be out of date: a host advertised a target
+    /// it does not cover, or a webhook named a repository it does not know.
+    inventory_wanted: Notify,
 }
 
 /// When a wake was last sent for a repository and a set of required labels,
@@ -311,12 +314,41 @@ impl Registry {
         if let Some(current) = hosts.get_mut(host_id)
             && current.connection == connection
         {
+            let uncovered = hello
+                .targets
+                .iter()
+                .any(|target| !coverage.covers(&target.reference()));
             current.hello = Some(hello);
             // Always answered, even when unchanged: the host may have
             // reconnected and forgotten it.
             current.acked = None;
             acknowledge(host_id, current, &coverage);
+            if uncovered {
+                self.inventory_wanted.notify_one();
+            }
         }
+    }
+
+    /// A webhook named `repository`: asks for a fresh inventory when a
+    /// connected host serves it and the sweep does not read it yet.
+    pub fn repository_seen(&self, repository: &str) {
+        let known = self
+            .coverage()
+            .repositories
+            .contains(&repository.to_ascii_lowercase());
+        if !known
+            && self
+                .advertised()
+                .iter()
+                .any(|target| target.covers(repository))
+        {
+            self.inventory_wanted.notify_one();
+        }
+    }
+
+    /// Resolves when the sweep should read its inventory again.
+    pub async fn inventory_wanted(&self) {
+        self.inventory_wanted.notified().await;
     }
 
     /// What the sweep covers now.

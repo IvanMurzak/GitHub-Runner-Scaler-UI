@@ -153,6 +153,24 @@ that is already queued. A link that drops keeps `coordinated` for 30 seconds, so
 changes nothing; after that every target polls on its own again at once. A coordinator without a
 GitHub App covers nothing, so its hosts are in `fallback` and behave as in stage 1.
 
+The coordinator reads its GitHub App's installations and their repositories every 10 minutes, and
+at once (at most every 30 seconds, followed by a sweep) when a host advertises a target its sweep
+does not cover, or a webhook names a repository a host serves that the sweep does not know. A
+repository just added on a host is therefore normally covered within seconds.
+
+`repo add` and `host show` count a `coordinated` target at the coordinated interval (one poll every
+300 s by default), not the refresh interval, and every other target at the refresh interval. A new
+target has no coverage yet, because a coordinator only reports on what a host advertised. While the
+link is up and the coordinator's sweep runs, the new target is counted at the coordinated interval
+too; if that is what admits it, `repo add` prints a note saying so. With the link down, or no sweep,
+every target is counted at the refresh interval as without a coordinator.
+
+A set of targets admitted this way can exceed the host's budget (2,500 requests an hour) when its
+targets poll on their own: the coordinator does not cover one, or the link stays down past 30
+seconds. Charged polls of a target not in `coordinated` then stretch to the interval that fits the
+budget (64 s for 11 repositories, 116 s for 20). Runners keep starting, and idle polls, answered 304
+and not charged, keep their pace. A set that fits at the default interval is not affected.
+
 A dropped link reconnects after 1 second, then waits twice as long after every failed attempt,
 never more than 30 seconds between attempts (a random part of up to a third of the wait spreads a
 fleet out; a refused key or version waits up to 5 minutes). A connection that stayed up longer than
@@ -252,7 +270,8 @@ and its job, if still queued, is placed again at once:
   was coming for, so the host is told to drop that launch;
 - when it expires. When a job leaves the queue another way (cancelled, or taken by a runner
 outside the pool), the surplus lease is cancelled (`cancel_launch`) and its host starts no runner
-for it. The sweep's counts correct lost webhooks; a listing GitHub truncated only ever adds jobs.
+for it. The sweep's listing corrects lost webhooks, job by job; a listing GitHub truncated only ever adds
+jobs.
 
 A queue left with fewer runners on their way than jobs says why, at most once a minute per queue
 in the log (`a pool queue is not placed`, with `reason` and, for a refusal, `refusal`) and in
@@ -347,8 +366,9 @@ and labels), not a single job:
 
 1. **Demand**: the heaviest p90 peak memory among the jobs queued there. A job never measured
    counts as its repository's p90 (over all its samples); a repository never measured as
-   `COORDINATOR_DEFAULT_JOB_RAM` (2 GiB). Jobs only the sweep counted are unnamed: they count as
-   the repository's p90 or the default too.
+   `COORDINATOR_DEFAULT_JOB_RAM` (2 GiB). The sweep names the jobs it lists just as a webhook
+   does (same job id, workflow and job name), so a job only the sweep saw is weighed by its own
+   samples. Only a job with no name to go by counts as the repository's p90 or the default.
 2. **Filter**: a host whose free memory (by its last heartbeat) less the estimates of its
    launches whose runner has not taken a job yet cannot hold the demand plus
    `COORDINATOR_RAM_MARGIN` (512 MiB) is passed over. A host that reports no free memory is not

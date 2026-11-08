@@ -1420,6 +1420,9 @@ pub struct TargetCost {
     scope: TargetScope,
     installed_repositories: u32,
     demand_requests_per_repository: u32,
+    /// Polled at its own interval rather than the projection's: a target a
+    /// coordinator's sweep reads.
+    polled_every_secs: Option<u16>,
 }
 
 impl TargetCost {
@@ -1430,6 +1433,7 @@ impl TargetCost {
             scope: TargetScope::Repository,
             installed_repositories: 1,
             demand_requests_per_repository: DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH,
+            polled_every_secs: None,
         }
     }
 
@@ -1440,6 +1444,7 @@ impl TargetCost {
             scope: TargetScope::Organization,
             installed_repositories,
             demand_requests_per_repository: DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH,
+            polled_every_secs: None,
         }
     }
 
@@ -1459,6 +1464,16 @@ impl TargetCost {
     #[must_use]
     pub fn with_demand_requests_per_repository(mut self, requests: u32) -> Self {
         self.demand_requests_per_repository = requests;
+        self
+    }
+
+    /// This target is polled every `secs` whatever the host's refresh interval:
+    /// a coordinator's sweep reads its queue. Zero is ignored.
+    #[must_use]
+    pub const fn polled_every(mut self, secs: u16) -> Self {
+        if secs > 0 {
+            self.polled_every_secs = Some(secs);
+        }
         self
     }
 
@@ -1504,8 +1519,11 @@ impl TargetCost {
     /// Requests one hour of refreshing this target at `interval` costs.
     #[must_use]
     pub fn requests_per_hour(&self, interval: RefreshInterval) -> u32 {
-        self.requests_per_refresh()
-            .saturating_mul(refreshes_per_hour(interval))
+        let refreshes = self.polled_every_secs.map_or_else(
+            || refreshes_per_hour(interval),
+            |secs| SECONDS_PER_HOUR / u32::from(secs),
+        );
+        self.requests_per_refresh().saturating_mul(refreshes)
     }
 }
 
@@ -4592,6 +4610,30 @@ mod tests {
 
     /// The Definition of Done's "roughly 10 targets per host at the 60-second
     /// default and 5 at the 30-second floor".
+    /// A target polled on its own interval (a coordinator's sweep reads its
+    /// queue) costs that interval's refreshes, whatever the projection's.
+    #[test]
+    fn a_target_polled_every_300_seconds_costs_a_fifth_of_one_polled_every_60() {
+        let default = RefreshInterval::default();
+        let target = TargetCost::repository();
+        let coordinated = target.polled_every(300);
+        assert_eq!(
+            coordinated.requests_per_hour(default),
+            target.requests_per_hour(default) / 5
+        );
+        // The refresh interval does not change it; a zero is no interval.
+        let floor = RefreshInterval::from_secs(30).expect("the floor");
+        assert_eq!(
+            coordinated.requests_per_hour(floor),
+            coordinated.requests_per_hour(default)
+        );
+        assert_eq!(target.polled_every(0), target);
+        // The eleventh repository is refused at 60 s and admitted at 300 s.
+        let ten = BudgetProjection::new(default, vec![target; 10]);
+        assert!(!ten.admit(target).is_admitted());
+        assert!(ten.admit(coordinated).is_admitted());
+    }
+
     #[test]
     fn the_projection_reproduces_the_documented_target_ceilings() {
         assert_eq!(HOURLY_REQUEST_CEILING, 5_000);

@@ -320,6 +320,7 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             let action = action_name(&job.action);
             let required = required_labels(&job.workflow_job.labels);
             let repository = &job.repository.full_name;
+            state.registry.repository_seen(repository);
             let identity = JobIdentity::new(
                 repository,
                 job.workflow_job.workflow_name.as_deref(),
