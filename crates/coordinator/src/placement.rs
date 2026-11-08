@@ -838,15 +838,27 @@ impl Placement {
 
     /// A host's heartbeat listed the launches it still holds open (`held`):
     /// every accepted lease of that host it does not list is closed, and the
-    /// number closed returned. A lease still being offered, or whose runner
-    /// took a job, is left alone: the host reports those another way.
+    /// number closed returned. One it lists is alive, however long its runner
+    /// takes to come up, so its lifetime starts over: the lifetime is what ends
+    /// a lease when its host stops saying so. A lease still being offered, or
+    /// whose runner took a job, is left alone: the host reports those another
+    /// way.
     ///
     /// Sound because one connection is ordered: a lease is accepted here only
     /// after its `launch_ack`, so a heartbeat read after that was sent after
     /// it, when the host already held the launch.
     pub fn reconcile_leases(&self, host_id: &str, held: &[String]) -> usize {
         let held: HashSet<&str> = held.iter().map(String::as_str).collect();
+        let renewed = Instant::now() + self.lease_ttl;
         let mut state = self.state();
+        for (id, lease) in &mut state.leases {
+            if lease.host_id == host_id
+                && lease.state == LeaseState::Accepted
+                && held.contains(id.as_str())
+            {
+                lease.expires = lease.expires.max(renewed);
+            }
+        }
         let stale: Vec<String> = state
             .leases
             .iter()
@@ -1609,6 +1621,34 @@ mod tests {
         assert_eq!(placement.counts(&key), (1, 0));
         assert_eq!(placement.rebalance(&key).await.accepted, 1);
         assert_eq!(launches(&host.await.expect("host")), 2);
+    }
+
+    /// Listed by its host's heartbeat, a lease lives on however long its runner
+    /// takes; no longer heard of, its lifetime ends it.
+    #[tokio::test]
+    async fn a_heartbeat_listing_a_lease_renews_it() {
+        let ttl = Duration::from_secs(60);
+        let (registry, placement) = setup_with_ttl(ttl);
+        let host = connect(&registry, "h", LAUNCH_VERSION, POOL, 4, 8 << 30);
+        let _host = answer(&placement, "h", host, Answer::Accept);
+        let key = placement
+            .queued("octo/app", &required(POOL), 1)
+            .expect("pool");
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        let id = placement.state().leases.keys().next().unwrap().clone();
+        // As though nearly out of time.
+        placement.state().leases.get_mut(&id).unwrap().expires = Instant::now();
+
+        assert_eq!(
+            placement.reconcile_leases("h", std::slice::from_ref(&id)),
+            0
+        );
+
+        assert!(
+            placement.expire(Instant::now() + ttl / 2).is_empty(),
+            "renewed"
+        );
+        assert_eq!(placement.expire(Instant::now() + ttl * 2), vec![key]);
     }
 
     #[tokio::test]

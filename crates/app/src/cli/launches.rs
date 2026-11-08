@@ -31,6 +31,14 @@
 //! [`DemandDirector::launched`]) → it closes when that runner leaves the
 //! unassigned states (takes a job, or ends), when the coordinator cancels it,
 //! or when it expires (`ttl_secs`, measured on this host's clock).
+//!
+//! # A launch being worked on does not run out
+//!
+//! A launch whose runner is still being brought up keeps its lease, however
+//! long the package takes, up to [`BRING_UP_LIMIT`]: its runner is coming, and
+//! placing its job again would only start a second one. The heartbeat lists it,
+//! which is what renews the lease at the coordinator. Nor does waiting for a
+//! turn count against it: [`START_LIMIT`] is measured from a start that failed.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -58,10 +66,16 @@ const SEEN_MEMORY: usize = 1024;
 /// Attempts whose lease is remembered for the attempt reports.
 const LEASED_MEMORY: usize = 1024;
 
-/// How long an accepted launch may go without a runner, whatever the reason,
-/// before it is dropped and its job placed again: well inside a lease's
-/// lifetime, with room for a retry.
+/// How long after a start failed for a real reason an accepted launch may go
+/// on without a runner before it is dropped and its job placed again: well
+/// inside a lease's lifetime, with room for a retry.
 const START_LIMIT: Duration = Duration::from_secs(45);
+
+/// How long a launch's runner may be brought up before the launch stops being
+/// kept for it, and how long a launch is kept after: time for a runner just up
+/// to take the job.
+const BRING_UP_LIMIT: Duration = Duration::from_secs(15 * 60);
+const TAKE_JOB_GRACE: Duration = Duration::from_secs(30);
 
 /// One accepted launch.
 #[derive(Debug, Clone)]
@@ -69,8 +83,10 @@ struct Open {
     policy: PolicyId,
     expires: Instant,
     accepted_at: Instant,
-    /// The runner started for it, once the pass started one.
+    /// The runner reserved for it, once a pass reserved one.
     attempt: Option<AttemptId>,
+    /// Since when no runner can be started for it, for a real reason.
+    blocked_since: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -97,19 +113,38 @@ impl Book {
         }
     }
 
-    /// Whatever kept it from starting, a launch with no runner for
-    /// [`START_LIMIT`] goes, well before its lease would run out.
+    /// A launch no runner could be started for since [`START_LIMIT`] ago goes,
+    /// well before its lease would run out. One bound to a runner, or waiting
+    /// its turn, has not failed to start.
     fn drop_late(&mut self, now: Instant) {
         let before = self.open.len();
         self.open.retain(|lease, open| {
             let late = open.attempt.is_none()
-                && now.saturating_duration_since(open.accepted_at) >= START_LIMIT;
+                && open
+                    .blocked_since
+                    .is_some_and(|since| now.saturating_duration_since(since) >= START_LIMIT);
             if late {
                 tracing::warn!(%lease, "no runner could be started for a launch in time; it was dropped");
             }
             !late
         });
         self.dropped |= self.open.len() != before;
+    }
+
+    /// A launch whose runner is still being brought up is not out of time.
+    fn keep_while_coming_up(&mut self, attempts: &[RunnerAttempt], now: Instant) {
+        for open in self.open.values_mut() {
+            let coming_up = open.attempt.is_some_and(|id| {
+                attempts.iter().any(|attempt| {
+                    attempt.id == id
+                        && attempt.state().is_unassigned()
+                        && attempt.state() != AttemptState::Idle
+                })
+            });
+            if coming_up && now.saturating_duration_since(open.accepted_at) < BRING_UP_LIMIT {
+                open.expires = open.expires.max(now + TAKE_JOB_GRACE);
+            }
+        }
     }
 
     /// A launch whose runner exited idle waits again, with a fresh start
@@ -139,6 +174,7 @@ impl Book {
                 {
                     open.attempt = None;
                     open.accepted_at = now;
+                    open.blocked_since = None;
                     released.push(attempt);
                 }
                 // Not read yet (bound since those reads): looked at next time.
@@ -363,6 +399,9 @@ impl Launches {
         });
 
         let mut book = self.book();
+        if let Some(attempts) = &attempts {
+            book.keep_while_coming_up(attempts, now);
+        }
         book.open
             .retain(|_, open| open.expires > now && !gone.contains(&open.policy));
         book.drop_late(now);
@@ -458,6 +497,7 @@ impl Launches {
                 expires: now + ttl,
                 accepted_at: now,
                 attempt: None,
+                blocked_since: None,
             },
         );
         LaunchAck::accepted(&launch.lease_id)
@@ -550,6 +590,32 @@ impl DemandDirector for Launches {
             }
             book.lease_runner(attempt, &lease_id);
         }
+    }
+
+    fn start_failed(&self, policy: &ScalePolicy) {
+        let now = Instant::now();
+        for open in self.book().open.values_mut() {
+            if open.policy == policy.id && open.attempt.is_none() {
+                open.blocked_since.get_or_insert(now);
+            }
+        }
+    }
+
+    fn older_waiting(&self, policy: &ScalePolicy) -> bool {
+        let book = self.book();
+        let waiting = || book.open.values().filter(|open| open.attempt.is_none());
+        waiting()
+            .filter(|open| open.policy == policy.id)
+            .map(|open| open.accepted_at)
+            .min()
+            .is_some_and(|oldest| {
+                // One that cannot start is no reason to wait for it.
+                waiting().any(|open| {
+                    open.policy != policy.id
+                        && open.blocked_since.is_none()
+                        && open.accepted_at < oldest
+                })
+            })
     }
 }
 
@@ -813,6 +879,114 @@ mod tests {
         );
     }
 
+    /// Waiting its turn, however long, is not "no runner could be started":
+    /// only its lease runs out on it.
+    #[test]
+    fn a_launch_waiting_its_turn_is_not_late() {
+        let (_store, policy, launches) = setup(LAUNCH_VERSION);
+        assert!(
+            launches
+                .decide(&launch(&policy, "a"), false, false)
+                .accepted
+        );
+        launches.settle(Instant::now() + START_LIMIT * 2);
+        assert_eq!(launches.open_for(policy.id), 1);
+        assert!(!launches.take_dropped());
+
+        // The limit counts from the failure, and a second failure moves nothing.
+        launches.start_failed(&policy);
+        let failed = Instant::now();
+        launches.settle(failed + START_LIMIT / 2);
+        assert_eq!(launches.open_for(policy.id), 1);
+        launches.start_failed(&policy);
+        launches.settle(failed + START_LIMIT + Duration::from_secs(1));
+        assert_eq!(launches.open_for(policy.id), 0);
+        assert!(launches.take_dropped());
+    }
+
+    /// A runner still being brought up keeps its launch past the launch's own
+    /// lifetime, within a limit, and the heartbeat goes on listing it.
+    #[test]
+    fn a_launch_outlives_its_ttl_while_its_runner_comes_up() {
+        for state in [
+            AttemptState::Allocated,
+            AttemptState::Preparing,
+            AttemptState::Starting,
+        ] {
+            let (store, policy, launches) = setup(LAUNCH_VERSION);
+            assert!(
+                launches
+                    .decide(&launch(&policy, "a"), false, false)
+                    .accepted
+            );
+            let runner = AttemptId::new_random();
+            store
+                .record_attempt(&attempt_in(&policy, runner, state))
+                .expect("recorded");
+            launches.launched(&policy, runner);
+
+            // Heartbeats every 20 s, well past the launch's own 300 s.
+            let start = Instant::now();
+            for ahead in (20..=600).step_by(20) {
+                launches.settle(start + Duration::from_secs(ahead));
+                assert_eq!(launches.open_for(policy.id), 1, "{state:?} at {ahead} s");
+            }
+            assert_eq!(launches.open_leases(), vec!["a".to_string()]);
+            assert!(!launches.take_dropped());
+
+            // Long after the limit, with nothing else to keep it: gone.
+            launches.settle(Instant::now() + BRING_UP_LIMIT + TAKE_JOB_GRACE * 2);
+            assert_eq!(launches.open_for(policy.id), 0, "{state:?}");
+        }
+    }
+
+    /// A runner that is up had its chance at the job: the lease's lifetime
+    /// applies, so a job it did not take is placed again.
+    #[test]
+    fn a_launch_whose_runner_is_up_expires_at_its_ttl() {
+        let (store, policy, launches) = setup(LAUNCH_VERSION);
+        assert!(
+            launches
+                .decide(&launch(&policy, "a"), false, false)
+                .accepted
+        );
+        let runner = AttemptId::new_random();
+        store
+            .record_attempt(&attempt_in(&policy, runner, AttemptState::Idle))
+            .expect("recorded");
+        launches.launched(&policy, runner);
+        launches.settle(Instant::now() + Duration::from_secs(301));
+        assert_eq!(launches.open_for(policy.id), 0);
+    }
+
+    #[test]
+    fn an_older_launch_of_another_profile_goes_first() {
+        let (store, policy, launches) = setup(LAUNCH_VERSION);
+        let other = second_profile(&store, &policy, 6);
+
+        assert!(!launches.older_waiting(&policy), "nothing open");
+        {
+            let now = Instant::now();
+            let mut book = launches.book();
+            for (lease, owner, age) in [("old", other.id, 10), ("new", policy.id, 1)] {
+                book.open.insert(
+                    lease.into(),
+                    Open {
+                        policy: owner,
+                        expires: now + Duration::from_secs(300),
+                        accepted_at: now - Duration::from_secs(age),
+                        attempt: None,
+                        blocked_since: None,
+                    },
+                );
+            }
+        }
+        assert!(launches.older_waiting(&policy));
+        assert!(!launches.older_waiting(&other), "it is the oldest");
+        launches.launched(&other, AttemptId::new_random());
+        assert!(!launches.older_waiting(&policy), "it has its runner");
+    }
+
     /// The invariant: a launch has a runner able to take a job, or one this
     /// host can start, or it is dropped. A slot taken since it was accepted
     /// (a runner of another profile) leaves it with none of those: the newest
@@ -881,7 +1055,7 @@ mod tests {
     /// Whatever keeps a launch from starting, it does not hold its lease to
     /// the end: it is dropped well inside the lease's lifetime.
     #[test]
-    fn a_launch_with_no_runner_for_too_long_is_dropped() {
+    fn a_launch_that_could_not_be_started_for_too_long_is_dropped() {
         let (_store, policy, launches) = setup(LAUNCH_VERSION);
         let before = Instant::now();
         assert!(
@@ -889,6 +1063,7 @@ mod tests {
                 .decide(&launch(&policy, "a"), false, false)
                 .accepted
         );
+        launches.start_failed(&policy);
         launches.settle(before + START_LIMIT - Duration::from_secs(1));
         assert_eq!(launches.open_for(policy.id), 1);
         assert!(!launches.take_dropped());

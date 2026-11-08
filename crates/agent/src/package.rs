@@ -1232,11 +1232,7 @@ impl PackageCache {
         // network: an unsupported pair has no package and never will.
         host_os::validate(self.os, self.arch)?;
 
-        let now = self.ports.clock.now();
-        if !force
-            && !self.check_is_due(now)?
-            && let Some(entry) = self.newest_installed()?
-        {
+        if !force && let Some(entry) = self.reusable()? {
             return Ok((entry, false));
         }
 
@@ -1293,6 +1289,16 @@ impl PackageCache {
     #[must_use]
     pub fn is_stale(&self, package: &InstalledPackage, now: Timestamp) -> bool {
         now.signed_duration_since(package.installed_at) > self.freshness.window
+    }
+
+    /// The entry an install would return without asking anybody, if no check
+    /// is due: it neither looks anything up nor changes anything.
+    pub(crate) fn reusable(&self) -> Result<Option<InstalledPackage>, PackageError> {
+        host_os::validate(self.os, self.arch)?;
+        if self.check_is_due(self.ports.clock.now())? {
+            return Ok(None);
+        }
+        self.newest_installed()
     }
 
     /// Whether the published version is due to be re-checked.
@@ -1631,7 +1637,7 @@ impl PackageCache {
     }
 
     /// The most recently installed entry, which is the one a cold start reuses.
-    fn newest_installed(&self) -> Result<Option<InstalledPackage>, PackageError> {
+    pub(crate) fn newest_installed(&self) -> Result<Option<InstalledPackage>, PackageError> {
         Ok(self
             .installed()?
             .into_iter()
@@ -4244,6 +4250,129 @@ mod tests {
             .state(state)
             .runtime_path(runtime.to_string_lossy().to_string())
             .build()
+    }
+
+    /// An attempt about to be materialized, with its runner root in place.
+    fn reserved(harness: &Harness, id: u128) -> RunnerAttempt {
+        let attempt = attempt_in(harness, id, AttemptState::Allocated);
+        fs::create_dir_all(attempt.runtime_path().parent().unwrap()).unwrap();
+        attempt
+    }
+
+    /// One daemon's adapter for each of two targets over one package directory.
+    fn two_targets(
+        harness: &Harness,
+    ) -> (
+        crate::lifecycle::CachedRuntimePackages,
+        crate::lifecycle::CachedRuntimePackages,
+        crate::lifecycle::SharedPackages,
+    ) {
+        use crate::lifecycle::{CachedRuntimePackages, SharedPackages};
+        let shared = SharedPackages::default();
+        (
+            CachedRuntimePackages::with_shared(Arc::new(harness.cache()), shared.clone()),
+            CachedRuntimePackages::with_shared(Arc::new(harness.cache()), shared.clone()),
+            shared,
+        )
+    }
+
+    /// The 142 s launch: each target distrusted the tree the other installed,
+    /// so every switch between them downloaded the package again.
+    #[tokio::test]
+    async fn switching_between_targets_does_not_download_the_package_again() {
+        use crate::lifecycle::RuntimePackages as _;
+
+        let (harness, _, _) = linux_fixture();
+        let (one, two, _shared) = two_targets(&harness);
+        for (id, packages) in [(1, &one), (2, &two), (3, &one), (4, &two)] {
+            let attempt = reserved(&harness, id);
+            packages.materialize(&attempt).await.expect("materialized");
+            assert!(attempt.runtime_path().join("run.sh").exists());
+            let timings = packages.take_timings(attempt.id);
+            assert_eq!(timings.downloaded, id == 1, "attempt {id}: {timings:?}");
+        }
+        assert_eq!(harness.fetcher.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn launches_materializing_together_share_one_download() {
+        use crate::lifecycle::RuntimePackages as _;
+
+        let (harness, _, _) = linux_fixture();
+        let (one, two, _shared) = two_targets(&harness);
+        let first = reserved(&harness, 1);
+        let second = reserved(&harness, 2);
+
+        let (a, b) = tokio::join!(one.materialize(&first), two.materialize(&second));
+
+        a.expect("the first");
+        b.expect("the second");
+        assert_eq!(harness.fetcher.count(), 1);
+    }
+
+    /// Still replaced when a job edits it, whichever target notices.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tree_a_job_edited_is_replaced_for_every_target() {
+        use crate::lifecycle::RuntimePackages as _;
+
+        let (harness, _, _) = linux_fixture();
+        let (one, two, _shared) = two_targets(&harness);
+        one.materialize(&reserved(&harness, 1))
+            .await
+            .expect("materialized");
+        let entry = harness.cache().installed().unwrap().remove(0);
+        fs::write(entry.root().join("planted"), b"from a job").unwrap();
+
+        two.materialize(&reserved(&harness, 2))
+            .await
+            .expect("materialized");
+
+        assert_eq!(harness.fetcher.count(), 2);
+        assert!(!entry.root().join("planted").exists());
+    }
+
+    /// A superseded version goes only when no copy or install is under way.
+    #[tokio::test]
+    async fn a_prune_leaves_the_trees_alone_while_they_are_in_use() {
+        use crate::lifecycle::{PruneAuthority, RuntimePackages as _};
+        use crate::reconcile::{AllocationLock as _, InProcessAllocationLock};
+
+        let (harness, _, _) = linux_fixture();
+        let (one, _two, shared) = two_targets(&harness);
+        one.materialize(&reserved(&harness, 1))
+            .await
+            .expect("materialized");
+        one.release(AttemptId::from_u128(1)).expect("released");
+        let newer = tar_gz_bytes(&[("run.sh", "newer\n")]);
+        harness.catalog.publish(vec![published(
+            "linux",
+            "x64",
+            "2.340.0",
+            ".tar.gz",
+            Some(&hex_digest(&newer)),
+        )]);
+        harness.fetcher.serve(newer);
+        harness
+            .clock
+            .advance(Elapsed::days(FRESHNESS_WINDOW_DAYS + 1));
+        let cache = harness.cache();
+        cache.ensure_installed().await.expect("the newer install");
+        assert_eq!(cache.installed().unwrap().len(), 2);
+
+        let lock = InProcessAllocationLock::new();
+        let guard = lock.acquire().await.unwrap();
+        {
+            let _copying = shared.copying().await;
+            one.prune_obsolete_guarded(PruneAuthority::from_launch_request(&guard), &[])
+                .expect("nothing to do yet");
+            assert_eq!(cache.installed().unwrap().len(), 2);
+        }
+        one.prune_obsolete_guarded(PruneAuthority::from_launch_request(&guard), &[])
+            .expect("pruned");
+        let left = cache.installed().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].version(), &version("2.340.0"));
     }
 
     #[tokio::test]
