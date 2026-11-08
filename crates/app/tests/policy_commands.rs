@@ -124,6 +124,21 @@ fn the_budget_guard_counts_a_coordinators_sweep() {
         admitted.both()
     );
     assert_eq!(database(data_dir.path()).policies().unwrap().len(), 11);
+
+    // All covered now: a shorter coordinated interval is a budget decision.
+    link.covered = names.iter().map(|name| format!("repo:{name}")).collect();
+    records::record_link(&paths, &link).unwrap();
+    let interval = |value: &str| {
+        run({
+            let mut command = runner_manager_against(data_dir.path(), &github);
+            command.args(["host", "set-poll-interval", "--coordinated", value]);
+            command
+        })
+    };
+    let refused = interval("60s");
+    assert_eq!(refused.code, 12, "over the budget: {}", refused.both());
+    let accepted = interval("600s");
+    assert_eq!(accepted.code, 0, "{}", accepted.both());
 }
 
 #[test]

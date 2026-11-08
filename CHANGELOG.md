@@ -59,16 +59,17 @@ the version being prepared rather than the version in `Cargo.toml`.
   for it. The sweep now names the jobs it lists, as a webhook does.
 - **A repository just added is covered within seconds, not 10 minutes.** The
   coordinator reads its GitHub App's repositories again (at most every 30 s)
-  when a host advertises one its sweep does not cover or a webhook names one it
-  does not know. Until now such a repository stayed in `fallback`: its pool jobs
+  when a host advertises one they do not include, or a webhook names one. Until now such a repository stayed in `fallback`: its pool jobs
   were only woken, and waited for the host's next poll.
 - **`repo add` no longer refuses a repository the coordinator will poll for
   you.** The REST budget (also in `host show`, `host set-poll-interval` and the
   TUI) counts a coordinated target at the coordinated interval instead of 60 s.
-  A new repository on a host whose link is up and whose coordinator runs a sweep
-  is counted the same way, with a printed note. If
+  A new repository (not a new organization) on a host whose link is up and whose
+  coordinator runs a sweep is counted the same way, with a printed note. If
   coordination is lost, a set that no longer fits stretches its charged polls to
-  stay within the budget (64 s for 11 repositories) and keeps starting runners.
+  the interval `repo add` would allow (64 s for 11 repositories) and keeps starting
+  runners. `host set-poll-interval` now also refuses a shorter `--coordinated`
+  that would go over the budget.
 - A test of the runner process fixture could read its readiness file before
   it was written and fail at random.
 

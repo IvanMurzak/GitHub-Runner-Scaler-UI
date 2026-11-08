@@ -226,6 +226,16 @@ impl CoordinatedPricing {
             && self.snapshot.reconcile_interval_secs.is_some()
     }
 
+    /// These records, as they would price targets at `interval`.
+    #[must_use]
+    pub const fn at_interval(
+        mut self,
+        interval: runner_manager_domain::model::CoordinatedPollInterval,
+    ) -> Self {
+        self.interval = interval;
+        self
+    }
+
     #[must_use]
     pub const fn interval_secs(&self) -> u16 {
         self.interval.as_secs()
@@ -249,7 +259,13 @@ impl CoordinatedPricing {
         target: &ScaleTarget,
         candidate: TargetCost,
     ) -> (TargetCost, bool) {
-        if !self.covers(target) && self.may_presume() {
+        // Never an organization: its cost grows with its repositories, and
+        // pacing prices it as one, so nothing would hold it to the budget if
+        // the presumption failed.
+        if matches!(target, ScaleTarget::Repository(_))
+            && !self.covers(target)
+            && self.may_presume()
+        {
             (candidate.polled_every(self.interval), true)
         } else {
             (self.price(target, candidate), false)
@@ -1277,6 +1293,13 @@ mod tests {
                 .admit(candidate)
                 .is_admitted()
         );
+
+        // An organization is never presumed: nothing would hold it to the
+        // budget if the presumption failed.
+        let org = organization("acme");
+        let (priced, presumed) = on.price_addition(&org, TargetCost::organization(40));
+        assert!(!presumed);
+        assert_eq!(priced, TargetCost::organization(40));
 
         // Enough uncovered targets that only the presumption admits it.
         let full = vec![cost; 10];

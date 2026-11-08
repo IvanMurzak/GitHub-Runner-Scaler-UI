@@ -2246,6 +2246,23 @@ fn active_autoscale_targets(mut policies: Vec<ScalePolicy>) -> Vec<Vec<ScalePoli
     targets
 }
 
+/// The targets among `policies` that poll on their own schedule right now:
+/// ones with a loop, and not `coordinated`.
+fn polling_on_their_own(
+    policies: &[ScalePolicy],
+    view: &super::coordinator::LinkView,
+    now: tokio::time::Instant,
+) -> Vec<ScaleTarget> {
+    policies
+        .iter()
+        .filter(|policy| policy.may_start_runners() || policy.state() == PolicyState::Draining)
+        .filter(|policy| {
+            view.mode(&policy.target, now) != super::coordinator::PollMode::Coordinated
+        })
+        .map(|policy| policy.target.clone())
+        .collect()
+}
+
 trait TargetReconciler: Send + 'static {
     fn policies(&self) -> &[ScalePolicy];
     fn begin_drain(&mut self);
@@ -2421,9 +2438,14 @@ impl TargetReconciler for ManagedTarget {
             );
             return;
         };
-        let every_target: Vec<ScaleTarget> =
-            all.iter().map(|policy| policy.target.clone()).collect();
-        self.pacing_floor = super::host::pacing_floor(&every_target);
+        self.pacing_floor = {
+            let view = self.coordination.borrow();
+            super::host::pacing_floor(&polling_on_their_own(
+                &all,
+                &view,
+                tokio::time::Instant::now(),
+            ))
+        };
         let refreshed: Vec<ScalePolicy> = all
             .into_iter()
             .filter(|policy| {
@@ -2663,8 +2685,8 @@ async fn run_target_loop<T: TargetReconciler>(
         });
         let slept_at = tokio::time::Instant::now();
         let scheduled = slept_at + delay;
-        // A set of targets admitted on the coordinated budget does not fit it
-        // when each polls on its own: charged polls stretch to what does.
+        // Targets polling on their own (not coordinated) may not fit the
+        // budget together: charged polls stretch to what does.
         // Idle polls are answered 304, which is free, and a drain is bounded.
         let paced = if draining.is_some()
             || report.next_poll.pace == runner_manager_agent::reconcile::PollPace::Idle
@@ -2695,12 +2717,14 @@ async fn run_target_loop<T: TargetReconciler>(
             let (planned, fallback_at) = match (&mut coordination, &target_name) {
                 (Some(view), Some(name)) => {
                     let view = view.borrow_and_update();
-                    if view.mode(name, now) != super::coordinator::PollMode::Coordinated {
-                        (paced, None)
-                    } else if let Some(stretched) = stretched {
-                        (stretched, view.fallback_at())
-                    } else {
-                        (scheduled, None)
+                    match stretched {
+                        Some(stretched)
+                            if view.mode(name, now)
+                                == super::coordinator::PollMode::Coordinated =>
+                        {
+                            (stretched, view.fallback_at())
+                        }
+                        _ => (paced, None),
                     }
                 }
                 _ => (paced, None),
@@ -4224,6 +4248,83 @@ mod tests {
             after(120).await;
             let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
         }
+    }
+
+    /// The documented loss of coordination: a target that is not coordinated
+    /// paces its charged polls to the budget; one coordinated waits for its
+    /// own interval, and the floor counts only the targets polling on their
+    /// own.
+    #[tokio::test(start_paused = true)]
+    async fn a_target_not_coordinated_is_paced_and_only_those_count_towards_the_floor() {
+        use super::super::coordinator::LinkView;
+        use runner_manager_domain::coordinator_protocol::{HelloAck, TargetRef, TargetScope};
+
+        let mut report = ReconcileReport::default();
+        report.next_poll.delay = Duration::from_secs(60);
+        report.next_poll.pace = runner_manager_agent::reconcile::PollPace::Nominal;
+        let policy = fixtures::policy()
+            .repository("acme/repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let other = fixtures::policy()
+            .id(runner_manager_domain::model::PolicyId::new_random())
+            .repository("acme/other")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let (mut target, calls) = FakeTarget::repeating(policy.clone(), report);
+        target.active = 0;
+        target.pacing_floor = Duration::from_secs(90);
+        // Joined, the link down well past the grace: fallback.
+        let down = LinkView {
+            configured: true,
+            connected: false,
+            down_since: tokio::time::Instant::now().checked_sub(Duration::from_secs(600)),
+            ack: None,
+            version: Some(4),
+        };
+        let (_link, view) = tokio::sync::watch::channel(down.clone());
+        target.coordination = Some(view);
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            never_upgraded(),
+            Arc::new(CountingContacts::default()) as Arc<dyn ContactRecorder>,
+        ));
+        after(0).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the first pass");
+        after(89).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "not at 60 s");
+        after(1).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "at the floor");
+        stop.send(true).unwrap();
+        after(120).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+
+        // The floor counts what polls on its own: both while the link is
+        // down; only the uncovered one while it is up.
+        let now = tokio::time::Instant::now();
+        let policies = [policy.clone(), other.clone()];
+        assert_eq!(polling_on_their_own(&policies, &down, now).len(), 2);
+        let up = LinkView {
+            configured: true,
+            connected: true,
+            down_since: None,
+            ack: Some(HelloAck {
+                reconcile_interval_secs: Some(120),
+                covered: vec![TargetRef {
+                    scope: TargetScope::Repo,
+                    name: "acme/repo".into(),
+                }],
+            }),
+            version: Some(4),
+        };
+        assert_eq!(
+            polling_on_their_own(&policies, &up, now),
+            vec![other.target.clone()]
+        );
     }
 
     /// Accepted launches start their runners at once, however recently the

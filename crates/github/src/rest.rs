@@ -1520,7 +1520,8 @@ impl TargetCost {
     pub fn requests_per_hour(&self, interval: RefreshInterval) -> u32 {
         let refreshes = self.polled_every_secs.map_or_else(
             || refreshes_per_hour(interval),
-            |secs| SECONDS_PER_HOUR / u32::from(secs),
+            // Rounded up: a target polled less than hourly still costs.
+            |secs| SECONDS_PER_HOUR.div_ceil(u32::from(secs)),
         );
         self.requests_per_refresh().saturating_mul(refreshes)
     }
@@ -4624,6 +4625,12 @@ mod tests {
         assert_eq!(
             coordinated.requests_per_hour(floor),
             coordinated.requests_per_hour(default)
+        );
+        // Polled less than hourly, it still costs something.
+        let rare = target.polled_every(CoordinatedPollInterval::from_secs(7200).expect("in range"));
+        assert_eq!(
+            rare.requests_per_hour(default),
+            target.requests_per_refresh()
         );
         // The eleventh repository is refused at 60 s and admitted at 300 s.
         let ten = BudgetProjection::new(default, vec![target; 10]);
