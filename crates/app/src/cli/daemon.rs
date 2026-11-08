@@ -488,6 +488,7 @@ async fn run_generation(
                 wake: signals.wake,
                 launch: signals.launch,
                 coordination: coordination.subscribe(),
+                draining: false,
             })
         }
     };
@@ -2336,6 +2337,9 @@ struct ManagedTarget {
     wake: Arc<tokio::sync::Notify>,
     launch: Arc<tokio::sync::Notify>,
     coordination: tokio::sync::watch::Receiver<super::coordinator::LinkView>,
+    /// Draining: a policy read afresh is drained too, so a repository added
+    /// back while this loop winds down is not served by it.
+    draining: bool,
 }
 
 impl TargetReconciler for ManagedTarget {
@@ -2372,6 +2376,7 @@ impl TargetReconciler for ManagedTarget {
     }
 
     fn begin_drain(&mut self) {
+        self.draining = true;
         self.cancel.cancel();
         begin_drain(&mut self.policies);
     }
@@ -2415,6 +2420,9 @@ impl TargetReconciler for ManagedTarget {
         // still up is supervised; the target-set watch is what ends the loop.
         if !refreshed.is_empty() {
             self.policies = refreshed;
+            if self.draining {
+                begin_drain(&mut self.policies);
+            }
         }
     }
 

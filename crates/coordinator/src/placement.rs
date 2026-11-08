@@ -359,15 +359,13 @@ impl State {
         true
     }
 
-    /// Records why `key` is short of runners; logs it when that changed or a
-    /// minute passed.
+    /// Records why `key` is short of runners; logs it at most once a minute.
     fn note_unplaced(&mut self, key: &JobKey, reason: Unplaced) {
         let now = Instant::now();
         let entry = self.unplaced.entry(key.clone()).or_insert((reason, None));
-        let due = entry.0 != reason
-            || entry
-                .1
-                .is_none_or(|at| now.saturating_duration_since(at) >= UNPLACED_LOG_EVERY);
+        let due = entry
+            .1
+            .is_none_or(|at| now.saturating_duration_since(at) >= UNPLACED_LOG_EVERY);
         entry.0 = reason;
         if due {
             entry.1 = Some(now);
@@ -562,12 +560,13 @@ impl Placement {
                     return Some(key);
                 }
                 Some(_) => {}
-                // Its host has not said yet: its `attempt_started` decides.
-                None => {
-                    if state.taken.len() < MAX_RUNNERS {
-                        state.taken.insert(name, (key.clone(), now));
-                    }
+                // Its host has not said yet: its `attempt_started` settles
+                // this job, whichever lease (or none) the runner had.
+                None if state.taken.len() < MAX_RUNNERS => {
+                    state.taken.insert(name, (key.clone(), now));
+                    return Some(key);
                 }
+                None => {}
             }
         }
         // The runner that took it closes its lease; if it already said so,
@@ -691,16 +690,26 @@ impl Placement {
                 },
             );
         }
-        let Some(lease_id) = started.lease_id.as_deref() else {
-            // A runner of no lease took a job a webhook already named: that
-            // job's credit is its, and the host's oldest lease for that queue
-            // is not coming to anything.
-            if let Some((key, _)) = taken {
-                if let Some(credits) = state.credits.get_mut(&key) {
-                    credits.pop_front();
+        let lease_key = started
+            .lease_id
+            .as_deref()
+            .and_then(|lease| state.leases.get(lease))
+            .filter(|lease| lease.host_id == host_id)
+            .map(|lease| lease.key.clone());
+        // A webhook already said this runner took a job of `taken`.
+        if let Some((taken, _)) = taken {
+            match (started.lease_id.as_deref(), lease_key) {
+                // Its own lease's job: that lease is done.
+                (Some(lease_id), Some(key)) if key == taken => {
+                    state.release_claimed(lease_id, Instant::now());
                 }
-                state.close_oldest_accepted(&self.registry, host_id, &key);
+                // Another queue's job, or a runner of no lease: the host's
+                // oldest lease for that queue is not coming to anything.
+                _ => state.close_oldest_accepted(&self.registry, host_id, &taken),
             }
+            return;
+        }
+        let Some(lease_id) = started.lease_id.as_deref() else {
             return;
         };
         let Some(key) = state
@@ -953,6 +962,13 @@ impl Placement {
             let (sender, receiver) = oneshot::channel();
             self.waiting()
                 .insert(lease_id.clone(), (host_id.clone(), sender));
+            // The host reconnected since the offer (its leases were dropped):
+            // the launch is not sent to its new link untracked.
+            if !self.state().leases.contains_key(&lease_id) {
+                self.waiting().remove(&lease_id);
+                tried.insert(host_id);
+                continue;
+            }
             // `Ok(Err)`: undeliverable, or the host went away meanwhile.
             let answer = if self.registry.send(&host_id, ServerMessage::Launch(launch)) {
                 tokio::time::timeout(self.ack_timeout, receiver)
@@ -1788,6 +1804,62 @@ mod tests {
             vec![first, second],
             "the host drops them too"
         );
+    }
+
+    /// A runner started for one queue's lease takes another queue's job, and
+    /// the webhook says so before its host does: the other queue's lease of
+    /// that host closes, the runner's own lease is left for its heartbeat,
+    /// and no credit is left behind.
+    #[tokio::test]
+    async fn a_runner_taking_another_queues_job_closes_that_queues_lease_in_either_order() {
+        let (registry, placement) = setup();
+        let host = connect(
+            &registry,
+            "h",
+            LAUNCH_VERSION,
+            &["rm-pool-linux", "gpu"],
+            8,
+            8 << 30,
+        );
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let plain = required(&["rm-pool-linux"]);
+        let gpu = required(&["rm-pool-linux", "gpu"]);
+        let plain_key = placement.queued("octo/app", &plain, 1).expect("pool");
+        let gpu_key = placement.queued("octo/app", &gpu, 2).expect("pool");
+        assert_eq!(placement.rebalance(&plain_key).await.accepted, 1);
+        assert_eq!(placement.rebalance(&gpu_key).await.accepted, 1);
+        let lease_of = |placement: &Placement, key: &JobKey| {
+            placement
+                .state()
+                .leases
+                .iter()
+                .find(|(_, lease)| &lease.key == key)
+                .map(|(id, _)| id.clone())
+                .expect("a lease")
+        };
+        let plain_lease = lease_of(&placement, &plain_key);
+        let gpu_lease = lease_of(&placement, &gpu_key);
+
+        // The plain lease's runner took the gpu job; the webhook came first.
+        placement.dequeued_by("octo/app", &gpu, 2, Some("runner-manager-p"));
+        placement.attempt_started("h", &started_by("runner-manager-p", Some(&plain_lease)));
+        assert_eq!(
+            placement.counts(&gpu_key),
+            (0, 0),
+            "the gpu lease is not coming"
+        );
+        assert_eq!(
+            placement.counts(&plain_key),
+            (1, 1),
+            "the plain one is its heartbeat's"
+        );
+        assert!(
+            placement.state().credits.is_empty(),
+            "no credit for a later claim"
+        );
+        assert!(placement.state().taken.is_empty());
+        let seen = host.await.expect("host");
+        assert_eq!(cancels(&seen), vec![gpu_lease]);
     }
 
     /// A queue left short says why, and `stats` lists it with the open

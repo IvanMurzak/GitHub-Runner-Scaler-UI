@@ -1214,18 +1214,15 @@ fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy
     }
 }
 
-/// `policies`' live runners, counted per policy rather than by reading every
-/// attempt this host ever ran.
-fn heartbeat(
-    ports: &LinkPorts,
-    policies: &[ScalePolicy],
-    open_leases: Option<Vec<String>>,
-) -> Heartbeat {
-    let busy = policies
-        .iter()
-        .filter_map(|policy| ports.store.active_attempts_for_policy(policy.id).ok())
+/// This host's live runners, counted over its whole attempt journal as the
+/// allocator counts them: a repository removed while its runners finish has
+/// no policy any more, and its runners still hold their slots.
+fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
+    let busy = ports
+        .store
+        .attempts()
         .map(|attempts| active_count(attempts.iter()))
-        .fold(0_u16, u16::saturating_add);
+        .unwrap_or(0);
     Heartbeat {
         free_slots: u32::from(ports.host.host_capacity.get().saturating_sub(busy)),
         busy_slots: u32::from(busy),
@@ -1555,11 +1552,7 @@ async fn report_attempts(
         }
     }
     if beat || reports.take_released() {
-        send(
-            socket,
-            &HostMessage::Heartbeat(heartbeat(ports, &policies, open)),
-        )
-        .await?;
+        send(socket, &HostMessage::Heartbeat(heartbeat(ports, open))).await?;
     }
     Ok(())
 }

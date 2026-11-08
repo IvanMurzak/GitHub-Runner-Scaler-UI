@@ -626,8 +626,6 @@ async fn a_freed_slot_places_a_waiting_pool_job_at_once() {
     assert!(matches!(launched, ServerMessage::Launch(_)), "{launched:?}");
 }
 
-/// A `workflow_job` event: queued at 10:00:00, started at 10:00:04 and, once
-/// `completed`, done at 10:00:18 (a 14-second job).
 /// Accepts the next launch `socket` is sent; its lease.
 async fn accept(socket: &mut Socket) -> String {
     use runner_manager_domain::coordinator_protocol::LaunchAck;
@@ -756,6 +754,8 @@ async fn a_lease_its_host_dropped_is_closed_on_reconnect_and_by_its_heartbeat() 
     assert_ne!(third, again);
 }
 
+/// A `workflow_job` event: queued at 10:00:00, started at 10:00:04 and, once
+/// `completed`, done at 10:00:18 (a 14-second job).
 fn job_event(action: &str, job_id: u64, runner: Option<&str>) -> String {
     serde_json::json!({
         "action": action,

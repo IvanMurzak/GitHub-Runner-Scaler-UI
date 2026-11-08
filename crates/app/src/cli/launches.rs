@@ -279,12 +279,11 @@ impl Launches {
         if let Ok(Some(current)) = self.store.host(self.host.id) {
             host.host_capacity = current.host_capacity;
         }
-        let attempts: Vec<RunnerAttempt> = policies
-            .iter()
-            .filter(|policy| policy.is_owned_by(self.host.id))
-            .filter_map(|policy| self.store.uncleaned_attempts_for_policy(policy.id).ok())
-            .flatten()
-            .collect();
+        // Host-wide, as the allocator of the pass counts them: the runners of
+        // a repository removed while they finish still hold their slots.
+        let Ok(attempts) = self.store.attempts() else {
+            return refuse(RefusalReason::Other);
+        };
         let open = self.open_for(policy.id);
         let allocator = HostAllocator::from_attempts(&host, &attempts);
         let without = allocator.clone().allocate(policy, open);
@@ -606,6 +605,7 @@ mod tests {
             .active()
             .build();
         store.insert_policy(&other).expect("added");
+        let _ = launches.directed_demand(&policy);
         assert_eq!(launches.open_leases(), vec!["b".to_string()]);
         // Its own profile removed: nothing to start it with, from the next
         // pass on.
