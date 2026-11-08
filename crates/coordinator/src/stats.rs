@@ -7,7 +7,7 @@
 //! its process tree used ([`AttemptUsage`]). Which job that runner took, and
 //! when, is GitHub's to say: the `workflow_job` webhooks `in_progress` and
 //! `completed` name the `runner_name` together with the repository, the
-//! workflow, the job (the matrix-expanded name, as GitHub gives it) and the
+//! job (the matrix-expanded name, as GitHub gives it) and the
 //! job's `created_at`, `started_at` and `completed_at`. The [`Correlator`]
 //! joins them in whichever order they arrive, and an attempt that ran a job
 //! becomes one [`JobSample`] under the job key `owner/repo/job`.
@@ -39,7 +39,7 @@
 //!
 //! # Logging
 //!
-//! Host ids, byte counts, scores and fixed words. Repository, workflow, job
+//! Host ids, byte counts, scores and fixed words. Repository, job
 //! and runner names came off the wire: they are stored and shown to the
 //! owner by `stats`, never logged.
 
@@ -58,7 +58,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::{JobSample, Store, StoreError};
 
-/// The longest repository, workflow or job name kept.
+/// The longest repository or job name kept.
 const MAX_NAME_CHARS: usize = 120;
 
 /// How long a webhook's runner-to-job mapping waits for its attempt report,

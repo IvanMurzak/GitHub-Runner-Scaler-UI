@@ -533,8 +533,8 @@ impl Placement {
 
     /// The statistics keys of `key`'s queued jobs, and whether any job has
     /// none.
-    #[must_use]
-    pub fn queued_job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
+    #[cfg(test)]
+    pub(crate) fn queued_job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
         self.state().job_keys(key)
     }
 
@@ -2119,8 +2119,6 @@ mod tests {
     /// never measured in the same queue still counts as the repository.
     #[tokio::test]
     async fn a_queue_is_estimated_by_its_own_jobs_not_by_its_repository() {
-        use runner_manager_domain::coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
-
         let registry = Arc::new(Registry::default());
         registry.set_coverage(covering());
         let (placement, stats) = measured(
@@ -2137,27 +2135,7 @@ mod tests {
             .chain(std::iter::repeat_n(("heavy", 12_u64 << 30), 5))
             .enumerate()
         {
-            let runner = format!("runner-manager-{index}");
-            stats.job_identified(
-                &runner,
-                crate::stats::JobIdentity::new("octo/app", Some(job)).expect("named"),
-                crate::stats::JobTimes::parse(None, None, Some("2026-11-07T10:10:00Z")),
-            );
-            stats.attempt_finished(
-                "elsewhere",
-                &AttemptFinished {
-                    lease_id: None,
-                    runner_name: runner.clone(),
-                    outcome: AttemptOutcomeKind::CompletedJob,
-                    duration_secs: Some(60),
-                    usage: Some(AttemptUsage {
-                        peak_rss_bytes: peak,
-                        samples: 10,
-                        ..AttemptUsage::default()
-                    }),
-                },
-                None,
-            );
+            teach(&stats, &format!("runner-manager-{index}"), job, peak);
         }
         let host = connect(
             &registry,
@@ -2211,11 +2189,35 @@ mod tests {
         drop(host);
     }
 
+    /// One finished attempt of `job` on another host, peaking at `peak`.
+    fn teach(stats: &Statistics, runner: &str, job: &str, peak: u64) {
+        use runner_manager_domain::coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
+
+        stats.job_identified(
+            runner,
+            crate::stats::JobIdentity::new("octo/app", Some(job)).expect("named"),
+            crate::stats::JobTimes::parse(None, None, Some("2026-11-07T10:10:00Z")),
+        );
+        stats.attempt_finished(
+            "elsewhere",
+            &AttemptFinished {
+                lease_id: None,
+                runner_name: runner.to_string(),
+                outcome: AttemptOutcomeKind::CompletedJob,
+                duration_secs: Some(60),
+                usage: Some(AttemptUsage {
+                    peak_rss_bytes: peak,
+                    samples: 10,
+                    ..AttemptUsage::default()
+                }),
+            },
+            None,
+        );
+    }
+
     /// Placement with samples: `light` peaks at 0.5 GiB, `mem` at 3.5 GiB, so
     /// the repository's p90 is `mem`'s. One host with 8 GiB available.
     fn light_and_mem() -> (Arc<Registry>, Arc<Placement>) {
-        use runner_manager_domain::coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
-
         let registry = Arc::new(Registry::default());
         registry.set_coverage(covering());
         let (placement, stats) = measured(
@@ -2230,27 +2232,7 @@ mod tests {
             .chain(std::iter::repeat_n(("mem", 7_u64 << 29), 5))
             .enumerate()
         {
-            let runner = format!("runner-manager-{index}");
-            stats.job_identified(
-                &runner,
-                crate::stats::JobIdentity::new("octo/app", Some(job)).expect("named"),
-                crate::stats::JobTimes::parse(None, None, Some("2026-11-07T10:10:00Z")),
-            );
-            stats.attempt_finished(
-                "elsewhere",
-                &AttemptFinished {
-                    lease_id: None,
-                    runner_name: runner.clone(),
-                    outcome: AttemptOutcomeKind::CompletedJob,
-                    duration_secs: Some(60),
-                    usage: Some(AttemptUsage {
-                        peak_rss_bytes: peak,
-                        samples: 10,
-                        ..AttemptUsage::default()
-                    }),
-                },
-                None,
-            );
+            teach(&stats, &format!("runner-manager-{index}"), job, peak);
         }
         (registry, placement)
     }
@@ -2328,26 +2310,11 @@ mod tests {
         for round in 0..6 {
             // Heavy jobs measured elsewhere, under this round's run title.
             for index in 0..4 {
-                let runner = format!("runner-manager-mem-{round}-{index}");
-                stats.job_identified(
-                    &runner,
-                    crate::stats::JobIdentity::new("octo/app", Some("mem")).expect("named"),
-                    crate::stats::JobTimes::parse(None, None, Some("2026-11-07T10:10:00Z")),
-                );
-                stats.attempt_finished(
-                    "elsewhere",
-                    &AttemptFinished {
-                        lease_id: None,
-                        runner_name: runner,
-                        outcome: AttemptOutcomeKind::CompletedJob,
-                        duration_secs: Some(60),
-                        usage: Some(AttemptUsage {
-                            peak_rss_bytes: 7 * GIB / 2,
-                            samples: 10,
-                            ..AttemptUsage::default()
-                        }),
-                    },
-                    None,
+                teach(
+                    &stats,
+                    &format!("runner-manager-mem-{round}-{index}"),
+                    "mem",
+                    7 * GIB / 2,
                 );
             }
             // Six light jobs: every one placed, none waiting.

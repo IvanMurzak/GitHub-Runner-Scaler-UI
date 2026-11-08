@@ -27,7 +27,6 @@ const REPOSITORY: &str = "secretive-owner/hush-hush-repo";
 const POOL: &str = "rm-pool-linux";
 const EXTRA: &str = "very-private-label";
 const RUNNER: &str = "runner-manager-wire-runner-name";
-const WORKFLOW: &str = "Confidential Release Pipeline";
 const JOB: &str = "sign-with-hsm (prod, eu)";
 
 #[derive(Clone, Default)]
@@ -215,7 +214,6 @@ fn no_wire_text_reaches_the_placement_logs() {
         "hush-hush",
         EXTRA,
         RUNNER,
-        WORKFLOW,
         "Confidential",
         JOB,
         "sign-with-hsm",

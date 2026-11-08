@@ -387,6 +387,7 @@ fn rekey_samples(connection: &Connection) -> Result<(), StoreError> {
         .prepare("SELECT id, job_key, repository FROM job_samples")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
+    let transaction = connection.unchecked_transaction()?;
     for (id, key, repository) in rows {
         let Some(rest) = key
             .strip_prefix(&repository)
@@ -397,11 +398,12 @@ fn rekey_samples(connection: &Connection) -> Result<(), StoreError> {
         let Some((_, job)) = rest.rsplit_once('/') else {
             continue;
         };
-        connection.execute(
+        transaction.execute(
             "UPDATE job_samples SET job_key = ?1 WHERE id = ?2",
             params![format!("{repository}/{job}"), id],
         )?;
     }
+    transaction.commit()?;
     Ok(())
 }
 

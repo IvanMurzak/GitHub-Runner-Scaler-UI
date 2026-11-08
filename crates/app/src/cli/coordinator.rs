@@ -1220,7 +1220,7 @@ fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy
 fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
     let busy = ports
         .store
-        .attempts()
+        .uncleaned_attempts()
         .map(|attempts| active_count(attempts.iter()))
         .unwrap_or(0);
     // A launch with no runner yet has a slot spoken for: said here, the

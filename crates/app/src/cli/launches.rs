@@ -60,7 +60,7 @@ const LEASED_MEMORY: usize = 1024;
 
 /// How long an accepted launch may go without a runner, whatever the reason,
 /// before it is dropped and its job placed again: well inside a lease's
-/// lifetime, and several tries at starting one.
+/// lifetime, with room for a retry.
 const START_LIMIT: Duration = Duration::from_secs(45);
 
 /// One accepted launch.
@@ -91,6 +91,132 @@ impl Book {
                 && let Some(oldest) = self.seen.pop_front()
             {
                 self.seen_set.remove(&oldest);
+            }
+        }
+    }
+
+    /// Whatever kept it from starting, a launch with no runner for
+    /// [`START_LIMIT`] goes, well before its lease would run out.
+    fn drop_late(&mut self, now: Instant) {
+        self.open.retain(|lease, open| {
+            let late = open.attempt.is_none()
+                && now.saturating_duration_since(open.accepted_at) >= START_LIMIT;
+            if late {
+                tracing::warn!(%lease, "no runner could be started for a launch in time; it was dropped");
+            }
+            !late
+        });
+    }
+
+    /// A launch whose runner exited idle waits again, with a fresh start
+    /// limit; one whose runner took a job, failed or vanished is closed.
+    fn release_ended(
+        &mut self,
+        attempts: &[RunnerAttempt],
+        cleaned: &[RunnerAttempt],
+        now: Instant,
+    ) {
+        let mut released = Vec::new();
+        for open in self.open.values_mut() {
+            let Some(attempt) = open.attempt else {
+                continue;
+            };
+            let runner = attempts
+                .iter()
+                .chain(cleaned)
+                .find(|runner| runner.id == attempt);
+            match runner {
+                Some(runner) if runner.state().is_unassigned() => {}
+                Some(runner)
+                    if matches!(
+                        runner.outcome(),
+                        Some(AttemptOutcome::ExitedIdleWithoutWork)
+                    ) =>
+                {
+                    open.attempt = None;
+                    open.accepted_at = now;
+                    released.push(attempt);
+                }
+                _ => open.expires = now,
+            }
+        }
+        self.open.retain(|_, open| open.expires > now);
+        for attempt in released {
+            self.leased.remove(&attempt);
+        }
+    }
+
+    /// Gives a launch without a runner a waiting runner of its profile that no
+    /// launch holds: that runner serves it, so no other is started.
+    fn bind_free(&mut self, attempts: &[RunnerAttempt]) {
+        let held: HashSet<AttemptId> = self.open.values().filter_map(|open| open.attempt).collect();
+        let mut free: HashMap<PolicyId, Vec<AttemptId>> = HashMap::new();
+        for attempt in attempts {
+            if attempt.state().is_unassigned() && !held.contains(&attempt.id) {
+                free.entry(attempt.policy_id).or_default().push(attempt.id);
+            }
+        }
+        let mut bound = Vec::new();
+        for (lease_id, open) in &mut self.open {
+            if open.attempt.is_none()
+                && let Some(attempt) = free.get_mut(&open.policy).and_then(Vec::pop)
+            {
+                open.attempt = Some(attempt);
+                bound.push((attempt, lease_id.clone()));
+            }
+        }
+        for (attempt, lease_id) in bound {
+            self.lease_runner(attempt, &lease_id);
+        }
+    }
+
+    /// Drops the launches with no runner beyond what this host can start: the
+    /// slots are the host's, its oldest launch's profile first, and each
+    /// profile's oldest launches keep theirs.
+    fn drop_unstartable(
+        &mut self,
+        own: &HashMap<PolicyId, ScalePolicy>,
+        directed: &HashSet<PolicyId>,
+        host: &Host,
+        attempts: &[RunnerAttempt],
+    ) {
+        let mut by_age: Vec<(Instant, PolicyId)> = own
+            .keys()
+            .filter_map(|policy| {
+                let oldest = self
+                    .open
+                    .values()
+                    .filter(|open| open.policy == *policy)
+                    .map(|open| open.accepted_at)
+                    .min()?;
+                Some((oldest, *policy))
+            })
+            .collect();
+        by_age.sort();
+        let mut allocator = HostAllocator::from_attempts(host, attempts);
+        for (_, policy) in by_age {
+            let mut waiting: Vec<(Instant, String)> = self
+                .open
+                .iter()
+                .filter(|(_, open)| open.policy == policy && open.attempt.is_none())
+                .map(|(id, open)| (open.accepted_at, id.clone()))
+                .collect();
+            waiting.sort();
+            let demand = self
+                .open
+                .values()
+                .filter(|open| open.policy == policy)
+                .count();
+            let startable = if directed.contains(&policy) {
+                allocator
+                    .allocate(&own[&policy], u32::try_from(demand).unwrap_or(u32::MAX))
+                    .to_start
+            } else {
+                0
+            };
+            for (_, lease) in waiting.iter().skip(usize::from(startable)) {
+                self.open.remove(lease);
+                tracing::info!(%lease, "a launch this host cannot start was dropped");
             }
         }
     }
@@ -208,117 +334,37 @@ impl Launches {
                 Err(_) => {}
             }
         }
-        let attempts = self.store.attempts().ok();
+        let attempts = self.store.uncleaned_attempts().ok();
         let host = self.current_host();
         let directed: HashSet<PolicyId> = own
             .values()
             .filter(|policy| self.is_directed(policy))
             .map(|policy| policy.id)
             .collect();
+        // A runner already cleaned is not among those, and how it ended counts.
+        let held: Vec<AttemptId> = self
+            .book()
+            .open
+            .values()
+            .filter_map(|open| open.attempt)
+            .collect();
+        let cleaned: Vec<RunnerAttempt> = attempts.as_ref().map_or_else(Vec::new, |attempts| {
+            held.into_iter()
+                .filter(|id| !attempts.iter().any(|attempt| attempt.id == *id))
+                .filter_map(|id| self.store.attempt(id).ok().flatten())
+                .collect()
+        });
 
         let mut book = self.book();
         book.open
             .retain(|_, open| open.expires > now && !gone.contains(&open.policy));
-        book.open.retain(|lease, open| {
-            let late = open.attempt.is_none()
-                && now.saturating_duration_since(open.accepted_at) >= START_LIMIT;
-            if late {
-                tracing::warn!(%lease, "no runner could be started for a launch in time; it was dropped");
-            }
-            !late
-        });
+        book.drop_late(now);
         let Some(attempts) = attempts else {
             return;
         };
-        let by_id: HashMap<AttemptId, &RunnerAttempt> = attempts
-            .iter()
-            .map(|attempt| (attempt.id, attempt))
-            .collect();
-
-        let mut released = Vec::new();
-        for open in book.open.values_mut() {
-            let Some(attempt) = open.attempt else {
-                continue;
-            };
-            match by_id.get(&attempt) {
-                Some(runner) if runner.state().is_unassigned() => {}
-                Some(runner)
-                    if matches!(
-                        runner.outcome(),
-                        Some(AttemptOutcome::ExitedIdleWithoutWork)
-                    ) =>
-                {
-                    open.attempt = None;
-                    released.push(attempt);
-                }
-                _ => open.expires = now,
-            }
-        }
-        book.open.retain(|_, open| open.expires > now);
-        for attempt in released {
-            book.leased.remove(&attempt);
-        }
-
-        let held: HashSet<AttemptId> = book.open.values().filter_map(|open| open.attempt).collect();
-        let mut free: HashMap<PolicyId, Vec<AttemptId>> = HashMap::new();
-        for attempt in &attempts {
-            if attempt.state().is_unassigned() && !held.contains(&attempt.id) {
-                free.entry(attempt.policy_id).or_default().push(attempt.id);
-            }
-        }
-        let mut bound = Vec::new();
-        for (lease_id, open) in &mut book.open {
-            if open.attempt.is_none()
-                && let Some(attempt) = free.get_mut(&open.policy).and_then(Vec::pop)
-            {
-                open.attempt = Some(attempt);
-                bound.push((attempt, lease_id.clone()));
-            }
-        }
-        for (attempt, lease_id) in bound {
-            book.lease_runner(attempt, &lease_id);
-        }
-
-        // The oldest launch's profile is served first.
-        let mut by_age: Vec<(Instant, PolicyId)> = own
-            .keys()
-            .filter_map(|policy| {
-                let oldest = book
-                    .open
-                    .values()
-                    .filter(|open| open.policy == *policy)
-                    .map(|open| open.accepted_at)
-                    .min()?;
-                Some((oldest, *policy))
-            })
-            .collect();
-        by_age.sort();
-        let mut allocator = HostAllocator::from_attempts(&host, &attempts);
-        for (_, policy) in by_age {
-            let mut waiting: Vec<(Instant, String)> = book
-                .open
-                .iter()
-                .filter(|(_, open)| open.policy == policy && open.attempt.is_none())
-                .map(|(id, open)| (open.accepted_at, id.clone()))
-                .collect();
-            waiting.sort();
-            let demand = book
-                .open
-                .values()
-                .filter(|open| open.policy == policy)
-                .count();
-            let startable = if directed.contains(&policy) {
-                allocator
-                    .allocate(&own[&policy], u32::try_from(demand).unwrap_or(u32::MAX))
-                    .to_start
-            } else {
-                0
-            };
-            for (_, lease) in waiting.iter().skip(usize::from(startable)) {
-                book.open.remove(lease);
-                tracing::info!(%lease, "a launch this host cannot start was dropped");
-            }
-        }
+        book.release_ended(&attempts, &cleaned, now);
+        book.bind_free(&attempts);
+        book.drop_unstartable(&own, &directed, &host, &attempts);
     }
 
     /// This host, at the capacity its operator last set.
@@ -369,7 +415,7 @@ impl Launches {
         let host = self.current_host();
         // Host-wide, as the allocator of the pass counts them: the runners of
         // a repository removed while they finish still hold their slots.
-        let Ok(attempts) = self.store.attempts() else {
+        let Ok(attempts) = self.store.uncleaned_attempts() else {
             return refuse(RefusalReason::Other);
         };
         // Slots are the host's: every other profile's open launches take
@@ -873,6 +919,8 @@ mod tests {
                     .build(),
             )
             .expect("recorded");
+        // However long it idled first: the start limit counts from now.
+        launches.settle(Instant::now() + START_LIMIT + Duration::from_secs(1));
         assert_eq!(launches.open_leases(), vec!["a".to_string()], "still open");
         assert_eq!(launches.lease_of(runner), None);
         assert!(launches.holds_unstarted(std::slice::from_ref(&policy)));
