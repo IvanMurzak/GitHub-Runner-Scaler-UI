@@ -533,8 +533,8 @@ impl Placement {
 
     /// The statistics keys of `key`'s queued jobs, and whether any job has
     /// none.
-    #[cfg(test)]
-    pub(crate) fn queued_job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
+    #[must_use]
+    pub fn queued_job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
         self.state().job_keys(key)
     }
 
@@ -1259,8 +1259,9 @@ impl Placement {
                 candidates = scored.len(),
                 fitting = scored.iter().filter(|(_, score)| score.fits).count(),
                 jobs_named = state.job_keys(key).0.len(),
-                jobs_measured = demand
-                    .job_keys
+                jobs_measured = state
+                    .job_keys(key)
+                    .0
                     .iter()
                     .filter(|job| {
                         aggregates
@@ -2284,9 +2285,9 @@ mod tests {
 
     /// Regression guard, from live experiments E4 → E4b → E4c, where one
     /// scenario got slower every time it ran: heavy samples accumulate round
-    /// after round, each round a new run title as GitHub reports it, and a
-    /// queue of light jobs is still placed at once, by its own samples. Short
-    /// jobs that ended leave nothing reserved for the next round.
+    /// after round, and a queue of light jobs is still placed at once, first
+    /// as a job never measured and from then on by its own samples. Short jobs
+    /// that ended leave nothing reserved for the next round.
     #[tokio::test]
     async fn a_queue_of_light_jobs_stays_placed_as_heavy_samples_accumulate() {
         use runner_manager_domain::coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
@@ -2325,6 +2326,17 @@ mod tests {
             let placed = placement.rebalance(&key).await;
             assert_eq!(placed.accepted, 6, "round {round}");
             assert!(placement.snapshot().0.is_empty(), "round {round}");
+            let report = stats.report(chrono::Utc::now()).expect("report");
+            let decided = report.decisions.first().expect("decided");
+            if round == 0 {
+                assert_eq!(decided.estimate_source, "repository");
+            } else {
+                assert_eq!(
+                    (decided.estimate_source.as_str(), decided.estimate_bytes),
+                    ("job", GIB / 8),
+                    "round {round}: by its own samples"
+                );
+            }
             // Their runners take them, run, end, and teach their own weight.
             let leases: Vec<String> = placement.state().leases.keys().cloned().collect();
             for (index, lease) in leases.iter().enumerate() {

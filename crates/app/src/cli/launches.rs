@@ -81,6 +81,8 @@ struct Book {
     /// Which lease each runner was started for, for the attempt reports.
     leased: HashMap<AttemptId, String>,
     leased_order: VecDeque<AttemptId>,
+    /// A launch was dropped since the link last asked: say so at once.
+    dropped: bool,
 }
 
 impl Book {
@@ -98,6 +100,7 @@ impl Book {
     /// Whatever kept it from starting, a launch with no runner for
     /// [`START_LIMIT`] goes, well before its lease would run out.
     fn drop_late(&mut self, now: Instant) {
+        let before = self.open.len();
         self.open.retain(|lease, open| {
             let late = open.attempt.is_none()
                 && now.saturating_duration_since(open.accepted_at) >= START_LIMIT;
@@ -106,6 +109,7 @@ impl Book {
             }
             !late
         });
+        self.dropped |= self.open.len() != before;
     }
 
     /// A launch whose runner exited idle waits again, with a fresh start
@@ -137,6 +141,8 @@ impl Book {
                     open.accepted_at = now;
                     released.push(attempt);
                 }
+                // Not read yet (bound since those reads): looked at next time.
+                None => {}
                 _ => open.expires = now,
             }
         }
@@ -216,6 +222,7 @@ impl Book {
             };
             for (_, lease) in waiting.iter().skip(usize::from(startable)) {
                 self.open.remove(lease);
+                self.dropped = true;
                 tracing::info!(%lease, "a launch this host cannot start was dropped");
             }
         }
@@ -368,7 +375,7 @@ impl Launches {
     }
 
     /// This host, at the capacity its operator last set.
-    fn current_host(&self) -> Host {
+    pub fn current_host(&self) -> Host {
         let mut host = self.host.clone();
         if let Ok(Some(current)) = self.store.host(self.host.id) {
             host.host_capacity = current.host_capacity;
@@ -478,6 +485,11 @@ impl Launches {
             .take(MAX_OPEN_LEASES)
             .cloned()
             .collect()
+    }
+
+    /// Whether a launch was dropped since the last call.
+    pub fn take_dropped(&self) -> bool {
+        std::mem::take(&mut self.book().dropped)
     }
 
     /// How many open launches have no runner yet, across this host: slots
@@ -871,15 +883,19 @@ mod tests {
     #[test]
     fn a_launch_with_no_runner_for_too_long_is_dropped() {
         let (_store, policy, launches) = setup(LAUNCH_VERSION);
+        let before = Instant::now();
         assert!(
             launches
                 .decide(&launch(&policy, "a"), false, false)
                 .accepted
         );
-        launches.settle(Instant::now() + START_LIMIT - Duration::from_secs(1));
+        launches.settle(before + START_LIMIT - Duration::from_secs(1));
         assert_eq!(launches.open_for(policy.id), 1);
+        assert!(!launches.take_dropped());
         launches.settle(Instant::now() + START_LIMIT);
         assert_eq!(launches.open_for(policy.id), 0);
+        assert!(launches.take_dropped(), "the link says so at once");
+        assert!(!launches.take_dropped());
     }
 
     /// A launch's runner took a job: served, closed, without any pass. Its

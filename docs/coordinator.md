@@ -350,7 +350,7 @@ jobs.
 ### How a sample is kept
 
 GitHub's `workflow_job` webhooks `in_progress` and `completed` name the runner that took the job
-together with the repository, the workflow and the job (matrix values included, as GitHub expands
+together with the repository and the job (matrix values included, as GitHub expands
 them: `build (ubuntu, 3.12)`), and the job's `created_at`, `started_at` and `completed_at`. The
 coordinator remembers that only for runner names `runner-manager` registers
 (`runner-manager-...`), joins it with the host's report of the same runner name, in whichever
@@ -395,9 +395,9 @@ and labels), not a single job:
    filtered. Each launch reserves the queue's next heaviest job, so one heavy job among light
    ones counts once; the host must still hold the heaviest job, since a runner can take any of
    them. "Free memory" is what the OS says new work can have: Linux's `MemAvailable`, Windows'
-   available physical memory, macOS's free plus inactive pages. Only a job's own samples filter: when the demand is a guess (a job never measured, counted as its
-   repository's p90 or the default), nothing is filtered, so another job's heavy samples never keep it
-   waiting, and the guess only ranks the hosts. Nor is anything filtered when the
+   available physical memory, macOS's free plus inactive pages. Only the jobs' own samples filter: a job never measured counts for the estimate and the ranking,
+   not the filter, so another job's heavy samples never keep it waiting, though it may land on a host
+   too small for what it turns out to need. It reserves at most `COORDINATOR_DEFAULT_JOB_RAM`. Nor is anything filtered when the
    demand plus the margin is more than every candidate's total memory: no host could ever hold
    it, so the job runs where the score says. The estimates of a host's launches stay reserved
    for 2 minutes after their runner took its job, while the build's memory ramps up, or until
@@ -475,7 +475,7 @@ Last placements, newest first (scores in points):
   over whatever its score.
 - The counters are all-time; launches and wakes reach the database within a minute.
 
-Repository, workflow and job names in `stats` come from your own repositories' webhooks; they
+Repository and job names in `stats` come from your own repositories' webhooks; they
 are shown to your enrolled hosts and on the coordinator's machine, never logged.
 
 ## Enroll a host

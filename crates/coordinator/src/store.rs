@@ -381,7 +381,9 @@ impl Store {
 
 /// 0.4.48: a sample's key loses the workflow, which was the run's title: from
 /// `owner/repo/title/job` to `owner/repo/job`, so what was measured counts at
-/// once. A job name holding a `/` keeps only its last part, and starts over.
+/// once. A title and a job name may both hold a `/`, so the split is a best
+/// guess: at the last `/` without a space beside it, since GitHub names a
+/// reusable workflow's jobs `caller / job`.
 fn rekey_samples(connection: &Connection) -> Result<(), StoreError> {
     let rows: Vec<(i64, String, String)> = connection
         .prepare("SELECT id, job_key, repository FROM job_samples")?
@@ -395,7 +397,7 @@ fn rekey_samples(connection: &Connection) -> Result<(), StoreError> {
         else {
             continue;
         };
-        let Some((_, job)) = rest.rsplit_once('/') else {
+        let Some(job) = job_after_title(rest) else {
             continue;
         };
         transaction.execute(
@@ -405,6 +407,14 @@ fn rekey_samples(connection: &Connection) -> Result<(), StoreError> {
     }
     transaction.commit()?;
     Ok(())
+}
+
+/// The job in `title/job`; `None` when `rest` holds no title (already rekeyed).
+fn job_after_title(rest: &str) -> Option<&str> {
+    let split = rest.char_indices().rev().find(|(at, c)| {
+        *c == '/' && !rest[..*at].ends_with(' ') && !rest[at + 1..].starts_with(' ')
+    })?;
+    Some(rest[split.0 + 1..].trim())
 }
 
 /// Whether `table` has a column named `column`.
@@ -417,7 +427,7 @@ fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool
 /// One measured attempt: a job of `job_key` that ran on `host_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSample {
-    /// `owner/repo/workflow/job`, as [`crate::stats::JobIdentity::key`] makes it.
+    /// `owner/repo/job`, as [`crate::stats::JobIdentity::key`] makes it.
     pub job_key: String,
     /// `owner/repo`, lower-cased.
     pub repository: String,
@@ -879,13 +889,15 @@ mod tests {
         let oldest = now() - chrono::TimeDelta::days(90);
         {
             let mut store = Store::open(&path).expect("created");
-            for title in ["load light [1,2] (e4b)", "load light [1,2] (e4c)"] {
+            for key in [
+                "octo/app/load light [1,2] (e4b)/light",
+                "octo/app/fix/a slash in a title/light",
+                "octo/app/CI/caller / build",
+                "octo/app/caller / build",
+                "octo/app/already",
+            ] {
                 store
-                    .record_sample(
-                        &sample(&format!("octo/app/{title}/light"), now()),
-                        30,
-                        oldest,
-                    )
+                    .record_sample(&sample(key, now()), 30, oldest)
                     .expect("recorded");
             }
             store
@@ -900,7 +912,16 @@ mod tests {
             .into_iter()
             .map(|sample| sample.job_key)
             .collect();
-        assert_eq!(keys, vec!["octo/app/light"; 2]);
+        assert_eq!(
+            keys,
+            vec![
+                "octo/app/light",
+                "octo/app/light",
+                "octo/app/caller / build",
+                "octo/app/caller / build",
+                "octo/app/already",
+            ]
+        );
     }
 
     #[test]

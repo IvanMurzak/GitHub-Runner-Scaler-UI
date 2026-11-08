@@ -586,6 +586,9 @@ impl EstimateSource {
 pub struct Demand {
     pub estimate: u64,
     pub source: EstimateSource,
+    /// The heaviest queued job with samples of its own: what hosts are filtered
+    /// by. A guess at a job never measured may exceed it, and only ranks.
+    pub measured_job: Option<u64>,
     /// The named job keys queued, for the speed term.
     pub job_keys: Vec<String>,
     /// Any statistics at all for this queue: its keys or its repository.
@@ -608,6 +611,7 @@ impl Aggregates {
             (bytes, EstimateSource::Repository)
         });
         let mut heaviest: Option<(u64, EstimateSource)> = None;
+        let mut measured_job: Option<u64> = None;
         let mut measured = repository_p90.is_some();
         let mut consider = |candidate: (u64, EstimateSource)| {
             if heaviest.is_none_or(|(bytes, _)| candidate.0 > bytes) {
@@ -618,6 +622,7 @@ impl Aggregates {
             match self.job(key).and_then(|figures| figures.p90_peak_rss_bytes) {
                 Some(bytes) => {
                     measured = true;
+                    measured_job = Some(measured_job.map_or(bytes, |known| known.max(bytes)));
                     consider((bytes, EstimateSource::Job));
                 }
                 None => consider(fallback),
@@ -633,6 +638,7 @@ impl Aggregates {
         Demand {
             estimate,
             source,
+            measured_job,
             job_keys,
             measured,
         }
@@ -640,10 +646,10 @@ impl Aggregates {
 }
 
 impl Aggregates {
-    /// What each queued job is expected to need, heaviest first: its own p90,
-    /// else its repository's, else `default_job_ram`. `unnamed` jobs have no
-    /// key and count as the repository. A lease reserves one of these, not the
-    /// heaviest: a queue of five jobs holds one heaviest job, not five.
+    /// What a lease of each queued job reserves, heaviest first: its own p90,
+    /// else the lesser of its repository's and `default_job_ram`, a guess that
+    /// must not hold memory a measured job needs. `unnamed` jobs have no key.
+    /// A lease reserves one of these: five jobs hold one heaviest job, not five.
     #[must_use]
     pub fn job_estimates(
         &self,
@@ -654,7 +660,7 @@ impl Aggregates {
     ) -> Vec<u64> {
         let fallback = self
             .repository_p90_rss(repository)
-            .unwrap_or(default_job_ram);
+            .map_or(default_job_ram, |bytes| bytes.min(default_job_ram));
         let mut estimates: Vec<u64> = job_keys
             .iter()
             .map(|key| {
@@ -751,18 +757,20 @@ pub fn score(
     // job never measured, and heavy samples of another job must not keep it
     // waiting. Nor when no host could ever hold it: waiting would be forever,
     // and the job is better run somewhere.
-    let needed = demand.estimate.saturating_add(config.ram_margin);
-    let filtering = demand.source == EstimateSource::Job
-        && contenders
+    let required = demand.measured_job.filter(|bytes| {
+        let needed = bytes.saturating_add(config.ram_margin);
+        contenders
             .iter()
-            .any(|contender| contender.total_ram.is_none_or(|total| total >= needed));
+            .any(|contender| contender.total_ram.is_none_or(|total| total >= needed))
+    });
     let ratios: Vec<BTreeMap<String, HostRatio>> = demand
         .job_keys
         .iter()
         .map(|key| aggregates.host_ratios(key))
         .collect();
-    let fits =
-        |contender: &Contender| !filtering || contender.fits(demand.estimate, config.ram_margin);
+    let fits = |contender: &Contender| {
+        required.is_none_or(|bytes| contender.fits(bytes, config.ram_margin))
+    };
     let mut scored: Vec<(Contender, HostScore)> = contenders
         .iter()
         .map(|contender| {
@@ -1409,6 +1417,45 @@ mod tests {
         );
     }
 
+    /// A guess can exceed a measured job without hiding it: the queue's own
+    /// samples still filter, and the guess alone does not.
+    #[test]
+    fn a_guess_never_hides_a_measured_heavy_job_from_the_filter() {
+        // `build` is the repository's only job, at 6 GiB; `new` was never run.
+        let aggregates = Aggregates::from_samples(
+            (0..5)
+                .map(|_| sample("octo/app/build", "h", 60, 6 * GIB))
+                .collect(),
+            30,
+        );
+        let contender = |free| Contender {
+            host_id: "small".into(),
+            warm: false,
+            free_ram: Some(free),
+            total_ram: Some(64 * GIB),
+            busy_slots: 0,
+            reserved: 0,
+        };
+        let config = StatsConfig::default();
+        let fits = |job_keys: &[String]| {
+            let demand = aggregates.demand("octo/app", job_keys, false, config.default_job_ram);
+            score(&[contender(GIB)], &demand, None, &config, &aggregates)[0]
+                .1
+                .fits
+        };
+        let (build, new) = ("octo/app/build".to_string(), "octo/app/new".to_string());
+        assert!(
+            !fits(&[new.clone(), build]),
+            "`new` first: `build` still filters"
+        );
+        assert!(fits(&[new]), "a guess alone does not");
+        // A guess reserves at most the default, not the repository's p90.
+        assert_eq!(
+            aggregates.job_estimates("octo/app", &["octo/app/new".into()], 1, 2 * GIB),
+            vec![2 * GIB, 2 * GIB]
+        );
+    }
+
     #[test]
     fn webhook_times_parse_leniently_and_never_go_backwards() {
         let backwards = JobTimes::parse(
@@ -1525,6 +1572,7 @@ mod tests {
         let demand = Demand {
             estimate: 4 * GIB,
             source: EstimateSource::Job,
+            measured_job: Some(4 * GIB),
             job_keys: vec![],
             measured: true,
         };
@@ -1562,6 +1610,7 @@ mod tests {
         let light = Demand {
             estimate: GIB,
             source: EstimateSource::Job,
+            measured_job: Some(GIB),
             job_keys: vec!["k".into()],
             measured: true,
         };
@@ -1627,6 +1676,7 @@ mod tests {
         let demand = Demand {
             estimate: 40 * GIB,
             source: EstimateSource::Job,
+            measured_job: Some(40 * GIB),
             job_keys: vec![],
             measured: true,
         };

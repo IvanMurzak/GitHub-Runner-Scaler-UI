@@ -118,6 +118,87 @@ async fn an_installation_that_cannot_be_read_keeps_what_was_known_of_it() {
     );
 }
 
+/// Live experiment E4c, end to end: what GitHub really lists for a matrix job
+/// of a workflow with `run-name` and `name: ${{ inputs.kind }}` (run 42464203137
+/// of `load.yml`): `workflow_name` is the run's title, every matrix job has the
+/// same name. The sweep's key must be the one a webhook makes for the same job,
+/// whatever this run is titled, or its samples are never found.
+#[tokio::test]
+async fn the_sweep_and_a_webhook_key_a_titled_matrix_job_alike() {
+    use runner_manager_coordinator::placement::{JobKey, Placement};
+    use runner_manager_coordinator::stats::JobIdentity;
+    use runner_manager_coordinator::webhook::WorkflowJobEvent;
+    use runner_manager_domain::model::Label;
+
+    const TITLE: &str = "load light [1,2,3,4] on rm-pool-linux (e4c-linux-long-short-68527f0)";
+    let keys = app_keys();
+    let server = fake_github(&keys, Duration::from_secs(3600)).await;
+    let job = |id: u64| {
+        json!({
+            "id": id, "run_id": 11_u64, "status": "queued", "name": "light",
+            "workflow_name": TITLE, "labels": ["rm-pool-linux"],
+            "created_at": "2026-11-08T08:44:31Z", "started_at": null, "completed_at": null,
+        })
+    };
+    for (status, body) in [
+        (
+            "queued",
+            json!({ "total_count": 1, "workflow_runs": [{
+            "id": 11_u64, "name": TITLE, "display_title": TITLE,
+            "path": ".github/workflows/load.yml", "status": "queued",
+        }] }),
+        ),
+        (
+            "in_progress",
+            json!({ "total_count": 0, "workflow_runs": [] }),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/app/actions/runs"))
+            .and(query_param("status", status))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/repos/octo/app/actions/runs/11/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 4, "jobs": [job(1), job(2), job(3), job(4)],
+        })))
+        .mount(&server)
+        .await;
+
+    let registry = Arc::new(Registry::default());
+    let _rx = host(&registry);
+    let placement = Arc::new(Placement::new(Arc::clone(&registry)));
+    let mut sweeper =
+        sweeper(app(&keys, &server), &registry).with_placement(Arc::clone(&placement));
+    sweeper.sweep_once().await;
+
+    // The `in_progress` webhook of an earlier run, under another title.
+    let event: WorkflowJobEvent = serde_json::from_value(json!({
+        "action": "in_progress",
+        "workflow_job": {
+            "id": 99_u64, "run_id": 10_u64, "labels": ["rm-pool-linux"], "name": "light",
+            "workflow_name": "load light [1,2] on rm-pool-linux (e4b)",
+            "runner_name": "runner-manager-1",
+        },
+        "repository": { "full_name": "Octo/App" },
+    }))
+    .expect("parses");
+    let sampled = JobIdentity::new(
+        &event.repository.full_name,
+        event.workflow_job.name.as_deref(),
+    )
+    .expect("named")
+    .key();
+
+    let queue = JobKey::new("octo/app", &[Label::new("rm-pool-linux").expect("label")]);
+    let (listed, unnamed) = placement.queued_job_keys(&queue);
+    assert_eq!(listed, vec![sampled; 4], "four matrix jobs, one key");
+    assert!(!unnamed);
+}
+
 #[tokio::test]
 async fn a_token_close_to_expiry_is_replaced_before_it_is_used_again() {
     let keys = app_keys();

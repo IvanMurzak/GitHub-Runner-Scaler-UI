@@ -16,8 +16,9 @@ the version being prepared rather than the version in `Cargo.toml`.
   workflow with a `run-name` got a new key at every dispatch. Its samples were
   never found, and almost every queue was estimated at its repository's p90
   (104 of 106 placements in a live test). The key is now `owner/repo/job`, and
-  existing samples are rekeyed on upgrade. Jobs with the same name in two
-  workflows of one repository now share their statistics.
+  existing samples are rekeyed on upgrade, as a best guess where a run title or
+  job name holds a `/`. Jobs with the same name in two workflows of one
+  repository now share their statistics.
 - **A job that ended stops reserving memory.** A lease's estimate stayed reserved
   on its host for 2 minutes after its runner took a job, even if the job had
   already finished, so a run of short jobs could keep a host "full" for the next
@@ -54,6 +55,15 @@ the version being prepared rather than the version in `Cargo.toml`.
   the interval `repo add` would allow (64 s for 11 repositories) and keeps starting
   runners. `host set-poll-interval` now also refuses a shorter `--coordinated`
   that would go over the budget.
+
+### Changed
+
+- **Only a job's own samples can keep it off a host.** A job never measured used
+  to be held back by its repository's p90, so one heavy job could block every new
+  job of that repository. Now such a job is only ranked by that figure, and
+  reserves at most `COORDINATOR_DEFAULT_JOB_RAM`. It may land on a host too small
+  for what it turns out to need, once: from its first sample it is filtered by
+  its own figure.
 
 ### Added
 
