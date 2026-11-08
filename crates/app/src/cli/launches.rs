@@ -58,6 +58,11 @@ const SEEN_MEMORY: usize = 1024;
 /// Attempts whose lease is remembered for the attempt reports.
 const LEASED_MEMORY: usize = 1024;
 
+/// How long an accepted launch may go without a runner, whatever the reason,
+/// before it is dropped and its job placed again: well inside a lease's
+/// lifetime, and several tries at starting one.
+const START_LIMIT: Duration = Duration::from_secs(45);
+
 /// One accepted launch.
 #[derive(Debug, Clone)]
 struct Open {
@@ -214,6 +219,14 @@ impl Launches {
         let mut book = self.book();
         book.open
             .retain(|_, open| open.expires > now && !gone.contains(&open.policy));
+        book.open.retain(|lease, open| {
+            let late = open.attempt.is_none()
+                && now.saturating_duration_since(open.accepted_at) >= START_LIMIT;
+            if late {
+                tracing::warn!(%lease, "no runner could be started for a launch in time; it was dropped");
+            }
+            !late
+        });
         let Some(attempts) = attempts else {
             return;
         };
@@ -421,6 +434,19 @@ impl Launches {
             .collect()
     }
 
+    /// How many open launches have no runner yet, across this host: slots
+    /// that are spoken for though no attempt counts them.
+    #[must_use]
+    pub fn unstarted(&self) -> u16 {
+        let count = self
+            .book()
+            .open
+            .values()
+            .filter(|open| open.attempt.is_none())
+            .count();
+        u16::try_from(count).unwrap_or(u16::MAX)
+    }
+
     /// Whether a launch of `policies` is open with no runner yet: its target's
     /// loop must not sleep on the coordinator's long interval.
     #[must_use]
@@ -448,6 +474,11 @@ impl DemandDirector for Launches {
 
     fn launched(&self, policy: &ScalePolicy, attempt: AttemptId) {
         let mut book = self.book();
+        // `settle` may have bound it already: an attempt exists, and waits,
+        // while it is still being started. One runner serves one launch.
+        if book.open.values().any(|open| open.attempt == Some(attempt)) {
+            return;
+        }
         // The oldest launch still waiting for a runner gets this one.
         let lease = book
             .open
@@ -755,6 +786,54 @@ mod tests {
             .expect("recorded");
         assert_eq!(launches.open_leases(), vec!["old".to_string()]);
         assert!(launches.holds_unstarted(std::slice::from_ref(&policy)));
+    }
+
+    /// An attempt is visible and waiting while it is still being started, so
+    /// `settle` can give it to a launch before the pass reports it. It serves
+    /// one launch, not two: the other still gets a runner of its own.
+    #[test]
+    fn a_runner_being_started_serves_one_launch_not_two() {
+        let (store, policy, launches) = setup(LAUNCH_VERSION);
+        assert!(
+            launches
+                .decide(&launch(&policy, "a"), false, false)
+                .accepted
+        );
+        assert!(
+            launches
+                .decide(&launch(&policy, "b"), false, false)
+                .accepted
+        );
+        let runner = AttemptId::new_random();
+        store
+            .record_attempt(
+                &fixtures::attempt()
+                    .id(runner)
+                    .policy_id(policy.id)
+                    .state(AttemptState::Starting)
+                    .build(),
+            )
+            .expect("recorded");
+        assert_eq!(launches.open_leases().len(), 2, "settled while it starts");
+        launches.launched(&policy, runner);
+        assert_eq!(launches.unstarted(), 1, "the other still needs a runner");
+        assert_eq!(launches.directed_demand(&policy), Some(2));
+    }
+
+    /// Whatever keeps a launch from starting, it does not hold its lease to
+    /// the end: it is dropped well inside the lease's lifetime.
+    #[test]
+    fn a_launch_with_no_runner_for_too_long_is_dropped() {
+        let (_store, policy, launches) = setup(LAUNCH_VERSION);
+        assert!(
+            launches
+                .decide(&launch(&policy, "a"), false, false)
+                .accepted
+        );
+        launches.settle(Instant::now() + START_LIMIT - Duration::from_secs(1));
+        assert_eq!(launches.open_for(policy.id), 1);
+        launches.settle(Instant::now() + START_LIMIT);
+        assert_eq!(launches.open_for(policy.id), 0);
     }
 
     /// A launch's runner took a job: served, closed, without any pass. Its

@@ -108,7 +108,7 @@ fn no_wire_text_reaches_the_placement_logs() {
                 Arc::new(Mutex::new(Store::open_in_memory().expect("store"))),
                 StatsConfig::default(),
             ));
-            let identity = JobIdentity::new(REPOSITORY, Some(WORKFLOW), Some(JOB)).expect("named");
+            let identity = JobIdentity::new(REPOSITORY, Some(JOB)).expect("named");
             stats.job_identified(
                 RUNNER,
                 identity.clone(),

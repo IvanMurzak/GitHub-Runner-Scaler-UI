@@ -626,6 +626,166 @@ async fn a_freed_slot_places_a_waiting_pool_job_at_once() {
     assert!(matches!(launched, ServerMessage::Launch(_)), "{launched:?}");
 }
 
+/// A `workflow_job` event as GitHub sends it for a matrix job of a workflow
+/// with `run-name`: `workflow_name` is the run's title, different at every
+/// dispatch (captured from `load.yml` in the live experiments).
+fn titled_job_event(
+    action: &str,
+    job_id: u64,
+    kind: &str,
+    tag: &str,
+    runner: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "action": action,
+        "workflow_job": {
+            "id": job_id, "run_id": 42_464_203_137_u64, "labels": ["rm-pool-linux"],
+            "name": kind,
+            "workflow_name": format!("load {kind} [1,2,3,4] on rm-pool-linux ({tag})"),
+            "runner_name": runner,
+            "created_at": "2026-11-08T08:44:31Z",
+            "started_at": (action != "queued").then_some("2026-11-08T08:47:29Z"),
+            "completed_at": (action == "completed").then_some("2026-11-08T08:47:45Z"),
+        },
+        "repository": {"full_name": "IvanMurzak/rm-coordinator-smoke"},
+    })
+    .to_string()
+}
+
+/// Live experiment E4c: 104 of 106 placements fell back to the repository's
+/// p90, though `light` and `mem` had samples, because the run's title was part
+/// of the key. A job measured under one title is known under the next.
+#[tokio::test]
+async fn a_job_is_known_by_its_samples_whatever_the_runs_title() {
+    use runner_manager_coordinator::placement::JobKey;
+    use runner_manager_coordinator::registry::Coverage;
+    use runner_manager_domain::coordinator_protocol::{
+        AttemptFinished, AttemptOutcomeKind, AttemptUsage, Heartbeat,
+    };
+    use runner_manager_domain::model::Label;
+
+    const REPOSITORY: &str = "IvanMurzak/rm-coordinator-smoke";
+    let coordinator = start_configured(Store::open_in_memory().expect("store"), |config| {
+        config.placement_tick = Duration::from_secs(3600);
+    })
+    .await;
+    coordinator.state.registry.set_coverage(Coverage {
+        interval: Some(Duration::from_secs(120)),
+        repositories: std::collections::BTreeSet::from([REPOSITORY.to_ascii_lowercase()]),
+        accounts: std::collections::BTreeSet::new(),
+    });
+    let (host_id, key) = enrolled(&coordinator, "wsl", 51).await;
+    let mut link = coordinator.connect(&host_id, &key).await;
+    assert!(matches!(
+        next(&mut link).await,
+        ServerMessage::Welcome { .. }
+    ));
+    let HostMessage::Hello(mut described) = hello(PROTOCOL_VERSION, &host_id) else {
+        unreachable!()
+    };
+    described.ram_bytes = Some(23 << 30);
+    described.targets[0].scope = TargetScope::Repo;
+    described.targets[0].name = REPOSITORY.into();
+    described.targets[0].profiles[0]
+        .labels
+        .push("rm-pool-linux".into());
+    send(&mut link, &HostMessage::Hello(described)).await;
+    assert!(matches!(next(&mut link).await, ServerMessage::HelloAck(_)));
+
+    // The first experiment: `light` and `mem`, measured under its titles.
+    let mut delivery = 0;
+    let mut webhook = |body: String| {
+        delivery += 1;
+        let id = format!("titled-{delivery}");
+        let coordinator = &coordinator;
+        async move {
+            assert_eq!(
+                coordinator.webhook("workflow_job", &id, &body, true).await,
+                200
+            );
+        }
+    };
+    for (job, kind, peak) in [(1, "light", 1_u64 << 28), (2, "mem", 7_u64 << 29)] {
+        let runner = format!("runner-manager-{kind}");
+        for action in ["in_progress", "completed"] {
+            webhook(titled_job_event(action, job, kind, "e4b", Some(&runner))).await;
+        }
+        send(
+            &mut link,
+            &HostMessage::AttemptFinished(AttemptFinished {
+                lease_id: None,
+                runner_name: runner,
+                outcome: AttemptOutcomeKind::CompletedJob,
+                duration_secs: Some(60),
+                usage: Some(AttemptUsage {
+                    peak_rss_bytes: peak,
+                    samples: 10,
+                    ..AttemptUsage::default()
+                }),
+            }),
+        )
+        .await;
+    }
+    let measured = || {
+        coordinator.state.statistics.with_aggregates(|aggregates| {
+            ["light", "mem"].iter().all(|kind| {
+                aggregates
+                    .job(&format!("{}/{kind}", REPOSITORY.to_ascii_lowercase()))
+                    .is_some()
+            })
+        })
+    };
+    for _ in 0..250 {
+        if measured() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(measured(), "samples are kept by job, not by title");
+
+    // The next experiment, another title: `light` is estimated as `light`.
+    send(
+        &mut link,
+        &HostMessage::Heartbeat(Heartbeat {
+            free_slots: 8,
+            free_ram_bytes: Some(18 << 30),
+            ..Heartbeat::default()
+        }),
+    )
+    .await;
+    for _ in 0..250 {
+        if coordinator
+            .state
+            .registry
+            .connected()
+            .iter()
+            .all(|host| host.heartbeat.is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    webhook(titled_job_event("queued", 3, "light", "e4c", None)).await;
+    accept(&mut link).await;
+    let queue = JobKey::new(REPOSITORY, &[Label::new("rm-pool-linux").expect("label")]);
+    assert_eq!(coordinator.state.placement.counts(&queue).0, 1);
+    let report = coordinator
+        .state
+        .statistics
+        .report(Utc::now())
+        .expect("report");
+    let placed = report
+        .decisions
+        .first()
+        .expect("the placement was recorded");
+    assert_eq!(placed.estimate_source, "job");
+    assert_eq!(
+        placed.estimate_bytes,
+        1 << 28,
+        "`light`'s, not the repository's p90"
+    );
+}
+
 /// Accepts the next launch `socket` is sent; its lease.
 async fn accept(socket: &mut Socket) -> String {
     use runner_manager_domain::coordinator_protocol::LaunchAck;
@@ -898,7 +1058,7 @@ async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_quer
         coordinator
             .state
             .statistics
-            .with_aggregates(|a| a.job("octo/app/CI/build (linux, 3.12)"))
+            .with_aggregates(|a| a.job("octo/app/build (linux, 3.12)"))
             .map_or(0, |job| job.samples)
     };
     // The old host's sample waits until its job is known to have ended.
@@ -931,7 +1091,7 @@ async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_quer
         .filter(|report| report.jobs.first().is_some_and(|job| job.samples == 2));
     let report = report.expect("both samples recorded");
     let job = &report.jobs[0];
-    assert_eq!(job.job_key, "octo/app/CI/build (linux, 3.12)");
+    assert_eq!(job.job_key, "octo/app/build (linux, 3.12)");
     assert_eq!(job.p90_peak_rss_bytes, Some(3 << 30));
     assert_eq!(job.p50_duration_secs, Some(14), "the job's run time");
     assert_eq!(job.p90_queue_wait_secs, Some(4));

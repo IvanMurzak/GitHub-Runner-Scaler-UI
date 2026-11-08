@@ -1362,7 +1362,6 @@ impl RestDemand {
                             RunsOn::from_job_labels(job.labels),
                             QueuedJobIdentity {
                                 id: job.id,
-                                workflow: job.workflow_name,
                                 name: job.name,
                             },
                         )
@@ -1465,11 +1464,11 @@ impl DemandGateway for RestDemand {
 // ---------------------------------------------------------------------------
 
 /// Which job a queued entry is, as GitHub's job listing names it: the same id
-/// and names a `workflow_job` webhook carries.
+/// and name a `workflow_job` webhook carries. Not its `workflow_name`, which is
+/// the run's title and changes at every dispatch of a workflow with a `run-name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedJobIdentity {
     pub id: Option<u64>,
-    pub workflow: Option<String>,
     /// The job's name, matrix values expanded.
     pub name: Option<String>,
 }
@@ -1550,8 +1549,6 @@ struct RunJob {
     labels: Vec<String>,
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
-    workflow_name: Option<String>,
 }
 
 // The unit tests below are inline rather than in a `src/demand/tests.rs`, and
@@ -2007,12 +2004,10 @@ mod tests {
             vec![
                 QueuedJobIdentity {
                     id: Some(8),
-                    workflow: Some("CI".into()),
                     name: Some("build (linux, 3.12)".into()),
                 },
                 QueuedJobIdentity {
                     id: Some(9),
-                    workflow: None,
                     name: Some("older".into()),
                 },
             ]

@@ -94,8 +94,6 @@ pub struct WorkflowJob {
     /// The job's name, matrix values expanded: `build (ubuntu, 3.12)`.
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
-    pub workflow_name: Option<String>,
     /// The runner that took the job (`in_progress`, `completed`).
     #[serde(default)]
     pub runner_name: Option<String>,
@@ -266,7 +264,6 @@ mod tests {
             Some("2026-11-07T10:00:04Z")
         );
         assert_eq!(event.workflow_job.completed_at, None);
-        assert_eq!(event.workflow_job.workflow_name.as_deref(), Some("CI"));
         assert_eq!(
             event.workflow_job.runner_name.as_deref(),
             Some("runner-manager-abc")

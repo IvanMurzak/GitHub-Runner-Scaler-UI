@@ -11,14 +11,23 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 ### Fixed
 
-- **A pool job no longer waits out a launch that was never going to start.** A
-  host checked a launch against its own slots counting only that repository's
-  open launches, so two repositories together could accept more than the host
-  can run. The surplus never started, because the repository holding it was not
-  told when another's runner freed a slot, and each job waited about 2 minutes
-  for its lease to expire. A host now refuses such a launch, so the coordinator
-  can try another host. It also drops a launch it can no longer start, and tells
-  the coordinator at once, which places the job again as soon as there is room.
+- **A job's statistics now apply to its next run, whatever the run is called.**
+  A job's key included GitHub's `workflow_name`, which is the run's title, so a
+  workflow with a `run-name` got a new key at every dispatch. Its samples were
+  never found, and almost every queue was estimated at its repository's p90
+  (104 of 106 placements in a live test). The key is now `owner/repo/job`, and
+  existing samples are rekeyed on upgrade. Jobs with the same name in two
+  workflows of one repository now share their statistics.
+- **A job that ended stops reserving memory.** A lease's estimate stayed reserved
+  on its host for 2 minutes after its runner took a job, even if the job had
+  already finished, so a run of short jobs could keep a host "full" for the next
+  ones. It is released as soon as the job ends.
+- **A launch that cannot start no longer holds its job for 2 minutes.** A host
+  counts its other repositories' open launches against its slots, and refuses a
+  launch it has no slot for. It drops one it can no longer start, or that has no
+  runner after 45 s for any reason, and tells the coordinator at once, which
+  places the job again. Its heartbeat's free slots leave out those its waiting
+  launches have spoken for. Two launches can no longer share one runner.
 - **A launch outlives a runner that took nothing.** When the idle runner serving
   a launch exits without a job, the host starts another or hands it to another
   waiting runner, and the lease stays open.
@@ -45,6 +54,20 @@ the version being prepared rather than the version in `Cargo.toml`.
   the interval `repo add` would allow (64 s for 11 repositories) and keeps starting
   runners. `host set-poll-interval` now also refuses a shorter `--coordinated`
   that would go over the budget.
+
+### Added
+
+- The coordinator's `a pool queue was weighed` log line says how many of the
+  queue's jobs are named, measured and unnamed.
+
+### Upgrade notes
+
+- The coordinator's database moves to schema 5: sample keys lose the run's title.
+  To roll back, stop the service and run
+  `sqlite3 coordinator.db 'PRAGMA user_version = 4'`; 0.4.47 then starts new keys
+  beside these.
+- The launch fixes are on the host, so hosts need 0.4.48 too. An older host keeps
+  working: only the coordinator's fixes apply to it.
 
 ## 0.4.47
 

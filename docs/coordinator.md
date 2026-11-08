@@ -187,8 +187,8 @@ Upgrading to stage 4 moves the coordinator's database to schema 2 (three new tab
 coordinator refuses to open it (`written by a newer coordinator`): to roll back, restore the
 database from before the upgrade, or stop the service and run
 `sqlite3 coordinator.db 'PRAGMA user_version = 1'` (the stage-3 code never reads the new
-tables, and a later upgrade keeps them). 0.4.47 moves it to schema 4 (a `queue_wait_secs` column on
-the samples, and a `live_state` table); to roll back to 0.4.46, `sqlite3 coordinator.db 'PRAGMA user_version = 2'` the same
+tables, and a later upgrade keeps them). 0.4.47 moved it to schema 4 (a `queue_wait_secs` column on the samples, a `live_state` table) and
+0.4.48 to schema 5 (sample keys without the run's title); to roll back to 0.4.46, `sqlite3 coordinator.db 'PRAGMA user_version = 2'` the same
 way (0.4.46 never reads the column, and upgrading again keeps it).
 
 The protocol is versioned: a stage-1 host and this coordinator, or this host and a stage-1
@@ -295,7 +295,9 @@ runners only for the launches it accepted, never from its own reading of the que
 host of the pool sees the same way). It accepts a launch only when its own allocator, over its
 own attempts and ceilings, grants one more runner, counting the launches its other profiles hold
 open: slots are the host's. A launch it can no longer start (another profile's runner took the
-slot since) is dropped, newest first, and the next heartbeat, sent at once, closes its lease.
+slot since) is dropped, newest first, and the next heartbeat, sent at once, closes its lease; so is
+one still without a runner after 45 seconds, whatever the reason (a warning in the host's log). A
+heartbeat's free slots leave out the ones its launches with no runner yet have spoken for.
 Accepted launches start their runners at once:
 the link signals the target's loop, which starts every launch open at that moment in one go,
 without polling GitHub, so the 5-second gap between polls does not apply; the next full pass
@@ -355,8 +357,13 @@ coordinator remembers that only for runner names `runner-manager` registers
 order they arrive (a report waits up to 15 minutes for its job to be named, a webhook 6 hours for
 its report, 10,000 of each at most, the oldest dropped first), and stores one sample per attempt
 that ran a job, completed or failed (an out-of-memory kill is what placement must learn), under
-the key `owner/repo/workflow/job` with the host that ran it. An attempt that exited idle is not
+the key `owner/repo/job` with the host that ran it. An attempt that exited idle is not
 a sample.
+
+The key has no workflow in it. GitHub's `workflow_name` on a job is the run's title, so a workflow
+with a `run-name` has a different one at every dispatch, and nothing on a webhook names the workflow
+stably. Jobs of the same name in two workflows of one repository therefore share their statistics:
+give them different names if their weight differs.
 
 A sample's **duration** is the job's own run time, `started_at` to `completed_at`, so a 14-second
 job reads 14 seconds and not the minute its runner lived. Its **queue wait** is `created_at` to
@@ -379,7 +386,7 @@ and labels), not a single job:
 1. **Demand**: the heaviest p90 peak memory among the jobs queued there. A job never measured
    counts as its repository's p90 (over all its samples); a repository never measured as
    `COORDINATOR_DEFAULT_JOB_RAM` (2 GiB). The sweep names the jobs it lists just as a webhook
-   does (same job id, workflow and job name), so a job only the sweep saw is weighed by its own
+   does (same job id and name), so a job only the sweep saw is weighed by its own
    samples. A job never measured, or with no name to go by, counts as the repository's p90 or the
    default.
 2. **Filter**: a host whose free memory (by its last heartbeat) less the estimates of its
@@ -388,11 +395,13 @@ and labels), not a single job:
    filtered. Each launch reserves the queue's next heaviest job, so one heavy job among light
    ones counts once; the host must still hold the heaviest job, since a runner can take any of
    them. "Free memory" is what the OS says new work can have: Linux's `MemAvailable`, Windows'
-   available physical memory, macOS's free plus inactive pages. When the demand is the global default (nothing measured for that repository),
-   nothing is filtered: a guess never keeps a job waiting. Nor is anything filtered when the
+   available physical memory, macOS's free plus inactive pages. Only a job's own samples filter: when the demand is a guess (a job never measured, counted as its
+   repository's p90 or the default), nothing is filtered, so another job's heavy samples never keep it
+   waiting, and the guess only ranks the hosts. Nor is anything filtered when the
    demand plus the margin is more than every candidate's total memory: no host could ever hold
    it, so the job runs where the score says. The estimates of a host's launches stay reserved
-   for 2 minutes after their runner took its job, while the build's memory ramps up.
+   for 2 minutes after their runner took its job, while the build's memory ramps up, or until
+   that job ends, whichever is first.
 3. **Score** = `cache` x warm workspace (0 or 1) + `headroom` x (memory free after the job, as a
    share of the host's memory) + `speed` x (how much faster than usual this host ran these jobs,
    -1 to 1) - `bigfit` x (1 when the heaviest measured queue waiting elsewhere needs at least
@@ -431,7 +440,7 @@ Job statistics: the last 30 samples per job, kept 90 days
   queue wait (queued to started): p50 3s, p90 41s
 
 Heaviest jobs (p90 peak memory, p90 CPU, p50 run time, p50/p90 queue wait, samples):
-  octo/app/CI/build (linux, 3.12)
+  octo/app/build (linux, 3.12)
       6.2 GiB  3.40 cores  11m 05s  wait 4s/52s  (14)
       on linux (4f1c...)            9 samples  p50 9m 50s  0.85x the usual time
       on win-big (77aa...)          5 samples  p50 13m 10s  1.14x the usual time

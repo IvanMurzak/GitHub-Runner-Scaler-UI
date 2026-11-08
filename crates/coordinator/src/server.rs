@@ -321,11 +321,7 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             let required = required_labels(&job.workflow_job.labels);
             let repository = &job.repository.full_name;
             state.registry.repository_seen(repository);
-            let identity = JobIdentity::new(
-                repository,
-                job.workflow_job.workflow_name.as_deref(),
-                job.workflow_job.name.as_deref(),
-            );
+            let identity = JobIdentity::new(repository, job.workflow_job.name.as_deref());
             if action == "queued" {
                 let woken = required.as_ref().map_or(0, |required| {
                     state

@@ -1223,8 +1223,18 @@ fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
         .attempts()
         .map(|attempts| active_count(attempts.iter()))
         .unwrap_or(0);
+    // A launch with no runner yet has a slot spoken for: said here, the
+    // coordinator offers what this host can really start.
+    let spoken_for = ports.launches.unstarted();
     Heartbeat {
-        free_slots: u32::from(ports.host.host_capacity.get().saturating_sub(busy)),
+        free_slots: u32::from(
+            ports
+                .host
+                .host_capacity
+                .get()
+                .saturating_sub(busy)
+                .saturating_sub(spoken_for),
+        ),
         busy_slots: u32::from(busy),
         cpu_load_percent: runner_manager_platform::host_fitness::cpu_load_percent(),
         free_ram_bytes: runner_manager_platform::host_fitness::available_memory_bytes(),

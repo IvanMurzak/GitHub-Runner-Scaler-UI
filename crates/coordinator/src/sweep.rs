@@ -297,12 +297,8 @@ impl Sweeper {
                 match identity.and_then(|identity| Some((identity.id?, identity))) {
                     Some((id, identity)) => queue.jobs.push((
                         id,
-                        JobIdentity::new(
-                            &name,
-                            identity.workflow.as_deref(),
-                            identity.name.as_deref(),
-                        )
-                        .map(|identity| identity.key()),
+                        JobIdentity::new(&name, identity.name.as_deref())
+                            .map(|identity| identity.key()),
                     )),
                     None => queue.unnamed += 1,
                 }
@@ -536,6 +532,8 @@ mod tests {
             fn forget(&mut self, _id: u64) {}
         }
 
+        // As GitHub lists them for a workflow with a `run-name`: the same key
+        // a webhook makes for this job, whatever the run's title.
         let repository = OwnerRepo::parse("octo/app").expect("repo");
         let demand = QueuedDemand::of(
             repository.clone(),
@@ -546,13 +544,11 @@ mod tests {
             vec![
                 QueuedJobIdentity {
                     id: Some(11),
-                    workflow: Some("CI".into()),
                     name: Some("light".into()),
                 },
                 QueuedJobIdentity {
                     id: Some(12),
-                    workflow: None,
-                    name: Some("nameless workflow".into()),
+                    name: None,
                 },
             ],
         );
@@ -573,8 +569,8 @@ mod tests {
         assert_eq!(placement.counts(&key).0, 2);
         assert_eq!(
             placement.queued_job_keys(&key),
-            (vec!["octo/app/CI/light".to_string()], true),
-            "named from the listing; the other has no workflow name, so no key"
+            (vec!["octo/app/light".to_string()], true),
+            "named from the listing; the other has no job name, so no key"
         );
     }
 

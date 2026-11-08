@@ -16,7 +16,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// The prefix every invite code carries, so one is recognisable in a paste.
 pub const INVITE_PREFIX: &str = "rmc_";
@@ -199,6 +199,10 @@ impl Store {
                 PRAGMA user_version = 4;",
             )?;
         }
+        if version < 5 {
+            rekey_samples(&connection)?;
+            connection.pragma_update(None, "user_version", 5)?;
+        }
         Ok(Self { connection })
     }
 
@@ -373,6 +377,32 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// 0.4.48: a sample's key loses the workflow, which was the run's title: from
+/// `owner/repo/title/job` to `owner/repo/job`, so what was measured counts at
+/// once. A job name holding a `/` keeps only its last part, and starts over.
+fn rekey_samples(connection: &Connection) -> Result<(), StoreError> {
+    let rows: Vec<(i64, String, String)> = connection
+        .prepare("SELECT id, job_key, repository FROM job_samples")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    for (id, key, repository) in rows {
+        let Some(rest) = key
+            .strip_prefix(&repository)
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            continue;
+        };
+        let Some((_, job)) = rest.rsplit_once('/') else {
+            continue;
+        };
+        connection.execute(
+            "UPDATE job_samples SET job_key = ?1 WHERE id = ?2",
+            params![format!("{repository}/{job}"), id],
+        )?;
+    }
+    Ok(())
 }
 
 /// Whether `table` has a column named `column`.
@@ -836,6 +866,39 @@ mod tests {
             store.samples(oldest).expect("read")[0].queue_wait_secs,
             Some(7)
         );
+    }
+
+    /// Samples keyed by a run's title (`load light [1,2] (e4)`) join under the
+    /// job's name, whichever title they were measured under.
+    #[test]
+    fn samples_keyed_by_a_runs_title_are_rekeyed_by_job() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("coordinator.db");
+        let oldest = now() - chrono::TimeDelta::days(90);
+        {
+            let mut store = Store::open(&path).expect("created");
+            for title in ["load light [1,2] (e4b)", "load light [1,2] (e4c)"] {
+                store
+                    .record_sample(
+                        &sample(&format!("octo/app/{title}/light"), now()),
+                        30,
+                        oldest,
+                    )
+                    .expect("recorded");
+            }
+            store
+                .connection
+                .pragma_update(None, "user_version", 4)
+                .expect("a schema-4 database");
+        }
+        let store = Store::open(&path).expect("upgraded");
+        let keys: Vec<String> = store
+            .samples(oldest)
+            .expect("read")
+            .into_iter()
+            .map(|sample| sample.job_key)
+            .collect();
+        assert_eq!(keys, vec!["octo/app/light"; 2]);
     }
 
     #[test]
