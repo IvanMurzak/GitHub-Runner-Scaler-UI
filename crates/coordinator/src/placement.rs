@@ -15,13 +15,17 @@
 //! places one more; while more exist it cancels the newest (`cancel_launch`),
 //! which a host honours only while that runner has not started.
 //!
-//! A lease closes when its runner takes a job (the host's `attempt_started`),
-//! when its attempt ends (`attempt_finished`), when its host disconnects or
-//! connects again, when the host's heartbeat no longer lists it (the host
-//! dropped it), when another runner of the same host takes a job of its queue
-//! (a runner takes *any* job of its labels, so that host's runner for the
-//! lease would find nothing left), or when it expires ([`LEASE_TTL`],
-//! `COORDINATOR_LEASE_TTL`); the job, if still queued, is then placed again. A webhook `in_progress` or `completed` takes the job out of the
+//! A lease closes, and its job (if still queued) is placed again, when:
+//!
+//! * its runner takes a job (the host's `attempt_started`) or its attempt
+//!   ends (`attempt_finished`);
+//! * its host disconnects or connects again;
+//! * its host's heartbeat no longer lists it (the host dropped it);
+//! * another runner of the same host takes a job of its queue: a runner takes
+//!   *any* job of its labels, so the lease's runner would find nothing left;
+//! * it expires ([`LEASE_TTL`], `COORDINATOR_LEASE_TTL`).
+//!
+//! A webhook `in_progress` or `completed` takes the job out of the
 //! queue; the caller rebalances after [`CLAIM_GRACE`], by when the host whose
 //! runner took it has normally closed that very lease, so a surplus lease
 //! cancelled is one whose runner took nothing.
@@ -56,12 +60,10 @@ use std::time::{Duration, Instant};
 
 use runner_manager_domain::coordinator_protocol::{
     AttemptFinished, AttemptStarted, CancelLaunch, Launch, LaunchAck, OpenLease, PendingQueue,
-    PlacementDecision, RefusalReason, ServerMessage,
+    PlacementDecision, RefusalReason, ServerMessage, is_managed_runner_name,
 };
 use runner_manager_domain::model::Label;
 use tokio::sync::oneshot;
-
-use runner_manager_domain::coordinator_protocol::is_managed_runner_name;
 
 use crate::registry::{Candidate, Registry, is_pool_job};
 use crate::stats::{Aggregates, Contender, Demand, Statistics, score};
@@ -135,6 +137,16 @@ impl JobKey {
             labels: required.iter().cloned().collect(),
         }
     }
+
+    /// Its labels, comma-separated, as `stats` shows them.
+    #[must_use]
+    pub fn labels_csv(&self) -> String {
+        self.labels
+            .iter()
+            .map(Label::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -167,6 +179,16 @@ enum LeaseState {
     /// Its runner took a job; held until the webhook takes that job out of
     /// the queue, so the job is not placed a second time meanwhile.
     Claimed(Instant),
+}
+
+impl LeaseState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Offered => "offered",
+            Self::Accepted => "accepted",
+            Self::Claimed(_) => "claimed",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -315,29 +337,32 @@ impl State {
             })
             .min_by_key(|(_, lease)| lease.sent)
             .map(|(id, _)| id.clone());
-        if let Some(lease_id) = oldest {
-            self.leases.remove(&lease_id);
-            registry.send(
-                host_id,
-                ServerMessage::CancelLaunch(CancelLaunch {
-                    lease_id: lease_id.clone(),
-                }),
-            );
+        if let Some(lease_id) = oldest
+            && self.cancel_lease(registry, &lease_id)
+        {
             tracing::info!(%lease_id, %host_id, "a lease was closed: another runner of its host took its queue's job");
         }
+    }
+
+    /// Removes `lease_id` and tells its host to drop the launch; `false`
+    /// when there was no such lease.
+    fn cancel_lease(&mut self, registry: &Registry, lease_id: &str) -> bool {
+        let Some(lease) = self.leases.remove(lease_id) else {
+            return false;
+        };
+        registry.send(
+            &lease.host_id,
+            ServerMessage::CancelLaunch(CancelLaunch {
+                lease_id: lease_id.to_string(),
+            }),
+        );
+        true
     }
 
     /// Records why `key` is short of runners; logs it when that changed or a
     /// minute passed.
     fn note_unplaced(&mut self, key: &JobKey, reason: Unplaced) {
         let now = Instant::now();
-        let queued = self.queues.get(key).map_or(0, Queue::len);
-        let oldest_job = self
-            .queues
-            .get(key)
-            .and_then(|queue| queue.jobs.iter().min_by_key(|(_, (at, _))| *at))
-            .map(|(id, _)| *id);
-        let leases = self.leases_for(key);
         let entry = self.unplaced.entry(key.clone()).or_insert((reason, None));
         let due = entry.0 != reason
             || entry
@@ -346,6 +371,12 @@ impl State {
         entry.0 = reason;
         if due {
             entry.1 = Some(now);
+            let queue = self.queues.get(key);
+            let queued = queue.map_or(0, Queue::len);
+            let oldest_job = queue
+                .and_then(|queue| queue.jobs.iter().min_by_key(|(_, (at, _))| *at))
+                .map(|(id, _)| *id);
+            let leases = self.leases_for(key);
             tracing::info!(
                 reason = reason.as_str(),
                 refusal = reason.refusal().map_or("", RefusalReason::as_str),
@@ -810,17 +841,15 @@ impl Placement {
     pub fn snapshot(&self) -> (Vec<PendingQueue>, Vec<OpenLease>) {
         let now = Instant::now();
         let state = self.state();
-        let labels = |key: &JobKey| {
-            key.labels
-                .iter()
-                .map(Label::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        };
+        let mut open: HashMap<&JobKey, usize> = HashMap::new();
+        for lease in state.leases.values() {
+            *open.entry(&lease.key).or_default() += 1;
+        }
+        let leases_for = |key: &JobKey| open.get(key).copied().unwrap_or(0);
         let mut pending: Vec<(Option<Instant>, PendingQueue)> = state
             .queues
             .iter()
-            .filter(|(key, queue)| queue.len() > state.leases_for(key))
+            .filter(|(key, queue)| queue.len() > leases_for(key))
             .map(|(key, queue)| {
                 let oldest = queue.jobs.values().map(|(at, _)| *at).min();
                 let reason = state.unplaced.get(key).map(|(reason, _)| *reason);
@@ -828,9 +857,9 @@ impl Placement {
                     oldest,
                     PendingQueue {
                         repository: key.repository.clone(),
-                        labels: labels(key),
+                        labels: key.labels_csv(),
                         queued: u32::try_from(queue.len()).unwrap_or(u32::MAX),
-                        leases: u32::try_from(state.leases_for(key)).unwrap_or(u32::MAX),
+                        leases: u32::try_from(leases_for(key)).unwrap_or(u32::MAX),
                         oldest_wait_secs: oldest
                             .map(|at| now.saturating_duration_since(at).as_secs()),
                         reason: reason.map(|reason| reason.as_str().to_string()),
@@ -852,12 +881,7 @@ impl Placement {
                     OpenLease {
                         host_id: lease.host_id.clone(),
                         lease_id: id.clone(),
-                        state: match lease.state {
-                            LeaseState::Offered => "offered",
-                            LeaseState::Accepted => "accepted",
-                            LeaseState::Claimed(_) => "claimed",
-                        }
-                        .to_string(),
+                        state: lease.state.as_str().to_string(),
                         age_secs: now.saturating_duration_since(lease.sent).as_secs(),
                         repository: lease.key.repository.clone(),
                     },
@@ -1007,41 +1031,32 @@ impl Placement {
             state.unplaced.remove(key);
             return None;
         }
-        // Each filter that empties the field names why nothing is placed.
-        let untried: Vec<Candidate> = candidates
-            .into_iter()
-            .filter(|candidate| !tried.contains(&candidate.host_id))
-            .collect();
-        let fit: Vec<Candidate> = untried
-            .iter()
-            .filter(|candidate| !candidate.heartbeat.unfit && !candidate.heartbeat.draining)
-            .cloned()
-            .collect();
-        let eligible: Vec<Candidate> = fit
-            .iter()
-            .filter(|candidate| {
-                candidate.heartbeat.free_slots
-                    > state.unreported_on(&candidate.host_id, candidate.heartbeat_at)
-            })
-            .cloned()
-            .collect();
-        // A host was tried this round and nobody else can take it: what that
-        // host said is the most telling reason.
-        let empty = if !tried.is_empty() && eligible.is_empty() {
-            Some(last_failure.unwrap_or(Unplaced::Unanswered))
-        } else if untried.is_empty() {
-            Some(Unplaced::NoCandidate)
-        } else if fit.is_empty() {
-            Some(Unplaced::UnfitOrDraining)
-        } else if eligible.is_empty() {
-            Some(Unplaced::NoFreeSlot)
-        } else {
-            None
+        let untried = |candidate: &Candidate| !tried.contains(&candidate.host_id);
+        let fit =
+            |candidate: &Candidate| !candidate.heartbeat.unfit && !candidate.heartbeat.draining;
+        let free = |candidate: &Candidate| {
+            candidate.heartbeat.free_slots
+                > state.unreported_on(&candidate.host_id, candidate.heartbeat_at)
         };
-        if let Some(reason) = empty {
+        // When nothing is left, the first filter that emptied the field says
+        // why; a host tried this round says it best.
+        if !candidates.iter().any(|c| untried(c) && fit(c) && free(c)) {
+            let reason = if !tried.is_empty() {
+                last_failure.unwrap_or(Unplaced::Unanswered)
+            } else if candidates.is_empty() {
+                Unplaced::NoCandidate
+            } else if !candidates.iter().any(fit) {
+                Unplaced::UnfitOrDraining
+            } else {
+                Unplaced::NoFreeSlot
+            };
             state.note_unplaced(key, reason);
             return None;
         }
+        let eligible: Vec<Candidate> = candidates
+            .into_iter()
+            .filter(|c| untried(c) && fit(c) && free(c))
+            .collect();
         let chosen = match &self.stats {
             Some(stats) => Self::weigh(stats, &state, key, eligible, decision),
             None => rank(eligible).into_iter().next().map(|chosen| (chosen, 0)),
@@ -1160,12 +1175,7 @@ impl Placement {
             *decision = Some(PlacementDecision {
                 at: chrono::Utc::now().timestamp(),
                 repository: key.repository.clone(),
-                labels: key
-                    .labels
-                    .iter()
-                    .map(Label::as_str)
-                    .collect::<Vec<_>>()
-                    .join(","),
+                labels: key.labels_csv(),
                 estimate_bytes: demand.estimate,
                 estimate_source: demand.source.as_str().to_string(),
                 method: method.to_string(),
@@ -1197,15 +1207,9 @@ impl Placement {
             .collect();
         accepted.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
         for (lease_id, _) in accepted.into_iter().take(surplus) {
-            if let Some(lease) = state.leases.remove(&lease_id) {
-                self.registry.send(
-                    &lease.host_id,
-                    ServerMessage::CancelLaunch(CancelLaunch {
-                        lease_id: lease_id.clone(),
-                    }),
-                );
+            if state.cancel_lease(&self.registry, &lease_id) {
                 report.cancelled += 1;
-                tracing::info!(%lease_id, host_id = %lease.host_id, "a launch was cancelled: its job is no longer queued");
+                tracing::info!(%lease_id, "a launch was cancelled: its job is no longer queued");
             }
         }
     }

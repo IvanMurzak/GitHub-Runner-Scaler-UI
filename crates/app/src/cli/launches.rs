@@ -173,33 +173,31 @@ impl Launches {
     fn settle(&self, now: Instant) {
         let policies: HashSet<PolicyId> =
             self.book().open.values().map(|open| open.policy).collect();
-        // A launch whose profile was removed, or stopped being this host's
-        // pool profile, starts nothing any more; every other one survives a
+        // Read without holding the book: the link and the passes use it. A
+        // launch whose profile was removed, or stopped being this host's pool
+        // profile, starts nothing any more; every other one survives a
         // policy change. `Err` (unreadable) keeps them all.
-        let gone: HashSet<PolicyId> = policies
-            .iter()
-            .copied()
-            .filter(|policy| {
-                self.store
-                    .policy(*policy)
-                    .is_ok_and(|found| found.is_none_or(|found| !self.is_own_pool_profile(&found)))
-            })
-            .collect();
-        // Read without holding the book: the link and the passes use it.
-        let waiting: HashMap<PolicyId, Vec<AttemptId>> = policies
-            .into_iter()
-            .map(|policy| {
-                let attempts = self
-                    .store
-                    .uncleaned_attempts_for_policy(policy)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|attempt| attempt.state().is_unassigned())
-                    .map(|attempt| attempt.id)
-                    .collect();
-                (policy, attempts)
-            })
-            .collect();
+        let mut gone: HashSet<PolicyId> = HashSet::new();
+        let mut waiting: HashMap<PolicyId, Vec<AttemptId>> = HashMap::new();
+        for policy in policies {
+            let removed = self
+                .store
+                .policy(policy)
+                .is_ok_and(|found| found.is_none_or(|found| !self.is_own_pool_profile(&found)));
+            if removed {
+                gone.insert(policy);
+                continue;
+            }
+            let attempts = self
+                .store
+                .uncleaned_attempts_for_policy(policy)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|attempt| attempt.state().is_unassigned())
+                .map(|attempt| attempt.id)
+                .collect();
+            waiting.insert(policy, attempts);
+        }
         let mut book = self.book();
         book.open
             .retain(|_, open| open.expires > now && !gone.contains(&open.policy));
@@ -327,10 +325,11 @@ impl Launches {
     }
 
     /// The launches still open, for the heartbeat: the coordinator closes
-    /// any accepted lease of this host not among them.
+    /// any accepted lease of this host not among them. Not settled here (the
+    /// passes and `decide` do that): one listed a little longer only lasts
+    /// until the next heartbeat.
     #[must_use]
     pub fn open_leases(&self) -> Vec<String> {
-        self.settle(Instant::now());
         self.book()
             .open
             .keys()
@@ -608,10 +607,12 @@ mod tests {
             .build();
         store.insert_policy(&other).expect("added");
         assert_eq!(launches.open_leases(), vec!["b".to_string()]);
-        // Its own profile removed: nothing to start it with.
+        // Its own profile removed: nothing to start it with, from the next
+        // pass on.
         store
             .remove_policy(policy.id, policy.revision())
             .expect("removed");
+        let _ = launches.directed_demand(&policy);
         assert!(launches.open_leases().is_empty());
         assert_eq!(launches.open_for(policy.id), 0);
     }

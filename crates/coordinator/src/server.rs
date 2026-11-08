@@ -675,11 +675,12 @@ async fn serve_host(
                         );
                         state.registry.set_hello(host_id, connection, hello);
                     }
-                    Ok(HostMessage::Heartbeat(heartbeat)) => {
+                    Ok(HostMessage::Heartbeat(mut heartbeat)) => {
                         // Leases the host no longer holds are closed, and
-                        // their jobs placed again.
-                        let dropped = match (&heartbeat.open_leases, version >= LAUNCH_VERSION) {
-                            (Some(held), true) => state.placement.reconcile_leases(host_id, held),
+                        // their jobs placed again. The list is not kept: every
+                        // placement copies the heartbeat.
+                        let dropped = match (heartbeat.open_leases.take(), version >= LAUNCH_VERSION) {
+                            (Some(held), true) => state.placement.reconcile_leases(host_id, &held),
                             _ => 0,
                         };
                         // A slot freed (a host sends a heartbeat right after

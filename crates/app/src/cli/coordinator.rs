@@ -796,7 +796,7 @@ impl WakeRoutes {
 
     /// Starts `target`'s accepted launches now. Several accepted in a row
     /// are served together: the signal holds one permit.
-    pub fn nudge(&self, target: &TargetRef) {
+    pub fn launch_now(&self, target: &TargetRef) {
         if let Some((_, signals)) = self.signals(target) {
             signals.launch.notify_one();
         }
@@ -1216,7 +1216,11 @@ fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy
 
 /// `policies`' live runners, counted per policy rather than by reading every
 /// attempt this host ever ran.
-fn heartbeat(ports: &LinkPorts, policies: &[ScalePolicy]) -> Heartbeat {
+fn heartbeat(
+    ports: &LinkPorts,
+    policies: &[ScalePolicy],
+    open_leases: Option<Vec<String>>,
+) -> Heartbeat {
     let busy = policies
         .iter()
         .filter_map(|policy| ports.store.active_attempts_for_policy(policy.id).ok())
@@ -1229,7 +1233,7 @@ fn heartbeat(ports: &LinkPorts, policies: &[ScalePolicy]) -> Heartbeat {
         free_ram_bytes: runner_manager_platform::host_fitness::available_memory_bytes(),
         unfit: ports.unfit.load(Ordering::Relaxed),
         draining: ports.draining.load(Ordering::Relaxed),
-        open_leases: None,
+        open_leases,
     }
 }
 
@@ -1461,7 +1465,7 @@ async fn serve(
                             return end;
                         }
                         if accepted {
-                            ports.routes.nudge(&launch.target);
+                            ports.routes.launch_now(&launch.target);
                         }
                     }
                     Ok(ServerMessage::CancelLaunch(cancel)) if version >= LAUNCH_VERSION => {
@@ -1551,9 +1555,11 @@ async fn report_attempts(
         }
     }
     if beat || reports.take_released() {
-        let mut heartbeat = heartbeat(ports, &policies);
-        heartbeat.open_leases = open;
-        send(socket, &HostMessage::Heartbeat(heartbeat)).await?;
+        send(
+            socket,
+            &HostMessage::Heartbeat(heartbeat(ports, &policies, open)),
+        )
+        .await?;
     }
     Ok(())
 }

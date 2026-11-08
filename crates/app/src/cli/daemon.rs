@@ -181,7 +181,7 @@ async fn run_generation(
                 return stop_for_upgrade(context, host.service_start_mode, own_binary.as_deref(), &version, out)
                     .map(|()| DaemonOutcome::Stopped);
             }
-            () = wait_for_policy_set_change(Arc::clone(&store) as Arc<dyn Store>, BTreeSet::new()) => {
+            _ = wait_for_policy_set_change(Arc::clone(&store) as Arc<dyn Store>, BTreeSet::new()) => {
                 writeln!(out, "a repository policy was added; reloading").map_err(failed)?;
                 return Ok(DaemonOutcome::Reload);
             }
@@ -1906,11 +1906,7 @@ where
 {
     loop {
         tokio::select! {
-            () = wait_for_policy_set_change(Arc::clone(&store), serving.served()) => {
-                let Ok(policies) = store.policies() else {
-                    continue;
-                };
-                let groups = active_autoscale_targets(policies);
+            groups = wait_for_policy_set_change(Arc::clone(&store), serving.served()) => {
                 if groups.is_empty() {
                     return None;
                 }
@@ -1967,7 +1963,12 @@ where
 /// a startup recovery that ran once. So a repository *added* while the daemon
 /// runs needs a loop built for it, and one *removed* leaves a loop with
 /// nothing to serve: [`follow_policy_set`] does both, one target at a time.
-async fn wait_for_policy_set_change(store: Arc<dyn Store>, initial: BTreeSet<String>) {
+/// Returns the new set, grouped by target as [`active_autoscale_targets`]
+/// groups it.
+async fn wait_for_policy_set_change(
+    store: Arc<dyn Store>,
+    initial: BTreeSet<String>,
+) -> Vec<Vec<ScalePolicy>> {
     loop {
         tokio::time::sleep(POLICY_SET_CHECK_INTERVAL).await;
         let Ok(policies) = store.policies() else {
@@ -1975,12 +1976,13 @@ async fn wait_for_policy_set_change(store: Arc<dyn Store>, initial: BTreeSet<Str
             // would turn a blip into a drain.
             continue;
         };
-        let current: BTreeSet<String> = active_autoscale_targets(policies)
+        let groups = active_autoscale_targets(policies);
+        let current: BTreeSet<String> = groups
             .iter()
             .map(|group| group[0].target.to_string())
             .collect();
         if current != initial {
-            return;
+            return groups;
         }
     }
 }
