@@ -1063,6 +1063,11 @@ impl fmt::Debug for CachePorts {
     }
 }
 
+/// When the published version was last checked: per cache, or shared by the
+/// caches over one package directory.
+#[derive(Debug, Clone, Default)]
+pub struct LastCheck(Arc<Mutex<Option<Timestamp>>>);
+
 /// The versioned, immutable, checksum-verified runner package cache.
 #[derive(Debug)]
 pub struct PackageCache {
@@ -1080,7 +1085,7 @@ pub struct PackageCache {
     /// re-check is the *correct* behaviour — the agent has no idea how long it
     /// was down — so persisting this would only buy the ability to skip a check
     /// that should not be skipped.
-    last_check: Mutex<Option<Timestamp>>,
+    last_check: LastCheck,
 }
 
 impl PackageCache {
@@ -1102,7 +1107,7 @@ impl PackageCache {
             pins: PinnedDigests::new(),
             freshness: Freshness::default(),
             retry_budget: RETRY_BUDGET,
-            last_check: Mutex::new(None),
+            last_check: LastCheck::default(),
         }
     }
 
@@ -1115,6 +1120,13 @@ impl PackageCache {
     #[must_use]
     pub const fn with_freshness(mut self, freshness: Freshness) -> Self {
         self.freshness = freshness;
+        self
+    }
+
+    /// Shares when the published version was last checked with other caches.
+    #[must_use]
+    pub fn with_last_check(mut self, last_check: LastCheck) -> Self {
+        self.last_check = last_check;
         self
     }
 
@@ -1242,6 +1254,7 @@ impl PackageCache {
                 Ok(package) => {
                     *self
                         .last_check
+                        .0
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
                         Some(self.ports.clock.now());
@@ -1324,6 +1337,7 @@ impl PackageCache {
         }
         let last = *self
             .last_check
+            .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(match last {
@@ -4270,8 +4284,14 @@ mod tests {
         use crate::lifecycle::{CachedRuntimePackages, SharedPackages};
         let shared = SharedPackages::default();
         (
-            CachedRuntimePackages::with_shared(Arc::new(harness.cache()), shared.clone()),
-            CachedRuntimePackages::with_shared(Arc::new(harness.cache()), shared.clone()),
+            CachedRuntimePackages::new(
+                Arc::new(harness.cache().with_last_check(shared.last_check())),
+                shared.clone(),
+            ),
+            CachedRuntimePackages::new(
+                Arc::new(harness.cache().with_last_check(shared.last_check())),
+                shared.clone(),
+            ),
             shared,
         )
     }
@@ -4280,30 +4300,39 @@ mod tests {
     /// so every switch between them downloaded the package again.
     #[tokio::test]
     async fn switching_between_targets_does_not_download_the_package_again() {
-        use crate::lifecycle::RuntimePackages as _;
+        use crate::lifecycle::{PackageTimings, RuntimePackages as _};
 
         let (harness, _, _) = linux_fixture();
         let (one, two, _shared) = two_targets(&harness);
         for (id, packages) in [(1, &one), (2, &two), (3, &one), (4, &two)] {
             let attempt = reserved(&harness, id);
-            packages.materialize(&attempt).await.expect("materialized");
+            let mut timings = PackageTimings::default();
+            packages
+                .materialize(&attempt, &mut timings)
+                .await
+                .expect("materialized");
             assert!(attempt.runtime_path().join("run.sh").exists());
-            let timings = packages.take_timings(attempt.id);
             assert_eq!(timings.downloaded, id == 1, "attempt {id}: {timings:?}");
         }
         assert_eq!(harness.fetcher.count(), 1);
+        assert_eq!(harness.catalog.calls(), 1, "one check, not one per target");
     }
 
     #[tokio::test]
     async fn launches_materializing_together_share_one_download() {
-        use crate::lifecycle::RuntimePackages as _;
+        use crate::lifecycle::{PackageTimings, RuntimePackages as _};
 
         let (harness, _, _) = linux_fixture();
         let (one, two, _shared) = two_targets(&harness);
         let first = reserved(&harness, 1);
         let second = reserved(&harness, 2);
 
-        let (a, b) = tokio::join!(one.materialize(&first), two.materialize(&second));
+        let (mut one_timings, mut two_timings) =
+            (PackageTimings::default(), PackageTimings::default());
+        let (a, b) = tokio::join!(
+            one.materialize(&first, &mut one_timings),
+            two.materialize(&second, &mut two_timings)
+        );
 
         a.expect("the first");
         b.expect("the second");
@@ -4314,17 +4343,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_tree_a_job_edited_is_replaced_for_every_target() {
-        use crate::lifecycle::RuntimePackages as _;
+        use crate::lifecycle::{PackageTimings, RuntimePackages as _};
 
         let (harness, _, _) = linux_fixture();
         let (one, two, _shared) = two_targets(&harness);
-        one.materialize(&reserved(&harness, 1))
+        one.materialize(&reserved(&harness, 1), &mut PackageTimings::default())
             .await
             .expect("materialized");
         let entry = harness.cache().installed().unwrap().remove(0);
         fs::write(entry.root().join("planted"), b"from a job").unwrap();
 
-        two.materialize(&reserved(&harness, 2))
+        two.materialize(&reserved(&harness, 2), &mut PackageTimings::default())
             .await
             .expect("materialized");
 
@@ -4335,12 +4364,12 @@ mod tests {
     /// A superseded version goes only when no copy or install is under way.
     #[tokio::test]
     async fn a_prune_leaves_the_trees_alone_while_they_are_in_use() {
-        use crate::lifecycle::{PruneAuthority, RuntimePackages as _};
+        use crate::lifecycle::{PackageTimings, PruneAuthority, RuntimePackages as _};
         use crate::reconcile::{AllocationLock as _, InProcessAllocationLock};
 
         let (harness, _, _) = linux_fixture();
         let (one, _two, shared) = two_targets(&harness);
-        one.materialize(&reserved(&harness, 1))
+        one.materialize(&reserved(&harness, 1), &mut PackageTimings::default())
             .await
             .expect("materialized");
         one.release(AttemptId::from_u128(1)).expect("released");
@@ -4364,11 +4393,11 @@ mod tests {
         let guard = lock.acquire().await.unwrap();
         {
             let _copying = shared.copying().await;
-            one.prune_obsolete_guarded(PruneAuthority::from_launch_request(&guard), &[])
+            one.prune_obsolete_guarded(PruneAuthority::for_test(&guard), &[])
                 .expect("nothing to do yet");
             assert_eq!(cache.installed().unwrap().len(), 2);
         }
-        one.prune_obsolete_guarded(PruneAuthority::from_launch_request(&guard), &[])
+        one.prune_obsolete_guarded(PruneAuthority::for_test(&guard), &[])
             .expect("pruned");
         let left = cache.installed().unwrap();
         assert_eq!(left.len(), 1);

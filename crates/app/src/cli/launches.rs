@@ -572,6 +572,12 @@ impl DemandDirector for Launches {
 
     fn launched(&self, policy: &ScalePolicy, attempt: AttemptId) {
         let mut book = self.book();
+        // Its launches can start after all.
+        for open in book.open.values_mut() {
+            if open.policy == policy.id {
+                open.blocked_since = None;
+            }
+        }
         // `settle` may have bound it already: an attempt exists, and waits,
         // while it is still being started. One runner serves one launch.
         if book.open.values().any(|open| open.attempt == Some(attempt)) {

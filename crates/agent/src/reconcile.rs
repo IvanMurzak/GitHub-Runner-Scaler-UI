@@ -1622,14 +1622,59 @@ impl WslRecoveryAllocationLock {
     }
 }
 
+/// Claim the guest launch fence under `root`, or say what holds it.
+fn claim_guest_fence(
+    root: &std::path::Path,
+) -> Result<Arc<LaunchFenceGuard>, runner_manager_platform::launch_health::BlockCause> {
+    use runner_manager_platform::launch_health::BlockCause;
+    use runner_manager_platform::wsl::fence::{
+        FENCE_DIRECTORY, FenceClaim, GuestClaimAttempt, try_claim_guest_launch,
+    };
+
+    match try_claim_guest_launch(root) {
+        Ok(GuestClaimAttempt::Claimed { claim, reclaimed }) => {
+            if let Some(reclaimed) = reclaimed {
+                tracing::warn!(
+                    shared_root = %root.display(),
+                    %reclaimed,
+                    "reclaimed a WSL launch fence claim whose owner is gone"
+                );
+            }
+            // Guarded at once, so a claim let go on the drain path is released
+            // -- and logged when it cannot be -- like any other.
+            Ok(Arc::new(LaunchFenceGuard(Some(claim))))
+        }
+        Ok(GuestClaimAttempt::Busy) => {
+            let directory = root.join(FENCE_DIRECTORY);
+            Err(match FenceClaim::owner(root) {
+                Ok(owner) => BlockCause::FenceHeld { directory, owner },
+                Err(error) => BlockCause::FenceOwnerUnreadable {
+                    directory,
+                    detail: error.to_string(),
+                },
+            })
+        }
+        Err(error) => {
+            // An owner record nobody can decode stops the reclaim the same way
+            // on every pass; name it rather than the config.
+            Err(match FenceClaim::owner(root) {
+                Err(owner_error) => BlockCause::FenceOwnerUnreadable {
+                    directory: root.join(FENCE_DIRECTORY),
+                    detail: owner_error.to_string(),
+                },
+                Ok(_) => BlockCause::FenceUnusable {
+                    detail: error.to_string(),
+                },
+            })
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl AllocationLock for WslRecoveryAllocationLock {
     async fn acquire(&self) -> Result<AllocationGuard, AllocationLockBusy> {
         use runner_manager_platform::launch_health::BlockCause;
-        use runner_manager_platform::wsl::fence::{
-            DrainRequest, FENCE_DIRECTORY, FenceClaim, GuestClaimAttempt, GuestRecoveryConfig,
-            try_claim_guest_launch,
-        };
+        use runner_manager_platform::wsl::fence::{DrainRequest, GuestRecoveryConfig};
 
         let paths = Arc::clone(&self.paths);
         let mut shared = self.claim.lock().await;
@@ -1647,41 +1692,7 @@ impl AllocationLock for WslRecoveryAllocationLock {
             let claim = match held {
                 // A launch of this process already owns the directory.
                 Some(held) => held,
-                None => match try_claim_guest_launch(&root) {
-                    Ok(GuestClaimAttempt::Claimed { claim, reclaimed }) => {
-                        if let Some(reclaimed) = reclaimed {
-                            tracing::warn!(
-                                shared_root = %root.display(),
-                                %reclaimed,
-                                "reclaimed a WSL launch fence claim whose owner is gone"
-                            );
-                        }
-                        // Guarded at once, so a claim let go on the drain path below
-                        // is released -- and logged when it cannot be -- like any other.
-                        Arc::new(LaunchFenceGuard(Some(claim)))
-                    }
-                    Ok(GuestClaimAttempt::Busy) => {
-                        let directory = root.join(FENCE_DIRECTORY);
-                        return Err(match FenceClaim::owner(&root) {
-                            Ok(owner) => BlockCause::FenceHeld { directory, owner },
-                            Err(error) => BlockCause::FenceOwnerUnreadable {
-                                directory,
-                                detail: error.to_string(),
-                            },
-                        });
-                    }
-                    Err(error) => {
-                        // An owner record nobody can decode stops the reclaim the
-                        // same way on every pass; name it rather than the config.
-                        return Err(match FenceClaim::owner(&root) {
-                            Err(owner_error) => BlockCause::FenceOwnerUnreadable {
-                                directory: root.join(FENCE_DIRECTORY),
-                                detail: owner_error.to_string(),
-                            },
-                            Ok(_) => unusable(&error),
-                        });
-                    }
-                },
+                None => claim_guest_fence(&root)?,
             };
             match DrainRequest::read(&root) {
                 Ok(None) => Ok(claim),
@@ -2733,7 +2744,6 @@ impl Reconciler {
     /// in [`Self::reconcile`]; the next full pass supervises them.
     pub async fn start_directed(&mut self, policies: &[ScalePolicy]) -> ReconcileReport {
         let mut report = ReconcileReport::default();
-        let mut launched: Vec<RunnerAttempt> = Vec::new();
         let mut reserved: Vec<Reserved> = Vec::new();
         for policy in policies {
             if !policy.owns_runners()
@@ -2743,7 +2753,7 @@ impl Reconciler {
                 continue;
             }
             if let Some(directed) = self.director.directed_demand(policy) {
-                self.start_runners(policy, directed, &mut report, &mut launched, &mut reserved)
+                self.start_runners(policy, directed, &mut report, &mut reserved)
                     .await;
             }
         }
@@ -2769,7 +2779,6 @@ impl Reconciler {
         // Everything this pass has created, carried across policies so that the
         // host-wide total cannot be computed from a set that is missing it. See
         // `RunnerLauncher::launch`.
-        let mut launched: Vec<RunnerAttempt> = Vec::new();
         let mut reserved: Vec<Reserved> = Vec::new();
 
         // --- Flow 2.1-2.2: who is even asking, and what did GitHub say -------
@@ -2875,7 +2884,7 @@ impl Reconciler {
                 // Ownership rule 2 and precedence rule 4. Allocated for with no
                 // demand, so the refusal is reported by name rather than by
                 // absence.
-                match self.allocate_only(policy, 0, &launched).await {
+                match self.allocate_only(policy, 0, &reserved).await {
                     Ok(allocation) => {
                         self.emit_allocation(&allocation);
                         report.allocations.push(allocation);
@@ -2891,7 +2900,7 @@ impl Reconciler {
             // here are the demand, whatever this host's own reading says (or
             // whether it could read at all).
             if let Some(directed) = self.director.directed_demand(policy) {
-                self.start_runners(policy, directed, &mut report, &mut launched, &mut reserved)
+                self.start_runners(policy, directed, &mut report, &mut reserved)
                     .await;
                 continue;
             }
@@ -2922,7 +2931,7 @@ impl Reconciler {
                         unresolvable: u32::try_from(tally.unresolvable.len()).unwrap_or(u32::MAX),
                         complete: demand.is_complete(),
                     });
-                    self.start_runners(policy, count, &mut report, &mut launched, &mut reserved)
+                    self.start_runners(policy, count, &mut report, &mut reserved)
                         .await;
                 }
             }
@@ -3024,7 +3033,7 @@ impl Reconciler {
         &self,
         policy: &ScalePolicy,
         demand: u32,
-        launched: &[RunnerAttempt],
+        reserved: &[Reserved],
     ) -> Result<Allocation, AllocationFailure> {
         // Read again under the shared launch lock, not just at each target's
         // poll boundary: another target must not use an old, higher ceiling.
@@ -3035,7 +3044,7 @@ impl Reconciler {
             .await
             .map_err(AllocationFailure::HostCapacity)?;
         let attempts = self
-            .host_attempts(launched)
+            .host_attempts(reserved)
             .await
             .map_err(AllocationFailure::Attempts)?;
         let mut allocator = HostAllocator::from_attempts(&host, &attempts);
@@ -3068,7 +3077,6 @@ impl Reconciler {
         policy: &ScalePolicy,
         demand: u32,
         report: &mut ReconcileReport,
-        launched: &mut Vec<RunnerAttempt>,
         reserved: &mut Vec<Reserved>,
     ) {
         // A lock-free pre-check, for one reason only: the host-wide lock should
@@ -3082,7 +3090,7 @@ impl Reconciler {
         // thing it can get wrong in the other direction is refusing a grant that
         // headroom freed a moment later would have allowed, which the next poll
         // picks up.
-        let intent = match self.allocate_only(policy, demand, launched).await {
+        let intent = match self.allocate_only(policy, demand, reserved).await {
             Ok(intent) => intent,
             Err(failure) => {
                 self.report_allocation_failure(report, &failure);
@@ -3127,7 +3135,7 @@ impl Reconciler {
             // whole sequence rather than on the decision alone -- reading the
             // headroom outside the lock is the shape in which two policies both
             // find room for the last slot.
-            let allocation = match self.allocate_only(policy, demand, launched).await {
+            let allocation = match self.allocate_only(policy, demand, reserved).await {
                 Ok(allocation) => allocation,
                 Err(failure) => {
                     drop(guard);
@@ -3166,14 +3174,13 @@ impl Reconciler {
             match created {
                 Ok(attempt) => {
                     let id = attempt.id;
-                    // Carried across policies for the rest of this pass, so the
-                    // host-wide total cannot be computed from a set that is
-                    // missing it. See `RunnerLauncher::launch`.
-                    launched.push(attempt.clone());
                     // At once, not once it is up: the launch has its runner, and
                     // the runner's report names the launch it was started for.
                     self.director.launched(policy, id);
                     budget -= 1;
+                    // Carried across policies for the rest of this pass, so the
+                    // host-wide total cannot be computed from a set that is
+                    // missing it. See `RunnerLauncher::launch`.
                     reserved.push(Reserved {
                         policy: policy.clone(),
                         attempt,
@@ -3246,7 +3253,7 @@ impl Reconciler {
     /// Whatever [`RunnerLauncher::attempts`] reported.
     async fn host_attempts(
         &self,
-        launched: &[RunnerAttempt],
+        reserved: &[Reserved],
     ) -> Result<Vec<RunnerAttempt>, LaunchFailure> {
         let mut attempts = self.launcher.attempts().await?;
 
@@ -3257,12 +3264,12 @@ impl Reconciler {
         // duplicate instead. `RunnerLauncher::launch` states the requirement;
         // this is what makes it findable.
         debug_assert!(
-            launched
+            reserved
                 .iter()
-                .map(|attempt| attempt.id)
+                .map(|reserved| reserved.attempt.id)
                 .collect::<BTreeSet<AttemptId>>()
                 .len()
-                == launched.len(),
+                == reserved.len(),
             "`RunnerLauncher::launch` returned an AttemptId this pass had already seen; \
              the host ceiling is enforced against a set keyed on that identifier, so a \
              duplicate is two runtimes counted as one"
@@ -3270,10 +3277,10 @@ impl Reconciler {
 
         let known: BTreeSet<AttemptId> = attempts.iter().map(|attempt| attempt.id).collect();
         attempts.extend(
-            launched
+            reserved
                 .iter()
-                .filter(|attempt| !known.contains(&attempt.id))
-                .cloned(),
+                .filter(|reserved| !known.contains(&reserved.attempt.id))
+                .map(|reserved| reserved.attempt.clone()),
         );
         Ok(attempts)
     }

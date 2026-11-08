@@ -47,7 +47,7 @@ use secrecy::SecretString;
 
 use crate::dependency_caches::DependencyCaches;
 use crate::oci::OciProcesses;
-use crate::package::{InstalledPackage, PackageCache, PackageError, RunnerVersion};
+use crate::package::{InstalledPackage, LastCheck, PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
     AllocationGuard, CleanBackoff, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent,
     OutcomeKind, ReplacementIntent, RunnerLauncher, failure_reason_kind,
@@ -299,16 +299,6 @@ pub struct PackageTimings {
     pub copy: Duration,
     /// A package was downloaded for this launch.
     pub downloaded: bool,
-}
-
-impl PackageTimings {
-    fn add(&mut self, other: Self) {
-        self.wait += other.wait;
-        self.install += other.install;
-        self.verify += other.verify;
-        self.copy += other.copy;
-        self.downloaded |= other.downloaded;
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -588,18 +578,19 @@ where
 /// Package/cache operations used by one attempt.
 #[async_trait]
 pub trait RuntimePackages: fmt::Debug + Send + Sync {
-    async fn materialize(&self, attempt: &RunnerAttempt) -> Result<RunnerVersion, FailureReason>;
+    /// Copy the package into `attempt`'s runtime, adding where the time went
+    /// to `timings`.
+    async fn materialize(
+        &self,
+        attempt: &RunnerAttempt,
+        timings: &mut PackageTimings,
+    ) -> Result<RunnerVersion, FailureReason>;
     fn release(&self, attempt: AttemptId) -> Result<(), FailureReason>;
     fn prune_obsolete_guarded(
         &self,
         authority: PruneAuthority<'_>,
         attempts: &[RunnerAttempt],
     ) -> Result<(), FailureReason>;
-
-    /// Where [`Self::materialize`] spent `attempt`'s time so far; asked once.
-    fn take_timings(&self, _attempt: AttemptId) -> PackageTimings {
-        PackageTimings::default()
-    }
 }
 
 /// Unforgeable evidence that pruning was reached through e1's launch request.
@@ -617,7 +608,12 @@ impl fmt::Debug for PruneAuthority<'_> {
 }
 
 impl<'a> PruneAuthority<'a> {
-    pub(crate) fn from_launch_request(guard: &'a AllocationGuard) -> Self {
+    fn from_launch_request(guard: &'a AllocationGuard) -> Self {
+        Self { _guard: guard }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(guard: &'a AllocationGuard) -> Self {
         Self { _guard: guard }
     }
 }
@@ -634,6 +630,17 @@ pub struct SharedPackages {
     /// or seed is not replaced under a copy.
     trees: Arc<tokio::sync::RwLock<()>>,
     trusted: Arc<TrustedTrees>,
+    last_check: LastCheck,
+}
+
+impl SharedPackages {
+    /// For each target's [`PackageCache`]: the published version is one fact,
+    /// so one target's check spares the others theirs, and each check holds
+    /// every copy on this host back.
+    #[must_use]
+    pub fn last_check(&self) -> LastCheck {
+        self.last_check.clone()
+    }
 }
 
 #[cfg(test)]
@@ -649,7 +656,14 @@ impl SharedPackages {
 pub struct CachedRuntimePackages {
     cache: Arc<PackageCache>,
     shared: SharedPackages,
-    timings: Mutex<HashMap<AttemptId, PackageTimings>>,
+}
+
+/// Add how long `work` took to `slot`.
+async fn timed<T>(slot: &mut Duration, work: impl std::future::Future<Output = T>) -> T {
+    let began = std::time::Instant::now();
+    let result = work.await;
+    *slot += began.elapsed();
+    result
 }
 
 impl CachedRuntimePackages {
@@ -667,19 +681,10 @@ impl CachedRuntimePackages {
             .map_err(|_| FailureReason::ProcessStartFailed)
     }
 
-    #[must_use]
-    pub fn new(cache: Arc<PackageCache>) -> Self {
-        Self::with_shared(cache, SharedPackages::default())
-    }
-
     /// One target's view of the package directory the targets of `shared` use.
     #[must_use]
-    pub fn with_shared(cache: Arc<PackageCache>, shared: SharedPackages) -> Self {
-        Self {
-            cache,
-            shared,
-            timings: Mutex::default(),
-        }
+    pub const fn new(cache: Arc<PackageCache>, shared: SharedPackages) -> Self {
+        Self { cache, shared }
     }
 
     /// The tree a runtime can be copied from right now, under nothing more than
@@ -694,17 +699,14 @@ impl CachedRuntimePackages {
             return Ok(None);
         };
         let destination = destination.to_path_buf();
-        let verifying = std::time::Instant::now();
-        let origin = self
-            .blocking(installed.root(), move |trusted, source| {
-                if trusted.holds(source) {
-                    copy_origin_ready(source, &destination, trusted)
-                } else {
-                    None
-                }
-            })
-            .await?;
-        timings.verify += verifying.elapsed();
+        let verifying = self.blocking(installed.root(), move |trusted, source| {
+            if trusted.holds(source) {
+                copy_origin_ready(source, &destination, trusted)
+            } else {
+                None
+            }
+        });
+        let origin = timed(&mut timings.verify, verifying).await?;
         Ok(origin.map(|origin| (installed, origin)))
     }
 
@@ -715,68 +717,78 @@ impl CachedRuntimePackages {
         destination: &Path,
         timings: &mut PackageTimings,
     ) -> Result<(InstalledPackage, PathBuf), FailureReason> {
-        let installing = std::time::Instant::now();
-        let (mut installed, downloaded) = self
-            .cache
-            .ensure_installed_reporting()
-            .await
-            .map_err(package_failure)?;
-        timings.install += installing.elapsed();
+        let (mut installed, downloaded) = timed(
+            &mut timings.install,
+            self.cache.ensure_installed_reporting(),
+        )
+        .await
+        .map_err(package_failure)?;
         timings.downloaded |= downloaded;
         // A cache entry this process did not install, or one that has changed
         // since, may hold a job's edits; replace it with one downloaded and
         // verified now. One this call just downloaded is trusted as it lands.
         // See `TrustedTrees`.
-        let verifying = std::time::Instant::now();
-        let fresh = downloaded || !self.blocking(installed.root(), TrustedTrees::holds).await?;
-        timings.verify += verifying.elapsed();
+        let fresh = downloaded
+            || !timed(
+                &mut timings.verify,
+                self.blocking(installed.root(), TrustedTrees::holds),
+            )
+            .await?;
         if fresh && !downloaded {
-            let installing = std::time::Instant::now();
-            installed = self.cache.reinstall().await.map_err(package_failure)?;
-            timings.install += installing.elapsed();
+            installed = timed(&mut timings.install, self.cache.reinstall())
+                .await
+                .map_err(package_failure)?;
             timings.downloaded = true;
         }
         let destination = destination.to_path_buf();
-        let verifying = std::time::Instant::now();
-        let origin = self
-            .blocking(installed.root(), move |trusted, source| {
+        let origin = timed(
+            &mut timings.verify,
+            self.blocking(installed.root(), move |trusted, source| {
                 if fresh {
                     trusted.record(source)?;
                 }
                 Ok::<_, std::io::Error>(copy_origin(source, &destination, trusted))
-            })
-            .await?
-            .map_err(|_| FailureReason::ProcessStartFailed)?;
-        timings.verify += verifying.elapsed();
+            }),
+        )
+        .await?
+        .map_err(|_| FailureReason::ProcessStartFailed)?;
         Ok((installed, origin))
     }
+}
 
-    async fn materialize_timed(
+#[async_trait]
+impl RuntimePackages for CachedRuntimePackages {
+    async fn materialize(
         &self,
         attempt: &RunnerAttempt,
         timings: &mut PackageTimings,
     ) -> Result<RunnerVersion, FailureReason> {
         let destination = attempt.runtime_path().to_path_buf();
-        let waiting = std::time::Instant::now();
-        let mut hold = self.shared.trees.read().await;
-        timings.wait += waiting.elapsed();
-        let (installed, origin) = match self.ready(&destination, timings).await? {
-            Some(ready) => ready,
-            None => {
-                drop(hold);
-                let waiting = std::time::Instant::now();
-                let exclusive = self.shared.trees.write().await;
-                timings.wait += waiting.elapsed();
-                let ready = self.install_trusted(&destination, timings).await?;
-                hold = exclusive.downgrade();
-                ready
+        let trees = &self.shared.trees;
+        // Only a launch that has something to change goes exclusive, and it lets
+        // go before it copies, so the launches queued behind it do not wait for
+        // its copy too. Once more if the tree still is not ready: a job edited
+        // it meanwhile, or a seed cannot be made here. Then it copies under what
+        // it just made, which no other launch can change.
+        let mut installs = 0;
+        let (hold, (installed, origin)) = loop {
+            let hold = timed(&mut timings.wait, trees.read()).await;
+            if let Some(ready) = self.ready(&destination, timings).await? {
+                break (hold, ready);
+            }
+            drop(hold);
+            let exclusive = timed(&mut timings.wait, trees.write()).await;
+            let ready = self.install_trusted(&destination, timings).await?;
+            installs += 1;
+            if installs == 2 {
+                break (exclusive.downgrade(), ready);
             }
         };
         // Off the async thread: the daemon runs a current-thread runtime, and a
         // copy can take minutes on a busy disk.
-        let copying = std::time::Instant::now();
-        let copied = self
-            .blocking(installed.root(), move |trusted, source| {
+        let copied = timed(
+            &mut timings.copy,
+            self.blocking(installed.root(), move |trusted, source| {
                 copy_package_from(source, &origin, &destination, trusted)?;
                 // Checked again after the copy: an edit a job made while it ran
                 // moved the entry's print, and the runtime may hold it.
@@ -787,9 +799,9 @@ impl CachedRuntimePackages {
                         "the runner package changed while copied",
                     ))
                 }
-            })
-            .await?;
-        timings.copy += copying.elapsed();
+            }),
+        )
+        .await?;
         if copied.is_err() {
             // Nothing a failed or tainted copy left may reach a retry's copy,
             // which lays out over the same runtime.
@@ -807,21 +819,6 @@ impl CachedRuntimePackages {
         // exclusive hold finds this runtime's lease.
         drop(hold);
         Ok(installed.version().clone())
-    }
-}
-
-#[async_trait]
-impl RuntimePackages for CachedRuntimePackages {
-    async fn materialize(&self, attempt: &RunnerAttempt) -> Result<RunnerVersion, FailureReason> {
-        let mut timings = PackageTimings::default();
-        let result = self.materialize_timed(attempt, &mut timings).await;
-        self.timings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(attempt.id)
-            .or_default()
-            .add(timings);
-        result
     }
 
     fn release(&self, attempt: AttemptId) -> Result<(), FailureReason> {
@@ -851,14 +848,6 @@ impl RuntimePackages for CachedRuntimePackages {
             }
         }
         Ok(())
-    }
-
-    fn take_timings(&self, attempt: AttemptId) -> PackageTimings {
-        self.timings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&attempt)
-            .unwrap_or_default()
     }
 }
 
@@ -1615,20 +1604,6 @@ fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
 /// byte copy of the ~9,000-file package across volumes took four minutes on a
 /// host whose runner root shared a busy disk with a build, and a queued job
 /// waits for every second of it.
-#[cfg(test)]
-fn copy_package_tree(
-    source: &Path,
-    destination: &Path,
-    seeds: &TrustedTrees,
-) -> std::io::Result<()> {
-    copy_package_from(
-        source,
-        &copy_origin(source, destination, seeds),
-        destination,
-        seeds,
-    )
-}
-
 /// The tree to copy `source` from, making a seed where one helps; a change to
 /// a tree, so only under the exclusive hold of [`SharedPackages::trees`].
 ///
@@ -1861,6 +1836,14 @@ fn tree_fingerprint(root: &Path) -> std::io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+#[cfg(unix)]
+fn seed_path(source: &Path, seeds: &Path) -> std::io::Result<PathBuf> {
+    let version = source
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("a cache entry has no name"))?;
+    Ok(seeds.join(version))
+}
+
 /// The seed of `source` under `seeds`, if its manifest matches the cache
 /// entry's and its fingerprint the one this process recorded.
 #[cfg(unix)]
@@ -1871,10 +1854,7 @@ fn held_seed(
 ) -> std::io::Result<Option<PathBuf>> {
     use crate::package::MANIFEST_FILE;
 
-    let version = source
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("a cache entry has no name"))?;
-    let seed = seeds.join(version);
+    let seed = seed_path(source, seeds)?;
     let manifest = fs::read(source.join(MANIFEST_FILE))?;
     let held = fs::read(seed.join(MANIFEST_FILE)).is_ok_and(|held| held == manifest)
         && trusted.holds(&seed);
@@ -1891,10 +1871,7 @@ fn refresh_package_seed(
     if let Some(seed) = held_seed(source, seeds, trusted)? {
         return Ok(seed);
     }
-    let version = source
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("a cache entry has no name"))?;
-    let seed = seeds.join(version);
+    let seed = seed_path(source, seeds)?;
 
     // Superseded versions, a stale seed and interrupted stagings all go.
     match remove_runtime_tree(seeds) {
@@ -4352,11 +4329,12 @@ impl LifecycleLauncher {
         &self,
         policy: &ScalePolicy,
         attempt: &RunnerAttempt,
+        timings: &mut PackageTimings,
     ) -> Result<RunnerVersion, FailureReason> {
         let mut issued = 0_u32;
         loop {
             issued = issued.saturating_add(1);
-            match self.ports.packages.materialize(attempt).await {
+            match self.ports.packages.materialize(attempt, timings).await {
                 Ok(version) => return Ok(version),
                 Err(reason)
                     if package_failure_is_terminal(&reason)
@@ -4703,7 +4681,6 @@ impl LifecycleLauncher {
         let mut stopwatch = LaunchStopwatch::new(lock_wait);
         let result = self.launch_steps(policy, attempt, &mut stopwatch).await;
         stopwatch.finish();
-        stopwatch.timings.package = self.ports.packages.take_timings(id);
         self.ports.events.emit(AttemptEvent::Launched {
             attempt: id,
             started: result.is_ok(),
@@ -4802,7 +4779,11 @@ impl LifecycleLauncher {
         // Never closed; held through the preparation below.
         let turn = self.turns.acquire().await.ok();
         stopwatch.begin(LaunchStep::Materialize);
-        let version = match self.materialize_with_retry(policy, &attempt).await {
+        let package_timings = &mut stopwatch.timings.package;
+        let version = match self
+            .materialize_with_retry(policy, &attempt, package_timings)
+            .await
+        {
             Ok(version) => version,
             Err(reason) => return self.fail_launch(&mut attempt, reason),
         };
@@ -5581,6 +5562,7 @@ mod tests {
         async fn materialize(
             &self,
             attempt: &RunnerAttempt,
+            _timings: &mut PackageTimings,
         ) -> Result<RunnerVersion, FailureReason> {
             self.materializations.fetch_add(1, Ordering::SeqCst);
             let now = self.materializing.fetch_add(1, Ordering::SeqCst) + 1;
@@ -6285,23 +6267,22 @@ mod tests {
             &self,
             launcher: &LifecycleLauncher,
         ) -> Result<RunnerAttempt, LaunchFailure> {
-            let guard = self.allocation_lock.acquire().await.unwrap();
-            let reserved = launcher
-                .launch(LaunchRequest {
-                    host: &self.host,
-                    policy: &self.policy,
-                    allocation_guard: &guard,
-                })
-                .await?;
-            drop(guard);
+            let reserved = self.reserve_through(launcher).await?;
             launcher
                 .finish_launch(&self.policy, reserved, Duration::ZERO)
                 .await
         }
 
         async fn reserve(&self) -> Result<RunnerAttempt, LaunchFailure> {
+            self.reserve_through(&self.launcher).await
+        }
+
+        async fn reserve_through(
+            &self,
+            launcher: &LifecycleLauncher,
+        ) -> Result<RunnerAttempt, LaunchFailure> {
             let guard = self.allocation_lock.acquire().await.unwrap();
-            self.launcher
+            launcher
                 .launch(LaunchRequest {
                     host: &self.host,
                     policy: &self.policy,
@@ -9238,7 +9219,11 @@ mod tests {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         harness.ready().await;
         let reserved = harness.reserve().await.unwrap();
-        harness.packages.materialize(&reserved).await.unwrap();
+        harness
+            .packages
+            .materialize(&reserved, &mut PackageTimings::default())
+            .await
+            .unwrap();
         harness.clock.advance_secs(31);
 
         harness
@@ -9283,6 +9268,15 @@ mod tests {
         assert_eq!(harness.packages.prunes.load(Ordering::SeqCst), 0);
         harness.launch().await;
         assert_eq!(harness.packages.prunes.load(Ordering::SeqCst), 1);
+    }
+
+    fn copy_package_tree(
+        source: &Path,
+        destination: &Path,
+        seeds: &TrustedTrees,
+    ) -> std::io::Result<()> {
+        let origin = copy_origin(source, destination, seeds);
+        copy_package_from(source, &origin, destination, seeds)
     }
 
     fn assert_no_jit_file(runtime: &Path) {

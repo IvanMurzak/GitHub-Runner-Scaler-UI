@@ -404,17 +404,20 @@ async fn run_generation(
                 RestInventory::new(Arc::clone(&client), Arc::clone(&clock)),
                 package_target.clone(),
             ));
-            let cache = Arc::new(PackageCache::new(
-                &target_paths,
-                host.os,
-                host.architecture,
-                CachePorts {
-                    catalog,
-                    fetcher: Arc::new(HttpFetcher::default()),
-                    backoff: Arc::new(ExponentialBackoff::default()),
-                    clock: Arc::clone(&clock),
-                },
-            ));
+            let cache = Arc::new(
+                PackageCache::new(
+                    &target_paths,
+                    host.os,
+                    host.architecture,
+                    CachePorts {
+                        catalog,
+                        fetcher: Arc::new(HttpFetcher::default()),
+                        backoff: Arc::new(ExponentialBackoff::default()),
+                        clock: Arc::clone(&clock),
+                    },
+                )
+                .with_last_check(shared_packages.last_check()),
+            );
             let lifecycle_store = Arc::new(TargetRecoveryStore::new(
                 Arc::clone(&store) as Arc<dyn Store>,
                 &policies,
@@ -430,10 +433,7 @@ async fn run_generation(
                     LifecyclePorts {
                         store: Arc::clone(&lifecycle_store) as Arc<dyn Store>,
                         github: Arc::clone(&lifecycle_github) as Arc<dyn LifecycleGithub>,
-                        packages: Arc::new(CachedRuntimePackages::with_shared(
-                            cache,
-                            shared_packages,
-                        )),
+                        packages: Arc::new(CachedRuntimePackages::new(cache, shared_packages)),
                         processes: Arc::new(
                             PlatformExecutionProvider::new(host.id)
                                 .with_runner_env_file(runner_manager_platform::runner_env::path_in(
@@ -3352,13 +3352,15 @@ mod tests {
     struct UnusedPackages;
 
     impl RuntimePackages for UnusedPackages {
-        fn materialize<'life0, 'life1, 'async_trait>(
+        fn materialize<'life0, 'life1, 'life2, 'async_trait>(
             &'life0 self,
             _attempt: &'life1 RunnerAttempt,
+            _timings: &'life2 mut runner_manager_agent::lifecycle::PackageTimings,
         ) -> Pin<Box<dyn Future<Output = Result<RunnerVersion, FailureReason>> + Send + 'async_trait>>
         where
             'life0: 'async_trait,
             'life1: 'async_trait,
+            'life2: 'async_trait,
             Self: 'async_trait,
         {
             Box::pin(async { panic!("startup recovery must not materialize a package") })
