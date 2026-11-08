@@ -259,7 +259,8 @@ impl AttemptEventSink for NoAttemptEvents {
 /// Where one launch spent its time. A step the launch never reached is zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaunchTimings {
-    /// Waiting for the host allocation lock, which another launch may hold.
+    /// Waiting for the host allocation lock, which another launch may hold, and
+    /// for the rest of its pass to be reserved after it.
     pub lock_wait: Duration,
     /// Waiting for a turn to prepare: see [`preparation_turns`].
     pub turn_wait: Duration,
@@ -4553,7 +4554,7 @@ impl LifecycleLauncher {
     ///
     /// Steps 1 to 6 of `02-target-architecture.md`, "Slot allocation", in order;
     /// step 7 is the journal write [`Self::record_allocation`] owns. All of them
-    /// run under the host allocation lock, because [`Self::launch_attempt`] is
+    /// run under the host allocation lock, because [`Self::reserve_attempt`] is
     /// reachable only through a `LaunchRequest` and that carries the guard.
     ///
     /// **The filesystem is never consulted to decide which slots are taken**
@@ -4667,7 +4668,14 @@ impl LifecycleLauncher {
         policy: &ScalePolicy,
         allocation_guard: &AllocationGuard,
     ) -> Result<RunnerAttempt, LifecycleError> {
-        self.prune_under_allocation_lock(allocation_guard)?;
+        // What a prune leaves costs only disk, and a tree it cannot remove is one
+        // the launch's install may yet repair: not a reason to refuse the launch.
+        if let Err(error) = self.prune_under_allocation_lock(allocation_guard) {
+            tracing::warn!(
+                event = "package_prune_failed",
+                reason = failure_reason_kind(&error.reason()),
+            );
+        }
         self.allocate_attempt(policy)
     }
 

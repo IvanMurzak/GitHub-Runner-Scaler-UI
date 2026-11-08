@@ -1184,8 +1184,9 @@ impl PackageCache {
         }
         let installed = self.install(true).await;
         // Removing ~9,000 files per tree is blocking work, kept off the
-        // daemon's current-thread runtime.
-        let _ = tokio::task::spawn_blocking(move || drop(set_aside)).await;
+        // daemon's current-thread runtime. Not awaited: nothing depends on it,
+        // and the caller has a new tree to fingerprint before a job touches it.
+        tokio::task::spawn_blocking(move || drop(set_aside));
         installed.map(|(package, _)| package)
     }
 
@@ -1816,7 +1817,7 @@ impl PackageCache {
     /// [`Self::holders`] and *before* it removes the directory, leaving a live
     /// attempt holding a package that is gone. Nothing here detects that.
     ///
-    /// **What makes it safe is `e1`'s host allocation lock, and nothing this
+    /// **What makes it safe is the caller's hold on the trees, and nothing this
     /// module could add.** A `Mutex` of its own would not help, and saying it
     /// was declined merely to avoid "a second ordering to get wrong" overstated
     /// the alternative: a leaf mutex taken and released inside two synchronous
@@ -1825,12 +1826,13 @@ impl PackageCache {
     /// is between *callers*, and only a lock the caller already holds across
     /// both can close it.
     ///
-    /// So the requirement is on the caller: **prune under the same host-wide
-    /// allocation lock a launch is taken under.** That lock already serialises
-    /// the launch that takes a lease, which makes this method's
-    /// read-then-remove indivisible with respect to every lease this agent
-    /// creates. It says nothing about a second agent on the same machine; the
-    /// single-instance lock is what prevents that.
+    /// So the requirement is on the caller: **prune under the exclusive hold of
+    /// the trees, and lease under at least a shared one**
+    /// (`crate::lifecycle::SharedPackages`). A launch keeps its hold from the
+    /// copy through its lease, which makes this method's read-then-remove
+    /// indivisible with respect to every lease this agent creates. It says
+    /// nothing about a second agent on the same machine; the single-instance
+    /// lock is what prevents that.
     ///
     /// Stated rather than silently assumed, and stated here rather than
     /// enforced, which is a weaker position than this module takes at
@@ -4429,13 +4431,19 @@ mod tests {
             1,
             "the reinstalled entry is the only one left"
         );
-        assert!(
+        // Removed in the background.
+        let staged = || {
             fs::read_dir(cache.staging_root())
                 .map(|entries| entries.count())
                 .unwrap_or(0)
-                == 0,
-            "the set-aside tree is removed"
-        );
+        };
+        for _ in 0..500 {
+            if staged() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(staged(), 0, "the set-aside tree is removed");
     }
 
     #[tokio::test]

@@ -1691,7 +1691,12 @@ impl AllocationLock for WslRecoveryAllocationLock {
             let root = config.shared_root;
             let claim = match held {
                 // A launch of this process already owns the directory.
-                Some(held) => held,
+                Some(held) => {
+                    if let Some(Err(error)) = held.0.as_ref().map(|claim| claim.renew()) {
+                        tracing::warn!(%error, "the WSL launch fence's age could not be renewed");
+                    }
+                    held
+                }
                 None => claim_guest_fence(&root)?,
             };
             match DrainRequest::read(&root) {
@@ -2362,8 +2367,10 @@ pub trait DemandDirector: fmt::Debug + Send + Sync {
     fn launched(&self, policy: &ScalePolicy, attempt: AttemptId);
 
     /// No runner could be started for `policy`, for a real reason: not a
-    /// runner still being brought up, nor a turn of the allocation lock.
-    fn start_failed(&self, _policy: &ScalePolicy) {}
+    /// runner still being brought up. `attempt` is the one reported through
+    /// [`Self::launched`] whose bring-up failed, if it got that far: what it was
+    /// reported for is waiting again, to be retried rather than placed anew.
+    fn start_failed(&self, _policy: &ScalePolicy, _attempt: Option<AttemptId>) {}
 
     /// Whether an older launch of another policy on this host still has no
     /// runner, so `policy` should let its target's loop reserve first.
@@ -2381,6 +2388,7 @@ struct Reserved {
     policy: ScalePolicy,
     attempt: RunnerAttempt,
     lock_wait: Duration,
+    reserved_at: std::time::Instant,
     /// Let go when this runner is up or has failed.
     _hold: LaunchHold,
 }
@@ -3094,7 +3102,7 @@ impl Reconciler {
             Ok(intent) => intent,
             Err(failure) => {
                 self.report_allocation_failure(report, &failure);
-                self.director.start_failed(policy);
+                self.director.start_failed(policy, None);
                 return;
             }
         };
@@ -3125,13 +3133,16 @@ impl Reconciler {
                         policy: policy.id,
                         count: budget,
                     });
+                    // The lock is held briefly now, so this is not a turn: a
+                    // Windows drain, the fence, or another process.
+                    self.director.start_failed(policy, None);
                     break;
                 }
             };
             let lock_wait = waiting_since.elapsed();
 
             // The read and the decision are both inside the hold, and so is the
-            // creation below. Two concurrent passes therefore serialise on the
+            // journalled reservation below. Two concurrent passes therefore serialise on the
             // whole sequence rather than on the decision alone -- reading the
             // headroom outside the lock is the shape in which two policies both
             // find room for the last slot.
@@ -3140,7 +3151,7 @@ impl Reconciler {
                 Err(failure) => {
                     drop(guard);
                     self.report_allocation_failure(report, &failure);
-                    self.director.start_failed(policy);
+                    self.director.start_failed(policy, None);
                     break;
                 }
             };
@@ -3185,11 +3196,12 @@ impl Reconciler {
                         policy: policy.clone(),
                         attempt,
                         lock_wait,
+                        reserved_at: std::time::Instant::now(),
                         _hold: hold,
                     });
                 }
                 Err(failure) => {
-                    self.note_start_failed(policy, &failure);
+                    self.note_start_failed(policy, None, &failure);
                     break;
                 }
             }
@@ -3210,33 +3222,40 @@ impl Reconciler {
     async fn finish_reserved(&self, reserved: Vec<Reserved>, report: &mut ReconcileReport) {
         let finished = futures::future::join_all(reserved.into_iter().map(|reserved| async move {
             let id = reserved.attempt.id;
+            let waited = reserved.lock_wait + reserved.reserved_at.elapsed();
             let result = self
                 .launcher
-                .finish_launch(&reserved.policy, reserved.attempt, reserved.lock_wait)
+                .finish_launch(&reserved.policy, reserved.attempt, waited)
                 .await;
-            (reserved.policy, id, result)
+            // Told here and not after the others are up: the journal already
+            // says this one failed, and the attempt reports read it.
+            match &result {
+                Ok(_) => self.events.emit(LifecycleEvent::RunnerStarted {
+                    policy: reserved.policy.id,
+                    attempt: id,
+                }),
+                Err(failure) => self.note_start_failed(&reserved.policy, Some(id), failure),
+            }
+            result.is_ok()
         }))
         .await;
-        for (policy, id, result) in finished {
-            match result {
-                Ok(_) => {
-                    report.started = report.started.saturating_add(1);
-                    self.events.emit(LifecycleEvent::RunnerStarted {
-                        policy: policy.id,
-                        attempt: id,
-                    });
-                }
-                Err(failure) => self.note_start_failed(&policy, &failure),
-            }
-        }
+        let started = finished.into_iter().filter(|started| *started).count();
+        report.started = report
+            .started
+            .saturating_add(u16::try_from(started).unwrap_or(u16::MAX));
     }
 
-    fn note_start_failed(&self, policy: &ScalePolicy, failure: &LaunchFailure) {
+    fn note_start_failed(
+        &self,
+        policy: &ScalePolicy,
+        attempt: Option<AttemptId>,
+        failure: &LaunchFailure,
+    ) {
         self.events.emit(LifecycleEvent::RunnerStartFailed {
             policy: policy.id,
             reason: failure_reason_kind(&failure.reason),
         });
-        self.director.start_failed(policy);
+        self.director.start_failed(policy, attempt);
     }
 
     /// The attempt set the host holds, plus everything this pass has already
@@ -4238,7 +4257,20 @@ mod tests {
         drop(first);
         assert!(claimed(shared.path()), "held while its runner comes up");
 
+        let claimed_at = FenceClaim::owner(shared.path())
+            .unwrap()
+            .unwrap()
+            .acquired_at;
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let second = lock.acquire().await.expect("this process owns the fence");
+        assert!(
+            FenceClaim::owner(shared.path())
+                .unwrap()
+                .unwrap()
+                .acquired_at
+                > claimed_at,
+            "a claim launches keep sharing is not one stuck for that long"
+        );
         let second_runner = second.launch_hold();
         drop(second);
         drop(first_runner);
@@ -7409,7 +7441,7 @@ mod tests {
     struct FixedDirector {
         directed: Mutex<BTreeMap<PolicyId, u32>>,
         started: Mutex<Vec<(PolicyId, AttemptId)>>,
-        failed: Mutex<Vec<PolicyId>>,
+        failed: Mutex<Vec<(PolicyId, Option<AttemptId>)>>,
         /// How many more times an older launch is said to be waiting.
         older: AtomicUsize,
     }
@@ -7423,8 +7455,8 @@ mod tests {
             self.started.lock().unwrap().push((policy.id, attempt));
         }
 
-        fn start_failed(&self, policy: &ScalePolicy) {
-            self.failed.lock().unwrap().push(policy.id);
+        fn start_failed(&self, policy: &ScalePolicy, attempt: Option<AttemptId>) {
+            self.failed.lock().unwrap().push((policy.id, attempt));
         }
 
         fn older_waiting(&self, _policy: &ScalePolicy) -> bool {
@@ -7603,8 +7635,11 @@ mod tests {
         let report = reconciler.start_directed(std::slice::from_ref(&pool)).await;
 
         assert_eq!(report.started, 0);
-        assert_eq!(director.started.lock().unwrap().len(), 1);
-        assert_eq!(*director.failed.lock().unwrap(), vec![pool.id]);
+        let started = director.started.lock().unwrap()[0].1;
+        assert_eq!(
+            *director.failed.lock().unwrap(),
+            vec![(pool.id, Some(started))]
+        );
     }
 
     /// Oldest first across targets: a younger launch waits for an older one to

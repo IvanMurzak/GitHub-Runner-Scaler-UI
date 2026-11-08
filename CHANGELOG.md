@@ -29,8 +29,11 @@ the version being prepared rather than the version in `Cargo.toml`.
   launches whose runner was waiting for a turn. It now counts from a start that
   failed for a real reason. A launch whose runner is coming up keeps its lease past
   its lifetime, for up to 15 minutes, because the heartbeat that lists it now renews
-  the lease at the coordinator. A launch whose runner is up and took no job expires
-  as before.
+  the lease at the coordinator. So does one waiting for its target's loop to finish
+  bringing up other runners of its profile. A launch whose runner is up and took no
+  job expires as before, and one whose runner failed coming up is retried within the
+  45 seconds. Upgrade the coordinator first: an older one does not renew a lease, so
+  a slow runner's job can be placed a second time, leaving a surplus runner.
 - **Launches start oldest first across the targets of a host.** A younger launch
   lets an older one reserve first, for at most 2 seconds, and runners take their
   turns to prepare in the order they were reserved.

@@ -306,8 +306,9 @@ without polling GitHub, so the 5-second gap between polls does not apply; the ne
 stays where it was scheduled. Each runner's slot is reserved and journalled one after another under
 the host-wide allocation lock, the same lock every pass takes, so the ceilings hold exactly. The lock
 is then released: runners of all targets of the host get their packages and register at the same time,
-a quarter of its cores at once (at least two), oldest first. A younger launch lets an older launch of
-another target reserve first, for at most 2 seconds. A daemon that dies in between leaves a journalled
+oldest first. A quarter of its cores (at least two) prepare at once; registration is not bounded. A
+younger launch lets an older launch of another target reserve first, for at most 2 seconds. A launch
+accepted while its target's loop brings up a batch starts when that batch is up. A daemon that dies in between leaves a journalled
 attempt, which startup recovery concludes.
 
 A slow launch is a warning in the host's log, `attempt_launch_slow`, saying where the time went:
