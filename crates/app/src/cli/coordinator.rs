@@ -1480,22 +1480,19 @@ async fn serve(
                     .into_iter()
                     .filter(|policy| policy.is_owned_by(ports.host.id))
                     .collect();
-                let mut freed = false;
                 for report in reports.poll(ports.store.as_ref(), &own, &ports.launches, meters) {
                     let message = match report {
                         AttemptReport::Started(started) => HostMessage::AttemptStarted(started),
-                        AttemptReport::Finished(finished) => {
-                            freed = true;
-                            HostMessage::AttemptFinished(finished)
-                        }
+                        AttemptReport::Finished(finished) => HostMessage::AttemptFinished(finished),
                     };
                     if let Err(end) = send(socket, &message).await {
                         return end;
                     }
                 }
                 // The coordinator places by the last heartbeat: a slot just
-                // freed is said at once, not at the next beat.
-                if freed {
+                // freed (an attempt ended, or an isolated one was cleaned)
+                // is said at once, not at the next beat.
+                if reports.take_released() {
                     let policies = ports.store.policies().unwrap_or_default();
                     let beat = HostMessage::Heartbeat(heartbeat(ports, &policies));
                     if let Err(end) = send(socket, &beat).await {
@@ -2012,7 +2009,9 @@ mod tests {
             .state(AttemptState::Finished)
             .outcome(AttemptOutcome::CompletedJob)
             .build();
-        tokio::time::sleep(ATTEMPT_WATCH + Duration::from_millis(500)).await;
+        // The accepted launch's runner: its end is reported even if the link
+        // never saw it busy, however slow this machine is.
+        launches.launched(&policy, first);
         sqlite.record_attempt(&finished).expect("finished");
         let busy = || {
             state

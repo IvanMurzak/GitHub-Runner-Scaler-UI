@@ -164,7 +164,7 @@ database from before the upgrade, or stop the service and run
 `sqlite3 coordinator.db 'PRAGMA user_version = 1'` (the stage-3 code never reads the new
 tables, and a later upgrade keeps them). 0.4.47 moves it to schema 3 (a `queue_wait_secs` column on
 the samples); to roll back to 0.4.46, `sqlite3 coordinator.db 'PRAGMA user_version = 2'` the same
-way (0.4.46 never reads the column).
+way (0.4.46 never reads the column, and upgrading again keeps it).
 
 The protocol is versioned: a stage-1 host and this coordinator, or this host and a stage-1
 coordinator, settle on version 1 and work as stage 1 did (the host is then in `fallback`).
@@ -233,7 +233,7 @@ it is joined the host checks every 2 seconds whether a live runner's process has
 so, runs that pass at once (at most 5 seconds after the previous one) instead of at the target's
 next scheduled poll (up to 60 seconds later). A runner in a container, a VM or a WSL distribution
 keeps its slot until its environment is proven gone and cleaned up, deliberately: until then it
-may still be running.
+may still be running. Its host sends a heartbeat as soon as that cleanup is done.
 
 A launch is a **lease** for 5 minutes. GitHub hands a runner *any* queued job its labels cover, so
 the coordinator counts per repository and label set: it never holds more leases than jobs are
@@ -304,7 +304,7 @@ a sample.
 A sample's **duration** is the job's own run time, `started_at` to `completed_at`, so a 14-second
 job reads 14 seconds and not the minute its runner lived. Its **queue wait** is `created_at` to
 `started_at`: how long the job waited for a runner, which placement exists to keep short. A report
-whose job is named waits up to 2 minutes for the `completed` webhook (normally seconds away, in
+whose job is named waits 2 to 3 minutes for the `completed` webhook (normally seconds away, in
 either direction); if it never comes, the sample is recorded with the host's attempt duration
 instead. Samples recorded before 0.4.47 carry the attempt duration and no queue wait; the newest
 30 per job replace them.

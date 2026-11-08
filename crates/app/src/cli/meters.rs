@@ -32,6 +32,10 @@ use tokio::time::Instant;
 /// How often each live attempt's process tree is sampled.
 pub const SAMPLE_EVERY: Duration = Duration::from_secs(2);
 
+/// How soon an exited runner whose attempt is still live is announced again:
+/// the 30-second floor of a target's own active polling.
+const ANNOUNCE_AGAIN: Duration = Duration::from_secs(30);
+
 /// How long a meter outlives its attempt's last sample, waiting for the
 /// attempt report that takes it.
 const KEEP_AFTER_LAST_SAMPLE: Duration = Duration::from_secs(10 * 60);
@@ -77,10 +81,11 @@ impl Meter {
 #[derive(Debug, Default)]
 pub struct AttemptMeters {
     meters: Mutex<HashMap<AttemptId, Meter>>,
-    /// Live attempts whose runner process was already seen gone: each is
-    /// announced once, so an attempt a pass cannot conclude yet (GitHub
-    /// unreachable) does not pull every later poll forward.
-    exited: Mutex<HashSet<AttemptId>>,
+    /// Live attempts whose runner process was seen gone, and when that was
+    /// last announced: again only after [`ANNOUNCE_AGAIN`], so an attempt a
+    /// pass cannot conclude yet (GitHub unreachable) does not pull every poll
+    /// forward, and one misread process table does not silence it for good.
+    exited: Mutex<HashMap<AttemptId, Instant>>,
 }
 
 impl AttemptMeters {
@@ -158,14 +163,21 @@ impl AttemptMeters {
             .exited
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        seen.retain(|attempt| live.contains(attempt));
+        seen.retain(|attempt, _| live.contains(attempt));
         for (attempt, pid, target) in roots {
-            match trees.get(&pid) {
-                Some(usage) => self.record(attempt, now, *usage),
-                // A repeated target is harmless: a nudge is one permit.
-                None if seen.insert(attempt) => exited.push(target.clone()),
-                None => {}
-            }
+            let Some(usage) = trees.get(&pid) else {
+                let due = seen
+                    .get(&attempt)
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= ANNOUNCE_AGAIN);
+                if due {
+                    seen.insert(attempt, now);
+                    // A repeated target is harmless: a nudge is one permit.
+                    exited.push(target.clone());
+                }
+                continue;
+            };
+            seen.remove(&attempt);
+            self.record(attempt, now, *usage);
         }
         drop(seen);
         self.forget_stale(&live, now);
@@ -268,10 +280,11 @@ mod tests {
         assert!(meters.take(stale).is_none());
     }
 
-    /// A live attempt whose runner process is gone is announced once, by
-    /// its target, so its loop concludes it now; a running one is sampled.
+    /// A live attempt whose runner process is gone is announced by its
+    /// target, so its loop concludes it now, and again only after a while;
+    /// a running one is sampled.
     #[test]
-    fn a_runner_whose_process_exited_is_announced_once() {
+    fn a_runner_whose_process_exited_is_announced_and_again_while_it_stays_live() {
         use runner_manager_domain::attempt::AttemptState;
         use runner_manager_domain::store::SqliteStore;
         use runner_manager_testkit::fixtures;
@@ -314,7 +327,18 @@ mod tests {
         );
         assert!(
             meters.sample_once(&store, host.id).is_empty(),
-            "announced once"
+            "not announced again at once"
+        );
+        // Still live a while later (its pass could not conclude it): again.
+        meters
+            .exited
+            .lock()
+            .expect("lock")
+            .values_mut()
+            .for_each(|at| *at = at.checked_sub(ANNOUNCE_AGAIN).expect("earlier"));
+        assert_eq!(
+            meters.sample_once(&store, host.id),
+            vec![policy.target.clone()]
         );
         assert!(
             meters.take(running).is_some(),

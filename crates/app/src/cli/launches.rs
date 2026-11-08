@@ -361,6 +361,10 @@ struct Watched {
 #[derive(Debug, Default)]
 pub struct AttemptReports {
     watched: HashMap<AttemptId, Watched>,
+    /// An attempt ended or was cleaned since [`Self::take_released`]: a slot
+    /// may have freed. An isolated attempt frees its slot only when cleaned,
+    /// after its `attempt_finished`.
+    released: bool,
 }
 
 /// One report to send.
@@ -418,6 +422,7 @@ impl AttemptReports {
                 }
                 if ended && !watched.finished {
                     watched.finished = true;
+                    self.released = true;
                     reports.push(finished(&attempt, launches, meters));
                 }
             }
@@ -429,6 +434,7 @@ impl AttemptReports {
             .filter(|id| !present.contains(id))
             .copied()
             .collect();
+        self.released |= !gone.is_empty();
         for id in gone {
             let unreported = self.watched.remove(&id).is_some_and(|watched| {
                 !watched.finished && policies.iter().any(|policy| policy.id == watched.policy)
@@ -438,6 +444,11 @@ impl AttemptReports {
             }
         }
         reports
+    }
+
+    /// Whether a slot may have freed since the last call.
+    pub fn take_released(&mut self) -> bool {
+        std::mem::take(&mut self.released)
     }
 }
 
@@ -539,6 +550,41 @@ mod tests {
             launches.decide(&launch(&policy, "l3"), true, false).reason,
             Some(RefusalReason::Unfit)
         );
+    }
+
+    /// A slot may free when an attempt ends and again when it is cleaned
+    /// (an isolated runner holds its slot until then): both are signalled,
+    /// each once.
+    #[test]
+    fn an_ended_and_a_cleaned_attempt_each_signal_a_released_slot() {
+        let (store, policy, launches) = setup(LAUNCH_VERSION);
+        let policies = vec![policy.clone()];
+        let meters = AttemptMeters::default();
+        let mut reports = AttemptReports::default();
+        let id = AttemptId::new_random();
+        let in_state = |state| {
+            fixtures::attempt()
+                .id(id)
+                .policy_id(policy.id)
+                .state(state)
+                .build()
+        };
+        store
+            .record_attempt(&in_state(AttemptState::Busy))
+            .expect("busy");
+        reports.poll(store.as_ref(), &policies, &launches, &meters);
+        assert!(!reports.take_released(), "a busy runner frees nothing");
+        store
+            .record_attempt(&in_state(AttemptState::Finished))
+            .expect("finished");
+        reports.poll(store.as_ref(), &policies, &launches, &meters);
+        assert!(reports.take_released());
+        assert!(!reports.take_released(), "said once");
+        store
+            .record_attempt(&in_state(AttemptState::Cleaned))
+            .expect("cleaned");
+        reports.poll(store.as_ref(), &policies, &launches, &meters);
+        assert!(reports.take_released(), "cleaned: its slot is free now");
     }
 
     #[test]

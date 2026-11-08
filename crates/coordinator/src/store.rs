@@ -172,11 +172,20 @@ impl Store {
             )?;
         }
         if version < 3 {
-            // 0.4.47: a sample's queue wait, by GitHub's webhooks.
-            connection.execute_batch(
-                "ALTER TABLE job_samples ADD COLUMN queue_wait_secs INTEGER;
-                PRAGMA user_version = 3;",
-            )?;
+            // 0.4.47: a sample's queue wait, by GitHub's webhooks. The column
+            // may already be there: a rollback to 0.4.46 only lowers
+            // `user_version`, and the admin CLI may upgrade the file at the
+            // same moment as the server.
+            if !has_column(&connection, "job_samples", "queue_wait_secs")?
+                && let Err(error) = connection.execute(
+                    "ALTER TABLE job_samples ADD COLUMN queue_wait_secs INTEGER",
+                    [],
+                )
+                && !has_column(&connection, "job_samples", "queue_wait_secs")?
+            {
+                return Err(error.into());
+            }
+            connection.pragma_update(None, "user_version", 3)?;
         }
         Ok(Self { connection })
     }
@@ -352,6 +361,13 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Whether `table` has a column named `column`.
+fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    Ok(connection
+        .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+        .exists(params![table, column])?)
 }
 
 /// One measured attempt: a job of `job_key` that ran on `host_id`.
@@ -801,6 +817,15 @@ mod tests {
             (kept[0].duration_secs, kept[0].queue_wait_secs),
             (Some(60), None)
         );
+        // Rolled back to 0.4.46 (`user_version = 2`, the column kept), then
+        // upgraded again: the column is not added twice.
+        store
+            .connection
+            .pragma_update(None, "user_version", 2)
+            .expect("rolled back");
+        drop(store);
+        let store = Store::open(&path).expect("upgraded again");
+        assert_eq!(store.samples(oldest).expect("read").len(), 1);
     }
 
     #[test]

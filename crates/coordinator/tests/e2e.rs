@@ -774,7 +774,13 @@ async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_quer
             .map_or(0, |job| job.samples)
     };
     // The old host's sample waits until its job is known to have ended.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..250 {
+        if samples() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(samples(), 1, "only the job known to have completed");
     assert_eq!(
         coordinator

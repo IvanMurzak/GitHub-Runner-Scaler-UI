@@ -15,8 +15,8 @@ the version being prepared rather than the version in `Cargo.toml`.
   `coordinator stats` is now GitHub's own `started_at` to `completed_at`, so a
   14-second job reads 14 s instead of the 60-80 s its runner lived (start-up,
   waiting for the job and cleanup included). Only when GitHub's `completed`
-  webhook never arrives (2 minutes) does a sample fall back to the host's
-  measured time. Peak memory and CPU are measured by the host as before.
+  webhook never arrives (within 2-3 minutes) does a sample fall back to the
+  host's measured time. Peak memory and CPU are measured by the host as before.
   Samples recorded by 0.4.45-0.4.46 keep their old durations until newer runs
   replace them (the last 30 per job).
 - **A freed slot is used at once.** When a runner ends, the host tells the
@@ -26,7 +26,8 @@ the version being prepared rather than the version in `Cargo.toml`.
   runner's process has exited and frees its slot then, instead of at the
   target's next poll (up to 60 s). Cleanup of the runner's files never held
   the slot; a container, VM or WSL runner still keeps it until its
-  environment is proven gone, as before.
+  environment is proven gone, as before, and its host reports the free slot
+  as soon as that cleanup is done.
 - **Hosts reconnect within 30 seconds after a coordinator restart.** The
   link's reconnect wait now stops at 30 s, random spread included (it could
   reach 90 s, which added up to minutes), and starts over after a connection
