@@ -278,21 +278,6 @@ impl Correlator {
             .retain(|_, (_, _, at)| now.saturating_duration_since(*at) < PENDING_MEMORY);
     }
 
-    /// Takes `runner`'s pending report and its job, if both are here.
-    fn take(&mut self, runner: &str) -> Option<Correlated> {
-        if !(self.pending.contains_key(runner) && self.identities.contains_key(runner)) {
-            return None;
-        }
-        let (host_id, finished, _) = self.pending.remove(runner)?;
-        let (identity, times, _) = self.identities.remove(runner)?;
-        Some(Correlated {
-            host_id,
-            identity,
-            times,
-            finished,
-        })
-    }
-
     /// A webhook named the job `runner` took (`in_progress`) or finished
     /// (`completed`), with its times; returns the host's report once the job
     /// is complete and the report is in.
@@ -310,24 +295,27 @@ impl Correlator {
         }
         self.forget_old(now);
         let runner = runner.to_ascii_lowercase();
-        let complete = match self.identities.get_mut(&runner) {
-            Some((known, known_times, at)) => {
-                *known = identity;
-                known_times.merge(times);
-                *at = now;
-                known_times.completed_at.is_some()
+        let times = match self.identities.remove(&runner) {
+            Some((_, mut known, _)) => {
+                known.merge(times);
+                known
             }
             None => {
                 make_room(&mut self.identities, |(_, _, at)| *at);
-                let complete = times.completed_at.is_some();
-                self.identities
-                    .insert(runner.clone(), (identity, times, now));
-                complete
+                times
             }
         };
-        if complete {
-            return self.take(&runner);
+        if times.completed_at.is_some()
+            && let Some((host_id, finished, _)) = self.pending.remove(&runner)
+        {
+            return Some(Correlated {
+                host_id,
+                identity,
+                times,
+                finished,
+            });
         }
+        self.identities.insert(runner, (identity, times, now));
         None
     }
 
@@ -354,16 +342,22 @@ impl Correlator {
             self.identities.remove(&runner);
             return None;
         }
-        let complete = self
+        if self
             .identities
             .get(&runner)
-            .is_some_and(|(_, times, _)| times.completed_at.is_some());
+            .is_some_and(|(_, times, _)| times.completed_at.is_some())
+            && let Some((identity, times, _)) = self.identities.remove(&runner)
+        {
+            return Some(Correlated {
+                host_id: host_id.to_string(),
+                identity,
+                times,
+                finished,
+            });
+        }
         make_room(&mut self.pending, |(_, _, at)| *at);
         self.pending
-            .insert(runner.clone(), (host_id.to_string(), finished, now));
-        if complete {
-            return self.take(&runner);
-        }
+            .insert(runner, (host_id.to_string(), finished, now));
         None
     }
 
@@ -379,7 +373,18 @@ impl Correlator {
             })
             .map(|(runner, _)| runner.clone())
             .collect();
-        due.iter().filter_map(|runner| self.take(runner)).collect()
+        due.into_iter()
+            .filter_map(|runner| {
+                let (host_id, finished, _) = self.pending.remove(&runner)?;
+                let (identity, times, _) = self.identities.remove(&runner)?;
+                Some(Correlated {
+                    host_id,
+                    identity,
+                    times,
+                    finished,
+                })
+            })
+            .collect()
     }
 }
 

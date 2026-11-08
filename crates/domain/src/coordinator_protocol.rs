@@ -684,6 +684,11 @@ pub enum SessionPurpose {
     Other,
 }
 
+/// Version of the `stats --json` document, on a host and on the coordinator.
+/// 2 (0.4.47): `p50_duration_secs` is the job's own run time by GitHub's
+/// webhooks, and the queue wait percentiles are added.
+pub const STATS_JSON_SCHEMA_VERSION: u32 = 2;
+
 /// The coordinator's job weight statistics, as `stats` prints them.
 ///
 /// Repository, workflow and job names come from GitHub's webhooks for the

@@ -15,7 +15,9 @@ use runner_manager_coordinator::server::{AppState, Config, serve};
 use runner_manager_coordinator::stats::{self, StatsConfig, Weights};
 use runner_manager_coordinator::store::{HostRecord, Store};
 use runner_manager_coordinator::sweep::{self, Sweeper};
-use runner_manager_domain::coordinator_protocol::{CoordinatorUrl, StatsReport};
+use runner_manager_domain::coordinator_protocol::{
+    CoordinatorUrl, STATS_JSON_SCHEMA_VERSION, StatsReport,
+};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 
@@ -24,10 +26,6 @@ const MIN_SECRET_LEN: usize = 16;
 
 /// Version of `hosts list --json`.
 const JSON_SCHEMA_VERSION: u32 = 1;
-
-/// Version of `stats --json`. 2 (0.4.47): `p50_duration_secs` is the job's own
-/// run time by GitHub's webhooks, and the queue wait percentiles are added.
-const STATS_JSON_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Parser)]
 #[command(name = "runner-manager-coordinator", version, about)]

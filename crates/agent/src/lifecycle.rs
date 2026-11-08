@@ -8872,12 +8872,10 @@ mod tests {
         let ready = std::env::var_os("RUNNER_MANAGER_TEST_LISTENER_READY")
             .map(PathBuf::from)
             .expect("the parent supplies the readiness path");
-        // Written aside and renamed into place: `fs::write` creates the file
-        // before it writes, and a parent polling for it could read it empty.
-        let mut staging = ready.clone().into_os_string();
-        staging.push(".tmp");
-        fs::write(&staging, b"ready\n").expect("the listener writes readiness aside");
-        fs::rename(&staging, &ready).expect("the listener publishes readiness");
+        // Atomically: the parent polls for the file and must never read it
+        // created but not yet written.
+        runner_manager_platform::host_fitness::write_atomically(&ready, b"ready\n")
+            .expect("the listener publishes readiness");
         std::thread::sleep(Duration::from_secs(30));
     }
 
@@ -8885,16 +8883,9 @@ mod tests {
         let ready = attempt.runtime_path().join(TEST_LISTENER_READY);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            // The helper renames the file into place, so it is complete or
-            // absent; a partial read is still only retried, never failed on.
-            if let Ok(contents) = fs::read(&ready) {
-                if contents == b"ready\n" {
-                    return;
-                }
-                assert!(
-                    b"ready\n".starts_with(&contents),
-                    "unexpected readiness contents {contents:?}"
-                );
+            if ready.is_file() {
+                assert_eq!(fs::read(&ready).unwrap(), b"ready\n");
+                return;
             }
             assert!(
                 processes.is_alive(attempt).unwrap(),

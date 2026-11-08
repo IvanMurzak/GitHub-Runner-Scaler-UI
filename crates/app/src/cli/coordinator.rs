@@ -67,6 +67,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::{SinkExt as _, StreamExt as _};
+use runner_manager_agent::reconcile::{Jitter, RandomJitter};
 use runner_manager_domain::attempt::active_count;
 use runner_manager_domain::coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CoordinatorUrl, EnrollRequest, EnrollResponse,
@@ -120,11 +121,6 @@ const CONFIG_RECHECK: Duration = Duration::from_secs(15);
 
 /// Version of `coordinator status --json`.
 const STATUS_SCHEMA_VERSION: u32 = 1;
-
-/// Version of `coordinator stats --json`. 2 (0.4.47): `p50_duration_secs` is
-/// the job's own run time by GitHub's webhooks, and the queue wait
-/// percentiles are added.
-const STATS_SCHEMA_VERSION: u32 = 2;
 
 /// How often the link looks at this host's attempts for its reports.
 const ATTEMPT_WATCH: Duration = Duration::from_secs(2);
@@ -419,7 +415,11 @@ fn stats(context: &Context, json: bool, out: &mut dyn Write) -> Result<(), CliEr
             )),
         })?;
     if json {
-        return write_document(out, STATS_SCHEMA_VERSION, &report);
+        return write_document(
+            out,
+            runner_manager_domain::coordinator_protocol::STATS_JSON_SCHEMA_VERSION,
+            &report,
+        );
     }
     let mut text = String::new();
     report
@@ -941,6 +941,8 @@ struct Recorder {
     paths: AppPaths,
     record: LinkRecord,
     written: Option<tokio::time::Instant>,
+    /// When the current session connected, for the reconnect back-off.
+    connected_at: Option<tokio::time::Instant>,
 }
 
 /// How often an unchanged link record is rewritten, well inside
@@ -966,6 +968,7 @@ impl Recorder {
     /// Connected at protocol `version`; a version-1 coordinator sends no
     /// `hello_ack`, so it covers nothing.
     fn connected(&mut self, version: u32) {
+        self.connected_at = Some(tokio::time::Instant::now());
         self.record.connected = true;
         self.record.since = Some(Utc::now());
         self.record.reason = None;
@@ -1027,6 +1030,7 @@ async fn link(ports: LinkPorts, meters: &AttemptMeters) {
         paths: ports.paths.clone(),
         record: LinkRecord::new(Utc::now()),
         written: None,
+        connected_at: None,
     };
     let mut backoff = Backoff::default();
     loop {
@@ -1053,16 +1057,8 @@ async fn link(ports: LinkPorts, meters: &AttemptMeters) {
             view.configured = true;
             changed
         });
-        let mut connected_at = None;
-        let end = session(
-            &ports,
-            meters,
-            &config,
-            tls.clone(),
-            &mut recorder,
-            &mut connected_at,
-        )
-        .await;
+        recorder.connected_at = None;
+        let end = session(&ports, meters, &config, tls.clone(), &mut recorder).await;
         // The coordinator forgets a disconnected host's launches and places
         // their jobs elsewhere; starting them here as well would double up.
         ports.launches.clear();
@@ -1087,12 +1083,11 @@ async fn link(ports: LinkPorts, meters: &AttemptMeters) {
             continue;
         }
         recorder.disconnected(end);
-        let connected_for = connected_at.map(|at| at.elapsed());
+        let connected_for = recorder.connected_at.map(|at| at.elapsed());
         // In steps, so a back-off longer than `LINK_STALE_AFTER` (a refusal
         // waits up to 5 minutes) does not make `status` call a running
         // service silent.
-        let resume =
-            tokio::time::Instant::now() + backoff.after(end, connected_for, rand::random::<f64>());
+        let resume = tokio::time::Instant::now() + backoff.after(end, connected_for, &RandomJitter);
         while tokio::time::Instant::now() < resume {
             tokio::time::sleep_until(resume.min(tokio::time::Instant::now() + LINK_KEEPALIVE))
                 .await;
@@ -1126,18 +1121,15 @@ impl Backoff {
         self.next = RECONNECT_FIRST;
     }
 
-    /// The wait after a session that ended `end`, having been connected for
-    /// `connected_for` (`None`: it never connected), with `fraction` (0 to 1)
-    /// of the jitter.
-    ///
-    /// The jitter adds up to half of the delay, so a fleet does not reconnect
-    /// in step; the delay itself stops at two thirds of the cap, so the wait
-    /// stays within the cap and is still spread out there.
+    /// The wait after a session that ended `end`, connected for
+    /// `connected_for` (`None`: never). Jitter adds up to half the delay, and
+    /// the delay stops at two thirds of the cap, so even the plateau is spread
+    /// out and within the cap.
     fn after(
         &mut self,
         end: SessionEnd,
         connected_for: Option<Duration>,
-        fraction: f64,
+        jitter: &dyn Jitter,
     ) -> Duration {
         if connected_for.is_some_and(|connected| connected > STABLE_SESSION) {
             self.reset();
@@ -1152,7 +1144,7 @@ impl Backoff {
         let delay = self.next.min(cap.mul_f64(2.0 / 3.0));
         self.next = self.next.saturating_mul(2);
         delay
-            .saturating_add(delay.mul_f64(fraction.clamp(0.0, 1.0) * 0.5))
+            .saturating_add(delay.mul_f64(jitter.fraction().clamp(0.0, 1.0) * 0.5))
             .min(cap)
     }
 }
@@ -1280,7 +1272,6 @@ async fn session(
     config: &CoordinatorConfig,
     tls: Option<Arc<rustls::ClientConfig>>,
     recorder: &mut Recorder,
-    connected_at: &mut Option<tokio::time::Instant>,
 ) -> SessionEnd {
     let Ok(url) = CoordinatorUrl::parse(&config.url) else {
         return SessionEnd::Unreachable;
@@ -1296,7 +1287,6 @@ async fn session(
         Ok(handshake) => {
             let version = handshake.version;
             drop(key);
-            *connected_at = Some(tokio::time::Instant::now());
             recorder.connected(version);
             ports.coordination.send_modify(|view| {
                 view.connected = true;
@@ -1487,9 +1477,8 @@ async fn serve(
             _ = watch.tick(), if version >= LAUNCH_VERSION => {
                 let policies = ports.store.policies().unwrap_or_default();
                 let own: Vec<ScalePolicy> = policies
-                    .iter()
+                    .into_iter()
                     .filter(|policy| policy.is_owned_by(ports.host.id))
-                    .cloned()
                     .collect();
                 let mut freed = false;
                 for report in reports.poll(ports.store.as_ref(), &own, &ports.launches, meters) {
@@ -1507,6 +1496,7 @@ async fn serve(
                 // The coordinator places by the last heartbeat: a slot just
                 // freed is said at once, not at the next beat.
                 if freed {
+                    let policies = ports.store.policies().unwrap_or_default();
                     let beat = HostMessage::Heartbeat(heartbeat(ports, &policies));
                     if let Err(end) = send(socket, &beat).await {
                         return end;
@@ -1520,6 +1510,7 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runner_manager_agent::reconcile::{FixedJitter, NoJitter};
     use runner_manager_domain::coordinator_protocol::{PROTOCOL_VERSION, WakeReason};
 
     #[test]
@@ -2165,11 +2156,11 @@ mod tests {
 
     #[test]
     fn jitter_only_ever_lengthens_the_wait() {
-        for fraction in [0.0, 0.3, 1.0] {
+        for fraction in [0.0, 0.3, 0.999] {
             let wait = Backoff {
                 next: Duration::from_secs(10),
             }
-            .after(SessionEnd::Unreachable, None, fraction);
+            .after(SessionEnd::Unreachable, None, &FixedJitter(fraction));
             assert!(wait >= Duration::from_secs(10) && wait <= Duration::from_secs(15));
         }
     }
@@ -2178,16 +2169,23 @@ mod tests {
     fn the_reconnect_wait_doubles_up_to_thirty_seconds_jitter_included() {
         let mut backoff = Backoff::default();
         let waits: Vec<u64> = (0..8)
-            .map(|_| backoff.after(SessionEnd::Unreachable, None, 0.0).as_secs())
+            .map(|_| {
+                backoff
+                    .after(SessionEnd::Unreachable, None, &NoJitter)
+                    .as_secs()
+            })
             .collect();
         assert_eq!(waits, [1, 2, 4, 8, 16, 20, 20, 20]);
         // The most jitter there is still stays within the cap, and spreads
         // the fleet out below it.
-        assert_eq!(backoff.after(SessionEnd::Closed, None, 1.0), RECONNECT_CAP);
-        assert!(backoff.after(SessionEnd::Closed, None, 0.5) < RECONNECT_CAP);
+        assert_eq!(
+            backoff.after(SessionEnd::Closed, None, &FixedJitter(1.0)),
+            RECONNECT_CAP
+        );
+        assert!(backoff.after(SessionEnd::Closed, None, &FixedJitter(0.5)) < RECONNECT_CAP);
         // A refusal keeps its own, longer cap.
-        assert!(backoff.after(SessionEnd::Rejected, None, 1.0) <= REJECTED_CAP);
-        assert!(backoff.after(SessionEnd::Rejected, None, 0.0) > RECONNECT_CAP);
+        assert!(backoff.after(SessionEnd::Rejected, None, &FixedJitter(1.0)) <= REJECTED_CAP);
+        assert!(backoff.after(SessionEnd::Rejected, None, &NoJitter) > RECONNECT_CAP);
     }
 
     #[test]
@@ -2195,14 +2193,14 @@ mod tests {
         let grown = || {
             let mut backoff = Backoff::default();
             for _ in 0..6 {
-                backoff.after(SessionEnd::Unreachable, None, 0.0);
+                backoff.after(SessionEnd::Unreachable, None, &NoJitter);
             }
             backoff
         };
         // Never connected, or connected only briefly: still backing off.
         for connected_for in [None, Some(Duration::from_secs(5)), Some(STABLE_SESSION)] {
             assert_eq!(
-                grown().after(SessionEnd::Closed, connected_for, 0.0),
+                grown().after(SessionEnd::Closed, connected_for, &NoJitter),
                 Duration::from_secs(20),
                 "{connected_for:?}"
             );
@@ -2213,12 +2211,12 @@ mod tests {
             backoff.after(
                 SessionEnd::Closed,
                 Some(STABLE_SESSION + Duration::from_secs(1)),
-                0.0
+                &NoJitter
             ),
             RECONNECT_FIRST
         );
         assert_eq!(
-            backoff.after(SessionEnd::Unreachable, None, 0.0),
+            backoff.after(SessionEnd::Unreachable, None, &NoJitter),
             Duration::from_secs(2)
         );
     }

@@ -14,12 +14,10 @@
 //! process to look at and reports no usage. Nothing here is a figure the
 //! host acts on; the coordinator uses it to estimate how heavy a job is.
 //!
-//! The same look also notices a live attempt whose runner process is gone:
-//! its target loop is nudged so the next pass concludes the attempt and
-//! frees its slot within seconds, instead of at the target's next scheduled
-//! poll (up to its active interval, 60 s by default) while the coordinator
-//! waits to place a queued job there. The pass decides, as always: a nudge
-//! is only "look now".
+//! The same look notices a live attempt whose runner process is gone and
+//! nudges its target loop, so the next pass concludes it and frees its slot
+//! within seconds instead of at the next scheduled poll (up to 60 s). The
+//! pass decides; a nudge only means "look now".
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -155,24 +153,21 @@ impl AttemptMeters {
         let pids: Vec<u32> = roots.iter().map(|(_, pid, _)| *pid).collect();
         let trees = sample_trees(&pids);
         let now = Instant::now();
-        let mut exited: Vec<ScaleTarget> = Vec::new();
-        {
-            let mut seen = self
-                .exited
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            seen.retain(|attempt| live.contains(attempt));
-            for (attempt, pid, target) in roots {
-                match trees.get(&pid) {
-                    Some(usage) => self.record(attempt, now, *usage),
-                    None => {
-                        if seen.insert(attempt) && !exited.contains(target) {
-                            exited.push(target.clone());
-                        }
-                    }
-                }
+        let mut exited = Vec::new();
+        let mut seen = self
+            .exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen.retain(|attempt| live.contains(attempt));
+        for (attempt, pid, target) in roots {
+            match trees.get(&pid) {
+                Some(usage) => self.record(attempt, now, *usage),
+                // A repeated target is harmless: a nudge is one permit.
+                None if seen.insert(attempt) => exited.push(target.clone()),
+                None => {}
             }
         }
+        drop(seen);
         self.forget_stale(&live, now);
         exited
     }
