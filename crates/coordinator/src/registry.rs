@@ -105,9 +105,31 @@ pub struct Registry {
     wakes: WakeLog,
     /// Wakes sent since the statistics last took the count.
     wakes_sent: AtomicU64,
+    /// What the App's inventory last listed, read or not.
+    inventory: Mutex<Inventory>,
     /// The sweep's inventory may be out of date: a host advertised a target
-    /// it does not cover, or a webhook named a repository it does not know.
+    /// it does not list, or a webhook named a repository it does not know.
     inventory_wanted: Notify,
+}
+
+/// What the App's installations list, whether or not the sweep could read
+/// them. A repository listed and unreadable (no Actions permission) is not
+/// covered, and reading the inventory again would not change that. Names are
+/// lower-cased.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Inventory {
+    pub repositories: BTreeSet<String>,
+    pub accounts: BTreeSet<String>,
+}
+
+impl Inventory {
+    fn lists(&self, target: &TargetRef) -> bool {
+        let name = target.name.to_ascii_lowercase();
+        match target.scope {
+            TargetScope::Repo => self.repositories.contains(&name),
+            TargetScope::Org => self.accounts.contains(&name),
+        }
+    }
 }
 
 /// When a wake was last sent for a repository and a set of required labels,
@@ -314,36 +336,56 @@ impl Registry {
         if let Some(current) = hosts.get_mut(host_id)
             && current.connection == connection
         {
-            let uncovered = hello
-                .targets
-                .iter()
-                .any(|target| !coverage.covers(&target.reference()));
+            let unlisted = {
+                let inventory = self
+                    .inventory
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                hello
+                    .targets
+                    .iter()
+                    .any(|target| !inventory.lists(&target.reference()))
+            };
             current.hello = Some(hello);
             // Always answered, even when unchanged: the host may have
             // reconnected and forgotten it.
             current.acked = None;
             acknowledge(host_id, current, &coverage);
-            if uncovered {
+            if unlisted {
                 self.inventory_wanted.notify_one();
             }
         }
     }
 
     /// A webhook named `repository`: asks for a fresh inventory when a
-    /// connected host serves it and the sweep does not read it yet.
+    /// connected host serves it and the inventory does not list it.
     pub fn repository_seen(&self, repository: &str) {
-        let known = self
-            .coverage()
+        let listed = self
+            .inventory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .repositories
             .contains(&repository.to_ascii_lowercase());
-        if !known
-            && self
-                .advertised()
-                .iter()
-                .any(|target| target.covers(repository))
+        if !listed
+            && self.lock().values().any(|connected| {
+                connected.hello.iter().any(|hello| {
+                    hello
+                        .targets
+                        .iter()
+                        .any(|target| target.reference().covers(repository))
+                })
+            })
         {
             self.inventory_wanted.notify_one();
         }
+    }
+
+    /// What the App's inventory lists now.
+    pub fn set_inventory(&self, inventory: Inventory) {
+        *self
+            .inventory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = inventory;
     }
 
     /// Resolves when the sweep should read its inventory again.

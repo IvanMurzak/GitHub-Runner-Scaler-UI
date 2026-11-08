@@ -1468,7 +1468,7 @@ impl DemandGateway for RestDemand {
 /// and names a `workflow_job` webhook carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedJobIdentity {
-    pub id: u64,
+    pub id: Option<u64>,
     pub workflow: Option<String>,
     /// The job's name, matrix values expanded.
     pub name: Option<String>,
@@ -1543,7 +1543,7 @@ struct RunJobsPage {
 #[derive(Debug, Deserialize)]
 struct RunJob {
     #[serde(default)]
-    id: u64,
+    id: Option<u64>,
     #[serde(default)]
     status: String,
     #[serde(default)]
@@ -2006,12 +2006,12 @@ mod tests {
             identities,
             vec![
                 QueuedJobIdentity {
-                    id: 8,
+                    id: Some(8),
                     workflow: Some("CI".into()),
                     name: Some("build (linux, 3.12)".into()),
                 },
                 QueuedJobIdentity {
-                    id: 9,
+                    id: Some(9),
                     workflow: None,
                     name: Some("older".into()),
                 },

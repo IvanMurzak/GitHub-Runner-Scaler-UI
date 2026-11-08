@@ -162,14 +162,15 @@ repository just added on a host is therefore normally covered within seconds.
 300 s by default), not the refresh interval, and every other target at the refresh interval. A new
 target has no coverage yet, because a coordinator only reports on what a host advertised. While the
 link is up and the coordinator's sweep runs, the new target is counted at the coordinated interval
-too; if that is what admits it, `repo add` prints a note saying so. With the link down, or no sweep,
+too, and `repo add` prints a note saying so. With the link down, or no sweep,
 every target is counted at the refresh interval as without a coordinator.
 
 A set of targets admitted this way can exceed the host's budget (2,500 requests an hour) when its
 targets poll on their own: the coordinator does not cover one, or the link stays down past 30
 seconds. Charged polls of a target not in `coordinated` then stretch to the interval that fits the
 budget (64 s for 11 repositories, 116 s for 20). Runners keep starting, and idle polls, answered 304
-and not charged, keep their pace. A set that fits at the default interval is not affected.
+and not charged, keep their pace. A set that fits at the default interval is not affected. An
+organization counts as one repository here, so one with many repositories can still run over.
 
 A dropped link reconnects after 1 second, then waits twice as long after every failed attempt,
 never more than 30 seconds between attempts (a random part of up to a third of the wait spreads a

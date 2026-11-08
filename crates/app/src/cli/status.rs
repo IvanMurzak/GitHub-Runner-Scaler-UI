@@ -539,7 +539,8 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
     .flatten();
 
     let targets: Vec<_> = policies.iter().map(|p| p.target.clone()).collect();
-    let budget = HostBudget::of(interval, &targets);
+    let coordination = super::host::CoordinatedPricing::read(context, &store).ok();
+    let budget = HostBudget::priced(interval, &targets, coordination.as_ref());
     // Tolerant on purpose: `status` must answer when something is broken, and
     // an unreadable `polling.toml` is reported by `host show`, which refuses.
     let configured = super::polling::configured(context, &store).unwrap_or_else(|error| {

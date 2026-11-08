@@ -494,8 +494,8 @@ impl Placement {
 
     /// The statistics keys of `key`'s queued jobs, and whether any job has
     /// none.
-    #[must_use]
-    pub fn queued_job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
+    #[cfg(test)]
+    pub(crate) fn queued_job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
         self.state().job_keys(key)
     }
 
@@ -650,19 +650,18 @@ impl Placement {
             }
             if !floor && swept.unnamed == 0 {
                 // Every queued job is listed by id: any other has left.
-                queue
-                    .jobs
-                    .retain(|id, _| swept.jobs.iter().any(|(listed, _)| listed == id));
+                let ids: HashSet<u64> = swept.jobs.iter().map(|(id, _)| *id).collect();
+                queue.jobs.retain(|id, _| ids.contains(id));
             }
-            let swept = u32::try_from(swept.jobs.len())
+            let total = u32::try_from(swept.jobs.len())
                 .unwrap_or(u32::MAX)
                 .saturating_add(swept.unnamed);
             let named = u32::try_from(queue.jobs.len()).unwrap_or(u32::MAX);
-            if swept >= named {
+            if total >= named {
                 queue.unnamed = if floor {
-                    queue.unnamed.max(swept - named)
+                    queue.unnamed.max(total - named)
                 } else {
-                    swept - named
+                    total - named
                 };
             } else if floor {
                 // A minimum below what is known says nothing.
@@ -670,7 +669,7 @@ impl Placement {
                 // Some announced jobs left without a webhook saying so: the
                 // oldest are the ones most likely gone.
                 queue.unnamed = 0;
-                let surplus = (named - swept) as usize;
+                let surplus = (named - total) as usize;
                 let oldest: Vec<u64> = {
                     let mut by_age: Vec<(u64, Instant)> =
                         queue.jobs.iter().map(|(id, (at, _))| (*id, *at)).collect();

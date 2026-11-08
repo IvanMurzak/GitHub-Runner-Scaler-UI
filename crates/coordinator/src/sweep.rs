@@ -31,7 +31,7 @@ use runner_manager_github::rest::{ActivityScope, CancelToken, InventoryError};
 
 use crate::github_app::{AppError, GithubApp};
 use crate::placement::{Placement, SweptQueue};
-use crate::registry::{Coverage, Registry, is_pool_job};
+use crate::registry::{Coverage, Inventory, Registry, is_pool_job};
 use crate::stats::JobIdentity;
 
 /// The shortest sweep interval accepted.
@@ -201,6 +201,17 @@ impl Sweeper {
             self.inventory_tried_at = Some(tokio::time::Instant::now());
         }
         let mut installations = self.reach.installations();
+        self.registry.set_inventory(Inventory {
+            repositories: installations
+                .iter()
+                .flat_map(|installation| &installation.repositories)
+                .map(|repository| repository.to_string().to_ascii_lowercase())
+                .collect(),
+            accounts: installations
+                .iter()
+                .map(|installation| installation.account.to_ascii_lowercase())
+                .collect(),
+        });
         let advertised = self.registry.advertised();
         let mut report = SweepReport::default();
         // What this sweep could not read is not covered: a host relies on the
@@ -283,9 +294,9 @@ impl Sweeper {
             report.queued += 1;
             if is_pool_job(&required) {
                 let queue = pool.entry(required.iter().cloned().collect()).or_default();
-                match identity.filter(|identity| identity.id != 0) {
-                    Some(identity) => queue.jobs.push((
-                        identity.id,
+                match identity.and_then(|identity| Some((identity.id?, identity))) {
+                    Some((id, identity)) => queue.jobs.push((
+                        id,
                         JobIdentity::new(
                             &name,
                             identity.workflow.as_deref(),
@@ -464,6 +475,20 @@ mod tests {
         settle().await;
         assert_eq!(count(), 3);
         sweep.abort();
+
+        // Listed but not covered (a repository the sweep cannot read): a
+        // fresh inventory would change nothing, so none is asked for.
+        registry.set_inventory(Inventory {
+            repositories: BTreeSet::from(["octo/new".to_string()]),
+            accounts: BTreeSet::new(),
+        });
+        registry.repository_seen("octo/new");
+        let _again = host(&registry, "h2", TargetScope::Repo, "octo/new");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), registry.inventory_wanted())
+                .await
+                .is_err()
+        );
     }
 
     /// The sweep's job listing names its jobs, so a job only the sweep saw is
@@ -520,12 +545,12 @@ mod tests {
             repository,
             vec![
                 QueuedJobIdentity {
-                    id: 11,
+                    id: Some(11),
                     workflow: Some("CI".into()),
                     name: Some("light".into()),
                 },
                 QueuedJobIdentity {
-                    id: 12,
+                    id: Some(12),
                     workflow: None,
                     name: Some("nameless workflow".into()),
                 },

@@ -89,7 +89,7 @@ use runner_manager_domain::model::{Host, RefreshInterval, ScaleTarget, StartMode
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_github::demand::DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL;
 use runner_manager_github::rest::{
-    BudgetProjection, TargetCost, budget_allowance, refreshes_per_hour,
+    BudgetProjection, SECONDS_PER_HOUR, TargetCost, budget_allowance, refreshes_per_hour,
 };
 use runner_manager_platform::runner_env::{self, RunnerEnv, RunnerEnvError, RunnerPlatform};
 use runner_manager_platform::runner_root::RootOwner;
@@ -182,13 +182,13 @@ pub struct HostBudget {
 pub struct CoordinatedPricing {
     snapshot: super::coordinator::CoordinatorSnapshot,
     now: chrono::DateTime<chrono::Utc>,
-    interval_secs: u16,
+    interval: runner_manager_domain::model::CoordinatedPollInterval,
 }
 
 /// The same records and interval, whenever they were read.
 impl PartialEq for CoordinatedPricing {
     fn eq(&self, other: &Self) -> bool {
-        self.snapshot == other.snapshot && self.interval_secs == other.interval_secs
+        self.snapshot == other.snapshot && self.interval == other.interval
     }
 }
 
@@ -206,13 +206,13 @@ impl CoordinatedPricing {
         Ok(Self {
             snapshot: super::coordinator::CoordinatorSnapshot::read(context.paths(), now),
             now,
-            interval_secs: intervals.coordinated.as_secs(),
+            interval: intervals.coordinated,
         })
     }
 
     /// Whether `target` is polled at the coordinated interval right now.
     #[must_use]
-    pub fn covers(&self, target: &ScaleTarget) -> bool {
+    fn covers(&self, target: &ScaleTarget) -> bool {
         self.snapshot.mode_for(target, self.now) == super::coordinator::PollMode::Coordinated
     }
 
@@ -221,43 +221,48 @@ impl CoordinatedPricing {
     /// within seconds of being advertised; if not, [`pacing_floor`] keeps the
     /// host inside its budget.
     #[must_use]
-    pub fn may_presume(&self) -> bool {
+    fn may_presume(&self) -> bool {
         self.snapshot.link == super::coordinator::LinkState::Connected
             && self.snapshot.reconcile_interval_secs.is_some()
     }
 
     #[must_use]
     pub const fn interval_secs(&self) -> u16 {
-        self.interval_secs
+        self.interval.as_secs()
     }
 
     /// `cost`, priced at the coordinated interval when `target` is covered.
     #[must_use]
     pub fn price(&self, target: &ScaleTarget, cost: TargetCost) -> TargetCost {
         if self.covers(target) {
-            cost.polled_every(self.interval_secs)
+            cost.polled_every(self.interval)
         } else {
             cost
         }
     }
 
-    /// `candidate`, a target about to be added to `existing`, priced for the
-    /// budget guard, and whether pricing it on the coordinated budget before
-    /// the coordinator covers it is what admits it.
+    /// `candidate`, a target about to be added, priced for the budget guard,
+    /// and whether that assumes coverage the coordinator has not reported yet.
     #[must_use]
     pub fn price_addition(
         &self,
         target: &ScaleTarget,
         candidate: TargetCost,
-        existing: &[TargetCost],
     ) -> (TargetCost, bool) {
-        if self.covers(target) || !self.may_presume() {
-            return (self.price(target, candidate), false);
+        if !self.covers(target) && self.may_presume() {
+            (candidate.polled_every(self.interval), true)
+        } else {
+            (self.price(target, candidate), false)
         }
-        let decided = !BudgetProjection::new(RefreshInterval::default(), existing.to_vec())
-            .admit(candidate)
-            .is_admitted();
-        (candidate.polled_every(self.interval_secs), decided)
+    }
+}
+
+/// What `target` costs before anything is known of it: an organization counts
+/// as its floor, one repository, because its repository count takes a request.
+fn default_cost(target: &ScaleTarget) -> TargetCost {
+    match target {
+        ScaleTarget::Repository(_) => TargetCost::repository(),
+        ScaleTarget::Organization(_) => TargetCost::organization(1),
     }
 }
 
@@ -267,24 +272,19 @@ impl CoordinatedPricing {
 /// A set the budget guard admitted on the coordinated budget can exceed the
 /// allowance once coordination is lost. A target loop that is not coordinated
 /// then stretches its charged polls to this instead of overspending a quota
-/// every host of the account shares. Priced as `repo add` prices a target, so
-/// any set the guard admits at the default interval is left untouched.
+/// every host of the account shares. Priced as `repo add` prices a repository,
+/// so any set the guard admits at the default interval is left untouched; an
+/// organization counts as its floor, so a large one can still run over.
 #[must_use]
 pub fn pacing_floor(targets: &[ScaleTarget]) -> std::time::Duration {
     let unique: BTreeSet<&ScaleTarget> = targets.iter().collect();
     let per_round: u64 = unique
         .into_iter()
-        .map(|target| {
-            u64::from(
-                match target {
-                    ScaleTarget::Repository(_) => TargetCost::repository(),
-                    ScaleTarget::Organization(_) => TargetCost::organization(1),
-                }
-                .requests_per_refresh(),
-            )
-        })
+        .map(|target| u64::from(default_cost(target).requests_per_refresh()))
         .sum();
-    std::time::Duration::from_secs((per_round * 3600).div_ceil(u64::from(budget_allowance())))
+    std::time::Duration::from_secs(
+        (per_round * u64::from(SECONDS_PER_HOUR)).div_ceil(u64::from(budget_allowance())),
+    )
 }
 
 impl HostBudget {
@@ -309,6 +309,7 @@ impl HostBudget {
     /// is priced at exactly one repository — its floor, and the point at which
     /// `c3`'s two cost formulas agree — and [`HostBudget::is_floor`] makes the
     /// shortfall sayable instead of silent.
+    #[cfg(test)]
     #[must_use]
     pub fn of(interval: RefreshInterval, targets: &[ScaleTarget]) -> Self {
         Self::priced(interval, targets, None)
@@ -327,17 +328,12 @@ impl HostBudget {
         let mut organization_targets = 0;
         let mut coordinated_targets = 0;
         for target in unique {
-            let cost = measured(match target {
-                ScaleTarget::Repository(_) => TargetCost::repository(),
-                ScaleTarget::Organization(_) => {
-                    organization_targets += 1;
-                    TargetCost::organization(1)
-                }
-            });
+            organization_targets += usize::from(matches!(target, ScaleTarget::Organization(_)));
+            let cost = measured(default_cost(target));
             costs.push(match coordination {
                 Some(coordination) if coordination.covers(target) => {
                     coordinated_targets += 1;
-                    coordination.price(target, cost)
+                    cost.polled_every(coordination.interval)
                 }
                 _ => cost,
             });
@@ -1244,7 +1240,8 @@ mod tests {
         CoordinatedPricing {
             snapshot,
             now: chrono::Utc::now(),
-            interval_secs: 300,
+            interval: runner_manager_domain::model::CoordinatedPollInterval::from_secs(300)
+                .expect("in range"),
         }
     }
 
@@ -1262,19 +1259,19 @@ mod tests {
         let new = repository("o/new");
 
         // Connected with a sweep: covered ones are cheap; the new one is
-        // priced the same way, and that is not what decided it.
+        // priced the same way.
         let on = pricing(true, true, &covered);
         let existing: Vec<TargetCost> = targets.iter().map(|t| on.price(t, cost)).collect();
         assert_eq!(
             BudgetProjection::new(at_60, existing.clone()).requests_per_hour(),
             10 * cost.requests_per_hour(at_60) / 5
         );
-        let (candidate, decided) = on.price_addition(&new, cost, &existing);
+        let (candidate, presumed) = on.price_addition(&new, cost);
         assert_eq!(
             candidate.requests_per_hour(at_60),
             cost.requests_per_hour(at_60) / 5
         );
-        assert!(!decided, "it fits at 60 s too");
+        assert!(presumed, "said in the note");
         assert!(
             BudgetProjection::new(at_60, existing)
                 .admit(candidate)
@@ -1283,8 +1280,7 @@ mod tests {
 
         // Enough uncovered targets that only the presumption admits it.
         let full = vec![cost; 10];
-        let (candidate, decided) = on.price_addition(&new, cost, &full);
-        assert!(decided, "said in the note");
+        let (candidate, _) = on.price_addition(&new, cost);
         assert!(
             BudgetProjection::new(at_60, full.clone())
                 .admit(candidate)
@@ -1298,8 +1294,8 @@ mod tests {
             pricing(false, true, &covered),
         ] {
             let existing: Vec<TargetCost> = targets.iter().map(|t| off.price(t, cost)).collect();
-            let (candidate, decided) = off.price_addition(&new, cost, &existing);
-            assert!(!decided);
+            let (candidate, presumed) = off.price_addition(&new, cost);
+            assert!(!presumed);
             assert!(
                 !BudgetProjection::new(at_60, existing)
                     .admit(candidate)

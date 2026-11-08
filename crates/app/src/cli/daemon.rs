@@ -489,6 +489,7 @@ async fn run_generation(
                 launch: signals.launch,
                 coordination: coordination.subscribe(),
                 draining: false,
+                pacing_floor: Duration::ZERO,
             })
         }
     };
@@ -2346,6 +2347,8 @@ struct ManagedTarget {
     /// Draining: a policy read afresh is drained too, so a repository added
     /// back while this loop winds down is not served by it.
     draining: bool,
+    /// From the policies last read: see `super::host::pacing_floor`.
+    pacing_floor: Duration,
 }
 
 impl TargetReconciler for ManagedTarget {
@@ -2358,11 +2361,7 @@ impl TargetReconciler for ManagedTarget {
     }
 
     fn pacing_floor(&self) -> Duration {
-        let Ok(policies) = self.store.policies() else {
-            return Duration::ZERO;
-        };
-        let targets: Vec<ScaleTarget> = policies.into_iter().map(|policy| policy.target).collect();
-        super::host::pacing_floor(&targets)
+        self.pacing_floor
     }
 
     fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -2422,6 +2421,9 @@ impl TargetReconciler for ManagedTarget {
             );
             return;
         };
+        let every_target: Vec<ScaleTarget> =
+            all.iter().map(|policy| policy.target.clone()).collect();
+        self.pacing_floor = super::host::pacing_floor(&every_target);
         let refreshed: Vec<ScalePolicy> = all
             .into_iter()
             .filter(|policy| {

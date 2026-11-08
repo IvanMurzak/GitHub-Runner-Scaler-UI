@@ -342,15 +342,14 @@ fn add(
         .collect();
     // A coordinated target is polled at the coordinated interval, and one a
     // connected coordinator's sweep is about to cover is admitted the same
-    // way. The note says so only where that decided it.
+    // way, and the note says so.
     let coordination = super::host::CoordinatedPricing::read(context, &store)?;
     let costs: Vec<TargetCost> = existing_targets
         .iter()
         .map(|target| coordination.price(target, cost_for(target, reachable)))
         .collect();
-    let (candidate, presumption_decided) =
-        coordination.price_addition(&target, own_candidate, &costs);
-    let admitted_by_presuming = presumption_decided && !existing_targets.contains(&target);
+    let (candidate, presumed) = coordination.price_addition(&target, own_candidate);
+    let admitted_by_presuming = presumed && !existing_targets.contains(&target);
     let armed = target.clone();
     if let Some(name) = profile_name.as_ref() {
         record_named_policy(
