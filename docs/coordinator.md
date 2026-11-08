@@ -162,8 +162,8 @@ Upgrading to stage 4 moves the coordinator's database to schema 2 (three new tab
 coordinator refuses to open it (`written by a newer coordinator`): to roll back, restore the
 database from before the upgrade, or stop the service and run
 `sqlite3 coordinator.db 'PRAGMA user_version = 1'` (the stage-3 code never reads the new
-tables, and a later upgrade keeps them). 0.4.47 moves it to schema 3 (a `queue_wait_secs` column on
-the samples); to roll back to 0.4.46, `sqlite3 coordinator.db 'PRAGMA user_version = 2'` the same
+tables, and a later upgrade keeps them). 0.4.47 moves it to schema 4 (a `queue_wait_secs` column on
+the samples, and a `live_state` table); to roll back to 0.4.46, `sqlite3 coordinator.db 'PRAGMA user_version = 2'` the same
 way (0.4.46 never reads the column, and upgrading again keeps it).
 
 The protocol is versioned: a stage-1 host and this coordinator, or this host and a stage-1
@@ -235,22 +235,48 @@ next scheduled poll (up to 60 seconds later). A runner in a container, a VM or a
 keeps its slot until its environment is proven gone and cleaned up, deliberately: until then it
 may still be running. Its host sends a heartbeat as soon as that cleanup is done.
 
-A launch is a **lease** for 5 minutes. GitHub hands a runner *any* queued job its labels cover, so
-the coordinator counts per repository and label set: it never holds more leases than jobs are
-queued. When a lease's runner takes a job (the host's `attempt_started`) the lease is held until
-the webhook takes that job out of the queue (at most 30 seconds), so the job is not placed twice
-meanwhile. A lease also closes when its attempt ends (`attempt_finished`), when its host
-disconnects (the host drops its open launches too), or when it expires; the job, if still queued,
-is then placed again. When a job leaves the queue another way (cancelled, or taken by a runner
+A launch is a **lease** for 2 minutes (`COORDINATOR_LEASE_TTL`, `--lease-ttl`, at least 30
+seconds). GitHub hands a runner *any* queued job its labels cover, so the coordinator counts per
+repository and label set: it never holds more leases than jobs are queued. When a lease's runner
+takes a job (the host's `attempt_started`) the lease is held until the webhook takes that job out
+of the queue (at most 30 seconds), so the job is not placed twice meanwhile. A lease also closes,
+and its job, if still queued, is placed again at once:
+
+- when its attempt ends (`attempt_finished`);
+- when its host disconnects or connects again (a new link starts with no launch: the host
+  dropped its open ones when it lost the old link, even one that never closed cleanly);
+- when its host's heartbeat no longer lists it: a 0.4.47 host names the launches it still
+  holds open in every heartbeat, after the attempt reports that would explain a missing one;
+- when another runner of the same host takes a job of the same queue (the webhook names the
+  runner): a runner started for no lease, or for a dropped one, took the job the lease's runner
+  was coming for, so the host is told to drop that launch;
+- when it expires. When a job leaves the queue another way (cancelled, or taken by a runner
 outside the pool), the surplus lease is cancelled (`cancel_launch`) and its host starts no runner
 for it. The sweep's counts correct lost webhooks; a listing GitHub truncated only ever adds jobs.
+
+A queue left with fewer runners on their way than jobs says why, at most once a minute per queue
+in the log (`a pool queue is not placed`, with `reason` and, for a refusal, `refusal`) and in
+`stats`: `no_candidate` (no connected, covered host serves it with an enabled pool profile),
+`unfit_or_draining`, `no_free_slot`, `no_memory_fit`, `refused` (the last host tried refused:
+`max_capacity`, `host_capacity`, ...), or `unanswered`.
 
 ### On the host
 
 A pool profile is **directed** while its target is `coordinated` on a version-3 link: it starts
 runners only for the launches it accepted, never from its own reading of the queue (which every
 host of the pool sees the same way). It accepts a launch only when its own allocator, over its
-own attempts and ceilings, grants one more runner. In `fallback` and `standalone`, against a
+own attempts and ceilings, grants one more runner. Accepted launches start their runners at once:
+the link signals the target's loop, which starts every launch open at that moment in one go,
+without polling GitHub, so the 5-second gap between polls does not apply; the next full pass
+stays where it was scheduled. The runners themselves are still created one after another under
+the host-wide allocation lock, the same lock every pass takes, so the ceilings hold exactly.
+
+A repository added or removed on a host (`repo add`, `repo remove`, a profile enabled or disabled)
+changes only its own target loop: a new target gets a loop of its own within 30 seconds, a removed
+one has its loop finish its runners and stop. The coordinator link, its accepted launches (unless
+their profile is gone) and every other target keep running; the link describes the new set of
+targets at its next heartbeat. When the last repository goes, the daemon finishes its runners and
+reloads as before. In `fallback` and `standalone`, against a
 version-2 coordinator, or without the GitHub App's sweep, a pool profile is an ordinary profile:
 it polls and starts runners from its own demand, and a surplus runner exits idle as before.
 
@@ -387,8 +413,14 @@ Last placements, newest first (scores in points):
   means jobs wait for a free host.
 - **Heaviest jobs**: the 20 job keys with the largest p90 peak memory, and per host how its
   median compares with the usual duration (below 1x: faster).
-- `--json` is schema version 2 since 0.4.47: `p50_duration_secs` is the job's run time, and
-  `p50_queue_wait_secs` / `p90_queue_wait_secs` are added (overall and per job).
+- **Pool queues waiting for a runner**: each queue (repository and labels) with fewer runners
+  on their way than jobs queued, the oldest job's wait, and why no more is placed (see above).
+- **Open leases**: per host, each launch not yet closed, its state (`offered`, `accepted`,
+  `claimed`) and age. On a host's `stats` these are live; the admin CLI on the coordinator's
+  machine reads the copy the server saves every minute (`as of ... ago`).
+- `--json` is schema version 3 since 0.4.47: `p50_duration_secs` is the job's run time,
+  `p50_queue_wait_secs` / `p90_queue_wait_secs` are added (overall and per job), and `pending`,
+  `leases` and `live_at`.
 - Names are printed with control, bidirectional and zero-width characters removed: a workflow
   or job name is whatever a pull request wrote.
 - **Last placements**: what the queue was estimated to need and why (`job`, `repository` or

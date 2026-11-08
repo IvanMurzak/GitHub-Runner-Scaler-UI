@@ -16,7 +16,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// The prefix every invite code carries, so one is recognisable in a paste.
 pub const INVITE_PREFIX: &str = "rmc_";
@@ -186,6 +186,18 @@ impl Store {
                 return Err(error.into());
             }
             connection.pragma_update(None, "user_version", 3)?;
+        }
+        if version < 4 {
+            // The server's pending queues and open leases, saved every minute
+            // for the admin CLI's `stats`, which runs in another process.
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS live_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    saved_at TEXT NOT NULL,
+                    state TEXT NOT NULL
+                );
+                PRAGMA user_version = 4;",
+            )?;
         }
         Ok(Self { connection })
     }
@@ -541,6 +553,34 @@ impl Store {
         Ok(())
     }
 
+    /// Replaces the saved live placement state (JSON).
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn save_live_state(&self, state: &str, at: DateTime<Utc>) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO live_state (id, saved_at, state) VALUES (1, ?1, ?2)
+             ON CONFLICT (id) DO UPDATE SET saved_at = ?1, state = ?2",
+            params![at, state],
+        )?;
+        Ok(())
+    }
+
+    /// The live placement state the server last saved, and when.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn live_state(&self) -> Result<Option<(String, DateTime<Utc>)>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT state, saved_at FROM live_state WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// The newest `limit` placement decisions, newest first, as JSON.
     ///
     /// # Errors
@@ -755,6 +795,13 @@ mod tests {
                 .record_decision(&format!("{{\"n\":{index}}}"), 2)
                 .expect("recorded");
         }
+        assert_eq!(store.live_state().expect("read"), None);
+        store.save_live_state("{\"a\":1}", now()).expect("saved");
+        store.save_live_state("{\"a\":2}", now()).expect("replaced");
+        assert_eq!(
+            store.live_state().expect("read"),
+            Some(("{\"a\":2}".to_string(), now()))
+        );
         assert_eq!(
             store.decisions(10).expect("read"),
             vec!["{\"n\":4}".to_string(), "{\"n\":3}".to_string()]

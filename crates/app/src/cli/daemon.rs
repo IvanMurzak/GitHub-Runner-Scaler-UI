@@ -181,7 +181,7 @@ async fn run_generation(
                 return stop_for_upgrade(context, host.service_start_mode, own_binary.as_deref(), &version, out)
                     .map(|()| DaemonOutcome::Stopped);
             }
-            () = wait_for_policy_set_change(Arc::clone(&store) as Arc<dyn Store>, BTreeSet::new()) => {
+            _ = wait_for_policy_set_change(Arc::clone(&store) as Arc<dyn Store>, BTreeSet::new()) => {
                 writeln!(out, "a repository policy was added; reloading").map_err(failed)?;
                 return Ok(DaemonOutcome::Reload);
             }
@@ -357,7 +357,7 @@ async fn run_generation(
     ));
     // The coordinator's wakes, one signal per target loop. Inert until this
     // host joins a coordinator; see `super::coordinator`.
-    let mut routes = super::coordinator::WakeRoutes::new(Some(Arc::clone(&demand_gateway)));
+    let routes = super::coordinator::WakeRoutes::new(Some(Arc::clone(&demand_gateway)));
     // What the link knows, for each loop's poll mode (standalone, coordinated,
     // fallback).
     let coordination = super::coordinator::coordination();
@@ -368,137 +368,157 @@ async fn run_generation(
         host.clone(),
         coordination.subscribe(),
     ));
+    let routes = Arc::new(routes);
+    // ------------------------------------------------------------------
+    // ONE LOOP PER TARGET, ADDED AND REMOVED WHILE THE DAEMON RUNS.
+    // ------------------------------------------------------------------
+    // A repository added or removed changes the set of loops, not the rest
+    // of the daemon: the coordinator link, its accepted launches and every
+    // other target's loop keep running. See `follow_policy_set`.
+    let build_target = |policies: Vec<ScalePolicy>| {
+        let target_paths = context.paths().clone();
+        let client = Arc::clone(&client);
+        let clock = Arc::clone(&clock);
+        let host = host.clone();
+        let store = Arc::clone(&store);
+        let lifecycle_github = Arc::clone(&lifecycle_github);
+        let dependency_caches = dependency_caches.clone();
+        let events = Arc::clone(&events);
+        let host_unfit = Arc::clone(&host_unfit);
+        let shared_lock = Arc::clone(&shared_lock);
+        let directory = Arc::clone(&directory);
+        let demand_gateway = Arc::clone(&demand_gateway);
+        let polling = Arc::clone(&polling);
+        let launches = Arc::clone(&launches);
+        let coordination = Arc::clone(&coordination);
+        let routes = Arc::clone(&routes);
+        async move {
+            let package_target = policies[0].target.clone();
+            let catalog = Arc::new(GatewayCatalog::new(
+                RestInventory::new(Arc::clone(&client), Arc::clone(&clock)),
+                package_target.clone(),
+            ));
+            let cache = Arc::new(PackageCache::new(
+                &target_paths,
+                host.os,
+                host.architecture,
+                CachePorts {
+                    catalog,
+                    fetcher: Arc::new(HttpFetcher::default()),
+                    backoff: Arc::new(ExponentialBackoff::default()),
+                    clock: Arc::clone(&clock),
+                },
+            ));
+            let lifecycle_store = Arc::new(TargetRecoveryStore::new(
+                Arc::clone(&store) as Arc<dyn Store>,
+                &policies,
+            ));
+            let launcher = Arc::new(LifecycleLauncher::new(
+                host.id,
+                target_paths.clone(),
+                target_paths.logs_dir(),
+                1,
+                runner_manager_domain::attempt::RecoveryTimeouts::provisional(),
+                RetryPolicy::bounded(3, Duration::from_secs(2), Duration::from_secs(30)),
+                LifecyclePorts {
+                    store: Arc::clone(&lifecycle_store) as Arc<dyn Store>,
+                    github: Arc::clone(&lifecycle_github) as Arc<dyn LifecycleGithub>,
+                    packages: Arc::new(CachedRuntimePackages::new(cache)),
+                    processes: Arc::new(
+                        PlatformExecutionProvider::new(host.id)
+                            .with_runner_env_file(runner_manager_platform::runner_env::path_in(
+                                target_paths.config_dir(),
+                            ))
+                            .with_dependency_caches(dependency_caches.clone())
+                            .with_docker_cleanup(
+                                runner_manager_agent::docker_cleanup::DockerCleanup::new(
+                                    host.id,
+                                    target_paths.config_dir(),
+                                    target_paths.state_dir(),
+                                ),
+                            ),
+                    ),
+                    clock: Arc::clone(&clock),
+                    demand: Arc::new(PersistentDemand),
+                    delay: Arc::new(TokioRetryDelay),
+                    events: Arc::new(TracingAttemptEvents),
+                    reconcile_events: Arc::clone(&events),
+                },
+            ));
+            launcher
+                .recover_startup(&policies)
+                .await
+                .map_err(|source| {
+                    CliError::new(
+                        Failure::LocalState,
+                        format!(
+                            "startup recovery for {} did not complete: {source}",
+                            package_target
+                        ),
+                    )
+                })?;
+            lifecycle_store.finish_recovery();
+            let cancel = CancelToken::new();
+            let demand = Arc::new(GatewayDemand::new(
+                Arc::clone(&demand_gateway),
+                cancel.clone(),
+            ));
+            let signals = routes.add(package_target.clone());
+            Ok(ManagedTarget {
+                policies,
+                store: Arc::clone(&store) as Arc<dyn Store>,
+                reconciler: Reconciler::new(
+                    host.clone(),
+                    ReconcilerPorts {
+                        demand,
+                        launcher: Arc::new(FitnessGatedLauncher::new(
+                            launcher,
+                            Arc::clone(&host_unfit),
+                        )),
+                        lock: Arc::clone(&shared_lock) as Arc<_>,
+                        directory: Arc::clone(&directory) as Arc<_>,
+                        clock: Arc::clone(&clock),
+                        jitter: Arc::new(RandomJitter),
+                        events: Arc::clone(&events),
+                    },
+                )
+                .with_director(Arc::clone(&launches) as Arc<dyn DemandDirector>),
+                cancel,
+                polling: Arc::clone(&polling),
+                wake: signals.wake,
+                launch: signals.launch,
+                coordination: coordination.subscribe(),
+                draining: false,
+            })
+        }
+    };
     let mut managed_targets = Vec::with_capacity(targets.len());
     for policies in targets {
-        let package_target = policies[0].target.clone();
-        let catalog = Arc::new(GatewayCatalog::new(
-            RestInventory::new(Arc::clone(&client), Arc::clone(&clock)),
-            package_target.clone(),
-        ));
-        let cache = Arc::new(PackageCache::new(
-            context.paths(),
-            host.os,
-            host.architecture,
-            CachePorts {
-                catalog,
-                fetcher: Arc::new(HttpFetcher::default()),
-                backoff: Arc::new(ExponentialBackoff::default()),
-                clock: Arc::clone(&clock),
-            },
-        ));
-        let lifecycle_store = Arc::new(TargetRecoveryStore::new(
-            Arc::clone(&store) as Arc<dyn Store>,
-            &policies,
-        ));
-        let launcher = Arc::new(LifecycleLauncher::new(
-            host.id,
-            context.paths().clone(),
-            context.paths().logs_dir(),
-            1,
-            runner_manager_domain::attempt::RecoveryTimeouts::provisional(),
-            RetryPolicy::bounded(3, Duration::from_secs(2), Duration::from_secs(30)),
-            LifecyclePorts {
-                store: Arc::clone(&lifecycle_store) as Arc<dyn Store>,
-                github: Arc::clone(&lifecycle_github) as Arc<dyn LifecycleGithub>,
-                packages: Arc::new(CachedRuntimePackages::new(cache)),
-                processes: Arc::new(
-                    PlatformExecutionProvider::new(host.id)
-                        .with_runner_env_file(runner_manager_platform::runner_env::path_in(
-                            context.paths().config_dir(),
-                        ))
-                        .with_dependency_caches(dependency_caches.clone())
-                        .with_docker_cleanup(
-                            runner_manager_agent::docker_cleanup::DockerCleanup::new(
-                                host.id,
-                                context.paths().config_dir(),
-                                context.paths().state_dir(),
-                            ),
-                        ),
-                ),
-                clock: Arc::clone(&clock),
-                demand: Arc::new(PersistentDemand),
-                delay: Arc::new(TokioRetryDelay),
-                events: Arc::new(TracingAttemptEvents),
-                reconcile_events: Arc::clone(&events),
-            },
-        ));
-        launcher
-            .recover_startup(&policies)
-            .await
-            .map_err(|source| {
-                CliError::new(
-                    Failure::LocalState,
-                    format!(
-                        "startup recovery for {} did not complete: {source}",
-                        package_target
-                    ),
-                )
-            })?;
-        lifecycle_store.finish_recovery();
-        let cancel = CancelToken::new();
-        let demand = Arc::new(GatewayDemand::new(
-            Arc::clone(&demand_gateway),
-            cancel.clone(),
-        ));
-        managed_targets.push(ManagedTarget {
-            policies,
-            store: Arc::clone(&store) as Arc<dyn Store>,
-            reconciler: Reconciler::new(
-                host.clone(),
-                ReconcilerPorts {
-                    demand,
-                    launcher: Arc::new(FitnessGatedLauncher::new(
-                        launcher,
-                        Arc::clone(&host_unfit),
-                    )),
-                    lock: Arc::clone(&shared_lock) as Arc<_>,
-                    directory: Arc::clone(&directory) as Arc<_>,
-                    clock: Arc::clone(&clock),
-                    jitter: Arc::new(RandomJitter),
-                    events: Arc::clone(&events),
-                },
-            )
-            .with_director(Arc::clone(&launches) as Arc<dyn DemandDirector>),
-            cancel,
-            polling: Arc::clone(&polling),
-            wake: routes.add(package_target.clone()),
-            coordination: coordination.subscribe(),
-        });
+        managed_targets.push(build_target(policies).await?);
     }
-    let routes = Arc::new(routes);
 
     let draining = Arc::new(AtomicBool::new(false));
     let _link = start_coordinator_link(
         context,
         &host,
         Arc::clone(&store) as Arc<dyn Store>,
-        routes,
+        Arc::clone(&routes),
         (Arc::clone(&host_unfit), Arc::clone(&draining)),
-        (coordination, launches),
+        (Arc::clone(&coordination), Arc::clone(&launches)),
     );
 
     let (shutdown, _) = tokio::sync::watch::channel(false);
-    let (upgrade, _) = tokio::sync::watch::channel(false);
     let mut loops = tokio::task::JoinSet::new();
     let contacts: Arc<dyn ContactRecorder> = Arc::new(FileContactRecorder {
         paths: context.paths().clone(),
         clock: Arc::clone(&clock),
         write: Mutex::new(None),
     });
-    // Captured before the targets are moved into their loops: this is the set a
-    // restart is measured against.
-    let served: BTreeSet<String> = managed_targets
-        .iter()
-        .filter_map(|target| target.policies.first())
-        .map(|policy| policy.target.to_string())
-        .collect();
+    // The loops running, by target: each with its own drain signal, which an
+    // upgrade or a reload sends to all and a removed target to its own.
+    let mut serving = Serving::default();
     for target in managed_targets {
-        loops.spawn(run_target_loop(
-            target,
-            shutdown.subscribe(),
-            upgrade.subscribe(),
-            Arc::clone(&contacts),
-        ));
+        serving.spawn(&mut loops, target, &shutdown, &contacts);
     }
 
     // The *source*, not `current_exe`. A service registered by `service
@@ -536,16 +556,25 @@ async fn run_generation(
             upgraded_to = Some(version);
             None
         }
-        () = wait_for_policy_set_change(Arc::clone(&store) as Arc<dyn Store>, served) => {
-            writeln!(
-                out,
-                "the set of repositories this host serves changed; finishing every running job                  before reloading"
-            )
-            .map_err(failed)?;
-            tracing::info!("the policy set changed; draining before restart");
-            restart_reason = Some("the set of repositories this host serves changed");
-            None
-        }
+        end = follow_policy_set(
+            Arc::clone(&store) as Arc<dyn Store>,
+            &build_target,
+            &mut serving,
+            &mut loops,
+            (&shutdown, &contacts, &routes),
+        ) => match end {
+            // Nothing left to serve: the reload starts the idle daemon.
+            None => {
+                writeln!(
+                    out,
+                    "this host no longer serves any repository; finishing every running job before reloading"
+                )
+                .map_err(failed)?;
+                restart_reason = Some("this host no longer serves any repository");
+                None
+            }
+            ended => ended,
+        },
         () = maintain_credential(Arc::clone(&client)) => {
             unreachable!("credential maintenance runs until the daemon is stopped")
         }
@@ -577,13 +606,12 @@ async fn run_generation(
         () = maintain_wsl_recovery(watchdog_paths, wsl_inventory, windows_service_host) => {
             unreachable!("WSL recovery watchdog runs until the daemon is stopped")
         }
-        result = loops.join_next() => result,
     };
     // Told to the coordinator on the next heartbeat; the link stays up while
     // the loops drain.
     draining.store(true, Ordering::Relaxed);
     if upgraded_to.is_some() || restart_reason.is_some() {
-        let _ = upgrade.send(true);
+        serving.drain_all();
         // Not `shutdown`: that one is bounded, and an upgrade must outlast any
         // job rather than any deadline.
         while let Some(result) = loops.join_next().await {
@@ -1779,6 +1807,153 @@ fn replace_own_binary(source: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+type LoopResult = Result<Result<(), CliError>, tokio::task::JoinError>;
+
+/// The target loops running, by target.
+#[derive(Default)]
+struct Serving {
+    loops: std::collections::BTreeMap<String, ServedTarget>,
+    /// Loops of removed targets, draining their own runners away.
+    retiring: std::collections::HashMap<tokio::task::Id, String>,
+}
+
+struct ServedTarget {
+    target: ScaleTarget,
+    drain: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::Id,
+}
+
+impl Serving {
+    fn spawn(
+        &mut self,
+        loops: &mut tokio::task::JoinSet<Result<(), CliError>>,
+        target: impl TargetReconciler,
+        shutdown: &tokio::sync::watch::Sender<bool>,
+        contacts: &Arc<dyn ContactRecorder>,
+    ) {
+        let Some(name) = target
+            .policies()
+            .first()
+            .map(|policy| policy.target.clone())
+        else {
+            return;
+        };
+        let (drain, drained) = tokio::sync::watch::channel(false);
+        let task = loops
+            .spawn(run_target_loop(
+                target,
+                shutdown.subscribe(),
+                drained,
+                Arc::clone(contacts),
+            ))
+            .id();
+        self.loops.insert(
+            name.to_string(),
+            ServedTarget {
+                target: name,
+                drain,
+                task,
+            },
+        );
+    }
+
+    fn served(&self) -> BTreeSet<String> {
+        self.loops.keys().cloned().collect()
+    }
+
+    /// An upgrade or a reload: every loop finishes its runners and stops.
+    fn drain_all(&self) {
+        for served in self.loops.values() {
+            let _ = served.drain.send(true);
+        }
+    }
+
+    /// `name` is no longer served: its loop drains away on its own.
+    fn retire(&mut self, name: &str) -> Option<ScaleTarget> {
+        let served = self.loops.remove(name)?;
+        let _ = served.drain.send(true);
+        self.retiring.insert(served.task, name.to_string());
+        Some(served.target)
+    }
+
+    fn is_retiring(&self, name: &str) -> bool {
+        self.retiring.values().any(|retiring| retiring == name)
+    }
+}
+
+/// Follows the set of targets this daemon serves while it runs: a target
+/// added gets a loop of its own (after its startup recovery), a target
+/// removed has its loop drain its own runners and stop. Every other loop,
+/// the coordinator link and its accepted launches are left alone; the link
+/// describes the new set at its next heartbeat.
+///
+/// Returns when a loop that was not retired stopped (its result), or `None`
+/// when nothing is left to serve, for the reload into the idle daemon.
+async fn follow_policy_set<F, Fut, T>(
+    store: Arc<dyn Store>,
+    build_target: &F,
+    serving: &mut Serving,
+    loops: &mut tokio::task::JoinSet<Result<(), CliError>>,
+    (shutdown, contacts, routes): (
+        &tokio::sync::watch::Sender<bool>,
+        &Arc<dyn ContactRecorder>,
+        &super::coordinator::WakeRoutes,
+    ),
+) -> Option<LoopResult>
+where
+    F: Fn(Vec<ScalePolicy>) -> Fut,
+    Fut: Future<Output = Result<T, CliError>>,
+    T: TargetReconciler,
+{
+    loop {
+        tokio::select! {
+            groups = wait_for_policy_set_change(Arc::clone(&store), serving.served()) => {
+                if groups.is_empty() {
+                    return None;
+                }
+                let current: BTreeSet<String> =
+                    groups.iter().map(|group| group[0].target.to_string()).collect();
+                for name in serving.served().difference(&current) {
+                    if let Some(target) = serving.retire(name) {
+                        routes.remove(&target);
+                        tracing::info!(%target, "a target is no longer served; its loop finishes its runners and stops");
+                    }
+                }
+                for group in groups {
+                    let target = group[0].target.clone();
+                    let name = target.to_string();
+                    // A removed target added back waits for its old loop.
+                    if serving.loops.contains_key(&name) || serving.is_retiring(&name) {
+                        continue;
+                    }
+                    match build_target(group).await {
+                        Ok(managed) => {
+                            serving.spawn(loops, managed, shutdown, contacts);
+                            tracing::info!(%target, "a target was added; its loop runs");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%target, %error, "a target that was added could not start; retrying shortly");
+                        }
+                    }
+                }
+            }
+            Some(joined) = loops.join_next_with_id(), if !loops.is_empty() => {
+                let id = match &joined {
+                    Ok((id, _)) => *id,
+                    Err(error) => error.id(),
+                };
+                if let Some(target) = serving.retiring.remove(&id) {
+                    if let Ok((_, Err(error))) = &joined {
+                        tracing::warn!(%target, %error, "a removed target's loop stopped with an error");
+                    }
+                    continue;
+                }
+                return Some(joined.map(|(_, result)| result));
+            }
+        }
+    }
+}
+
 /// Resolves when the *set* of targets this daemon should serve has changed.
 ///
 /// # Why this is separate from re-reading a policy
@@ -1787,14 +1962,14 @@ fn replace_own_binary(source: &std::path::Path) -> Result<(), String> {
 /// own policy — armed or drained, what capacity, which labels. It cannot create
 /// a loop that does not exist, and a loop owns a package cache, a launcher and
 /// a startup recovery that ran once. So a repository *added* while the daemon
-/// runs has no loop to refresh, and one *removed* leaves a loop with nothing to
-/// serve.
-///
-/// Both are handled the way an operator handles them today, minus the operator:
-/// finish what is running and let the service manager start a daemon that reads
-/// the whole set afresh. Startup recovery then adopts every runner still up,
-/// which is exactly what it exists for.
-async fn wait_for_policy_set_change(store: Arc<dyn Store>, initial: BTreeSet<String>) {
+/// runs needs a loop built for it, and one *removed* leaves a loop with
+/// nothing to serve: [`follow_policy_set`] does both, one target at a time.
+/// Returns the new set, grouped by target as [`active_autoscale_targets`]
+/// groups it.
+async fn wait_for_policy_set_change(
+    store: Arc<dyn Store>,
+    initial: BTreeSet<String>,
+) -> Vec<Vec<ScalePolicy>> {
     loop {
         tokio::time::sleep(POLICY_SET_CHECK_INTERVAL).await;
         let Ok(policies) = store.policies() else {
@@ -1802,12 +1977,13 @@ async fn wait_for_policy_set_change(store: Arc<dyn Store>, initial: BTreeSet<Str
             // would turn a blip into a drain.
             continue;
         };
-        let current: BTreeSet<String> = active_autoscale_targets(policies)
+        let groups = active_autoscale_targets(policies);
+        let current: BTreeSet<String> = groups
             .iter()
             .map(|group| group[0].target.to_string())
             .collect();
         if current != initial {
-            return;
+            return groups;
         }
     }
 }
@@ -2086,6 +2262,18 @@ trait TargetReconciler: Send + 'static {
         None
     }
 
+    /// The link's "start the accepted launches now" signal, when the daemon
+    /// routes one to this loop.
+    fn launch_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
+
+    /// Starts the runners of the coordinator launches accepted for this
+    /// target, without polling GitHub. See `Reconciler::start_directed`.
+    fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
     /// The link's view, for this target's poll mode. `None` where no link
     /// is wired.
     fn coordination(&self) -> Option<tokio::sync::watch::Receiver<super::coordinator::LinkView>> {
@@ -2147,12 +2335,32 @@ struct ManagedTarget {
     store: Arc<dyn Store>,
     polling: Arc<super::polling::PollingMonitor>,
     wake: Arc<tokio::sync::Notify>,
+    launch: Arc<tokio::sync::Notify>,
     coordination: tokio::sync::watch::Receiver<super::coordinator::LinkView>,
+    /// Draining: a policy read afresh is drained too, so a repository added
+    /// back while this loop winds down is not served by it.
+    draining: bool,
 }
 
 impl TargetReconciler for ManagedTarget {
     fn wake(&self) -> Option<Arc<tokio::sync::Notify>> {
         Some(Arc::clone(&self.wake))
+    }
+
+    fn launch_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(Arc::clone(&self.launch))
+    }
+
+    fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {
+            let report = self.reconciler.start_directed(&self.policies).await;
+            if report.started > 0 {
+                tracing::info!(
+                    started = report.started,
+                    "started the runners of accepted coordinator launches"
+                );
+            }
+        })
     }
 
     fn coordination(&self) -> Option<tokio::sync::watch::Receiver<super::coordinator::LinkView>> {
@@ -2168,6 +2376,7 @@ impl TargetReconciler for ManagedTarget {
     }
 
     fn begin_drain(&mut self) {
+        self.draining = true;
         self.cancel.cancel();
         begin_drain(&mut self.policies);
     }
@@ -2211,6 +2420,9 @@ impl TargetReconciler for ManagedTarget {
         // still up is supervised; the target-set watch is what ends the loop.
         if !refreshed.is_empty() {
             self.policies = refreshed;
+            if self.draining {
+                begin_drain(&mut self.policies);
+            }
         }
     }
 
@@ -2357,6 +2569,7 @@ async fn run_target_loop<T: TargetReconciler>(
         target.begin_drain();
     }
     let wake = target.wake();
+    let launch = target.launch_signal();
     let mut coordination = target.coordination();
     let target_name = target
         .policies()
@@ -2373,6 +2586,10 @@ async fn run_target_loop<T: TargetReconciler>(
         // pull the next poll forward for a job already seen.
         if let Some(wake) = &wake {
             let _ = futures::FutureExt::now_or_never(wake.notified());
+        }
+        // This pass starts every accepted launch too.
+        if let Some(launch) = &launch {
+            let _ = futures::FutureExt::now_or_never(launch.notified());
         }
         // Before deciding anything, so a policy an operator changed a moment
         // ago governs this pass rather than the next one.
@@ -2492,6 +2709,18 @@ async fn run_target_loop<T: TargetReconciler>(
                         None => std::future::pending().await,
                     }
                 } => {}
+                // Accepted coordinator launches: their runners start now,
+                // all of them, without a poll and so without its gap; the
+                // next pass stays where it was scheduled.
+                () = async {
+                    match &launch {
+                        Some(launch) => launch.notified().await,
+                        None => std::future::pending().await,
+                    }
+                }, if draining.is_none() => {
+                    target.refresh_policies();
+                    target.start_directed().await;
+                }
                 changed = shutdown.changed(), if draining != Some(DrainKind::Shutdown) => {
                     if changed.is_err() || *shutdown.borrow() {
                         // A shutdown arriving mid-upgrade supersedes it, deadline
@@ -3081,6 +3310,9 @@ mod tests {
         /// The link's view and the coordinated interval, when a test wires
         /// one.
         coordination: Option<tokio::sync::watch::Receiver<super::super::coordinator::LinkView>>,
+        /// The link's launch signal, and how often accepted launches were
+        /// started, when a test wires one.
+        launch: Option<(Arc<tokio::sync::Notify>, Arc<AtomicUsize>)>,
     }
 
     impl FakeTarget {
@@ -3098,6 +3330,7 @@ mod tests {
                     refreshes: Arc::new(AtomicUsize::new(0)),
                     wake: None,
                     coordination: None,
+                    launch: None,
                 },
                 calls,
             )
@@ -3115,6 +3348,7 @@ mod tests {
                 refreshes: Arc::new(AtomicUsize::new(0)),
                 wake: None,
                 coordination: None,
+                launch: None,
             }
         }
 
@@ -3132,6 +3366,7 @@ mod tests {
                 refreshes: Arc::new(AtomicUsize::new(0)),
                 wake: None,
                 coordination: None,
+                launch: None,
             }
         }
     }
@@ -3190,6 +3425,17 @@ mod tests {
             &self,
         ) -> Option<tokio::sync::watch::Receiver<super::super::coordinator::LinkView>> {
             self.coordination.clone()
+        }
+
+        fn launch_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+            self.launch.as_ref().map(|(signal, _)| Arc::clone(signal))
+        }
+
+        fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            if let Some((_, started)) = &self.launch {
+                started.fetch_add(1, Ordering::SeqCst);
+            }
+            Box::pin(async {})
         }
     }
 
@@ -3903,6 +4149,148 @@ mod tests {
         stop.send(true).unwrap();
         after(60).await;
         let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+    }
+
+    /// Accepted launches start their runners at once, however recently the
+    /// target was polled and however far its next poll is; a burst of them
+    /// is served together, and none of it is a poll.
+    #[tokio::test(start_paused = true)]
+    async fn accepted_launches_start_at_once_together_and_poll_nothing() {
+        let mut report = ReconcileReport::default();
+        report.next_poll.delay = Duration::from_secs(60);
+        let (mut target, calls) = FakeTarget::repeating(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+            report,
+        );
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        target.launch = Some((Arc::clone(&signal), Arc::clone(&started)));
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            never_upgraded(),
+            Arc::new(CountingContacts::default()) as Arc<dyn ContactRecorder>,
+        ));
+        after(0).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the first pass");
+
+        // Accepted one second after the poll: started then, not at five.
+        after(1).await;
+        signal.notify_one();
+        after(0).await;
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        // Six accepted at once: the start they woke and at most one more
+        // serve them all (each start serves every open launch).
+        for _ in 0..6 {
+            signal.notify_one();
+        }
+        after(0).await;
+        assert_eq!(started.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no poll was brought forward"
+        );
+        after(58).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        after(1).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the schedule is the schedule"
+        );
+
+        stop.send(true).unwrap();
+        after(60).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+    }
+
+    /// A repository added while the daemon runs gets a loop of its own; one
+    /// removed has only its own loop drain and stop. The others keep
+    /// running, and a removed target's loop stopping ends nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_set_of_target_loops_follows_the_policies_without_a_reload() {
+        use runner_manager_domain::store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let host = fixtures::host().build();
+        store.put_host(&host).expect("host");
+        let policy = |repository: &str| {
+            fixtures::policy()
+                .id(runner_manager_domain::model::PolicyId::new_random())
+                .repository(repository)
+                .host(host.id)
+                .autoscale("home", 1)
+                .active()
+                .build()
+        };
+        let (kept, removed, added) = (
+            policy("acme/kept"),
+            policy("acme/removed"),
+            policy("acme/added"),
+        );
+        store.insert_policy(&kept).expect("policy");
+        store.insert_policy(&removed).expect("policy");
+        let built = Arc::new(Mutex::new(Vec::<String>::new()));
+        let build = {
+            let built = Arc::clone(&built);
+            move |group: Vec<ScalePolicy>| {
+                built.lock().unwrap().push(group[0].target.to_string());
+                let mut report = ReconcileReport::default();
+                report.next_poll.delay = Duration::from_millis(50);
+                let (mut target, _) = FakeTarget::repeating(group[0].clone(), report);
+                target.active = 0;
+                std::future::ready(Ok::<_, CliError>(target))
+            }
+        };
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let contacts: Arc<dyn ContactRecorder> = Arc::new(CountingContacts::default());
+        let routes = super::super::coordinator::WakeRoutes::new(None);
+        let mut loops = tokio::task::JoinSet::new();
+        let mut serving = Serving::default();
+        for policy in [&kept, &removed] {
+            let target = build(vec![policy.clone()]).await.expect("built");
+            routes.add(policy.target.clone());
+            serving.spawn(&mut loops, target, &shutdown, &contacts);
+        }
+        built.lock().unwrap().clear();
+
+        store
+            .remove_policy(removed.id, removed.revision())
+            .expect("removed");
+        store.insert_policy(&added).expect("added");
+        let followed = tokio::time::timeout(
+            POLICY_SET_CHECK_INTERVAL * 3,
+            follow_policy_set(
+                Arc::clone(&store) as Arc<dyn Store>,
+                &build,
+                &mut serving,
+                &mut loops,
+                (&shutdown, &contacts, &routes),
+            ),
+        )
+        .await;
+        assert!(followed.is_err(), "nothing ended: the follower still runs");
+        assert_eq!(
+            *built.lock().unwrap(),
+            vec![added.target.to_string()],
+            "only the new target was built"
+        );
+        assert_eq!(
+            serving.served(),
+            BTreeSet::from([kept.target.to_string(), added.target.to_string()])
+        );
+        assert!(
+            serving.retiring.is_empty(),
+            "the removed loop drained and stopped"
+        );
+        assert_eq!(loops.len(), 2);
+        let _ = shutdown.send(true);
     }
 
     /// standalone → coordinated → fallback → coordinated, and the interval

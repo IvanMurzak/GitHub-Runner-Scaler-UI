@@ -2632,6 +2632,31 @@ impl Reconciler {
         &self.repositories
     }
 
+    /// Starts the runners of `policies`' coordinator launches, and nothing
+    /// else: no GitHub poll, no supervision. A launch the coordinator placed
+    /// here (`DemandDirector::directed_demand`) needs no reading of the queue,
+    /// so this runs as soon as one is accepted rather than at the next poll,
+    /// and every launch open at that moment is served by one call. The
+    /// runners go through the same allocator, ceilings and host-wide lock as
+    /// in [`Self::reconcile`]; the next full pass supervises them.
+    pub async fn start_directed(&mut self, policies: &[ScalePolicy]) -> ReconcileReport {
+        let mut report = ReconcileReport::default();
+        let mut launched: Vec<RunnerAttempt> = Vec::new();
+        for policy in policies {
+            if !policy.owns_runners()
+                || !policy.is_owned_by(self.host.id)
+                || !policy.may_start_runners()
+            {
+                continue;
+            }
+            if let Some(directed) = self.director.directed_demand(policy) {
+                self.start_runners(policy, directed, &mut report, &mut launched)
+                    .await;
+            }
+        }
+        report
+    }
+
     /// One reconciliation pass over `policies`.
     ///
     /// The order of operations is `03-control-flows.md` flow 2, and the two
@@ -7242,6 +7267,39 @@ mod tests {
         let report = reconciler.reconcile(std::slice::from_ref(&pool)).await;
         assert_eq!(report.started, 1);
         assert_eq!(launcher.live_count(), 2);
+
+        // A launch-only start: every open launch at once, and no poll.
+        let polls = demand.polls().len();
+        director.directed.lock().unwrap().insert(pool.id, 0);
+        let report = reconciler.start_directed(std::slice::from_ref(&pool)).await;
+        assert_eq!(report.started, 0);
+        let fresh = Arc::new(FakeLauncher::new());
+        let mut starter = Reconciler::new(
+            host_with(10),
+            ReconcilerPorts {
+                demand: Arc::clone(&demand) as Arc<dyn DemandSource>,
+                launcher: Arc::clone(&fresh) as Arc<dyn RunnerLauncher>,
+                lock: Arc::new(InProcessAllocationLock::new()),
+                directory: Arc::new(FakeDirectory::default()),
+                clock: Arc::new(FakeClock::default()),
+                jitter: Arc::new(NoJitter),
+                events: Arc::new(NoEvents),
+            },
+        )
+        .with_director(Arc::clone(&director) as Arc<dyn DemandDirector>);
+        let wide = policy(2, "acme/app", 6);
+        director.directed.lock().unwrap().insert(wide.id, 6);
+        let report = starter.start_directed(std::slice::from_ref(&wide)).await;
+        assert_eq!(report.started, 6, "six launches, one call");
+        assert_eq!(demand.polls().len(), polls, "GitHub was not polled");
+        // An undirected policy starts nothing this way.
+        assert_eq!(
+            starter
+                .start_directed(&[policy(3, "acme/app", 2)])
+                .await
+                .started,
+            0
+        );
 
         // Its own reading failed: a directed policy still starts its launch.
         let failing = Arc::new(FakeLauncher::new());

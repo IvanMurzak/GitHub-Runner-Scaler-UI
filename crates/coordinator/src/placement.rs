@@ -15,10 +15,17 @@
 //! places one more; while more exist it cancels the newest (`cancel_launch`),
 //! which a host honours only while that runner has not started.
 //!
-//! A lease closes when its runner takes a job (the host's `attempt_started`),
-//! when its attempt ends (`attempt_finished`), when its host disconnects, or
-//! when it expires ([`LEASE_TTL`]); the job, if still queued, is then placed
-//! again. A webhook `in_progress` or `completed` takes the job out of the
+//! A lease closes, and its job (if still queued) is placed again, when:
+//!
+//! * its runner takes a job (the host's `attempt_started`) or its attempt
+//!   ends (`attempt_finished`);
+//! * its host disconnects or connects again;
+//! * its host's heartbeat no longer lists it (the host dropped it);
+//! * another runner of the same host takes a job of its queue: a runner takes
+//!   *any* job of its labels, so the lease's runner would find nothing left;
+//! * it expires ([`LEASE_TTL`], `COORDINATOR_LEASE_TTL`).
+//!
+//! A webhook `in_progress` or `completed` takes the job out of the
 //! queue; the caller rebalances after [`CLAIM_GRACE`], by when the host whose
 //! runner took it has normally closed that very lease, so a surplus lease
 //! cancelled is one whose runner took nothing.
@@ -39,7 +46,8 @@
 //! the repository, then the most free RAM, then the fewest busy slots.
 //!
 //! The first is sent a `launch`; a refusal or no answer within
-//! [`ACK_TIMEOUT`] moves on to the next.
+//! [`ACK_TIMEOUT`] moves on to the next. A queue left short is given a reason
+//! ([`Unplaced`]), logged at most once a minute and shown by `stats`.
 //!
 //! # Logging
 //!
@@ -51,8 +59,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use runner_manager_domain::coordinator_protocol::{
-    AttemptFinished, AttemptStarted, CancelLaunch, Launch, LaunchAck, PlacementDecision,
-    ServerMessage,
+    AttemptFinished, AttemptStarted, CancelLaunch, Launch, LaunchAck, OpenLease, PendingQueue,
+    PlacementDecision, RefusalReason, ServerMessage, is_managed_runner_name,
 };
 use runner_manager_domain::model::Label;
 use tokio::sync::oneshot;
@@ -63,9 +71,30 @@ use crate::stats::{Aggregates, Contender, Demand, Statistics, score};
 /// How long a host has to answer a `launch`.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a lease counts once accepted: long enough for a cold runner
-/// (including an isolated one) to register and take a job.
-pub const LEASE_TTL: Duration = Duration::from_secs(5 * 60);
+/// How long a lease counts once accepted by default
+/// (`COORDINATOR_LEASE_TTL`): long enough for a cold runner to register and
+/// take a job. A lease whose runner is not coming is normally closed long
+/// before by the host's heartbeat or by another of its runners taking the job.
+pub const LEASE_TTL: Duration = Duration::from_secs(2 * 60);
+
+/// The shortest lease lifetime accepted.
+pub const MIN_LEASE_TTL: Duration = Duration::from_secs(30);
+
+/// A queue that stays unplaced for the same reason is logged at most this
+/// often.
+const UNPLACED_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// How long a host's runner is remembered from its `attempt_started`, and a
+/// runner that took a job before its host said so, for closing a lease when
+/// another runner of the same host takes its queue's job.
+const RUNNER_MEMORY: Duration = Duration::from_secs(10 * 60);
+
+/// Runners remembered at most, each way.
+const MAX_RUNNERS: usize = 10_000;
+
+/// Pending queues and open leases `stats` shows at most.
+const REPORT_PENDING: usize = 20;
+const REPORT_LEASES: usize = 50;
 
 /// How long after a job leaves the queue its key is rebalanced: time for the
 /// host whose runner took it to report `attempt_started`, so the lease
@@ -108,6 +137,16 @@ impl JobKey {
             labels: required.iter().cloned().collect(),
         }
     }
+
+    /// Its labels, comma-separated, as `stats` shows them.
+    #[must_use]
+    pub fn labels_csv(&self) -> String {
+        self.labels
+            .iter()
+            .map(Label::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -142,6 +181,16 @@ enum LeaseState {
     Claimed(Instant),
 }
 
+impl LeaseState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Offered => "offered",
+            Self::Accepted => "accepted",
+            Self::Claimed(_) => "claimed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Lease {
     key: JobKey,
@@ -153,9 +202,65 @@ struct Lease {
     estimate: u64,
 }
 
+/// Why a pool queue has fewer runners on their way than jobs queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unplaced {
+    /// No connected launch-mode host serves it with an enabled pool profile.
+    NoCandidate,
+    /// Every candidate is unfit or draining.
+    UnfitOrDraining,
+    /// Every candidate is full by its last heartbeat and open leases.
+    NoFreeSlot,
+    /// No candidate's free memory holds the queue's measured estimate.
+    NoMemoryFit,
+    /// The last candidate tried refused, for this reason.
+    Refused(RefusalReason),
+    /// The last candidate tried did not answer, or could not be reached.
+    Unanswered,
+}
+
+impl Unplaced {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCandidate => "no_candidate",
+            Self::UnfitOrDraining => "unfit_or_draining",
+            Self::NoFreeSlot => "no_free_slot",
+            Self::NoMemoryFit => "no_memory_fit",
+            Self::Refused(_) => "refused",
+            Self::Unanswered => "unanswered",
+        }
+    }
+
+    const fn refusal(self) -> Option<RefusalReason> {
+        match self {
+            Self::Refused(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// A runner a host said took a job, or a job taken by a runner its host had
+/// not said yet.
+#[derive(Debug, Clone)]
+struct Runner {
+    host_id: String,
+    /// The queue of the lease it was started for, if any.
+    queue: Option<JobKey>,
+    at: Instant,
+}
+
 #[derive(Debug, Default)]
 struct State {
     queues: HashMap<JobKey, Queue>,
+    /// Why each queue short of leases was not placed, and when it was last
+    /// logged.
+    unplaced: HashMap<JobKey, (Unplaced, Option<Instant>)>,
+    /// Runners whose `attempt_started` came in, by lower-cased name.
+    runners: HashMap<String, Runner>,
+    /// Jobs a webhook said a runner took before its host reported that
+    /// runner, by lower-cased runner name.
+    taken: HashMap<String, (JobKey, Instant)>,
     leases: HashMap<String, Lease>,
     /// When a webhook last changed a key's queue, so a sweep that read
     /// GitHub before that does not overwrite it.
@@ -219,6 +324,66 @@ impl State {
                 queue.unnamed > 0 || queue.jobs.values().any(|(_, job_key)| job_key.is_none()),
             )
         })
+    }
+
+    /// Closes the oldest accepted lease `host_id` holds for `key`: another of
+    /// its runners took that queue's job. The host is told to drop it.
+    fn close_oldest_accepted(&mut self, registry: &Registry, host_id: &str, key: &JobKey) {
+        let oldest = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| {
+                lease.host_id == host_id && &lease.key == key && lease.state == LeaseState::Accepted
+            })
+            .min_by_key(|(_, lease)| lease.sent)
+            .map(|(id, _)| id.clone());
+        if let Some(lease_id) = oldest
+            && self.cancel_lease(registry, &lease_id)
+        {
+            tracing::info!(%lease_id, %host_id, "a lease was closed: another runner of its host took its queue's job");
+        }
+    }
+
+    /// Removes `lease_id` and tells its host to drop the launch; `false`
+    /// when there was no such lease.
+    fn cancel_lease(&mut self, registry: &Registry, lease_id: &str) -> bool {
+        let Some(lease) = self.leases.remove(lease_id) else {
+            return false;
+        };
+        registry.send(
+            &lease.host_id,
+            ServerMessage::CancelLaunch(CancelLaunch {
+                lease_id: lease_id.to_string(),
+            }),
+        );
+        true
+    }
+
+    /// Records why `key` is short of runners; logs it at most once a minute.
+    fn note_unplaced(&mut self, key: &JobKey, reason: Unplaced) {
+        let now = Instant::now();
+        let entry = self.unplaced.entry(key.clone()).or_insert((reason, None));
+        let due = entry
+            .1
+            .is_none_or(|at| now.saturating_duration_since(at) >= UNPLACED_LOG_EVERY);
+        entry.0 = reason;
+        if due {
+            entry.1 = Some(now);
+            let queue = self.queues.get(key);
+            let queued = queue.map_or(0, Queue::len);
+            let oldest_job = queue
+                .and_then(|queue| queue.jobs.iter().min_by_key(|(_, (at, _))| *at))
+                .map(|(id, _)| *id);
+            let leases = self.leases_for(key);
+            tracing::info!(
+                reason = reason.as_str(),
+                refusal = reason.refusal().map_or("", RefusalReason::as_str),
+                queued,
+                leases,
+                oldest_job = oldest_job.unwrap_or_default(),
+                "a pool queue is not placed"
+            );
+        }
     }
 
     /// Launches on `host_id` its heartbeat at `heartbeat_at` cannot have
@@ -357,6 +522,20 @@ impl Placement {
     /// A webhook said a job left the queue: a runner took it
     /// (`in_progress`) or it ended (`completed`).
     pub fn dequeued(&self, repository: &str, required: &[Label], job_id: u64) -> Option<JobKey> {
+        self.dequeued_by(repository, required, job_id, None)
+    }
+
+    /// [`Self::dequeued`], naming the runner that took the job (`in_progress`).
+    /// A runner of this tool whose host started it for no lease of this
+    /// queue closes that host's oldest accepted lease for the queue: the
+    /// runner that lease was waiting for would find the job gone.
+    pub fn dequeued_by(
+        &self,
+        repository: &str,
+        required: &[Label],
+        job_id: u64,
+        runner: Option<&str>,
+    ) -> Option<JobKey> {
         if !is_pool_job(required) {
             return None;
         }
@@ -368,6 +547,26 @@ impl Placement {
             queue.take(job_id);
             if queue.len() == 0 {
                 state.queues.remove(&key);
+            }
+        }
+        let runner = runner
+            .filter(|name| is_managed_runner_name(name))
+            .map(str::to_ascii_lowercase);
+        if let Some(name) = runner {
+            match state.runners.get(&name).cloned() {
+                // Started for no lease, or for another queue's.
+                Some(known) if known.queue.as_ref() != Some(&key) => {
+                    state.close_oldest_accepted(&self.registry, &known.host_id, &key);
+                    return Some(key);
+                }
+                Some(_) => {}
+                // Its host has not said yet: its `attempt_started` settles
+                // this job, whichever lease (or none) the runner had.
+                None if state.taken.len() < MAX_RUNNERS => {
+                    state.taken.insert(name, (key.clone(), now));
+                    return Some(key);
+                }
+                None => {}
             }
         }
         // The runner that took it closes its lease; if it already said so,
@@ -472,10 +671,47 @@ impl Placement {
     /// A host's runner took a job. Its lease closes if the job already left
     /// the queue; otherwise it is held as claimed until the webhook says so.
     pub fn attempt_started(&self, host_id: &str, started: &AttemptStarted) {
+        let mut state = self.state();
+        let name = started.runner_name.to_ascii_lowercase();
+        let taken = state.taken.remove(&name);
+        if is_managed_runner_name(&name) && state.runners.len() < MAX_RUNNERS {
+            let queue = started
+                .lease_id
+                .as_ref()
+                .and_then(|lease| state.leases.get(lease))
+                .filter(|lease| lease.host_id == host_id)
+                .map(|lease| lease.key.clone());
+            state.runners.insert(
+                name,
+                Runner {
+                    host_id: host_id.to_string(),
+                    queue,
+                    at: Instant::now(),
+                },
+            );
+        }
+        let lease_key = started
+            .lease_id
+            .as_deref()
+            .and_then(|lease| state.leases.get(lease))
+            .filter(|lease| lease.host_id == host_id)
+            .map(|lease| lease.key.clone());
+        // A webhook already said this runner took a job of `taken`.
+        if let Some((taken, _)) = taken {
+            match (started.lease_id.as_deref(), lease_key) {
+                // Its own lease's job: that lease is done.
+                (Some(lease_id), Some(key)) if key == taken => {
+                    state.release_claimed(lease_id, Instant::now());
+                }
+                // Another queue's job, or a runner of no lease: the host's
+                // oldest lease for that queue is not coming to anything.
+                _ => state.close_oldest_accepted(&self.registry, host_id, &taken),
+            }
+            return;
+        }
         let Some(lease_id) = started.lease_id.as_deref() else {
             return;
         };
-        let mut state = self.state();
         let Some(key) = state
             .leases
             .get(lease_id)
@@ -516,8 +752,37 @@ impl Placement {
         }
     }
 
-    /// A host disconnected: its leases close, and a launch it was answering
-    /// is refused at once.
+    /// A host's heartbeat listed the launches it still holds open (`held`):
+    /// every accepted lease of that host it does not list is closed, and the
+    /// number closed returned. A lease still being offered, or whose runner
+    /// took a job, is left alone: the host reports those another way.
+    ///
+    /// Sound because one connection is ordered: a lease is accepted here only
+    /// after its `launch_ack`, so a heartbeat read after that was sent after
+    /// it, when the host already held the launch.
+    pub fn reconcile_leases(&self, host_id: &str, held: &[String]) -> usize {
+        let held: HashSet<&str> = held.iter().map(String::as_str).collect();
+        let mut state = self.state();
+        let stale: Vec<String> = state
+            .leases
+            .iter()
+            .filter(|(id, lease)| {
+                lease.host_id == host_id
+                    && lease.state == LeaseState::Accepted
+                    && !held.contains(id.as_str())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for lease_id in &stale {
+            state.leases.remove(lease_id);
+            tracing::info!(%lease_id, %host_id, "a lease was closed: its host no longer holds it");
+        }
+        stale.len()
+    }
+
+    /// A host disconnected, or connected again (its new link starts with no
+    /// launch, whatever an old half-open one held): its leases close, and a
+    /// launch it was answering is refused at once.
     pub fn host_gone(&self, host_id: &str) {
         self.state()
             .leases
@@ -554,6 +819,12 @@ impl Placement {
         state
             .touched
             .retain(|_, at| now.saturating_duration_since(*at) < JOB_MEMORY);
+        state
+            .runners
+            .retain(|_, runner| now.saturating_duration_since(runner.at) < RUNNER_MEMORY);
+        state
+            .taken
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < RUNNER_MEMORY);
         let expired = before - state.leases.len();
         if expired > 0 {
             tracing::info!(expired, "placement leases expired");
@@ -564,12 +835,81 @@ impl Placement {
                 .retain(|_, (at, _)| now.saturating_duration_since(*at) < JOB_MEMORY);
         }
         state.queues.retain(|_, queue| queue.len() > 0);
-        state
+        let short: Vec<JobKey> = state
             .queues
             .iter()
             .filter(|(key, queue)| queue.len() > state.leases_for(key))
             .map(|(key, _)| key.clone())
-            .collect()
+            .collect();
+        state.unplaced.retain(|key, _| short.contains(key));
+        short
+    }
+
+    /// The queues short of runners and the open leases, for `stats`.
+    #[must_use]
+    pub fn snapshot(&self) -> (Vec<PendingQueue>, Vec<OpenLease>) {
+        let now = Instant::now();
+        let state = self.state();
+        let mut open: HashMap<&JobKey, usize> = HashMap::new();
+        for lease in state.leases.values() {
+            *open.entry(&lease.key).or_default() += 1;
+        }
+        let leases_for = |key: &JobKey| open.get(key).copied().unwrap_or(0);
+        let mut pending: Vec<(Option<Instant>, PendingQueue)> = state
+            .queues
+            .iter()
+            .filter(|(key, queue)| queue.len() > leases_for(key))
+            .map(|(key, queue)| {
+                let oldest = queue.jobs.values().map(|(at, _)| *at).min();
+                let reason = state.unplaced.get(key).map(|(reason, _)| *reason);
+                (
+                    oldest,
+                    PendingQueue {
+                        repository: key.repository.clone(),
+                        labels: key.labels_csv(),
+                        queued: u32::try_from(queue.len()).unwrap_or(u32::MAX),
+                        leases: u32::try_from(leases_for(key)).unwrap_or(u32::MAX),
+                        oldest_wait_secs: oldest
+                            .map(|at| now.saturating_duration_since(at).as_secs()),
+                        reason: reason.map(|reason| reason.as_str().to_string()),
+                        refusal: reason
+                            .and_then(Unplaced::refusal)
+                            .map(|refusal| refusal.as_str().to_string()),
+                    },
+                )
+            })
+            .collect();
+        // The longest waiting first; queues only the sweep counted last.
+        pending.sort_by_key(|(oldest, _)| oldest.map_or((1, now), |at| (0, at)));
+        let mut leases: Vec<(Instant, OpenLease)> = state
+            .leases
+            .iter()
+            .map(|(id, lease)| {
+                (
+                    lease.sent,
+                    OpenLease {
+                        host_id: lease.host_id.clone(),
+                        lease_id: id.clone(),
+                        state: lease.state.as_str().to_string(),
+                        age_secs: now.saturating_duration_since(lease.sent).as_secs(),
+                        repository: lease.key.repository.clone(),
+                    },
+                )
+            })
+            .collect();
+        leases.sort_by(|(a_at, a), (b_at, b)| a.host_id.cmp(&b.host_id).then(a_at.cmp(b_at)));
+        (
+            pending
+                .into_iter()
+                .take(REPORT_PENDING)
+                .map(|(_, queue)| queue)
+                .collect(),
+            leases
+                .into_iter()
+                .take(REPORT_LEASES)
+                .map(|(_, lease)| lease)
+                .collect(),
+        )
     }
 
     /// Expires leases, then places every job still short of one.
@@ -609,9 +949,10 @@ impl Placement {
     pub async fn rebalance(&self, key: &JobKey) -> Rebalanced {
         let mut report = Rebalanced::default();
         let mut tried: HashSet<String> = HashSet::new();
+        let mut last_failure = None;
         loop {
             let mut decision = None;
-            let offered = self.offer(key, &tried, &mut report, &mut decision);
+            let offered = self.offer(key, &tried, last_failure, &mut report, &mut decision);
             if let (Some(stats), Some(decision)) = (&self.stats, decision) {
                 stats.decided(&decision);
             }
@@ -621,6 +962,13 @@ impl Placement {
             let (sender, receiver) = oneshot::channel();
             self.waiting()
                 .insert(lease_id.clone(), (host_id.clone(), sender));
+            // The host reconnected since the offer (its leases were dropped):
+            // the launch is not sent to its new link untracked.
+            if !self.state().leases.contains_key(&lease_id) {
+                self.waiting().remove(&lease_id);
+                tried.insert(host_id);
+                continue;
+            }
             // `Ok(Err)`: undeliverable, or the host went away meanwhile.
             let answer = if self.registry.send(&host_id, ServerMessage::Launch(launch)) {
                 tokio::time::timeout(self.ack_timeout, receiver)
@@ -649,11 +997,16 @@ impl Placement {
                         reason = ack.reason.map_or("unspecified", |reason| reason.as_str()),
                         "a host refused a launch; trying the next"
                     );
+                    last_failure = Some(Unplaced::Refused(
+                        ack.reason.unwrap_or(RefusalReason::Other),
+                    ));
                 }
                 Ok(Err(_)) => {
                     tracing::info!(%lease_id, %host_id, "a launch could not be delivered; trying the next host");
+                    last_failure = Some(Unplaced::Unanswered);
                 }
                 Err(_) => {
+                    last_failure = Some(Unplaced::Unanswered);
                     tracing::warn!(%lease_id, %host_id, "a host did not answer a launch in time; trying the next");
                     // It may still accept late: tell it not to.
                     self.registry.send(
@@ -676,6 +1029,7 @@ impl Placement {
         &self,
         key: &JobKey,
         tried: &HashSet<String>,
+        last_failure: Option<Unplaced>,
         report: &mut Rebalanced,
         decision: &mut Option<PlacementDecision>,
     ) -> Option<(String, String, Launch)> {
@@ -690,20 +1044,42 @@ impl Placement {
             return None;
         }
         if open == queued {
+            state.unplaced.remove(key);
+            return None;
+        }
+        let untried = |candidate: &Candidate| !tried.contains(&candidate.host_id);
+        let fit =
+            |candidate: &Candidate| !candidate.heartbeat.unfit && !candidate.heartbeat.draining;
+        let free = |candidate: &Candidate| {
+            candidate.heartbeat.free_slots
+                > state.unreported_on(&candidate.host_id, candidate.heartbeat_at)
+        };
+        // When nothing is left, the first filter that emptied the field says
+        // why; a host tried this round says it best.
+        if !candidates.iter().any(|c| untried(c) && fit(c) && free(c)) {
+            let reason = if !tried.is_empty() {
+                last_failure.unwrap_or(Unplaced::Unanswered)
+            } else if candidates.is_empty() {
+                Unplaced::NoCandidate
+            } else if !candidates.iter().any(fit) {
+                Unplaced::UnfitOrDraining
+            } else {
+                Unplaced::NoFreeSlot
+            };
+            state.note_unplaced(key, reason);
             return None;
         }
         let eligible: Vec<Candidate> = candidates
             .into_iter()
-            .filter(|candidate| !tried.contains(&candidate.host_id))
-            .filter(|candidate| !candidate.heartbeat.unfit && !candidate.heartbeat.draining)
-            .filter(|candidate| {
-                candidate.heartbeat.free_slots
-                    > state.unreported_on(&candidate.host_id, candidate.heartbeat_at)
-            })
+            .filter(|c| untried(c) && fit(c) && free(c))
             .collect();
-        let (chosen, estimate) = match &self.stats {
-            Some(stats) => Self::weigh(stats, &state, key, eligible, decision)?,
-            None => (rank(eligible).into_iter().next()?, 0),
+        let chosen = match &self.stats {
+            Some(stats) => Self::weigh(stats, &state, key, eligible, decision),
+            None => rank(eligible).into_iter().next().map(|chosen| (chosen, 0)),
+        };
+        let Some((chosen, estimate)) = chosen else {
+            state.note_unplaced(key, Unplaced::NoMemoryFit);
+            return None;
         };
         let lease_id = uuid::Uuid::new_v4().simple().to_string();
         let now = Instant::now();
@@ -815,12 +1191,7 @@ impl Placement {
             *decision = Some(PlacementDecision {
                 at: chrono::Utc::now().timestamp(),
                 repository: key.repository.clone(),
-                labels: key
-                    .labels
-                    .iter()
-                    .map(Label::as_str)
-                    .collect::<Vec<_>>()
-                    .join(","),
+                labels: key.labels_csv(),
                 estimate_bytes: demand.estimate,
                 estimate_source: demand.source.as_str().to_string(),
                 method: method.to_string(),
@@ -852,15 +1223,9 @@ impl Placement {
             .collect();
         accepted.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
         for (lease_id, _) in accepted.into_iter().take(surplus) {
-            if let Some(lease) = state.leases.remove(&lease_id) {
-                self.registry.send(
-                    &lease.host_id,
-                    ServerMessage::CancelLaunch(CancelLaunch {
-                        lease_id: lease_id.clone(),
-                    }),
-                );
+            if state.cancel_lease(&self.registry, &lease_id) {
                 report.cancelled += 1;
-                tracing::info!(%lease_id, host_id = %lease.host_id, "a launch was cancelled: its job is no longer queued");
+                tracing::info!(%lease_id, "a launch was cancelled: its job is no longer queued");
             }
         }
     }
@@ -1317,6 +1682,238 @@ mod tests {
         assert_eq!(launches(&host.await.expect("host")), 2);
     }
 
+    fn started_by(runner: &str, lease: Option<&str>) -> AttemptStarted {
+        AttemptStarted {
+            lease_id: lease.map(ToString::to_string),
+            runner_name: runner.into(),
+            target: TargetRef {
+                scope: TargetScope::Repo,
+                name: "octo/app".into(),
+            },
+            profile: "pool".into(),
+        }
+    }
+
+    fn cancels(seen: &[ServerMessage]) -> Vec<String> {
+        seen.iter()
+            .filter_map(|message| match message {
+                ServerMessage::CancelLaunch(cancel) => Some(cancel.lease_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The host's heartbeat lists the launches it still holds: an accepted
+    /// lease it no longer lists is closed and its job placed again at once;
+    /// an older host's heartbeat (no list) changes nothing.
+    #[tokio::test]
+    async fn a_lease_its_host_no_longer_holds_is_closed_by_its_heartbeat() {
+        let (registry, placement) = setup();
+        let host = connect(&registry, "h", LAUNCH_VERSION, POOL, 8, 8 << 30);
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let pool = required(POOL);
+        let key = placement.queued("octo/app", &pool, 1).expect("pool");
+        placement.queued("octo/app", &pool, 2);
+        placement.queued("octo/app", &pool, 3);
+        assert_eq!(placement.rebalance(&key).await.accepted, 3);
+        let mut leases: Vec<(String, Instant)> = placement
+            .state()
+            .leases
+            .iter()
+            .map(|(id, lease)| (id.clone(), lease.sent))
+            .collect();
+        leases.sort_by_key(|(_, at)| *at);
+        let ids: Vec<String> = leases.into_iter().map(|(id, _)| id).collect();
+        // One claimed: held whatever the list says.
+        placement.attempt_started("h", &started_by("runner-manager-c", Some(&ids[2])));
+        assert_eq!(
+            placement.reconcile_leases("h", std::slice::from_ref(&ids[0])),
+            1,
+            "only the accepted lease the host dropped"
+        );
+        assert_eq!(placement.counts(&key), (3, 2));
+        assert!(!placement.state().leases.contains_key(&ids[1]));
+        // Another host's list says nothing about these.
+        assert_eq!(placement.reconcile_leases("other", &[]), 0);
+        // Placed again.
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        assert_eq!(placement.counts(&key), (3, 3));
+        assert_eq!(launches(&host.await.expect("host")), 4);
+    }
+
+    /// A runner of a host takes a job of a queue it holds no lease for (an
+    /// idle runner, or one started for a dropped launch): the host's oldest
+    /// accepted lease for that queue is closed, and the host told, whether
+    /// the host's report or the webhook comes first.
+    #[tokio::test]
+    async fn another_runner_of_the_host_taking_the_job_closes_its_oldest_lease() {
+        let (registry, placement) = setup();
+        let host = connect(&registry, "h", LAUNCH_VERSION, POOL, 8, 8 << 30);
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let pool = required(POOL);
+        let key = placement.queued("octo/app", &pool, 1).expect("pool");
+        placement.queued("octo/app", &pool, 2);
+        placement.queued("octo/app", &pool, 3);
+        assert_eq!(placement.rebalance(&key).await.accepted, 3);
+        let oldest = |placement: &Placement| {
+            placement
+                .state()
+                .leases
+                .iter()
+                .min_by_key(|(_, lease)| lease.sent)
+                .map(|(id, _)| id.clone())
+                .expect("a lease")
+        };
+
+        // The host's report first, then the webhook naming that runner.
+        let first = oldest(&placement);
+        placement.attempt_started("h", &started_by("runner-manager-idle1", None));
+        assert_eq!(
+            placement.counts(&key),
+            (3, 3),
+            "a lease-less claim alone closes nothing"
+        );
+        placement.dequeued_by("octo/app", &pool, 1, Some("Runner-Manager-Idle1"));
+        assert_eq!(placement.counts(&key), (2, 2));
+        assert!(!placement.state().leases.contains_key(&first));
+
+        // The webhook first: its runner's report decides.
+        let second = oldest(&placement);
+        placement.dequeued_by("octo/app", &pool, 2, Some("runner-manager-idle2"));
+        assert_eq!(placement.counts(&key), (1, 2), "not yet known whose runner");
+        placement.attempt_started("h", &started_by("runner-manager-idle2", None));
+        assert_eq!(placement.counts(&key), (1, 1));
+        assert!(!placement.state().leases.contains_key(&second));
+        assert!(
+            placement
+                .state()
+                .credits
+                .get(&key)
+                .is_none_or(VecDeque::is_empty)
+        );
+
+        // A runner started for this very queue's lease is the ordinary claim.
+        let third = oldest(&placement);
+        placement.attempt_started("h", &started_by("runner-manager-own", Some(&third)));
+        placement.dequeued_by("octo/app", &pool, 3, Some("runner-manager-own"));
+        assert_eq!(placement.counts(&key), (0, 0));
+
+        let seen = host.await.expect("host");
+        assert_eq!(
+            cancels(&seen),
+            vec![first, second],
+            "the host drops them too"
+        );
+    }
+
+    /// A runner started for one queue's lease takes another queue's job, and
+    /// the webhook says so before its host does: the other queue's lease of
+    /// that host closes, the runner's own lease is left for its heartbeat,
+    /// and no credit is left behind.
+    #[tokio::test]
+    async fn a_runner_taking_another_queues_job_closes_that_queues_lease_in_either_order() {
+        let (registry, placement) = setup();
+        let host = connect(
+            &registry,
+            "h",
+            LAUNCH_VERSION,
+            &["rm-pool-linux", "gpu"],
+            8,
+            8 << 30,
+        );
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let plain = required(&["rm-pool-linux"]);
+        let gpu = required(&["rm-pool-linux", "gpu"]);
+        let plain_key = placement.queued("octo/app", &plain, 1).expect("pool");
+        let gpu_key = placement.queued("octo/app", &gpu, 2).expect("pool");
+        assert_eq!(placement.rebalance(&plain_key).await.accepted, 1);
+        assert_eq!(placement.rebalance(&gpu_key).await.accepted, 1);
+        let lease_of = |placement: &Placement, key: &JobKey| {
+            placement
+                .state()
+                .leases
+                .iter()
+                .find(|(_, lease)| &lease.key == key)
+                .map(|(id, _)| id.clone())
+                .expect("a lease")
+        };
+        let plain_lease = lease_of(&placement, &plain_key);
+        let gpu_lease = lease_of(&placement, &gpu_key);
+
+        // The plain lease's runner took the gpu job; the webhook came first.
+        placement.dequeued_by("octo/app", &gpu, 2, Some("runner-manager-p"));
+        placement.attempt_started("h", &started_by("runner-manager-p", Some(&plain_lease)));
+        assert_eq!(
+            placement.counts(&gpu_key),
+            (0, 0),
+            "the gpu lease is not coming"
+        );
+        assert_eq!(
+            placement.counts(&plain_key),
+            (1, 1),
+            "the plain one is its heartbeat's"
+        );
+        assert!(
+            placement.state().credits.is_empty(),
+            "no credit for a later claim"
+        );
+        assert!(placement.state().taken.is_empty());
+        let seen = host.await.expect("host");
+        assert_eq!(cancels(&seen), vec![gpu_lease]);
+    }
+
+    /// A queue left short says why, and `stats` lists it with the open
+    /// leases.
+    #[tokio::test]
+    async fn an_unplaced_queue_says_why_and_the_snapshot_lists_queues_and_leases() {
+        let (registry, placement) = setup();
+        let pool = required(POOL);
+        let key = placement.queued("octo/app", &pool, 1).expect("pool");
+        placement.rebalance(&key).await;
+        let reason = |placement: &Placement| {
+            let (pending, _) = placement.snapshot();
+            pending
+                .first()
+                .map(|queue| (queue.reason.clone(), queue.refusal.clone()))
+        };
+        assert_eq!(
+            reason(&placement),
+            Some((Some("no_candidate".into()), None))
+        );
+        let _full = connect(&registry, "full", LAUNCH_VERSION, POOL, 0, 8 << 30);
+        placement.rebalance(&key).await;
+        assert_eq!(
+            reason(&placement),
+            Some((Some("no_free_slot".into()), None))
+        );
+        let refuses = connect(&registry, "refuses", LAUNCH_VERSION, POOL, 1, 8 << 30);
+        let refuses = answer(&placement, "refuses", refuses, Answer::Refuse);
+        placement.rebalance(&key).await;
+        assert_eq!(
+            reason(&placement),
+            Some((Some("refused".into()), Some("host_capacity".into())))
+        );
+        let (pending, leases) = placement.snapshot();
+        assert_eq!(pending[0].repository, "octo/app");
+        assert_eq!(pending[0].labels, "rm-pool-linux");
+        assert_eq!((pending[0].queued, pending[0].leases), (1, 0));
+        assert!(pending[0].oldest_wait_secs.is_some());
+        assert!(leases.is_empty());
+        refuses.await.expect("host");
+
+        let accepts = connect(&registry, "accepts", LAUNCH_VERSION, POOL, 1, 8 << 30);
+        let accepts = answer(&placement, "accepts", accepts, Answer::Accept);
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        let (pending, leases) = placement.snapshot();
+        assert!(pending.is_empty(), "placed: nothing waits");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(
+            (leases[0].host_id.as_str(), leases[0].state.as_str()),
+            ("accepts", "accepted")
+        );
+        accepts.await.expect("host");
+    }
+
     #[tokio::test]
     async fn a_launch_already_counted_by_the_last_heartbeat_does_not_take_a_second_slot() {
         let (registry, placement) = setup();
@@ -1559,6 +2156,7 @@ mod tests {
         let offered = placement.offer(
             &key,
             &HashSet::new(),
+            None,
             &mut Rebalanced::default(),
             &mut decision,
         );

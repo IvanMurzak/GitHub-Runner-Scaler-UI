@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 
 use crate::placement::{CLAIM_GRACE, Placement};
 use crate::registry::{OUTBOUND_QUEUE, Outbound, Registry};
-use crate::stats::{JobIdentity, JobTimes, Statistics, StatsConfig};
+use crate::stats::{JobIdentity, JobTimes, LiveState, Statistics, StatsConfig};
 use crate::store::{EnrollError, Store};
 use crate::webhook::{
     DELIVERY_MEMORY, DeliveryLog, MAX_BODY_BYTES, WorkflowJobEvent, action_name, required_labels,
@@ -72,6 +72,9 @@ pub struct Config {
     /// How often placement expires leases and retries the queues nothing
     /// took ([`crate::placement::TICK`]); a freed slot retries at once.
     pub placement_tick: Duration,
+    /// How long an accepted launch counts without its runner taking a job
+    /// (`COORDINATOR_LEASE_TTL`).
+    pub lease_ttl: Duration,
 }
 
 impl Config {
@@ -87,6 +90,7 @@ impl Config {
             attempts_per_minute: 20,
             stats: StatsConfig::default(),
             placement_tick: crate::placement::TICK,
+            lease_ttl: crate::placement::LEASE_TTL,
         }
     }
 }
@@ -111,12 +115,18 @@ impl AppState {
         let registry = Arc::new(Registry::default());
         let store = Arc::new(Mutex::new(store));
         let statistics = Arc::new(Statistics::load(Arc::clone(&store), config.stats));
+        let lease_ttl = config.lease_ttl;
         Arc::new(Self {
             limiter: RateLimiter::new(config.attempts_per_minute),
             config,
             store,
             placement: Arc::new(
-                Placement::new(Arc::clone(&registry)).with_statistics(Arc::clone(&statistics)),
+                Placement::with_timings(
+                    Arc::clone(&registry),
+                    crate::placement::ACK_TIMEOUT,
+                    lease_ttl,
+                )
+                .with_statistics(Arc::clone(&statistics)),
             ),
             statistics,
             registry,
@@ -208,7 +218,8 @@ fn collect_wakes(state: &AppState) {
         .count_wakes(state.registry.take_wakes_sent());
 }
 
-/// Adds the launch and wake counts to the database every minute.
+/// Adds the launch and wake counts to the database every minute, and saves
+/// placement's live state for the admin CLI.
 async fn flush_counters(state: Arc<AppState>) {
     let mut ticks = tokio::time::interval(Duration::from_secs(60));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -216,7 +227,13 @@ async fn flush_counters(state: Arc<AppState>) {
         ticks.tick().await;
         collect_wakes(&state);
         state.statistics.flush();
+        state.statistics.save_live(&live_state(&state));
     }
+}
+
+fn live_state(state: &AppState) -> LiveState {
+    let (pending, leases) = state.placement.snapshot();
+    LiveState { pending, leases }
 }
 
 /// Closes a revoked host's connection as soon as `hosts revoke` commits.
@@ -339,9 +356,18 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                 // say so.
                 if matches!(action, "in_progress" | "completed")
                     && let Some(key) = required.and_then(|required| {
-                        state
-                            .placement
-                            .dequeued(repository, &required, job.workflow_job.id)
+                        // The runner that took it, said once: `in_progress`.
+                        let runner = job
+                            .workflow_job
+                            .runner_name
+                            .as_deref()
+                            .filter(|_| action == "in_progress");
+                        state.placement.dequeued_by(
+                            repository,
+                            &required,
+                            job.workflow_job.id,
+                            runner,
+                        )
                     })
                 {
                     state.placement.spawn_rebalance(key, CLAIM_GRACE);
@@ -553,6 +579,10 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         close(&mut socket, CLOSE_UNAUTHORIZED, "revoked").await;
         return;
     }
+    // Whatever an earlier (perhaps half-open) connection of this host held,
+    // the new link starts with no launch: the host dropped them when it lost
+    // the old one.
+    state.placement.host_gone(&host_id);
     tracing::info!(%host_id, version = protocol_version, "a host connected");
     let _ = state.store().touch(&host_id, Utc::now());
     serve_host(
@@ -582,7 +612,10 @@ async fn answer_query(socket: &mut WebSocket, state: &AppState, host_id: &str) {
         return;
     }
     collect_wakes(state);
-    match state.statistics.report(Utc::now()) {
+    match state
+        .statistics
+        .report_with(Utc::now(), Some(live_state(state)))
+    {
         Ok(report) => {
             tracing::info!(%host_id, jobs = report.jobs.len(), "a host read the statistics");
             // A reader that stops reading does not hold the task open.
@@ -642,11 +675,20 @@ async fn serve_host(
                         );
                         state.registry.set_hello(host_id, connection, hello);
                     }
-                    Ok(HostMessage::Heartbeat(heartbeat)) => {
+                    Ok(HostMessage::Heartbeat(mut heartbeat)) => {
+                        // Leases the host no longer holds are closed, and
+                        // their jobs placed again. The list is not kept: every
+                        // placement copies the heartbeat.
+                        let dropped = match (heartbeat.open_leases.take(), version >= LAUNCH_VERSION) {
+                            (Some(held), true) => state.placement.reconcile_leases(host_id, &held),
+                            _ => 0,
+                        };
                         // A slot freed (a host sends a heartbeat right after
                         // an attempt ends): pending pool jobs are placed now,
                         // not at the next tick.
-                        if state.registry.set_heartbeat(host_id, connection, heartbeat) {
+                        if state.registry.set_heartbeat(host_id, connection, heartbeat)
+                            || dropped > 0
+                        {
                             state.placement.spawn_retry_all();
                         }
                         // `last_seen_at` is for `hosts list`; a write per
