@@ -7,6 +7,55 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.47
+
+### Fixed
+
+- **Coordinator statistics show a job's real run time.** A job's duration in
+  `coordinator stats` is now GitHub's own `started_at` to `completed_at`, so a
+  14-second job reads 14 s instead of the 60-80 s its runner lived (start-up,
+  waiting for the job and cleanup included). Only when GitHub's `completed`
+  webhook never arrives (within 2-3 minutes) does a sample fall back to the
+  host's measured time. Peak memory and CPU are measured by the host as before.
+  Samples recorded by 0.4.45-0.4.46 keep their old durations until newer runs
+  replace them (the last 30 per job).
+- **A freed slot is used at once.** When a runner ends, the host tells the
+  coordinator its free slots right away instead of at its next heartbeat (up
+  to 15 s later), and the coordinator places a waiting pool job on it
+  immediately. A joined host also notices within about 2 seconds that a
+  runner's process has exited and frees its slot then, instead of at the
+  target's next poll (up to 60 s). Cleanup of the runner's files never held
+  the slot; a container, VM or WSL runner still keeps it until its
+  environment is proven gone, as before, and its host reports the free slot
+  as soon as that cleanup is done.
+- **Hosts reconnect within 30 seconds after a coordinator restart.** The
+  link's reconnect wait now stops at 30 s, random spread included (it could
+  reach 90 s, which added up to minutes), and starts over after a connection
+  that stayed up for over a minute. A refused key or version still waits up
+  to 5 minutes.
+- A test of the runner process fixture could read its readiness file before
+  it was written and fail at random.
+
+### Added
+
+- **Queue wait in `coordinator stats`.** How long jobs waited from being queued
+  to starting on a runner (GitHub's `created_at` to `started_at`), as p50 and
+  p90 over all samples and per job: the figure that shows whether jobs wait
+  for a free host.
+
+### Upgrade notes
+
+- `coordinator stats --json` (on a host and on the coordinator) is schema
+  version 2: `p50_duration_secs` is the job's run time, and
+  `p50_queue_wait_secs` and `p90_queue_wait_secs` are new, overall and per job.
+- The coordinator's database moves to schema 3 (one new column). To roll back
+  to 0.4.46, stop the service and run
+  `sqlite3 coordinator.db 'PRAGMA user_version = 2'`.
+- The coordinator protocol stays at version 4 and every change is additive:
+  0.4.47 hosts and coordinators work with 0.4.45-0.4.46 ones. An older host
+  still gets prompt placement once its next heartbeat shows a free slot; an
+  older coordinator ignores the extra heartbeat.
+
 ## 0.4.46
 
 ### Fixed

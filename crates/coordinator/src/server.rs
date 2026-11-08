@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 
 use crate::placement::{CLAIM_GRACE, Placement};
 use crate::registry::{OUTBOUND_QUEUE, Outbound, Registry};
-use crate::stats::{JobIdentity, Statistics, StatsConfig};
+use crate::stats::{JobIdentity, JobTimes, Statistics, StatsConfig};
 use crate::store::{EnrollError, Store};
 use crate::webhook::{
     DELIVERY_MEMORY, DeliveryLog, MAX_BODY_BYTES, WorkflowJobEvent, action_name, required_labels,
@@ -69,6 +69,9 @@ pub struct Config {
     pub attempts_per_minute: u32,
     /// Stage 4: job weight statistics and the placement weights.
     pub stats: StatsConfig,
+    /// How often placement expires leases and retries the queues nothing
+    /// took ([`crate::placement::TICK`]); a freed slot retries at once.
+    pub placement_tick: Duration,
 }
 
 impl Config {
@@ -83,6 +86,7 @@ impl Config {
             revocation_check: Duration::from_millis(500),
             attempts_per_minute: 20,
             stats: StatsConfig::default(),
+            placement_tick: crate::placement::TICK,
         }
     }
 }
@@ -180,7 +184,7 @@ pub async fn serve(
     state: Arc<AppState>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let placement = tokio::spawn(Arc::clone(&state.placement).run());
+    let placement = tokio::spawn(Arc::clone(&state.placement).run(state.config.placement_tick));
     let revocations = tokio::spawn(watch_revocations(Arc::clone(&state)));
     let counters = tokio::spawn(flush_counters(Arc::clone(&state)));
     let served = axum::serve(
@@ -342,13 +346,19 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                 {
                     state.placement.spawn_rebalance(key, CLAIM_GRACE);
                 }
-                // Which job a runner took, for its attempt's statistics: said
-                // once, when it starts (`completed` repeats it).
-                if action == "in_progress"
+                // Which job a runner took and when it ran, for its attempt's
+                // statistics: `in_progress` says when it started,
+                // `completed` when it ended.
+                if matches!(action, "in_progress" | "completed")
                     && let (Some(runner), Some(identity)) =
                         (job.workflow_job.runner_name.as_deref(), identity)
                 {
-                    state.statistics.job_identified(runner, identity);
+                    let times = JobTimes::parse(
+                        job.workflow_job.created_at.as_deref(),
+                        job.workflow_job.started_at.as_deref(),
+                        job.workflow_job.completed_at.as_deref(),
+                    );
+                    state.statistics.job_identified(runner, identity, times);
                 }
                 // Recorded for later stages (statistics, lease confirmation).
                 tracing::info!(
@@ -633,7 +643,12 @@ async fn serve_host(
                         state.registry.set_hello(host_id, connection, hello);
                     }
                     Ok(HostMessage::Heartbeat(heartbeat)) => {
-                        state.registry.set_heartbeat(host_id, connection, heartbeat);
+                        // A slot freed (a host sends a heartbeat right after
+                        // an attempt ends): pending pool jobs are placed now,
+                        // not at the next tick.
+                        if state.registry.set_heartbeat(host_id, connection, heartbeat) {
+                            state.placement.spawn_retry_all();
+                        }
                         // `last_seen_at` is for `hosts list`; a write per
                         // heartbeat per host would hold the shared store's
                         // lock on the runtime for nothing.

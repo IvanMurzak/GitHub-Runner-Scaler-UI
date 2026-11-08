@@ -15,14 +15,16 @@ use runner_manager_coordinator::server::{AppState, Config, serve};
 use runner_manager_coordinator::stats::{self, StatsConfig, Weights};
 use runner_manager_coordinator::store::{HostRecord, Store};
 use runner_manager_coordinator::sweep::{self, Sweeper};
-use runner_manager_domain::coordinator_protocol::{CoordinatorUrl, StatsReport};
+use runner_manager_domain::coordinator_protocol::{
+    CoordinatorUrl, STATS_JSON_SCHEMA_VERSION, StatsReport,
+};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 
 /// The shortest webhook secret accepted.
 const MIN_SECRET_LEN: usize = 16;
 
-/// Version of every `--json` document this binary prints.
+/// Version of `hosts list --json`.
 const JSON_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Parser)]
@@ -353,7 +355,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 serde_json::to_writer_pretty(
                     &mut out,
                     &StatsDocument {
-                        schema_version: JSON_SCHEMA_VERSION,
+                        schema_version: STATS_JSON_SCHEMA_VERSION,
                         report: &report,
                     },
                 )?;

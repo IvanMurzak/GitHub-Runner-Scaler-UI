@@ -362,13 +362,24 @@ impl Registry {
             .collect()
     }
 
-    pub fn set_heartbeat(&self, host_id: &str, connection: u64, heartbeat: Heartbeat) {
-        if let Some(current) = self.lock().get_mut(host_id)
-            && current.connection == connection
-        {
-            current.heartbeat = Some(heartbeat);
-            current.heartbeat_at = Instant::now();
-        }
+    /// Records `host_id`'s load; `true` when it reports more free slots than
+    /// its last heartbeat (or is its first): placement may now fit a queued
+    /// job there.
+    pub fn set_heartbeat(&self, host_id: &str, connection: u64, heartbeat: Heartbeat) -> bool {
+        let mut hosts = self.lock();
+        let Some(current) = hosts
+            .get_mut(host_id)
+            .filter(|current| current.connection == connection)
+        else {
+            return false;
+        };
+        let freed = current
+            .heartbeat
+            .as_ref()
+            .is_none_or(|last| heartbeat.free_slots > last.free_slots);
+        current.heartbeat = Some(heartbeat);
+        current.heartbeat_at = Instant::now();
+        freed
     }
 
     /// Every connected host.

@@ -594,9 +594,9 @@ impl Placement {
         tokio::spawn(async move { placement.retry_all().await });
     }
 
-    /// Expires and retries every [`TICK`], forever.
-    pub async fn run(self: Arc<Self>) {
-        let mut ticks = tokio::time::interval(TICK);
+    /// Expires and retries every `tick` ([`TICK`] in service), forever.
+    pub async fn run(self: Arc<Self>, tick: Duration) {
+        let mut ticks = tokio::time::interval(tick);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
@@ -1434,7 +1434,11 @@ mod tests {
         // `build` once peaked at 12 GiB.
         let identity =
             crate::stats::JobIdentity::new("octo/app", Some("ci"), Some("build")).expect("named");
-        stats.job_identified("runner-manager-x", identity.clone());
+        stats.job_identified(
+            "runner-manager-x",
+            identity.clone(),
+            crate::stats::JobTimes::parse(None, None, Some("2026-11-07T10:10:00Z")),
+        );
         stats.attempt_finished(
             "elsewhere",
             &AttemptFinished {

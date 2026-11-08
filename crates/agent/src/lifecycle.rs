@@ -8872,7 +8872,10 @@ mod tests {
         let ready = std::env::var_os("RUNNER_MANAGER_TEST_LISTENER_READY")
             .map(PathBuf::from)
             .expect("the parent supplies the readiness path");
-        fs::write(ready, b"ready\n").expect("the listener publishes readiness");
+        // Atomically: the parent polls for the file and must never read it
+        // created but not yet written.
+        runner_manager_platform::host_fitness::write_atomically(&ready, b"ready\n")
+            .expect("the listener publishes readiness");
         std::thread::sleep(Duration::from_secs(30));
     }
 
