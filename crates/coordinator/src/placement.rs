@@ -149,6 +149,16 @@ impl JobKey {
     }
 }
 
+/// One queue as a sweep listed it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweptQueue {
+    /// Job ids with their statistics key (`owner/repo/workflow/job`), when
+    /// the listing named them.
+    pub jobs: Vec<(u64, Option<String>)>,
+    /// Jobs listed without an identity.
+    pub unnamed: u32,
+}
+
 #[derive(Debug, Default)]
 struct Queue {
     /// Job ids a webhook announced, when, and their statistics key
@@ -482,6 +492,13 @@ impl Placement {
         )
     }
 
+    /// The statistics keys of `key`'s queued jobs, and whether any job has
+    /// none.
+    #[cfg(test)]
+    pub(crate) fn queued_job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
+        self.state().job_keys(key)
+    }
+
     // -- Events --------------------------------------------------------------
 
     /// A webhook announced a queued job; its key, or `None` (nothing
@@ -587,15 +604,15 @@ impl Placement {
         Some(key)
     }
 
-    /// The sweep counted `counts` queued pool jobs per required label set in
+    /// The sweep listed `listed` queued pool jobs per required label set in
     /// `repository`, reading it from `read_at` on. `floor`: the listing was
-    /// truncated, so a count is a minimum and nothing is taken away. A key a
+    /// truncated, so it is a minimum and nothing is taken away. A key a
     /// webhook changed after `read_at` is left alone: the webhook is newer.
     /// Returns the keys that changed.
     pub fn swept(
         &self,
         repository: &str,
-        counts: &HashMap<BTreeSet<Label>, u32>,
+        listed: &HashMap<BTreeSet<Label>, SweptQueue>,
         read_at: Instant,
         floor: bool,
     ) -> Vec<JobKey> {
@@ -607,7 +624,7 @@ impl Placement {
             .filter(|key| key.repository == repository)
             .cloned()
             .collect();
-        keys.extend(counts.keys().map(|labels| JobKey {
+        keys.extend(listed.keys().map(|labels| JobKey {
             repository: repository.clone(),
             labels: labels.clone(),
         }));
@@ -616,15 +633,35 @@ impl Placement {
             if state.touched.get(&key).is_some_and(|at| *at >= read_at) {
                 continue;
             }
-            let swept = counts.get(&key.labels).copied().unwrap_or(0);
+            let nothing = SweptQueue::default();
+            let swept = listed.get(&key.labels).unwrap_or(&nothing);
             let queue = state.queues.entry(key.clone()).or_default();
             let before = queue.len();
+            // The listing's ids are the webhooks' ids: a job known already
+            // gains its name, one not known yet is named from the start.
+            for (id, job_key) in &swept.jobs {
+                let known = queue
+                    .jobs
+                    .entry(*id)
+                    .or_insert_with(|| (Instant::now(), None));
+                if known.1.is_none() {
+                    known.1.clone_from(job_key);
+                }
+            }
+            if !floor && swept.unnamed == 0 {
+                // Every queued job is listed by id: any other has left.
+                let ids: HashSet<u64> = swept.jobs.iter().map(|(id, _)| *id).collect();
+                queue.jobs.retain(|id, _| ids.contains(id));
+            }
+            let total = u32::try_from(swept.jobs.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(swept.unnamed);
             let named = u32::try_from(queue.jobs.len()).unwrap_or(u32::MAX);
-            if swept >= named {
+            if total >= named {
                 queue.unnamed = if floor {
-                    queue.unnamed.max(swept - named)
+                    queue.unnamed.max(total - named)
                 } else {
-                    swept - named
+                    total - named
                 };
             } else if floor {
                 // A minimum below what is known says nothing.
@@ -632,7 +669,7 @@ impl Placement {
                 // Some announced jobs left without a webhook saying so: the
                 // oldest are the ones most likely gone.
                 queue.unnamed = 0;
-                let surplus = (named - swept) as usize;
+                let surplus = (named - total) as usize;
                 let oldest: Vec<u64> = {
                     let mut by_age: Vec<(u64, Instant)> =
                         queue.jobs.iter().map(|(id, (at, _))| (*id, *at)).collect();
@@ -1615,8 +1652,12 @@ mod tests {
         let labels: BTreeSet<Label> = pool.iter().cloned().collect();
         let key = placement.queued("octo/app", &pool, 1).expect("pool");
         let read_at = Instant::now();
+        let count = |unnamed| SweptQueue {
+            jobs: Vec::new(),
+            unnamed,
+        };
         // Three queued by the sweep's count, one of them announced.
-        let three = HashMap::from([(labels.clone(), 3)]);
+        let three = HashMap::from([(labels.clone(), count(3))]);
         assert_eq!(
             placement.swept("Octo/App", &three, read_at, false),
             vec![key.clone()]
@@ -1635,7 +1676,7 @@ mod tests {
         assert_eq!(placement.counts(&key).0, 3);
         // A truncated listing is a minimum: it never takes jobs away.
         let later = Instant::now();
-        let one = HashMap::from([(labels.clone(), 1)]);
+        let one = HashMap::from([(labels.clone(), count(1))]);
         assert!(placement.swept("octo/app", &one, later, true).is_empty());
         assert_eq!(placement.counts(&key).0, 3);
         // The next full sweep sees none: the queue empties and the leases are
@@ -2012,6 +2053,142 @@ mod tests {
             Arc::new(placement.with_statistics(Arc::clone(&stats))),
             stats,
         )
+    }
+
+    /// A light job with samples is estimated at its own p90, though a heavy
+    /// job of the same repository (another queue) pulls the repository's p90
+    /// far above it, whether a webhook or only the sweep named the job. A job
+    /// never measured in the same queue still counts as the repository.
+    #[tokio::test]
+    async fn a_queue_is_estimated_by_its_own_jobs_not_by_its_repository() {
+        use runner_manager_domain::coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
+
+        let registry = Arc::new(Registry::default());
+        registry.set_coverage(covering());
+        let (placement, stats) = measured(
+            Placement::with_timings(
+                Arc::clone(&registry),
+                Duration::from_millis(150),
+                Duration::from_secs(300),
+            ),
+            crate::store::Store::open_in_memory().expect("store"),
+        );
+        // Samples: `light` peaked at 1 GiB, `heavy` at 12 GiB, five of each so
+        // the repository's p90 is the heavy job's.
+        for (index, (job, peak)) in std::iter::repeat_n(("light", 1_u64 << 30), 5)
+            .chain(std::iter::repeat_n(("heavy", 12_u64 << 30), 5))
+            .enumerate()
+        {
+            let runner = format!("runner-manager-{index}");
+            stats.job_identified(
+                &runner,
+                crate::stats::JobIdentity::new("octo/app", Some("ci"), Some(job)).expect("named"),
+                crate::stats::JobTimes::parse(None, None, Some("2026-11-07T10:10:00Z")),
+            );
+            stats.attempt_finished(
+                "elsewhere",
+                &AttemptFinished {
+                    lease_id: None,
+                    runner_name: runner.clone(),
+                    outcome: AttemptOutcomeKind::CompletedJob,
+                    duration_secs: Some(60),
+                    usage: Some(AttemptUsage {
+                        peak_rss_bytes: peak,
+                        samples: 10,
+                        ..AttemptUsage::default()
+                    }),
+                },
+                None,
+            );
+        }
+        let host = connect(
+            &registry,
+            "h",
+            LAUNCH_VERSION,
+            &["rm-pool-linux", "heavy", "other"],
+            8,
+            64 << 30,
+        );
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let decide = |placement: &Placement, key: &JobKey| {
+            let mut decision = None;
+            placement.offer(
+                key,
+                &HashSet::new(),
+                None,
+                &mut Rebalanced::default(),
+                &mut decision,
+            );
+            let decision = decision.expect("weighed");
+            (decision.estimate_bytes, decision.estimate_source)
+        };
+        let job_source = "job".to_string();
+        let light = required(&["rm-pool-linux"]);
+        let heavy = required(&["rm-pool-linux", "heavy"]);
+        placement.queued_job("octo/app", &heavy, 2, Some("octo/app/ci/heavy".into()));
+        // Named by the webhook.
+        let key = placement
+            .queued_job("octo/app", &light, 1, Some("octo/app/ci/light".into()))
+            .expect("pool");
+        assert_eq!(decide(&placement, &key), (1 << 30, job_source.clone()));
+        // Named only by the sweep's listing: the same estimate.
+        let swept = required(&["rm-pool-linux", "other"]);
+        let labels: BTreeSet<Label> = swept.iter().cloned().collect();
+        let listed = HashMap::from([(
+            labels,
+            SweptQueue {
+                jobs: vec![(3, Some("octo/app/ci/light".into()))],
+                unnamed: 0,
+            },
+        )]);
+        // (A truncated listing: the queues it does not list are left alone.)
+        let swept_key = placement.swept("octo/app", &listed, Instant::now(), true)[0].clone();
+        assert_eq!(decide(&placement, &swept_key), (1 << 30, job_source));
+        // A job never measured in that queue: the repository's p90.
+        placement.queued_job("octo/app", &light, 4, Some("octo/app/ci/new".into()));
+        assert_eq!(
+            decide(&placement, &key),
+            (12 << 30, "repository".to_string())
+        );
+        drop(host);
+    }
+
+    /// A sweep listing jobs by id names the ones a webhook did not, keeps
+    /// them apart from its count, and removes the ones no longer listed.
+    #[tokio::test]
+    async fn a_sweep_listing_jobs_by_id_matches_the_webhooks_ids() {
+        let (_registry, placement) = setup();
+        let pool = required(POOL);
+        let labels: BTreeSet<Label> = pool.iter().cloned().collect();
+        let key = placement.queued("octo/app", &pool, 1).expect("pool");
+        let listing = |jobs: &[(u64, &str)]| {
+            HashMap::from([(
+                labels.clone(),
+                SweptQueue {
+                    jobs: jobs
+                        .iter()
+                        .map(|(id, name)| (*id, Some((*name).to_string())))
+                        .collect(),
+                    unnamed: 0,
+                },
+            )])
+        };
+        // Job 1, announced nameless, gains its name; job 2 is new, not a count.
+        let read = Instant::now();
+        placement.swept("octo/app", &listing(&[(1, "k1"), (2, "k2")]), read, false);
+        assert_eq!(placement.counts(&key).0, 2);
+        let (mut keys, unnamed) = placement.queued_job_keys(&key);
+        keys.sort();
+        assert_eq!((keys, unnamed), (vec!["k1".into(), "k2".into()], false));
+        // Its webhook, late, is not a third job.
+        placement.queued_job("octo/app", &pool, 2, Some("k2".into()));
+        assert_eq!(placement.counts(&key).0, 2);
+        // A truncated listing takes nothing away; a full one does, by id.
+        let later = Instant::now();
+        placement.swept("octo/app", &listing(&[(2, "k2")]), later, true);
+        assert_eq!(placement.counts(&key).0, 2);
+        placement.swept("octo/app", &listing(&[(2, "k2")]), later, false);
+        assert_eq!(placement.queued_job_keys(&key).0, vec!["k2".to_string()]);
     }
 
     #[tokio::test]

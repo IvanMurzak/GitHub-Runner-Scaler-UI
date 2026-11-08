@@ -264,20 +264,25 @@ pub fn set_poll_interval(
     }
     // The same gate the dashboard applies to the refresh interval, and only
     // for a shorter one: lengthening never adds load. Active polls are
-    // charged, so the projection is the right yardstick for them.
-    if active < before.active {
-        let budget = super::host::HostBudget::of(active, &targets);
+    // charged, so the projection is the right yardstick for them. So are a
+    // coordinated target's, at the coordinated interval this would set.
+    if active < before.active || coordinated < before.coordinated {
+        let coordination =
+            super::host::CoordinatedPricing::read(context, &store)?.at_interval(coordinated);
+        let budget = super::host::HostBudget::priced(active, &targets, Some(&coordination));
         if budget.exceeds_allowance() {
             return Err(CliError::with_remedy(
                 Failure::BudgetRefused,
                 format!(
-                    "a {}-second active interval projects {} requests/hour for the configured \
-                     targets, over the {} this host may plan to spend. Nothing was changed.",
+                    "an active interval of {} seconds and a coordinated one of {} project {} \
+                     requests/hour for the configured targets, over the {} this host may plan to \
+                     spend. Nothing was changed.",
                     active.as_secs(),
+                    coordinated.as_secs(),
                     budget.requests_per_hour(),
                     budget.allowance()
                 ),
-                "choose a longer active interval or remove a target",
+                "choose longer intervals or remove a target",
             ));
         }
     }

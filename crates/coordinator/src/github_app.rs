@@ -153,6 +153,7 @@ fn secs(duration: Duration) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// One installation of the App, with its own client and token.
+#[derive(Clone)]
 pub struct Installation {
     pub id: u64,
     /// The account it is installed on: a user or organization login.
@@ -275,8 +276,11 @@ impl GithubApp {
     /// or suspended is dropped with its client.
     ///
     /// # Errors
-    /// A failure listing the installations; one installation's failure is
-    /// logged and that installation dropped until the next inventory.
+    /// A failure listing the installations. One installation's failure is
+    /// logged, and it keeps what it had: its repositories, and the reader that
+    /// holds its rate-limit wait and its conditional-request cache. Dropping
+    /// those would make its repositories look unknown, and every webhook of
+    /// theirs ask for another inventory inside GitHub's wait.
     pub async fn refresh_inventory(&mut self) -> Result<(), AppError> {
         let app = self.app_client()?;
         let listed = list_installations(&app).await?;
@@ -289,6 +293,7 @@ impl GithubApp {
                 continue;
             }
             let existing = self.installations.remove(&raw.id);
+            let previous = existing.clone();
             match self
                 .prepare(&app, raw.id, account, raw.repository_selection, existing)
                 .await
@@ -300,9 +305,12 @@ impl GithubApp {
                     tracing::warn!(
                         installation = raw.id,
                         %error,
-                        "an installation of the GitHub App could not be read; it is skipped until \
-                         the next inventory"
+                        "an installation of the GitHub App could not be read; what is known of it \
+                         stands until the next inventory"
                     );
+                    if let Some(previous) = previous {
+                        kept.insert(raw.id, previous);
+                    }
                 }
             }
         }

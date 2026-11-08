@@ -89,6 +89,35 @@ async fn the_sweep_authenticates_as_the_app_and_wakes_for_a_queued_job_once() {
     assert_eq!(minted, 1);
 }
 
+/// An inventory that fails for one installation (a rate limit) leaves what
+/// is known of it: its repositories stay listed and its reader stays, or every
+/// webhook of theirs would ask for another inventory inside GitHub's wait.
+#[tokio::test]
+async fn an_installation_that_cannot_be_read_keeps_what_was_known_of_it() {
+    let keys = app_keys();
+    let server = fake_github(&keys, Duration::from_secs(3600)).await;
+    let mut app = app(&keys, &server);
+    app.refresh_inventory().await.expect("the first inventory");
+    assert_eq!(app.installations()[&INSTALLATION].repositories.len(), 1);
+
+    Mock::given(method("GET"))
+        .and(path("/installation/repositories"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "message": "API rate limit exceeded"
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    app.refresh_inventory()
+        .await
+        .expect("one installation failing is logged");
+    assert_eq!(
+        app.installations()[&INSTALLATION].repositories.len(),
+        1,
+        "still listed"
+    );
+}
+
 #[tokio::test]
 async fn a_token_close_to_expiry_is_replaced_before_it_is_used_again() {
     let keys = app_keys();

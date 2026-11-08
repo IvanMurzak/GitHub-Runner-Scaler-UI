@@ -153,6 +153,31 @@ that is already queued. A link that drops keeps `coordinated` for 30 seconds, so
 changes nothing; after that every target polls on its own again at once. A coordinator without a
 GitHub App covers nothing, so its hosts are in `fallback` and behave as in stage 1.
 
+The coordinator reads its GitHub App's installations and their repositories every 10 minutes, and
+at once (at most every 30 seconds, followed by a sweep) when a host advertises a target those
+listings do not include, or a webhook names a repository a host serves that they do not include. A
+repository just added on a host is therefore normally covered within seconds. A repository listed
+but unreadable (the App lacks Actions permission there) stays in `fallback` until that is fixed: a
+fresh listing would change nothing, so none is asked for.
+
+`repo add` and `host show` count a `coordinated` target at the coordinated interval (one poll every
+300 s by default), not the refresh interval, and every other target at the refresh interval. A new
+target has no coverage yet, because a coordinator only reports on what a host advertised. While the
+link is up and the coordinator's sweep runs, a new repository is counted at the coordinated interval
+too, and `repo add` prints a note saying so. A new organization is always counted at the refresh
+interval, for what its repositories cost. With the link down, or no sweep, every target is counted
+at the refresh interval as without a coordinator. `host set-poll-interval` refuses a shorter active
+or coordinated interval that would take the configured targets over the budget.
+
+A set admitted this way can exceed the host's budget (2,500 requests an hour) once its targets poll
+on their own: the coordinator does not cover one, or the link stays down past 30 seconds. Charged
+polls then stretch, on every target not waiting on the coordinator (including a coordinated one
+running a runner), to the interval at which the targets polling on their own fit the budget at the
+price `repo add` uses: 64 s for 11 repositories, 116 s for 20. Runners keep starting, and idle
+polls, answered 304 and not charged, keep their pace. A set `repo add` would admit at the default
+interval is not affected. This is pacing, not a guarantee: `host show` projects a higher worst case
+per poll than `repo add` prices, and an organization counts as one repository here.
+
 A dropped link reconnects after 1 second, then waits twice as long after every failed attempt,
 never more than 30 seconds between attempts (a random part of up to a third of the wait spreads a
 fleet out; a refused key or version waits up to 5 minutes). A connection that stayed up longer than
@@ -252,7 +277,8 @@ and its job, if still queued, is placed again at once:
   was coming for, so the host is told to drop that launch;
 - when it expires. When a job leaves the queue another way (cancelled, or taken by a runner
 outside the pool), the surplus lease is cancelled (`cancel_launch`) and its host starts no runner
-for it. The sweep's counts correct lost webhooks; a listing GitHub truncated only ever adds jobs.
+for it. The sweep's listing corrects lost webhooks, job by job; a listing GitHub truncated only ever adds
+jobs.
 
 A queue left with fewer runners on their way than jobs says why, at most once a minute per queue
 in the log (`a pool queue is not placed`, with `reason` and, for a refusal, `refusal`) and in
@@ -347,8 +373,10 @@ and labels), not a single job:
 
 1. **Demand**: the heaviest p90 peak memory among the jobs queued there. A job never measured
    counts as its repository's p90 (over all its samples); a repository never measured as
-   `COORDINATOR_DEFAULT_JOB_RAM` (2 GiB). Jobs only the sweep counted are unnamed: they count as
-   the repository's p90 or the default too.
+   `COORDINATOR_DEFAULT_JOB_RAM` (2 GiB). The sweep names the jobs it lists just as a webhook
+   does (same job id, workflow and job name), so a job only the sweep saw is weighed by its own
+   samples. A job never measured, or with no name to go by, counts as the repository's p90 or the
+   default.
 2. **Filter**: a host whose free memory (by its last heartbeat) less the estimates of its
    launches whose runner has not taken a job yet cannot hold the demand plus
    `COORDINATOR_RAM_MARGIN` (512 MiB) is passed over. A host that reports no free memory is not
@@ -414,7 +442,8 @@ Last placements, newest first (scores in points):
 - **Heaviest jobs**: the 20 job keys with the largest p90 peak memory, and per host how its
   median compares with the usual duration (below 1x: faster).
 - **Pool queues waiting for a runner**: each queue (repository and labels) with fewer runners
-  on their way than jobs queued, the oldest job's wait, and why no more is placed (see above).
+  on their way than jobs queued, the oldest job's wait (since the coordinator first saw it), and why
+  no more is placed (see above).
 - **Open leases**: per host, each launch not yet closed, its state (`offered`, `accepted`,
   `claimed`) and age. On a host's `stats` these are live; the admin CLI on the coordinator's
   machine reads the copy the server saves every minute (`as of ... ago`).

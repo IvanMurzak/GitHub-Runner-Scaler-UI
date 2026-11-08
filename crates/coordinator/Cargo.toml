@@ -45,5 +45,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 runner-manager-testkit = { workspace = true }
 tempfile = { workspace = true }
+# The sweep's debounce test drives `tokio::time::pause()`.
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }
 wiremock = { workspace = true }

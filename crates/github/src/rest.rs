@@ -99,7 +99,8 @@ use std::{
 };
 
 use runner_manager_domain::model::{
-    Arch, Clock, Org, Os, OwnerRepo, RefreshInterval, ScaleTarget, TargetScope, Timestamp,
+    Arch, Clock, CoordinatedPollInterval, Org, Os, OwnerRepo, RefreshInterval, ScaleTarget,
+    TargetScope, Timestamp,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -1420,6 +1421,9 @@ pub struct TargetCost {
     scope: TargetScope,
     installed_repositories: u32,
     demand_requests_per_repository: u32,
+    /// Polled at its own interval rather than the projection's: a target a
+    /// coordinator's sweep reads.
+    polled_every_secs: Option<u16>,
 }
 
 impl TargetCost {
@@ -1430,6 +1434,7 @@ impl TargetCost {
             scope: TargetScope::Repository,
             installed_repositories: 1,
             demand_requests_per_repository: DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH,
+            polled_every_secs: None,
         }
     }
 
@@ -1440,6 +1445,7 @@ impl TargetCost {
             scope: TargetScope::Organization,
             installed_repositories,
             demand_requests_per_repository: DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH,
+            polled_every_secs: None,
         }
     }
 
@@ -1459,6 +1465,14 @@ impl TargetCost {
     #[must_use]
     pub fn with_demand_requests_per_repository(mut self, requests: u32) -> Self {
         self.demand_requests_per_repository = requests;
+        self
+    }
+
+    /// This target is polled every `secs` whatever the host's refresh interval:
+    /// a coordinator's sweep reads its queue.
+    #[must_use]
+    pub const fn polled_every(mut self, interval: CoordinatedPollInterval) -> Self {
+        self.polled_every_secs = Some(interval.as_secs());
         self
     }
 
@@ -1504,8 +1518,12 @@ impl TargetCost {
     /// Requests one hour of refreshing this target at `interval` costs.
     #[must_use]
     pub fn requests_per_hour(&self, interval: RefreshInterval) -> u32 {
-        self.requests_per_refresh()
-            .saturating_mul(refreshes_per_hour(interval))
+        let refreshes = self.polled_every_secs.map_or_else(
+            || refreshes_per_hour(interval),
+            // Rounded up: a target polled less than hourly still costs.
+            |secs| SECONDS_PER_HOUR.div_ceil(u32::from(secs)),
+        );
+        self.requests_per_refresh().saturating_mul(refreshes)
     }
 }
 
@@ -4588,6 +4606,36 @@ mod tests {
             480,
             "and at the 30-second floor"
         );
+    }
+
+    /// A target polled on its own interval (a coordinator's sweep reads its
+    /// queue) costs that interval's refreshes, whatever the projection's.
+    #[test]
+    fn a_target_polled_every_300_seconds_costs_a_fifth_of_one_polled_every_60() {
+        let default = RefreshInterval::default();
+        let target = TargetCost::repository();
+        let coordinated =
+            target.polled_every(CoordinatedPollInterval::from_secs(300).expect("in range"));
+        assert_eq!(
+            coordinated.requests_per_hour(default),
+            target.requests_per_hour(default) / 5
+        );
+        // The refresh interval does not change it.
+        let floor = RefreshInterval::from_secs(30).expect("the floor");
+        assert_eq!(
+            coordinated.requests_per_hour(floor),
+            coordinated.requests_per_hour(default)
+        );
+        // Polled less than hourly, it still costs something.
+        let rare = target.polled_every(CoordinatedPollInterval::from_secs(7200).expect("in range"));
+        assert_eq!(
+            rare.requests_per_hour(default),
+            target.requests_per_refresh()
+        );
+        // The eleventh repository is refused at 60 s and admitted at 300 s.
+        let ten = BudgetProjection::new(default, vec![target; 10]);
+        assert!(!ten.admit(target).is_admitted());
+        assert!(ten.admit(coordinated).is_admitted());
     }
 
     /// The Definition of Done's "roughly 10 targets per host at the 60-second
