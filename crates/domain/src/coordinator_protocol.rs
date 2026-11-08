@@ -490,21 +490,31 @@ impl StatsReport {
             "  launches accepted {}, wakes sent {}, samples recorded {}",
             self.launches, self.wakes, self.samples
         )?;
+        if self.p50_queue_wait_secs.is_some() {
+            writeln!(
+                out,
+                "  queue wait (queued to started): p50 {}, p90 {}",
+                duration(self.p50_queue_wait_secs),
+                duration(self.p90_queue_wait_secs)
+            )?;
+        }
         if self.jobs.is_empty() {
             writeln!(out, "\nNo job has been measured yet.")?;
         } else {
             writeln!(
                 out,
-                "\nHeaviest jobs (p90 peak memory, p90 CPU, p50 duration, samples):"
+                "\nHeaviest jobs (p90 peak memory, p90 CPU, p50 run time, p50/p90 queue wait, samples):"
             )?;
             for job in &self.jobs {
                 writeln!(
                     out,
-                    "  {}\n      {}  {}  {}  ({})",
+                    "  {}\n      {}  {}  {}  wait {}/{}  ({})",
                     printable(&job.job_key),
                     bytes(job.p90_peak_rss_bytes),
                     cores(job.p90_cpu_millicores),
                     duration(job.p50_duration_secs),
+                    duration(job.p50_queue_wait_secs),
+                    duration(job.p90_queue_wait_secs),
                     job.samples
                 )?;
                 for host in &job.hosts {
@@ -692,6 +702,12 @@ pub struct StatsReport {
     pub launches: u64,
     pub wakes: u64,
     pub samples: u64,
+    /// How long jobs waited from being queued to starting on a runner, over
+    /// every kept sample (GitHub's `created_at` to `started_at`): what
+    /// placement exists to keep short. Absent from a coordinator older than
+    /// 0.4.47.
+    pub p50_queue_wait_secs: Option<u64>,
+    pub p90_queue_wait_secs: Option<u64>,
     /// The heaviest job keys by p90 peak memory, heaviest first.
     pub jobs: Vec<JobStats>,
     /// How the samples spread over the hosts.
@@ -706,7 +722,12 @@ pub struct StatsReport {
 pub struct JobStats {
     pub job_key: String,
     pub samples: u32,
+    /// The job's own run time, by GitHub's webhooks (`started_at` to
+    /// `completed_at`); a sample without them counts its host's attempt.
     pub p50_duration_secs: Option<u64>,
+    /// Queued to started, by GitHub's webhooks.
+    pub p50_queue_wait_secs: Option<u64>,
+    pub p90_queue_wait_secs: Option<u64>,
     pub p90_peak_rss_bytes: Option<u64>,
     pub p90_cpu_millicores: Option<u32>,
     /// Per host: its samples, its median duration and that median over the
@@ -1215,10 +1236,14 @@ mod tests {
                 launches: 4,
                 wakes: 9,
                 samples: 2,
+                p50_queue_wait_secs: Some(3),
+                p90_queue_wait_secs: Some(12),
                 jobs: vec![JobStats {
                     job_key: "octo/app/ci/build (linux)".into(),
                     samples: 2,
                     p50_duration_secs: Some(60),
+                    p50_queue_wait_secs: Some(3),
+                    p90_queue_wait_secs: Some(12),
                     p90_peak_rss_bytes: Some(1 << 30),
                     p90_cpu_millicores: Some(2000),
                     hosts: vec![HostJobStats {
@@ -1413,10 +1438,14 @@ mod tests {
             samples_per_job: 30,
             retention_days: 90,
             launches: 3,
+            p50_queue_wait_secs: Some(4),
+            p90_queue_wait_secs: Some(75),
             jobs: vec![JobStats {
                 job_key: "octo/app/ci/build".into(),
                 samples: 4,
                 p50_duration_secs: Some(372),
+                p50_queue_wait_secs: Some(3),
+                p90_queue_wait_secs: Some(61),
                 p90_peak_rss_bytes: Some(3 << 30),
                 p90_cpu_millicores: Some(2150),
                 hosts: vec![HostJobStats {
@@ -1449,7 +1478,8 @@ mod tests {
         for expected in [
             "launches accepted 3",
             "octo/app/ci/build",
-            "3.0 GiB  2.15 cores  6m 12s  (4)",
+            "queue wait (queued to started): p50 4s, p90 1m 15s",
+            "3.0 GiB  2.15 cores  6m 12s  wait 3s/1m 01s  (4)",
             "linux (h1)",
             "0.91x the usual time",
             "needs 3.0 GiB (job), weighted: h1",
@@ -1479,6 +1509,13 @@ mod tests {
         let mut empty = String::new();
         StatsReport::default().render(&mut empty).expect("renders");
         assert!(empty.contains("No job has been measured yet."));
+        assert!(!empty.contains("queue wait"), "nothing measured: no line");
+        // A 0.4.46 coordinator's report has no queue wait: it still decodes.
+        let older: StatsReport =
+            serde_json::from_str(r#"{"jobs":[{"job_key":"k","p50_duration_secs":63}]}"#)
+                .expect("decodes");
+        assert_eq!(older.jobs[0].p50_queue_wait_secs, None);
+        assert_eq!(older.p90_queue_wait_secs, None);
     }
 
     #[test]

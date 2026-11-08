@@ -108,11 +108,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// The heartbeat interval until the coordinator names one.
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
 
-/// Reconnect back-off: first wait, cap, and the cap after a refusal.
+/// Reconnect back-off: the first wait, and the longest wait, jitter
+/// included, in general and after a refusal.
 const RECONNECT_FIRST: Duration = Duration::from_secs(1);
-const RECONNECT_CAP: Duration = Duration::from_secs(60);
+const RECONNECT_CAP: Duration = Duration::from_secs(30);
 const REJECTED_CAP: Duration = Duration::from_secs(5 * 60);
-/// A session that lasted this long resets the back-off.
+/// A connection that stayed up longer than this resets the back-off.
 const STABLE_SESSION: Duration = Duration::from_secs(60);
 /// How often an unconfigured daemon looks for a `coordinator join`.
 const CONFIG_RECHECK: Duration = Duration::from_secs(15);
@@ -120,8 +121,10 @@ const CONFIG_RECHECK: Duration = Duration::from_secs(15);
 /// Version of `coordinator status --json`.
 const STATUS_SCHEMA_VERSION: u32 = 1;
 
-/// Version of `coordinator stats --json`.
-const STATS_SCHEMA_VERSION: u32 = 1;
+/// Version of `coordinator stats --json`. 2 (0.4.47): `p50_duration_secs` is
+/// the job's own run time by GitHub's webhooks, and the queue wait
+/// percentiles are added.
+const STATS_SCHEMA_VERSION: u32 = 2;
 
 /// How often the link looks at this host's attempts for its reports.
 const ATTEMPT_WATCH: Duration = Duration::from_secs(2);
@@ -1006,11 +1009,14 @@ impl Recorder {
 pub async fn maintain_link(ports: LinkPorts) {
     let meters = Arc::new(AttemptMeters::default());
     let coordination = Arc::clone(&ports.coordination);
+    let routes = Arc::clone(&ports.routes);
     let sampling = sample_attempts(
         Arc::clone(&meters),
         Arc::clone(&ports.store),
         ports.host.id,
         move || coordination.borrow().configured,
+        // A runner that exited holds its slot until a pass concludes it.
+        move |target| routes.nudge(&target_ref(target)),
     );
     tokio::join!(sampling, link(ports, &meters));
 }
@@ -1022,7 +1028,7 @@ async fn link(ports: LinkPorts, meters: &AttemptMeters) {
         record: LinkRecord::new(Utc::now()),
         written: None,
     };
-    let mut backoff = RECONNECT_FIRST;
+    let mut backoff = Backoff::default();
     loop {
         let config = match records::configured(&ports.paths) {
             Ok(Some(config)) => config,
@@ -1047,8 +1053,16 @@ async fn link(ports: LinkPorts, meters: &AttemptMeters) {
             view.configured = true;
             changed
         });
-        let started = tokio::time::Instant::now();
-        let end = session(&ports, meters, &config, tls.clone(), &mut recorder).await;
+        let mut connected_at = None;
+        let end = session(
+            &ports,
+            meters,
+            &config,
+            tls.clone(),
+            &mut recorder,
+            &mut connected_at,
+        )
+        .await;
         // The coordinator forgets a disconnected host's launches and places
         // their jobs elsewhere; starting them here as well would double up.
         ports.launches.clear();
@@ -1069,25 +1083,16 @@ async fn link(ports: LinkPorts, meters: &AttemptMeters) {
             if matches!(records::configured(&ports.paths), Ok(Some(_))) {
                 recorder.disconnected(end);
             }
-            backoff = RECONNECT_FIRST;
+            backoff.reset();
             continue;
         }
         recorder.disconnected(end);
-        if started.elapsed() >= STABLE_SESSION {
-            backoff = RECONNECT_FIRST;
-        }
-        let cap = match end {
-            SessionEnd::Rejected
-            | SessionEnd::UnsupportedVersion
-            | SessionEnd::NoKey
-            | SessionEnd::NoTls => REJECTED_CAP,
-            _ => RECONNECT_CAP,
-        };
-        backoff = backoff.min(cap);
+        let connected_for = connected_at.map(|at| at.elapsed());
         // In steps, so a back-off longer than `LINK_STALE_AFTER` (a refusal
-        // waits up to 7.5 minutes) does not make `status` call a running
+        // waits up to 5 minutes) does not make `status` call a running
         // service silent.
-        let resume = tokio::time::Instant::now() + jittered(backoff);
+        let resume =
+            tokio::time::Instant::now() + backoff.after(end, connected_for, rand::random::<f64>());
         while tokio::time::Instant::now() < resume {
             tokio::time::sleep_until(resume.min(tokio::time::Instant::now() + LINK_KEEPALIVE))
                 .await;
@@ -1097,13 +1102,59 @@ async fn link(ports: LinkPorts, meters: &AttemptMeters) {
             }
             recorder.keep_alive();
         }
-        backoff = backoff.saturating_mul(2).min(cap);
     }
 }
 
-/// `delay` plus up to half of it again, so a fleet does not reconnect in step.
-fn jittered(delay: Duration) -> Duration {
-    delay.saturating_add(delay.mul_f64(rand::random::<f64>() * 0.5))
+/// The link's reconnect back-off: doubles from [`RECONNECT_FIRST`] on every
+/// failed attempt, starts over after a connection that stayed up longer than
+/// [`STABLE_SESSION`], and never waits longer than its cap, jitter included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Backoff {
+    next: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self {
+            next: RECONNECT_FIRST,
+        }
+    }
+}
+
+impl Backoff {
+    fn reset(&mut self) {
+        self.next = RECONNECT_FIRST;
+    }
+
+    /// The wait after a session that ended `end`, having been connected for
+    /// `connected_for` (`None`: it never connected), with `fraction` (0 to 1)
+    /// of the jitter.
+    ///
+    /// The jitter adds up to half of the delay, so a fleet does not reconnect
+    /// in step; the delay itself stops at two thirds of the cap, so the wait
+    /// stays within the cap and is still spread out there.
+    fn after(
+        &mut self,
+        end: SessionEnd,
+        connected_for: Option<Duration>,
+        fraction: f64,
+    ) -> Duration {
+        if connected_for.is_some_and(|connected| connected > STABLE_SESSION) {
+            self.reset();
+        }
+        let cap = match end {
+            SessionEnd::Rejected
+            | SessionEnd::UnsupportedVersion
+            | SessionEnd::NoKey
+            | SessionEnd::NoTls => REJECTED_CAP,
+            _ => RECONNECT_CAP,
+        };
+        let delay = self.next.min(cap.mul_f64(2.0 / 3.0));
+        self.next = self.next.saturating_mul(2);
+        delay
+            .saturating_add(delay.mul_f64(fraction.clamp(0.0, 1.0) * 0.5))
+            .min(cap)
+    }
 }
 
 fn tls_config() -> Option<Arc<rustls::ClientConfig>> {
@@ -1229,6 +1280,7 @@ async fn session(
     config: &CoordinatorConfig,
     tls: Option<Arc<rustls::ClientConfig>>,
     recorder: &mut Recorder,
+    connected_at: &mut Option<tokio::time::Instant>,
 ) -> SessionEnd {
     let Ok(url) = CoordinatorUrl::parse(&config.url) else {
         return SessionEnd::Unreachable;
@@ -1244,6 +1296,7 @@ async fn session(
         Ok(handshake) => {
             let version = handshake.version;
             drop(key);
+            *connected_at = Some(tokio::time::Instant::now());
             recorder.connected(version);
             ports.coordination.send_modify(|view| {
                 view.connected = true;
@@ -1434,15 +1487,28 @@ async fn serve(
             _ = watch.tick(), if version >= LAUNCH_VERSION => {
                 let policies = ports.store.policies().unwrap_or_default();
                 let own: Vec<ScalePolicy> = policies
-                    .into_iter()
+                    .iter()
                     .filter(|policy| policy.is_owned_by(ports.host.id))
+                    .cloned()
                     .collect();
+                let mut freed = false;
                 for report in reports.poll(ports.store.as_ref(), &own, &ports.launches, meters) {
                     let message = match report {
                         AttemptReport::Started(started) => HostMessage::AttemptStarted(started),
-                        AttemptReport::Finished(finished) => HostMessage::AttemptFinished(finished),
+                        AttemptReport::Finished(finished) => {
+                            freed = true;
+                            HostMessage::AttemptFinished(finished)
+                        }
                     };
                     if let Err(end) = send(socket, &message).await {
+                        return end;
+                    }
+                }
+                // The coordinator places by the last heartbeat: a slot just
+                // freed is said at once, not at the next beat.
+                if freed {
+                    let beat = HostMessage::Heartbeat(heartbeat(ports, &policies));
+                    if let Err(end) = send(socket, &beat).await {
                         return end;
                     }
                 }
@@ -1750,7 +1816,9 @@ mod tests {
         use hmac::{Hmac, KeyInit as _, Mac as _};
         use runner_manager_agent::reconcile::DemandDirector as _;
         use runner_manager_coordinator::server::{AppState, Config, serve};
+        use runner_manager_domain::attempt::{AttemptOutcome, AttemptState};
         use runner_manager_domain::coordinator_protocol::{Launch, RefusalReason};
+        use runner_manager_domain::model::AttemptId;
         use runner_manager_domain::policy::pool_label;
         use runner_manager_domain::store::SqliteStore;
         use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope};
@@ -1762,8 +1830,12 @@ mod tests {
             .await
             .expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let mut config = Config::new(base.clone(), SecretString::from(SECRET));
+        // One heartbeat when the link comes up, then none for minutes: any
+        // other one the coordinator sees was sent for a reason.
+        config.heartbeat_interval = Duration::from_secs(300);
         let state = AppState::new(
-            Config::new(base.clone(), SecretString::from(SECRET)),
+            config,
             runner_manager_coordinator::store::Store::open_in_memory().expect("store"),
         );
         state
@@ -1825,10 +1897,10 @@ mod tests {
             .build();
         let pool = pool_label(host.os);
         policy.add_routing_label(pool.clone()).expect("pool label");
-        let sqlite = SqliteStore::open_in_memory().expect("store");
+        let sqlite = Arc::new(SqliteStore::open_in_memory().expect("store"));
         sqlite.put_host(&host).expect("host");
         sqlite.insert_policy(&policy).expect("policy");
-        let store: Arc<dyn Store> = Arc::new(sqlite);
+        let store: Arc<dyn Store> = Arc::clone(&sqlite) as Arc<dyn Store>;
         let mut routes = WakeRoutes::new(None);
         let nudged = routes.add(policy.target.clone());
         let coordination = coordination();
@@ -1926,6 +1998,46 @@ mod tests {
             !launches.cancel("second"),
             "a refused launch was never opened"
         );
+
+        // Two runners take jobs; when one ends, its freed slot reaches the
+        // coordinator with the attempt report, not at the next heartbeat
+        // (five minutes away here).
+        let (first, second) = (AttemptId::new_random(), AttemptId::new_random());
+        let attempt = |id, state| {
+            fixtures::attempt()
+                .id(id)
+                .policy_id(policy.id)
+                .state(state)
+                .build()
+        };
+        for id in [first, second] {
+            sqlite
+                .record_attempt(&attempt(id, AttemptState::Busy))
+                .expect("busy");
+        }
+        let finished = fixtures::attempt()
+            .id(first)
+            .policy_id(policy.id)
+            .state(AttemptState::Finished)
+            .outcome(AttemptOutcome::CompletedJob)
+            .build();
+        tokio::time::sleep(ATTEMPT_WATCH + Duration::from_millis(500)).await;
+        sqlite.record_attempt(&finished).expect("finished");
+        let busy = || {
+            state
+                .registry
+                .connected()
+                .first()
+                .and_then(|host| host.heartbeat.as_ref().map(|beat| beat.busy_slots))
+        };
+        assert_eq!(busy(), Some(0), "only the first heartbeat so far");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while busy() != Some(1) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the freed slot was reported with the finished attempt");
 
         // The link goes down and stays down past the fallback delay: the
         // profile is no longer directed and serves its own demand.
@@ -2053,9 +2165,61 @@ mod tests {
 
     #[test]
     fn jitter_only_ever_lengthens_the_wait() {
-        for _ in 0..100 {
-            let wait = jittered(Duration::from_secs(10));
+        for fraction in [0.0, 0.3, 1.0] {
+            let wait = Backoff {
+                next: Duration::from_secs(10),
+            }
+            .after(SessionEnd::Unreachable, None, fraction);
             assert!(wait >= Duration::from_secs(10) && wait <= Duration::from_secs(15));
         }
+    }
+
+    #[test]
+    fn the_reconnect_wait_doubles_up_to_thirty_seconds_jitter_included() {
+        let mut backoff = Backoff::default();
+        let waits: Vec<u64> = (0..8)
+            .map(|_| backoff.after(SessionEnd::Unreachable, None, 0.0).as_secs())
+            .collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 20, 20, 20]);
+        // The most jitter there is still stays within the cap, and spreads
+        // the fleet out below it.
+        assert_eq!(backoff.after(SessionEnd::Closed, None, 1.0), RECONNECT_CAP);
+        assert!(backoff.after(SessionEnd::Closed, None, 0.5) < RECONNECT_CAP);
+        // A refusal keeps its own, longer cap.
+        assert!(backoff.after(SessionEnd::Rejected, None, 1.0) <= REJECTED_CAP);
+        assert!(backoff.after(SessionEnd::Rejected, None, 0.0) > RECONNECT_CAP);
+    }
+
+    #[test]
+    fn only_a_connection_that_stayed_up_resets_the_reconnect_wait() {
+        let grown = || {
+            let mut backoff = Backoff::default();
+            for _ in 0..6 {
+                backoff.after(SessionEnd::Unreachable, None, 0.0);
+            }
+            backoff
+        };
+        // Never connected, or connected only briefly: still backing off.
+        for connected_for in [None, Some(Duration::from_secs(5)), Some(STABLE_SESSION)] {
+            assert_eq!(
+                grown().after(SessionEnd::Closed, connected_for, 0.0),
+                Duration::from_secs(20),
+                "{connected_for:?}"
+            );
+        }
+        // A connection that lasted over a minute starts over at once.
+        let mut backoff = grown();
+        assert_eq!(
+            backoff.after(
+                SessionEnd::Closed,
+                Some(STABLE_SESSION + Duration::from_secs(1)),
+                0.0
+            ),
+            RECONNECT_FIRST
+        );
+        assert_eq!(
+            backoff.after(SessionEnd::Unreachable, None, 0.0),
+            Duration::from_secs(2)
+        );
     }
 }

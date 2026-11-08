@@ -153,11 +153,18 @@ that is already queued. A link that drops keeps `coordinated` for 30 seconds, so
 changes nothing; after that every target polls on its own again at once. A coordinator without a
 GitHub App covers nothing, so its hosts are in `fallback` and behave as in stage 1.
 
+A dropped link reconnects after 1 second, then waits twice as long after every failed attempt,
+never more than 30 seconds between attempts (a random part of up to a third of the wait spreads a
+fleet out; a refused key or version waits up to 5 minutes). A connection that stayed up longer than
+a minute starts that over, so hosts are back within about 30 seconds of a coordinator restart.
+
 Upgrading to stage 4 moves the coordinator's database to schema 2 (three new tables). A stage-3
 coordinator refuses to open it (`written by a newer coordinator`): to roll back, restore the
 database from before the upgrade, or stop the service and run
 `sqlite3 coordinator.db 'PRAGMA user_version = 1'` (the stage-3 code never reads the new
-tables, and a later upgrade keeps them).
+tables, and a later upgrade keeps them). 0.4.47 moves it to schema 3 (a `queue_wait_secs` column on
+the samples); to roll back to 0.4.46, `sqlite3 coordinator.db 'PRAGMA user_version = 2'` the same
+way (0.4.46 never reads the column).
 
 The protocol is versioned: a stage-1 host and this coordinator, or this host and a stage-1
 coordinator, settle on version 1 and work as stage 1 did (the host is then in `fallback`).
@@ -215,7 +222,18 @@ any for that queue it prefers a profile with a persistent workspace for that rep
 checkout), then the most free RAM, then the fewest busy slots. It sends that host a `launch` and waits up to 10 seconds for the
 answer; a refusal (`max_capacity`, `host_capacity`, `unfit`, `draining`, `disabled`,
 `not_coordinated`, ...) or no answer moves on to the next candidate. A job no candidate can take
-waits and is retried every 5 seconds, and whenever a host reports a runner ended.
+waits and is retried every 5 seconds, and at once whenever a host reports a runner ended or a
+heartbeat with more free slots than its last one. A version-4 host of 0.4.47 or later sends that
+heartbeat right after its `attempt_finished`, so a freed slot takes the next queued job within
+moments rather than at the host's next heartbeat (15 seconds).
+
+A host frees a native runner's slot when it concludes the attempt, before it deletes the runner's
+files: cleanup never holds a slot. It concludes the attempt on its target's next pass, and while
+it is joined the host checks every 2 seconds whether a live runner's process has exited and, if
+so, runs that pass at once (at most 5 seconds after the previous one) instead of at the target's
+next scheduled poll (up to 60 seconds later). A runner in a container, a VM or a WSL distribution
+keeps its slot until its environment is proven gone and cleaned up, deliberately: until then it
+may still be running.
 
 A launch is a **lease** for 5 minutes. GitHub hands a runner *any* queued job its labels cover, so
 the coordinator counts per repository and label set: it never holds more leases than jobs are
@@ -260,9 +278,9 @@ When the attempt ends, its `attempt_finished` carries `usage`: the tree's peak r
 (summed per process, so shared pages count more than once; the coordinator caps it at the
 host's memory), its average CPU over the attempt and its busiest 2-second interval (in
 thousandths of a CPU), and how many samples were taken. CPU is the sum of the increases of the
-tree's CPU time between looks, so a process that exits loses at most its last 2 seconds. Both
-the wall duration and the average CPU are the attempt's, from its creation to its end, idle
-wait for a job included.
+tree's CPU time between looks, so a process that exits loses at most its last 2 seconds. The
+average CPU and the host's `duration_secs` are the attempt's, from its creation to its end:
+runner start, idle wait for a job and cleanup included. A sample's duration is not (see below).
 
 What is not seen: a runner in a container, a VM or a WSL distribution (no host process to look
 at, no usage reported); work that leaves the tree, such as `container:` jobs and `docker build`
@@ -272,19 +290,29 @@ jobs.
 
 ### How a sample is kept
 
-GitHub's `workflow_job` webhook `in_progress` names the runner that took the job together with
-the repository, the workflow and the job (matrix values included, as GitHub expands them:
-`build (ubuntu, 3.12)`). The coordinator remembers that only for runner names `runner-manager`
-registers (`runner-manager-...`), joins it with the host's report of the same runner name, in
-whichever order they arrive (a report waits up to 15 minutes for its webhook, a webhook 6 hours
-for its report, 10,000 of each at most, the oldest dropped first), and stores one sample per
-attempt that ran a job, completed or failed (an out-of-memory kill is what placement must
-learn), under the key `owner/repo/workflow/job` with the host that ran it. An attempt that
-exited idle is not a sample.
+GitHub's `workflow_job` webhooks `in_progress` and `completed` name the runner that took the job
+together with the repository, the workflow and the job (matrix values included, as GitHub expands
+them: `build (ubuntu, 3.12)`), and the job's `created_at`, `started_at` and `completed_at`. The
+coordinator remembers that only for runner names `runner-manager` registers
+(`runner-manager-...`), joins it with the host's report of the same runner name, in whichever
+order they arrive (a report waits up to 15 minutes for its job to be named, a webhook 6 hours for
+its report, 10,000 of each at most, the oldest dropped first), and stores one sample per attempt
+that ran a job, completed or failed (an out-of-memory kill is what placement must learn), under
+the key `owner/repo/workflow/job` with the host that ran it. An attempt that exited idle is not
+a sample.
+
+A sample's **duration** is the job's own run time, `started_at` to `completed_at`, so a 14-second
+job reads 14 seconds and not the minute its runner lived. Its **queue wait** is `created_at` to
+`started_at`: how long the job waited for a runner, which placement exists to keep short. A report
+whose job is named waits up to 2 minutes for the `completed` webhook (normally seconds away, in
+either direction); if it never comes, the sample is recorded with the host's attempt duration
+instead. Samples recorded before 0.4.47 carry the attempt duration and no queue wait; the newest
+30 per job replace them.
 
 The SQLite database keeps the last 30 samples per key (`COORDINATOR_STATS_SAMPLES`, 1-1000) and
-drops any older than 90 days. From them: p50 duration, p90 peak memory, p90 average CPU, and per
-host its median duration over the usual one (the mean of every host's median).
+drops any older than 90 days. From them: p50 duration, p50 and p90 queue wait, p90 peak memory,
+p90 average CPU, and per host its median duration over the usual one (the mean of every host's
+median).
 
 ### Weighted placement
 
@@ -338,10 +366,11 @@ does. A coordinator older than version 4 is reported as such.
 ```text
 Job statistics: the last 30 samples per job, kept 90 days
   launches accepted 41, wakes sent 312, samples recorded 97
+  queue wait (queued to started): p50 3s, p90 41s
 
-Heaviest jobs (p90 peak memory, p90 CPU, p50 duration, samples):
+Heaviest jobs (p90 peak memory, p90 CPU, p50 run time, p50/p90 queue wait, samples):
   octo/app/CI/build (linux, 3.12)
-      6.2 GiB  3.40 cores  11m 05s  (14)
+      6.2 GiB  3.40 cores  11m 05s  wait 4s/52s  (14)
       on linux (4f1c...)            9 samples  p50 9m 50s  0.85x the usual time
       on win-big (77aa...)          5 samples  p50 13m 10s  1.14x the usual time
 
@@ -354,8 +383,12 @@ Last placements, newest first (scores in points):
       9b20...   too full free after 0 MiB      cache 4.00 headroom 0.00 speed 0.00 bigfit -0.00 = 4.00
 ```
 
+- **Queue wait**: queued to started over every kept sample, then per job. A p90 that grows
+  means jobs wait for a free host.
 - **Heaviest jobs**: the 20 job keys with the largest p90 peak memory, and per host how its
   median compares with the usual duration (below 1x: faster).
+- `--json` is schema version 2 since 0.4.47: `p50_duration_secs` is the job's run time, and
+  `p50_queue_wait_secs` / `p90_queue_wait_secs` are added (overall and per job).
 - Names are printed with control, bidirectional and zero-width characters removed: a workflow
   or job name is whatever a pull request wrote.
 - **Last placements**: what the queue was estimated to need and why (`job`, `repository` or

@@ -99,6 +99,15 @@ pub struct WorkflowJob {
     /// The runner that took the job (`in_progress`, `completed`).
     #[serde(default)]
     pub runner_name: Option<String>,
+    /// RFC 3339 times, kept as text: one GitHub writes in an unexpected form
+    /// costs that figure in the statistics, never the event.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// `null` until `completed`.
+    #[serde(default)]
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -247,9 +256,16 @@ mod tests {
         assert_eq!(event.workflow_job.runner_name, None);
         let taken = r#"{"action":"in_progress","workflow_job":{"id":7,"run_id":9,
             "labels":["rm-pool-linux"],"name":"build (linux, 3.12)","workflow_name":"CI",
-            "runner_name":"runner-manager-abc","runner_id":3},
+            "runner_name":"runner-manager-abc","runner_id":3,
+            "created_at":"2026-11-07T10:00:00Z","started_at":"2026-11-07T10:00:04Z",
+            "completed_at":null},
             "repository":{"full_name":"octo/app"}}"#;
         let event: WorkflowJobEvent = serde_json::from_str(taken).expect("parses");
+        assert_eq!(
+            event.workflow_job.started_at.as_deref(),
+            Some("2026-11-07T10:00:04Z")
+        );
+        assert_eq!(event.workflow_job.completed_at, None);
         assert_eq!(event.workflow_job.workflow_name.as_deref(), Some("CI"));
         assert_eq!(
             event.workflow_job.runner_name.as_deref(),

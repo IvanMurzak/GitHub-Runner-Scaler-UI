@@ -22,8 +22,12 @@ use serde::Serialize;
 /// The shortest webhook secret accepted.
 const MIN_SECRET_LEN: usize = 16;
 
-/// Version of every `--json` document this binary prints.
+/// Version of `hosts list --json`.
 const JSON_SCHEMA_VERSION: u32 = 1;
+
+/// Version of `stats --json`. 2 (0.4.47): `p50_duration_secs` is the job's own
+/// run time by GitHub's webhooks, and the queue wait percentiles are added.
+const STATS_JSON_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Parser)]
 #[command(name = "runner-manager-coordinator", version, about)]
@@ -353,7 +357,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 serde_json::to_writer_pretty(
                     &mut out,
                     &StatsDocument {
-                        schema_version: JSON_SCHEMA_VERSION,
+                        schema_version: STATS_JSON_SCHEMA_VERSION,
                         report: &report,
                     },
                 )?;

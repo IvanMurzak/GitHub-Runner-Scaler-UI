@@ -38,12 +38,17 @@ async fn start() -> Coordinator {
 }
 
 async fn start_with(store: Store) -> Coordinator {
+    start_configured(store, |_| {}).await
+}
+
+async fn start_configured(store: Store, configure: impl FnOnce(&mut Config)) -> Coordinator {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let base = format!("http://{}", listener.local_addr().expect("addr"));
     let mut config = Config::new(base.clone(), SecretString::from(SECRET));
     config.revocation_check = Duration::from_millis(100);
+    configure(&mut config);
     let state = AppState::new(config, store);
     let (shutdown, stopped) = tokio::sync::oneshot::channel();
     tokio::spawn(serve(listener, Arc::clone(&state), async {
@@ -539,6 +544,90 @@ async fn a_pool_job_launches_on_one_version_three_host_and_wakes_a_version_two_o
     panic!("the accepted launch was not recorded as a lease");
 }
 
+/// A pool job queued while every slot is busy is placed as soon as a host
+/// reports a freed slot, not at placement's next tick (an hour away here).
+#[tokio::test]
+async fn a_freed_slot_places_a_waiting_pool_job_at_once() {
+    use runner_manager_coordinator::registry::Coverage;
+    use runner_manager_domain::coordinator_protocol::Heartbeat;
+
+    let coordinator = start_configured(Store::open_in_memory().expect("store"), |config| {
+        config.placement_tick = Duration::from_secs(3600);
+    })
+    .await;
+    coordinator.state.registry.set_coverage(Coverage {
+        interval: Some(Duration::from_secs(120)),
+        repositories: std::collections::BTreeSet::new(),
+        accounts: std::collections::BTreeSet::from(["octo".to_string()]),
+    });
+    let (host_id, key) = enrolled(&coordinator, "busy", 31).await;
+    let mut socket = coordinator.connect(&host_id, &key).await;
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerMessage::Welcome { .. }
+    ));
+    let HostMessage::Hello(mut pool_hello) = hello(PROTOCOL_VERSION, &host_id) else {
+        unreachable!()
+    };
+    pool_hello.targets[0].profiles[0]
+        .labels
+        .push("rm-pool-linux".into());
+    send(&mut socket, &HostMessage::Hello(pool_hello)).await;
+    let full = Heartbeat {
+        free_slots: 0,
+        busy_slots: 2,
+        ..Heartbeat::default()
+    };
+    send(&mut socket, &HostMessage::Heartbeat(full.clone())).await;
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerMessage::HelloAck(_)
+    ));
+    for _ in 0..100 {
+        if coordinator
+            .state
+            .registry
+            .connected()
+            .iter()
+            .all(|host| host.heartbeat.is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let body = queued("octo/app", &["rm-pool-linux"]);
+    assert_eq!(
+        coordinator
+            .webhook("workflow_job", "full-1", &body, true)
+            .await,
+        200
+    );
+    // No slot: nothing is launched, and the same full heartbeat again does
+    // not retry anything.
+    send(&mut socket, &HostMessage::Heartbeat(full)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), next(&mut socket))
+            .await
+            .is_err(),
+        "nothing to launch while the host is full"
+    );
+    send(
+        &mut socket,
+        &HostMessage::Heartbeat(Heartbeat {
+            free_slots: 1,
+            busy_slots: 1,
+            ..Heartbeat::default()
+        }),
+    )
+    .await;
+    let launched = tokio::time::timeout(Duration::from_secs(3), next(&mut socket))
+        .await
+        .expect("placed as soon as the slot was reported free");
+    assert!(matches!(launched, ServerMessage::Launch(_)), "{launched:?}");
+}
+
+/// A `workflow_job` event: queued at 10:00:00, started at 10:00:04 and, once
+/// `completed`, done at 10:00:18 (a 14-second job).
 fn job_event(action: &str, job_id: u64, runner: Option<&str>) -> String {
     serde_json::json!({
         "action": action,
@@ -546,6 +635,9 @@ fn job_event(action: &str, job_id: u64, runner: Option<&str>) -> String {
             "id": job_id, "run_id": 2, "labels": ["self-hosted", "linux"],
             "name": "build (linux, 3.12)", "workflow_name": "CI",
             "runner_name": runner,
+            "created_at": "2026-11-07T10:00:00Z",
+            "started_at": (action != "queued").then_some("2026-11-07T10:00:04Z"),
+            "completed_at": (action == "completed").then_some("2026-11-07T10:00:18Z"),
         },
         "repository": {"full_name": "Octo/App"},
     })
@@ -581,10 +673,12 @@ async fn query_stats(
     report
 }
 
-/// Stage 4 end to end: the webhook names the job a runner took, the host
-/// reports what the attempt used, and a query session reads the result
-/// while the host's link stays connected. A version-3 host's report (no
-/// usage) still counts its duration.
+/// Stage 4 end to end: the webhooks name the job a runner took and when it
+/// ran, the host reports what the attempt used, and a query session reads
+/// the result while the host's link stays connected. The duration is the
+/// job's own (14 s), not the host's attempt (300 s), whether `completed`
+/// comes before the report or after it. A version-3 host's report (no usage)
+/// still counts.
 #[tokio::test]
 async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_query() {
     use runner_manager_domain::coordinator_protocol::{
@@ -645,6 +739,19 @@ async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_quer
             usage,
         })
     };
+    // The new host's job completes before its report arrives, the old
+    // host's after it.
+    assert_eq!(
+        coordinator
+            .webhook(
+                "workflow_job",
+                "s-5",
+                &job_event("completed", 5, Some("runner-manager-new")),
+                true
+            )
+            .await,
+        200
+    );
     send(
         &mut link,
         &finished(
@@ -659,21 +766,42 @@ async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_quer
     )
     .await;
     send(&mut old, &finished("runner-manager-old", None)).await;
-
-    let mut report = None;
+    let samples = || {
+        coordinator
+            .state
+            .statistics
+            .with_aggregates(|a| a.job("octo/app/CI/build (linux, 3.12)"))
+            .map_or(0, |job| job.samples)
+    };
+    // The old host's sample waits until its job is known to have ended.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(samples(), 1, "only the job known to have completed");
+    assert_eq!(
+        coordinator
+            .webhook(
+                "workflow_job",
+                "s-6",
+                &job_event("completed", 6, Some("runner-manager-old")),
+                true
+            )
+            .await,
+        200
+    );
     for _ in 0..100 {
-        let read = query_stats(&coordinator, &new_id, &new_key).await;
-        if read.jobs.first().is_some_and(|job| job.samples == 2) {
-            report = Some(read);
+        if samples() == 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let report = Some(query_stats(&coordinator, &new_id, &new_key).await)
+        .filter(|report| report.jobs.first().is_some_and(|job| job.samples == 2));
     let report = report.expect("both samples recorded");
     let job = &report.jobs[0];
     assert_eq!(job.job_key, "octo/app/CI/build (linux, 3.12)");
     assert_eq!(job.p90_peak_rss_bytes, Some(3 << 30));
-    assert_eq!(job.p50_duration_secs, Some(300));
+    assert_eq!(job.p50_duration_secs, Some(14), "the job's run time");
+    assert_eq!(job.p90_queue_wait_secs, Some(4));
+    assert_eq!(report.p50_queue_wait_secs, Some(4));
     assert_eq!(report.wakes, 2, "the queued job woke both hosts");
     let names: Vec<Option<&str>> = report
         .hosts

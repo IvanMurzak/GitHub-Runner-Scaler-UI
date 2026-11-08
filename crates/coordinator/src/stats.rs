@@ -4,13 +4,20 @@
 //! # Where a sample comes from
 //!
 //! A host reports, in `attempt_finished`, how long its runner lived and what
-//! its process tree used ([`AttemptUsage`]). Which job that runner took is
-//! GitHub's to say: the `workflow_job` webhook `in_progress` (and
-//! `completed`) names the `runner_name` together with the repository, the
-//! workflow and the job (the matrix-expanded name, as GitHub gives it). The
-//! [`Correlator`] joins the two in whichever order they arrive, and an
-//! attempt that ran a job becomes one [`JobSample`] under the job key
-//! `owner/repo/workflow/job`.
+//! its process tree used ([`AttemptUsage`]). Which job that runner took, and
+//! when, is GitHub's to say: the `workflow_job` webhooks `in_progress` and
+//! `completed` name the `runner_name` together with the repository, the
+//! workflow, the job (the matrix-expanded name, as GitHub gives it) and the
+//! job's `created_at`, `started_at` and `completed_at`. The [`Correlator`]
+//! joins them in whichever order they arrive, and an attempt that ran a job
+//! becomes one [`JobSample`] under the job key `owner/repo/workflow/job`.
+//!
+//! A sample's duration is the **job's** run time, `started_at` to
+//! `completed_at`: the host's attempt also spans the runner's start, its wait
+//! for a job and its cleanup, which made a 14-second job read as a minute. Its
+//! queue wait is `created_at` to `started_at`. A host report waits up to
+//! [`COMPLETION_WAIT`] for the `completed` webhook once the job is known; past
+//! that (a lost delivery) it is recorded with the host's attempt duration.
 //!
 //! # What is kept
 //!
@@ -57,6 +64,11 @@ const MAX_NAME_CHARS: usize = 120;
 /// and the other way round.
 const CORRELATION_MEMORY: Duration = Duration::from_secs(6 * 60 * 60);
 const PENDING_MEMORY: Duration = Duration::from_secs(15 * 60);
+
+/// How long a report whose job is known waits for the `completed` webhook
+/// (normally seconds behind it, or ahead) before it is recorded without the
+/// job's own times.
+pub const COMPLETION_WAIT: Duration = Duration::from_secs(2 * 60);
 
 /// Mappings and pending reports remembered at most.
 const MAX_CORRELATIONS: usize = 10_000;
@@ -173,16 +185,75 @@ impl JobIdentity {
     }
 }
 
-/// Joins a webhook's "runner R took job J" with the host's "runner R ended",
-/// in either order.
+/// When GitHub says a job was queued, started and completed: the
+/// `workflow_job` webhook's `created_at`, `started_at` and `completed_at`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobTimes {
+    pub created_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Whole seconds from `from` to `to`; `None` unless both are known and in
+/// that order.
+fn seconds_between(from: Option<DateTime<Utc>>, to: Option<DateTime<Utc>>) -> Option<u64> {
+    u64::try_from((to? - from?).num_seconds()).ok()
+}
+
+impl JobTimes {
+    /// From a webhook's fields. A time that does not parse is unknown: a
+    /// malformed timestamp costs that figure, never the event.
+    #[must_use]
+    pub fn parse(created: Option<&str>, started: Option<&str>, completed: Option<&str>) -> Self {
+        let at = |raw: Option<&str>| {
+            DateTime::parse_from_rfc3339(raw?)
+                .ok()
+                .map(|at| at.with_timezone(&Utc))
+        };
+        Self {
+            created_at: at(created),
+            started_at: at(started),
+            completed_at: at(completed),
+        }
+    }
+
+    /// The job's own run time on the runner.
+    #[must_use]
+    pub fn run_secs(&self) -> Option<u64> {
+        seconds_between(self.started_at, self.completed_at)
+    }
+
+    /// How long the job waited for a runner.
+    #[must_use]
+    pub fn queue_wait_secs(&self) -> Option<u64> {
+        seconds_between(self.created_at, self.started_at)
+    }
+
+    /// `newer`'s times over these, keeping a time `newer` does not have.
+    fn merge(&mut self, newer: Self) {
+        self.created_at = newer.created_at.or(self.created_at);
+        self.started_at = newer.started_at.or(self.started_at);
+        self.completed_at = newer.completed_at.or(self.completed_at);
+    }
+}
+
+/// Joins a webhook's "runner R took job J" (and when it ran) with the host's
+/// "runner R ended", in either order.
 #[derive(Debug, Default)]
 pub struct Correlator {
-    identities: HashMap<String, (JobIdentity, Instant)>,
+    identities: HashMap<String, (JobIdentity, JobTimes, Instant)>,
+    /// Reports waiting for their job, or for its `completed` webhook.
     pending: HashMap<String, (String, AttemptFinished, Instant)>,
 }
 
 /// A host's report, now that its job is known.
-pub type Correlated = (String, JobIdentity, AttemptFinished);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Correlated {
+    pub host_id: String,
+    pub identity: JobIdentity,
+    pub times: JobTimes,
+    pub finished: AttemptFinished,
+}
 
 /// Makes room in `map` for one more entry: the oldest goes when it is full.
 fn make_room<V>(map: &mut HashMap<String, V>, at: impl Fn(&V) -> Instant) {
@@ -202,17 +273,34 @@ fn make_room<V>(map: &mut HashMap<String, V>, at: impl Fn(&V) -> Instant) {
 impl Correlator {
     fn forget_old(&mut self, now: Instant) {
         self.identities
-            .retain(|_, (_, at)| now.saturating_duration_since(*at) < CORRELATION_MEMORY);
+            .retain(|_, (_, _, at)| now.saturating_duration_since(*at) < CORRELATION_MEMORY);
         self.pending
             .retain(|_, (_, _, at)| now.saturating_duration_since(*at) < PENDING_MEMORY);
     }
 
-    /// The webhook named the job `runner` took; returns the host's report if
-    /// it came first.
+    /// Takes `runner`'s pending report and its job, if both are here.
+    fn take(&mut self, runner: &str) -> Option<Correlated> {
+        if !(self.pending.contains_key(runner) && self.identities.contains_key(runner)) {
+            return None;
+        }
+        let (host_id, finished, _) = self.pending.remove(runner)?;
+        let (identity, times, _) = self.identities.remove(runner)?;
+        Some(Correlated {
+            host_id,
+            identity,
+            times,
+            finished,
+        })
+    }
+
+    /// A webhook named the job `runner` took (`in_progress`) or finished
+    /// (`completed`), with its times; returns the host's report once the job
+    /// is complete and the report is in.
     pub fn identified(
         &mut self,
         runner: &str,
         identity: JobIdentity,
+        times: JobTimes,
         now: Instant,
     ) -> Option<Correlated> {
         // A runner this tool did not register (GitHub-hosted, another
@@ -222,18 +310,32 @@ impl Correlator {
         }
         self.forget_old(now);
         let runner = runner.to_ascii_lowercase();
-        if let Some((host_id, finished, _)) = self.pending.remove(&runner) {
-            return Some((host_id, identity, finished));
+        let complete = match self.identities.get_mut(&runner) {
+            Some((known, known_times, at)) => {
+                *known = identity;
+                known_times.merge(times);
+                *at = now;
+                known_times.completed_at.is_some()
+            }
+            None => {
+                make_room(&mut self.identities, |(_, _, at)| *at);
+                let complete = times.completed_at.is_some();
+                self.identities
+                    .insert(runner.clone(), (identity, times, now));
+                complete
+            }
+        };
+        if complete {
+            return self.take(&runner);
         }
-        make_room(&mut self.identities, |(_, at)| *at);
-        self.identities.insert(runner, (identity, now));
         None
     }
 
-    /// A host's attempt ended; returns it with its job if the webhook came
-    /// first. An attempt that took no job (an idle exit) is dropped: it has
-    /// nothing to say about a job's weight. One that failed after taking a
-    /// job (an out-of-memory kill) is exactly what placement must learn.
+    /// A host's attempt ended; returns it with its job if the webhooks
+    /// already said everything. An attempt that took no job (an idle exit)
+    /// is dropped: it has nothing to say about a job's weight. One that
+    /// failed after taking a job (an out-of-memory kill) is exactly what
+    /// placement must learn.
     pub fn finished(
         &mut self,
         host_id: &str,
@@ -252,13 +354,32 @@ impl Correlator {
             self.identities.remove(&runner);
             return None;
         }
-        if let Some((identity, _)) = self.identities.remove(&runner) {
-            return Some((host_id.to_string(), identity, finished));
-        }
+        let complete = self
+            .identities
+            .get(&runner)
+            .is_some_and(|(_, times, _)| times.completed_at.is_some());
         make_room(&mut self.pending, |(_, _, at)| *at);
         self.pending
-            .insert(runner, (host_id.to_string(), finished, now));
+            .insert(runner.clone(), (host_id.to_string(), finished, now));
+        if complete {
+            return self.take(&runner);
+        }
         None
+    }
+
+    /// Reports whose job is known but whose `completed` webhook has not come
+    /// within [`COMPLETION_WAIT`]: recorded with what is known.
+    pub fn overdue(&mut self, now: Instant) -> Vec<Correlated> {
+        let due: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(runner, (_, _, at))| {
+                now.saturating_duration_since(*at) >= COMPLETION_WAIT
+                    && self.identities.contains_key(*runner)
+            })
+            .map(|(runner, _)| runner.clone())
+            .collect();
+        due.iter().filter_map(|runner| self.take(runner)).collect()
     }
 }
 
@@ -322,6 +443,8 @@ pub struct Aggregates {
 pub struct JobFigures {
     pub samples: usize,
     pub p50_duration_secs: Option<u64>,
+    pub p50_queue_wait_secs: Option<u64>,
+    pub p90_queue_wait_secs: Option<u64>,
     pub p90_peak_rss_bytes: Option<u64>,
     pub p90_cpu_millicores: Option<u32>,
 }
@@ -359,6 +482,8 @@ impl Aggregates {
         Some(JobFigures {
             samples: samples.len(),
             p50_duration_secs: field_percentile(samples, |s| s.duration_secs, 50),
+            p50_queue_wait_secs: field_percentile(samples, |s| s.queue_wait_secs, 50),
+            p90_queue_wait_secs: field_percentile(samples, |s| s.queue_wait_secs, 90),
             p90_peak_rss_bytes: field_percentile(samples, |s| s.peak_rss_bytes, 90),
             p90_cpu_millicores: field_percentile(samples, |s| s.cpu_avg_millicores, 90),
         })
@@ -714,8 +839,14 @@ impl Statistics {
         self.wakes.fetch_add(woken, Ordering::Relaxed);
     }
 
-    /// Adds the counted launches and wakes to the database.
+    /// Records the reports that waited [`COMPLETION_WAIT`] in vain for their
+    /// `completed` webhook, and adds the counted launches and wakes to the
+    /// database.
     pub fn flush(&self) {
+        let overdue = lock(&self.correlator).overdue(Instant::now());
+        for correlated in overdue {
+            self.record(correlated);
+        }
         let launches = self.launches.swap(0, Ordering::Relaxed);
         let wakes = self.wakes.swap(0, Ordering::Relaxed);
         if launches + wakes == 0 {
@@ -728,9 +859,10 @@ impl Statistics {
         }
     }
 
-    /// A webhook said `runner` took the job `identity`.
-    pub fn job_identified(&self, runner: &str, identity: JobIdentity) {
-        let correlated = lock(&self.correlator).identified(runner, identity, Instant::now());
+    /// A webhook said `runner` took (or finished) the job `identity`, at
+    /// `times`.
+    pub fn job_identified(&self, runner: &str, identity: JobIdentity, times: JobTimes) {
+        let correlated = lock(&self.correlator).identified(runner, identity, times, Instant::now());
         if let Some(correlated) = correlated {
             self.record(correlated);
         }
@@ -756,15 +888,30 @@ impl Statistics {
         }
     }
 
-    fn record(&self, (host_id, identity, finished): Correlated) {
+    fn record(
+        &self,
+        Correlated {
+            host_id,
+            identity,
+            times,
+            finished,
+        }: Correlated,
+    ) {
         let usage = finished.usage;
         let now = Utc::now();
+        // The job's own run time; the host's attempt (start, wait for a job,
+        // cleanup) only when GitHub's times are missing.
+        let (duration_secs, duration_source) = match times.run_secs() {
+            Some(secs) => (Some(secs), "webhook"),
+            None => (finished.duration_secs, "host"),
+        };
         let sample = JobSample {
             job_key: identity.key(),
             repository: identity.repository,
             host_id: host_id.clone(),
             finished_at: now,
-            duration_secs: finished.duration_secs,
+            duration_secs,
+            queue_wait_secs: times.queue_wait_secs(),
             peak_rss_bytes: usage
                 .filter(|usage| usage.samples > 0)
                 .map(|usage| usage.peak_rss_bytes),
@@ -782,13 +929,16 @@ impl Statistics {
             tracing::warn!(%error, "a job sample could not be stored");
             return;
         }
+        let queue_wait_secs = sample.queue_wait_secs;
         let mut aggregates = lock(&self.aggregates);
         aggregates.add(sample, self.config.samples_per_job as usize);
         aggregates.expire(oldest);
         tracing::info!(
             %host_id,
             peak_rss_bytes = usage.map_or(0, |usage| usage.peak_rss_bytes),
-            duration_secs = finished.duration_secs.unwrap_or_default(),
+            duration_secs = duration_secs.unwrap_or_default(),
+            duration_source,
+            queue_wait_secs = queue_wait_secs.unwrap_or_default(),
             "a job sample was recorded"
         );
     }
@@ -870,6 +1020,8 @@ pub fn report(
                 job_key: key.clone(),
                 samples: u32::try_from(figures.samples).unwrap_or(u32::MAX),
                 p50_duration_secs: figures.p50_duration_secs,
+                p50_queue_wait_secs: figures.p50_queue_wait_secs,
+                p90_queue_wait_secs: figures.p90_queue_wait_secs,
                 p90_peak_rss_bytes: figures.p90_peak_rss_bytes,
                 p90_cpu_millicores: figures.p90_cpu_millicores,
                 hosts,
@@ -901,6 +1053,13 @@ pub fn report(
         })
         .collect();
 
+    let waits: Vec<u64> = aggregates
+        .by_key
+        .values()
+        .flatten()
+        .filter_map(|sample| sample.queue_wait_secs)
+        .collect();
+
     let decisions = store
         .decisions(REPORT_DECISIONS)?
         .iter()
@@ -913,6 +1072,8 @@ pub fn report(
         launches: counters.launches,
         wakes: counters.wakes,
         samples: counters.samples,
+        p50_queue_wait_secs: percentile(&waits, 50),
+        p90_queue_wait_secs: percentile(&waits, 90),
         jobs,
         hosts,
         decisions,
@@ -969,6 +1130,7 @@ mod tests {
             host_id: host.into(),
             finished_at: Utc::now(),
             duration_secs: Some(secs),
+            queue_wait_secs: None,
             peak_rss_bytes: Some(rss),
             cpu_avg_millicores: Some(1000),
             cpu_peak_millicores: None,
@@ -988,26 +1150,48 @@ mod tests {
         shuffled.clear();
     }
 
+    /// GitHub's times for a job queued at 10:00:00, started 4 s later and,
+    /// with `completed`, done 14 s after that.
+    fn times(completed: bool) -> JobTimes {
+        JobTimes::parse(
+            Some("2026-11-07T10:00:00Z"),
+            Some("2026-11-07T10:00:04Z"),
+            completed.then_some("2026-11-07T10:00:18Z"),
+        )
+    }
+
     #[test]
     fn a_webhook_identity_and_a_host_report_meet_in_either_order() {
         let mut correlator = Correlator::default();
         let now = Instant::now();
-        // Webhook first.
-        assert!(
-            correlator
-                .identified("runner-manager-A", identity("build (linux, 3.12)"), now)
-                .is_none()
-        );
-        let (host, who, _) = correlator
+        // Both webhooks first, then the report.
+        for completed in [false, true] {
+            assert!(
+                correlator
+                    .identified(
+                        "runner-manager-A",
+                        identity("build (linux, 3.12)"),
+                        times(completed),
+                        now
+                    )
+                    .is_none()
+            );
+        }
+        let met = correlator
             .finished(
                 "h1",
                 finished("runner-manager-a", AttemptOutcomeKind::CompletedJob, GIB),
                 now,
             )
             .expect("matched case-blind");
-        assert_eq!(host, "h1");
-        assert_eq!(who.key(), "octo/app/CI/build (linux, 3.12)");
-        // Report first.
+        assert_eq!(met.host_id, "h1");
+        assert_eq!(met.identity.key(), "octo/app/CI/build (linux, 3.12)");
+        assert_eq!(
+            (met.times.run_secs(), met.times.queue_wait_secs()),
+            (Some(14), Some(4))
+        );
+        // `in_progress`, the report, then `completed`: the report waits for it.
+        correlator.identified("runner-manager-b", identity("test"), times(false), now);
         assert!(
             correlator
                 .finished(
@@ -1015,17 +1199,34 @@ mod tests {
                     finished("runner-manager-b", AttemptOutcomeKind::CompletedJob, GIB),
                     now,
                 )
-                .is_none()
+                .is_none(),
+            "the job's end is not known yet"
         );
-        let (host, _, report) = correlator
-            .identified("runner-manager-b", identity("test"), now)
+        let met = correlator
+            .identified("runner-manager-b", identity("test"), times(true), now)
             .expect("the pending report");
         assert_eq!(
-            (host.as_str(), report.runner_name.as_str()),
+            (met.host_id.as_str(), met.finished.runner_name.as_str()),
             ("h2", "runner-manager-b")
         );
+        assert_eq!(met.times.run_secs(), Some(14));
+        // The report before any webhook: `completed` alone completes it.
+        assert!(
+            correlator
+                .finished(
+                    "h2",
+                    finished("runner-manager-f", AttemptOutcomeKind::CompletedJob, GIB),
+                    now,
+                )
+                .is_none()
+        );
+        assert!(
+            correlator
+                .identified("runner-manager-f", identity("test"), times(true), now)
+                .is_some()
+        );
         // An idle exit took no job: nothing to record, nothing kept.
-        correlator.identified("runner-manager-c", identity("lint"), now);
+        correlator.identified("runner-manager-c", identity("lint"), times(false), now);
         assert!(
             correlator
                 .finished(
@@ -1035,10 +1236,10 @@ mod tests {
                 )
                 .is_none()
         );
-        assert!(correlator.identities.is_empty());
+        assert!(correlator.identities.is_empty() && correlator.pending.is_empty());
         // A failed attempt that had taken a job (an out-of-memory kill) is a
         // sample; a runner this tool never registers is not remembered.
-        correlator.identified("runner-manager-e", identity("heavy"), now);
+        correlator.identified("runner-manager-e", identity("heavy"), times(true), now);
         assert!(
             correlator
                 .finished(
@@ -1048,7 +1249,7 @@ mod tests {
                 )
                 .is_some()
         );
-        correlator.identified("GitHub Actions 7", identity("hosted"), now);
+        correlator.identified("GitHub Actions 7", identity("hosted"), times(true), now);
         assert!(correlator.identities.is_empty());
         // A report nobody names is forgotten after a while.
         correlator.finished(
@@ -1058,8 +1259,83 @@ mod tests {
         );
         assert!(
             correlator
-                .identified("runner-manager-d", identity("x"), now + PENDING_MEMORY)
+                .identified(
+                    "runner-manager-d",
+                    identity("x"),
+                    times(true),
+                    now + PENDING_MEMORY
+                )
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_report_whose_completion_never_arrives_is_recorded_after_a_while() {
+        let mut correlator = Correlator::default();
+        let now = Instant::now();
+        correlator.identified("runner-manager-l", identity("lost"), times(false), now);
+        correlator.finished(
+            "h1",
+            finished("runner-manager-l", AttemptOutcomeKind::CompletedJob, GIB),
+            now,
+        );
+        // A report with no job named at all is not due: it waits for one.
+        correlator.finished(
+            "h1",
+            finished("runner-manager-u", AttemptOutcomeKind::CompletedJob, GIB),
+            now,
+        );
+        assert!(correlator.overdue(now + COMPLETION_WAIT / 2).is_empty());
+        let due = correlator.overdue(now + COMPLETION_WAIT);
+        assert_eq!(due.len(), 1);
+        // Known: when it waited and started; unknown: when it ended.
+        assert_eq!(
+            (due[0].times.run_secs(), due[0].times.queue_wait_secs()),
+            (None, Some(4))
+        );
+        assert!(correlator.overdue(now + COMPLETION_WAIT * 2).is_empty());
+        assert_eq!(correlator.pending.len(), 1, "the unnamed one still waits");
+    }
+
+    #[test]
+    fn without_the_jobs_own_times_a_sample_counts_the_hosts_attempt() {
+        let db = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let stats = Statistics::load(Arc::clone(&db), StatsConfig::default());
+        stats.record(Correlated {
+            host_id: "h1".into(),
+            identity: identity("lost"),
+            times: times(false),
+            finished: finished("runner-manager-l", AttemptOutcomeKind::CompletedJob, GIB),
+        });
+        let figures = stats
+            .with_aggregates(|aggregates| aggregates.job("octo/app/CI/lost"))
+            .expect("recorded");
+        assert_eq!(figures.p50_duration_secs, Some(100), "the host's attempt");
+        assert_eq!(
+            figures.p50_queue_wait_secs,
+            Some(4),
+            "what is known is kept"
+        );
+    }
+
+    #[test]
+    fn webhook_times_parse_leniently_and_never_go_backwards() {
+        let backwards = JobTimes::parse(
+            Some("2026-11-07T10:00:10Z"),
+            Some("2026-11-07T10:00:04+00:00"),
+            Some("2026-11-07T10:00:01Z"),
+        );
+        assert_eq!(
+            (backwards.run_secs(), backwards.queue_wait_secs()),
+            (None, None)
+        );
+        let garbled = JobTimes::parse(Some("yesterday"), None, Some(""));
+        assert_eq!(garbled, JobTimes::default());
+        let mut merged = times(false);
+        merged.merge(JobTimes::parse(None, None, Some("2026-11-07T10:01:04Z")));
+        assert_eq!(
+            (merged.run_secs(), merged.queue_wait_secs()),
+            (Some(60), Some(4))
         );
     }
 
@@ -1336,9 +1612,9 @@ mod tests {
     fn statistics_record_a_correlated_attempt_and_report_it() {
         let db = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
         let stats = Statistics::load(Arc::clone(&db), StatsConfig::default());
-        stats.job_identified("runner-manager-1", identity("build"));
+        stats.job_identified("runner-manager-1", identity("build"), times(true));
         // A peak above the host's memory is capped at it.
-        stats.job_identified("runner-manager-9", identity("inflated"));
+        stats.job_identified("runner-manager-9", identity("inflated"), times(true));
         stats.attempt_finished(
             "h1",
             &finished(
@@ -1375,9 +1651,17 @@ mod tests {
             .with_aggregates(|aggregates| aggregates.job("octo/app/CI/build"))
             .expect("in memory");
         assert_eq!(figures.p90_peak_rss_bytes, Some(3 * GIB));
+        // The job's 14 s, not the host's 100 s attempt; and its 4 s wait.
+        assert_eq!(figures.p50_duration_secs, Some(14));
+        assert_eq!(figures.p90_queue_wait_secs, Some(4));
         let report = stats.report(Utc::now()).expect("report");
         assert_eq!((report.launches, report.wakes, report.samples), (1, 4, 2));
         assert_eq!(report.jobs.len(), 2);
+        assert_eq!(
+            (report.p50_queue_wait_secs, report.p90_queue_wait_secs),
+            (Some(4), Some(4))
+        );
+        assert_eq!(report.jobs[0].p50_queue_wait_secs, Some(4));
         assert_eq!(report.hosts[0].host_id, "h1");
         // Flushed, the counters survive into a fresh load (the admin CLI).
         stats.flush();

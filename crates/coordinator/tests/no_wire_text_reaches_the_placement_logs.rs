@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use runner_manager_coordinator::placement::Placement;
 use runner_manager_coordinator::registry::{Coverage, Outbound, Registry};
-use runner_manager_coordinator::stats::{JobIdentity, Statistics, StatsConfig};
+use runner_manager_coordinator::stats::{JobIdentity, JobTimes, Statistics, StatsConfig};
 use runner_manager_coordinator::store::Store;
 use runner_manager_domain::coordinator_protocol::{
     AttemptFinished, AttemptOutcomeKind, AttemptStarted, AttemptUsage, Heartbeat, Hello,
@@ -109,7 +109,15 @@ fn no_wire_text_reaches_the_placement_logs() {
                 StatsConfig::default(),
             ));
             let identity = JobIdentity::new(REPOSITORY, Some(WORKFLOW), Some(JOB)).expect("named");
-            stats.job_identified(RUNNER, identity.clone());
+            stats.job_identified(
+                RUNNER,
+                identity.clone(),
+                JobTimes::parse(
+                    Some("2026-11-07T10:00:00Z"),
+                    Some("2026-11-07T10:00:04Z"),
+                    Some("2026-11-07T10:00:18Z"),
+                ),
+            );
             stats.attempt_finished(
                 "accepts",
                 &AttemptFinished {

@@ -13,13 +13,20 @@
 //! An isolated attempt (a container, a VM, a WSL distribution) has no host
 //! process to look at and reports no usage. Nothing here is a figure the
 //! host acts on; the coordinator uses it to estimate how heavy a job is.
+//!
+//! The same look also notices a live attempt whose runner process is gone:
+//! its target loop is nudged so the next pass concludes the attempt and
+//! frees its slot within seconds, instead of at the target's next scheduled
+//! poll (up to its active interval, 60 s by default) while the coordinator
+//! waits to place a queued job there. The pass decides, as always: a nudge
+//! is only "look now".
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use runner_manager_domain::coordinator_protocol::AttemptUsage;
-use runner_manager_domain::model::{AttemptId, HostId};
+use runner_manager_domain::model::{AttemptId, HostId, ScaleTarget};
 use runner_manager_domain::store::Store;
 use runner_manager_platform::resource_usage::{TreeUsage, sample_trees};
 use tokio::time::Instant;
@@ -72,6 +79,10 @@ impl Meter {
 #[derive(Debug, Default)]
 pub struct AttemptMeters {
     meters: Mutex<HashMap<AttemptId, Meter>>,
+    /// Live attempts whose runner process was already seen gone: each is
+    /// announced once, so an attempt a pass cannot conclude yet (GitHub
+    /// unreachable) does not pull every later poll forward.
+    exited: Mutex<HashSet<AttemptId>>,
 }
 
 impl AttemptMeters {
@@ -121,40 +132,61 @@ impl AttemptMeters {
     }
 
     /// One pass: samples every live native attempt of `host`'s own policies.
-    /// Blocking: SQLite and the process table.
-    pub fn sample_once(&self, store: &dyn Store, host: HostId) {
+    /// Returns the targets of the attempts whose runner process is newly
+    /// seen gone. Blocking: SQLite and the process table.
+    pub fn sample_once(&self, store: &dyn Store, host: HostId) -> Vec<ScaleTarget> {
         let policies = store.policies().unwrap_or_default();
         let mut live = HashSet::new();
-        let mut roots: Vec<(AttemptId, u32)> = Vec::new();
+        let mut roots: Vec<(AttemptId, u32, &ScaleTarget)> = Vec::new();
         for policy in policies.iter().filter(|policy| policy.is_owned_by(host)) {
             let Ok(attempts) = store.active_attempts_for_policy(policy.id) else {
                 continue;
             };
             for attempt in attempts {
                 live.insert(attempt.id);
-                roots.extend(attempt.process_id().map(|pid| (attempt.id, pid)));
+                roots.extend(
+                    attempt
+                        .process_id()
+                        .map(|pid| (attempt.id, pid, &policy.target)),
+                );
             }
         }
         // One look at the process table for every attempt.
-        let pids: Vec<u32> = roots.iter().map(|(_, pid)| *pid).collect();
+        let pids: Vec<u32> = roots.iter().map(|(_, pid, _)| *pid).collect();
         let trees = sample_trees(&pids);
         let now = Instant::now();
-        for (attempt, pid) in roots {
-            if let Some(usage) = trees.get(&pid) {
-                self.record(attempt, now, *usage);
+        let mut exited: Vec<ScaleTarget> = Vec::new();
+        {
+            let mut seen = self
+                .exited
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seen.retain(|attempt| live.contains(attempt));
+            for (attempt, pid, target) in roots {
+                match trees.get(&pid) {
+                    Some(usage) => self.record(attempt, now, *usage),
+                    None => {
+                        if seen.insert(attempt) && !exited.contains(target) {
+                            exited.push(target.clone());
+                        }
+                    }
+                }
             }
         }
         self.forget_stale(&live, now);
+        exited
     }
 }
 
 /// Samples this host's attempts every [`SAMPLE_EVERY`] while `joined` says
-/// it has joined a coordinator. Never returns.
+/// it has joined a coordinator, and hands `exited` the targets whose runner
+/// process just went away. Never returns.
 pub async fn sample_attempts(
     meters: Arc<AttemptMeters>,
     store: Arc<dyn Store>,
     host: HostId,
     joined: impl Fn() -> bool + Send,
+    exited: impl Fn(&ScaleTarget) + Send,
 ) {
     let mut ticks = tokio::time::interval(SAMPLE_EVERY);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -165,7 +197,12 @@ pub async fn sample_attempts(
         }
         let (meters, store) = (Arc::clone(&meters), Arc::clone(&store));
         // A pass that panics or is cancelled loses one sample, nothing more.
-        let _ = tokio::task::spawn_blocking(move || meters.sample_once(store.as_ref(), host)).await;
+        let gone = tokio::task::spawn_blocking(move || meters.sample_once(store.as_ref(), host))
+            .await
+            .unwrap_or_default();
+        for target in &gone {
+            exited(target);
+        }
     }
 }
 
@@ -234,5 +271,60 @@ mod tests {
         );
         assert!(meters.take(live).is_some());
         assert!(meters.take(stale).is_none());
+    }
+
+    /// A live attempt whose runner process is gone is announced once, by
+    /// its target, so its loop concludes it now; a running one is sampled.
+    #[test]
+    fn a_runner_whose_process_exited_is_announced_once() {
+        use runner_manager_domain::attempt::AttemptState;
+        use runner_manager_domain::store::SqliteStore;
+        use runner_manager_testkit::fixtures;
+
+        let host = fixtures::host().build();
+        let policy = fixtures::policy()
+            .repository("octo/app")
+            .host(host.id)
+            .autoscale("home", 2)
+            .active()
+            .build();
+        let store = SqliteStore::open_in_memory().expect("store");
+        store.put_host(&host).expect("host");
+        store.insert_policy(&policy).expect("policy");
+        // A process that ran and was reaped: its PID names nothing now.
+        let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args(["--exact", "no-such-test", "--quiet"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("a short-lived child");
+        let exited_pid = child.id();
+        child.wait().expect("reaped");
+        let (running, exited) = (AttemptId::new_random(), AttemptId::new_random());
+        for (id, pid) in [(running, std::process::id()), (exited, exited_pid)] {
+            store
+                .record_attempt(
+                    &fixtures::attempt()
+                        .id(id)
+                        .policy_id(policy.id)
+                        .state(AttemptState::Busy)
+                        .process_id(pid)
+                        .build(),
+                )
+                .expect("recorded");
+        }
+        let meters = AttemptMeters::default();
+        assert_eq!(
+            meters.sample_once(&store, host.id),
+            vec![policy.target.clone()]
+        );
+        assert!(
+            meters.sample_once(&store, host.id).is_empty(),
+            "announced once"
+        );
+        assert!(
+            meters.take(running).is_some(),
+            "the live runner was sampled"
+        );
+        assert!(meters.take(exited).is_none());
     }
 }

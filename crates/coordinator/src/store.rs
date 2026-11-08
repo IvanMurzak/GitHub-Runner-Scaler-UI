@@ -1,6 +1,7 @@
 //! The coordinator's SQLite database: enrolled hosts and one-time invites
-//! (stage 1), and the job weight statistics (stage 4, schema 2): measured
-//! attempts, all-time counters and the last placement decisions.
+//! (stage 1), and the job weight statistics (stage 4, schema 2; schema 3 adds
+//! each sample's queue wait): measured attempts, all-time counters and the
+//! last placement decisions.
 //!
 //! An invite's code is shown once, to the operator who ran `invite`, and only
 //! its SHA-256 is stored. A host's **public** key is stored; its private key
@@ -15,7 +16,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// The prefix every invite code carries, so one is recognisable in a paste.
 pub const INVITE_PREFIX: &str = "rmc_";
@@ -168,6 +169,13 @@ impl Store {
                     decision TEXT NOT NULL
                 );
                 PRAGMA user_version = 2;",
+            )?;
+        }
+        if version < 3 {
+            // 0.4.47: a sample's queue wait, by GitHub's webhooks.
+            connection.execute_batch(
+                "ALTER TABLE job_samples ADD COLUMN queue_wait_secs INTEGER;
+                PRAGMA user_version = 3;",
             )?;
         }
         Ok(Self { connection })
@@ -355,7 +363,11 @@ pub struct JobSample {
     pub repository: String,
     pub host_id: String,
     pub finished_at: DateTime<Utc>,
+    /// The job's run time by GitHub's webhooks (`started_at` to
+    /// `completed_at`), or the host's whole attempt when they did not say.
     pub duration_secs: Option<u64>,
+    /// Queued to started, by GitHub's webhooks.
+    pub queue_wait_secs: Option<u64>,
     pub peak_rss_bytes: Option<u64>,
     pub cpu_avg_millicores: Option<u32>,
     pub cpu_peak_millicores: Option<u32>,
@@ -392,8 +404,8 @@ impl Store {
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT INTO job_samples (job_key, repository, host_id, finished_at, duration_secs,
-                peak_rss_bytes, cpu_avg_millicores, cpu_peak_millicores)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                peak_rss_bytes, cpu_avg_millicores, cpu_peak_millicores, queue_wait_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 sample.job_key,
                 sample.repository,
@@ -402,7 +414,8 @@ impl Store {
                 to_sql(sample.duration_secs),
                 to_sql(sample.peak_rss_bytes),
                 sample.cpu_avg_millicores,
-                sample.cpu_peak_millicores
+                sample.cpu_peak_millicores,
+                to_sql(sample.queue_wait_secs)
             ],
         )?;
         transaction.execute(
@@ -430,7 +443,7 @@ impl Store {
     pub fn samples(&self, oldest: DateTime<Utc>) -> Result<Vec<JobSample>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT job_key, repository, host_id, finished_at, duration_secs, peak_rss_bytes,
-                cpu_avg_millicores, cpu_peak_millicores
+                cpu_avg_millicores, cpu_peak_millicores, queue_wait_secs
              FROM job_samples WHERE finished_at >= ?1 ORDER BY id",
         )?;
         let rows = statement.query_map(params![oldest], |row| {
@@ -443,6 +456,7 @@ impl Store {
                 peak_rss_bytes: from_sql(row.get(5)?),
                 cpu_avg_millicores: row.get(6)?,
                 cpu_peak_millicores: row.get(7)?,
+                queue_wait_secs: from_sql(row.get(8)?),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -673,6 +687,7 @@ mod tests {
             host_id: "h1".into(),
             finished_at: at,
             duration_secs: Some(60),
+            queue_wait_secs: Some(7),
             peak_rss_bytes: Some(u64::MAX),
             cpu_avg_millicores: Some(1500),
             cpu_peak_millicores: None,
@@ -750,9 +765,42 @@ mod tests {
         }
         let mut store = Store::open(&path).expect("upgraded");
         assert_eq!(store.hosts().expect("hosts").len(), 1, "hosts kept");
+        let oldest = now() - chrono::TimeDelta::days(90);
         store
-            .record_sample(&sample("a", now()), 30, now() - chrono::TimeDelta::days(90))
+            .record_sample(&sample("a", now()), 30, oldest)
             .expect("the new tables exist");
+        assert_eq!(
+            store.samples(oldest).expect("read")[0].queue_wait_secs,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn a_stage_four_database_gains_the_queue_wait_and_keeps_its_samples() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("coordinator.db");
+        let oldest = now() - chrono::TimeDelta::days(90);
+        {
+            let mut store = Store::open(&path).expect("created");
+            store
+                .record_sample(&sample("a", now()), 30, oldest)
+                .expect("recorded");
+            // As 0.4.46 left it: schema 2, no queue wait column.
+            store
+                .connection
+                .execute_batch(
+                    "ALTER TABLE job_samples DROP COLUMN queue_wait_secs;
+                     PRAGMA user_version = 2;",
+                )
+                .expect("a schema-2 database");
+        }
+        let store = Store::open(&path).expect("upgraded");
+        let kept = store.samples(oldest).expect("read");
+        assert_eq!(kept.len(), 1, "the sample survived");
+        assert_eq!(
+            (kept[0].duration_secs, kept[0].queue_wait_secs),
+            (Some(60), None)
+        );
     }
 
     #[test]
