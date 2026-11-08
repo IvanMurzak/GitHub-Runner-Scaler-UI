@@ -487,6 +487,7 @@ async fn run_generation(
                 polling: Arc::clone(&polling),
                 wake: signals.wake,
                 launch: signals.launch,
+                launches,
                 coordination: coordination.subscribe(),
                 draining: false,
                 pacing_floor: Duration::ZERO,
@@ -2280,6 +2281,11 @@ trait TargetReconciler: Send + 'static {
         None
     }
 
+    /// A coordinator launch of this target is open with no runner yet.
+    fn holds_unstarted_launches(&self) -> bool {
+        false
+    }
+
     /// The least time between this target's charged polls while it is not
     /// coordinated. See `super::host::pacing_floor`.
     fn pacing_floor(&self) -> Duration {
@@ -2360,6 +2366,7 @@ struct ManagedTarget {
     polling: Arc<super::polling::PollingMonitor>,
     wake: Arc<tokio::sync::Notify>,
     launch: Arc<tokio::sync::Notify>,
+    launches: Arc<super::launches::Launches>,
     coordination: tokio::sync::watch::Receiver<super::coordinator::LinkView>,
     /// Draining: a policy read afresh is drained too, so a repository added
     /// back while this loop winds down is not served by it.
@@ -2379,6 +2386,10 @@ impl TargetReconciler for ManagedTarget {
 
     fn pacing_floor(&self) -> Duration {
         self.pacing_floor
+    }
+
+    fn holds_unstarted_launches(&self) -> bool {
+        self.launches.holds_unstarted(&self.policies)
     }
 
     fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -2592,6 +2603,9 @@ enum DrainKind {
     Upgrade,
 }
 
+/// How soon a pass retries an accepted launch that did not start.
+const LAUNCH_RETRY: Duration = Duration::from_secs(30);
+
 async fn run_target_loop<T: TargetReconciler>(
     mut target: T,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -2700,9 +2714,11 @@ async fn run_target_loop<T: TargetReconciler>(
         // interval. Never while draining, and never while this host runs a
         // runner for the target: a finished job frees a slot that queued work
         // the coordinator already announced may need now.
-        let stretched =
-            (coordination.is_some() && draining.is_none() && target.local_active() == Some(0))
-                .then(|| slept_at + delay.max(target.coordinated_interval()));
+        let stretched = (coordination.is_some()
+            && draining.is_none()
+            && target.local_active() == Some(0)
+            && !target.holds_unstarted_launches())
+        .then(|| slept_at + delay.max(target.coordinated_interval()));
         // A coordinator's wake brings the next poll forward -- never while
         // draining, never while the schedule is a slowdown GitHub asked for
         // (rate limited, stretched, offline...), and never sooner than
@@ -2772,6 +2788,12 @@ async fn run_target_loop<T: TargetReconciler>(
                 }, if draining.is_none() => {
                     target.refresh_policies();
                     target.start_directed().await;
+                    // One that did not start (a registration that failed) is
+                    // tried again by a pass well inside its lease's lifetime.
+                    if target.holds_unstarted_launches() {
+                        let retry = tokio::time::Instant::now() + LAUNCH_RETRY;
+                        woken = Some(woken.map_or(retry, |woken| woken.min(retry)));
+                    }
                 }
                 changed = shutdown.changed(), if draining != Some(DrainKind::Shutdown) => {
                     if changed.is_err() || *shutdown.borrow() {
@@ -3367,6 +3389,8 @@ mod tests {
         launch: Option<(Arc<tokio::sync::Notify>, Arc<AtomicUsize>)>,
         /// What the budget says about this target's charged polls.
         pacing_floor: Duration,
+        /// A launch of this target stays open with no runner.
+        unstarted: bool,
     }
 
     impl FakeTarget {
@@ -3386,6 +3410,7 @@ mod tests {
                     coordination: None,
                     launch: None,
                     pacing_floor: Duration::ZERO,
+                    unstarted: false,
                 },
                 calls,
             )
@@ -3405,6 +3430,7 @@ mod tests {
                 coordination: None,
                 launch: None,
                 pacing_floor: Duration::ZERO,
+                unstarted: false,
             }
         }
 
@@ -3424,6 +3450,7 @@ mod tests {
                 coordination: None,
                 launch: None,
                 pacing_floor: Duration::ZERO,
+                unstarted: false,
             }
         }
     }
@@ -3490,6 +3517,10 @@ mod tests {
 
         fn pacing_floor(&self) -> Duration {
             self.pacing_floor
+        }
+
+        fn holds_unstarted_launches(&self) -> bool {
+            self.unstarted
         }
 
         fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -4248,6 +4279,69 @@ mod tests {
             after(120).await;
             let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
         }
+    }
+
+    /// A coordinated target with nothing running sleeps its long interval,
+    /// unless a launch of its own has no runner: its lease would run out first.
+    /// A launch that does not start is retried by a pass within 30 seconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_with_no_runner_keeps_its_target_from_the_long_sleep() {
+        use super::super::coordinator::LinkView;
+        use runner_manager_domain::coordinator_protocol::{HelloAck, TargetRef, TargetScope};
+
+        let mut report = ReconcileReport::default();
+        report.next_poll.delay = Duration::from_secs(60);
+        report.next_poll.pace = runner_manager_agent::reconcile::PollPace::Nominal;
+        let (mut target, calls) = FakeTarget::repeating(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+            report,
+        );
+        target.active = 0;
+        target.unstarted = true;
+        let signal = Arc::new(tokio::sync::Notify::new());
+        target.launch = Some((Arc::clone(&signal), Arc::new(AtomicUsize::new(0))));
+        let (_link, view) = tokio::sync::watch::channel(LinkView {
+            configured: true,
+            connected: true,
+            down_since: None,
+            ack: Some(HelloAck {
+                reconcile_interval_secs: Some(120),
+                covered: vec![TargetRef {
+                    scope: TargetScope::Repo,
+                    name: "acme/repo".into(),
+                }],
+            }),
+            version: Some(4),
+        });
+        target.coordination = Some(view);
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            never_upgraded(),
+            Arc::new(CountingContacts::default()) as Arc<dyn ContactRecorder>,
+        ));
+        after(0).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the first pass");
+        // Accepted, and still not started: a pass 30 seconds on.
+        signal.notify_one();
+        after(0).await;
+        after(29).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        after(1).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "retried at 30 s");
+        // With no launch signal, the 60 s schedule, not the 300 s one.
+        after(59).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        after(1).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "at 60 s");
+        stop.send(true).unwrap();
+        after(120).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
     }
 
     /// The documented loss of coordination: a target that is not coordinated

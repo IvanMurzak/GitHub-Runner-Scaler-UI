@@ -39,7 +39,8 @@
 //!
 //! Stage 4: with [`crate::stats::Statistics`] attached, the queue's demand is
 //! its heaviest queued job's p90 peak memory; a host that cannot hold it
-//! (less the estimates of its launches whose runner took no job yet) is
+//! (less what its launches whose runner took no job yet reserve: each the
+//! queue's next heaviest job, so `n` leases stand for its `n` heaviest) is
 //! passed over, and the rest are ranked by [`crate::stats::score`]. Each
 //! decision is logged with host ids and scores and kept for `stats`. With no
 //! statistics for the queue, the order is stage 3's: a warm workspace for
@@ -66,7 +67,7 @@ use runner_manager_domain::model::Label;
 use tokio::sync::oneshot;
 
 use crate::registry::{Candidate, Registry, is_pool_job};
-use crate::stats::{Aggregates, Contender, Demand, Statistics, score};
+use crate::stats::{Aggregates, Contender, Demand, Statistics, StatsConfig, score};
 
 /// How long a host has to answer a `launch`.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -152,7 +153,7 @@ impl JobKey {
 /// One queue as a sweep listed it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweptQueue {
-    /// Job ids with their statistics key (`owner/repo/workflow/job`), when
+    /// Job ids with their statistics key (`owner/repo/job`), when
     /// the listing named them.
     pub jobs: Vec<(u64, Option<String>)>,
     /// Jobs listed without an identity.
@@ -162,7 +163,7 @@ pub struct SweptQueue {
 #[derive(Debug, Default)]
 struct Queue {
     /// Job ids a webhook announced, when, and their statistics key
-    /// (`owner/repo/workflow/job`) when the webhook named it.
+    /// (`owner/repo/job`) when the webhook named it.
     jobs: BTreeMap<u64, (Instant, Option<String>)>,
     /// Queued jobs the sweep counted beyond `jobs`.
     unnamed: u32,
@@ -260,6 +261,15 @@ struct Runner {
     at: Instant,
 }
 
+/// Memory a job whose lease closed may yet grow into.
+#[derive(Debug)]
+struct Ramping {
+    lease_id: String,
+    host_id: String,
+    estimate: u64,
+    until: Instant,
+}
+
 #[derive(Debug, Default)]
 struct State {
     queues: HashMap<JobKey, Queue>,
@@ -278,9 +288,9 @@ struct State {
     /// Jobs that left the queue before the runner that took them was
     /// reported: the next claim on that key closes its lease outright.
     credits: HashMap<JobKey, VecDeque<Instant>>,
-    /// Stage 4: the estimates of leases whose runner took its job, per host,
-    /// held for [`RAMP_HOLD`] from the claim.
-    ramping: Vec<(String, u64, Instant)>,
+    /// Stage 4: the estimates of leases whose runner took its job, by lease,
+    /// held for [`RAMP_HOLD`] from the claim or until its attempt ends.
+    ramping: Vec<Ramping>,
 }
 
 impl State {
@@ -306,10 +316,8 @@ impl State {
             .fold(0u64, |sum, lease| sum.saturating_add(lease.estimate));
         self.ramping
             .iter()
-            .filter(|(host, _, until)| host == host_id && *until > now)
-            .fold(leased, |sum, (_, estimate, _)| {
-                sum.saturating_add(*estimate)
-            })
+            .filter(|ramping| ramping.host_id == host_id && ramping.until > now)
+            .fold(leased, |sum, ramping| sum.saturating_add(ramping.estimate))
     }
 
     /// Removes a lease whose runner took its job; its estimate stays
@@ -318,8 +326,12 @@ impl State {
         if let Some(lease) = self.leases.remove(lease_id)
             && lease.estimate > 0
         {
-            self.ramping
-                .push((lease.host_id, lease.estimate, claimed_at + RAMP_HOLD));
+            self.ramping.push(Ramping {
+                lease_id: lease_id.to_string(),
+                host_id: lease.host_id,
+                estimate: lease.estimate,
+                until: claimed_at + RAMP_HOLD,
+            });
         }
     }
 
@@ -394,6 +406,33 @@ impl State {
                 "a pool queue is not placed"
             );
         }
+    }
+
+    /// How many of `key`'s queued jobs have no statistics key.
+    fn unnamed_jobs(&self, key: &JobKey) -> usize {
+        let (job_keys, _) = self.job_keys(key);
+        self.queues
+            .get(key)
+            .map_or(0, Queue::len)
+            .saturating_sub(job_keys.len())
+    }
+
+    /// What the next lease of `key` reserves: the heaviest queued job no open
+    /// lease stands for yet. A runner takes any of them, so `n` leases stand
+    /// for the queue's `n` heaviest, whichever each runner ends up with.
+    fn lease_estimate(&self, key: &JobKey, aggregates: &Aggregates, config: &StatsConfig) -> u64 {
+        let (job_keys, _) = self.job_keys(key);
+        let estimates = aggregates.job_estimates(
+            &key.repository,
+            &job_keys,
+            self.unnamed_jobs(key),
+            config.default_job_ram,
+        );
+        let next = self.leases_for(key).min(estimates.len().saturating_sub(1));
+        estimates
+            .get(next)
+            .copied()
+            .unwrap_or(config.default_job_ram)
     }
 
     /// Launches on `host_id` its heartbeat at `heartbeat_at` cannot have
@@ -494,8 +533,8 @@ impl Placement {
 
     /// The statistics keys of `key`'s queued jobs, and whether any job has
     /// none.
-    #[cfg(test)]
-    pub(crate) fn queued_job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
+    #[must_use]
+    pub fn queued_job_keys(&self, key: &JobKey) -> (Vec<String>, bool) {
         self.state().job_keys(key)
     }
 
@@ -769,9 +808,17 @@ impl Placement {
         }
     }
 
-    /// A host's attempt ended. Closes its lease, if it still had one.
+    /// A host's attempt ended. Closes its lease, if it still had one, and
+    /// stops reserving what its job might have grown into: a job that ended
+    /// uses nothing, and a queue of short jobs would otherwise hold the host's
+    /// memory for minutes after they finished.
     pub fn attempt_finished(&self, host_id: &str, finished: &AttemptFinished) {
         self.close(host_id, finished.lease_id.as_deref());
+        if let Some(lease_id) = finished.lease_id.as_deref() {
+            self.state()
+                .ramping
+                .retain(|ramping| ramping.lease_id != lease_id || ramping.host_id != host_id);
+        }
     }
 
     /// Closes `lease_id` if `host_id` holds it.
@@ -848,7 +895,7 @@ impl Placement {
             state.release_claimed(&id, at);
         }
         state.leases.retain(|_, lease| lease.expires > now);
-        state.ramping.retain(|(_, _, until)| *until > now);
+        state.ramping.retain(|ramping| ramping.until > now);
         for credits in state.credits.values_mut() {
             credits.retain(|at| now.saturating_duration_since(*at) < CLAIM_HOLD);
         }
@@ -1211,6 +1258,18 @@ impl Placement {
                 method,
                 candidates = scored.len(),
                 fitting = scored.iter().filter(|(_, score)| score.fits).count(),
+                jobs_named = state.job_keys(key).0.len(),
+                jobs_measured = state
+                    .job_keys(key)
+                    .0
+                    .iter()
+                    .filter(|job| {
+                        aggregates
+                            .job(job)
+                            .is_some_and(|figures| figures.p90_peak_rss_bytes.is_some())
+                    })
+                    .count(),
+                jobs_unnamed = state.unnamed_jobs(key),
                 "a pool queue was weighed"
             );
             for (_, host) in &scored {
@@ -1239,7 +1298,7 @@ impl Placement {
             eligible
                 .into_iter()
                 .find(|candidate| candidate.host_id == chosen)
-                .map(|candidate| (candidate, demand.estimate))
+                .map(|candidate| (candidate, state.lease_estimate(key, aggregates, config)))
         })
     }
 
@@ -2061,8 +2120,6 @@ mod tests {
     /// never measured in the same queue still counts as the repository.
     #[tokio::test]
     async fn a_queue_is_estimated_by_its_own_jobs_not_by_its_repository() {
-        use runner_manager_domain::coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
-
         let registry = Arc::new(Registry::default());
         registry.set_coverage(covering());
         let (placement, stats) = measured(
@@ -2079,27 +2136,7 @@ mod tests {
             .chain(std::iter::repeat_n(("heavy", 12_u64 << 30), 5))
             .enumerate()
         {
-            let runner = format!("runner-manager-{index}");
-            stats.job_identified(
-                &runner,
-                crate::stats::JobIdentity::new("octo/app", Some("ci"), Some(job)).expect("named"),
-                crate::stats::JobTimes::parse(None, None, Some("2026-11-07T10:10:00Z")),
-            );
-            stats.attempt_finished(
-                "elsewhere",
-                &AttemptFinished {
-                    lease_id: None,
-                    runner_name: runner.clone(),
-                    outcome: AttemptOutcomeKind::CompletedJob,
-                    duration_secs: Some(60),
-                    usage: Some(AttemptUsage {
-                        peak_rss_bytes: peak,
-                        samples: 10,
-                        ..AttemptUsage::default()
-                    }),
-                },
-                None,
-            );
+            teach(&stats, &format!("runner-manager-{index}"), job, peak);
         }
         let host = connect(
             &registry,
@@ -2125,10 +2162,10 @@ mod tests {
         let job_source = "job".to_string();
         let light = required(&["rm-pool-linux"]);
         let heavy = required(&["rm-pool-linux", "heavy"]);
-        placement.queued_job("octo/app", &heavy, 2, Some("octo/app/ci/heavy".into()));
+        placement.queued_job("octo/app", &heavy, 2, Some("octo/app/heavy".into()));
         // Named by the webhook.
         let key = placement
-            .queued_job("octo/app", &light, 1, Some("octo/app/ci/light".into()))
+            .queued_job("octo/app", &light, 1, Some("octo/app/light".into()))
             .expect("pool");
         assert_eq!(decide(&placement, &key), (1 << 30, job_source.clone()));
         // Named only by the sweep's listing: the same estimate.
@@ -2137,7 +2174,7 @@ mod tests {
         let listed = HashMap::from([(
             labels,
             SweptQueue {
-                jobs: vec![(3, Some("octo/app/ci/light".into()))],
+                jobs: vec![(3, Some("octo/app/light".into()))],
                 unnamed: 0,
             },
         )]);
@@ -2145,11 +2182,189 @@ mod tests {
         let swept_key = placement.swept("octo/app", &listed, Instant::now(), true)[0].clone();
         assert_eq!(decide(&placement, &swept_key), (1 << 30, job_source));
         // A job never measured in that queue: the repository's p90.
-        placement.queued_job("octo/app", &light, 4, Some("octo/app/ci/new".into()));
+        placement.queued_job("octo/app", &light, 4, Some("octo/app/new".into()));
         assert_eq!(
             decide(&placement, &key),
             (12 << 30, "repository".to_string())
         );
+        drop(host);
+    }
+
+    /// One finished attempt of `job` on another host, peaking at `peak`.
+    fn teach(stats: &Statistics, runner: &str, job: &str, peak: u64) {
+        use runner_manager_domain::coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
+
+        stats.job_identified(
+            runner,
+            crate::stats::JobIdentity::new("octo/app", Some(job)).expect("named"),
+            crate::stats::JobTimes::parse(None, None, Some("2026-11-07T10:10:00Z")),
+        );
+        stats.attempt_finished(
+            "elsewhere",
+            &AttemptFinished {
+                lease_id: None,
+                runner_name: runner.to_string(),
+                outcome: AttemptOutcomeKind::CompletedJob,
+                duration_secs: Some(60),
+                usage: Some(AttemptUsage {
+                    peak_rss_bytes: peak,
+                    samples: 10,
+                    ..AttemptUsage::default()
+                }),
+            },
+            None,
+        );
+    }
+
+    /// Placement with samples: `light` peaks at 0.5 GiB, `mem` at 3.5 GiB, so
+    /// the repository's p90 is `mem`'s. One host with 8 GiB available.
+    fn light_and_mem() -> (Arc<Registry>, Arc<Placement>) {
+        let registry = Arc::new(Registry::default());
+        registry.set_coverage(covering());
+        let (placement, stats) = measured(
+            Placement::with_timings(
+                Arc::clone(&registry),
+                Duration::from_millis(150),
+                Duration::from_secs(300),
+            ),
+            crate::store::Store::open_in_memory().expect("store"),
+        );
+        for (index, (job, peak)) in std::iter::repeat_n(("light", 1_u64 << 29), 5)
+            .chain(std::iter::repeat_n(("mem", 7_u64 << 29), 5))
+            .enumerate()
+        {
+            teach(&stats, &format!("runner-manager-{index}"), job, peak);
+        }
+        (registry, placement)
+    }
+
+    /// Live experiment E4b's `no_memory_fit`: `mem`'s samples must not block a
+    /// queue of light jobs on a host with room for them.
+    #[tokio::test]
+    async fn a_queue_of_light_jobs_is_not_blocked_by_another_jobs_samples() {
+        let (registry, placement) = light_and_mem();
+        let host = connect(&registry, "h", LAUNCH_VERSION, POOL, 16, 8 << 30);
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let pool = required(POOL);
+        let mut key = None;
+        for id in 1..=8 {
+            key = placement.queued_job("octo/app", &pool, id, Some("octo/app/light".into()));
+        }
+        let key = key.expect("pool");
+        assert_eq!(placement.rebalance(&key).await.accepted, 8);
+        assert_eq!(placement.state().reserved_on("h"), 4 << 30);
+        assert!(placement.snapshot().0.is_empty(), "nothing waits");
+        drop(host);
+    }
+
+    /// A lease reserves one job's memory: a queue holding one heavy job and
+    /// three light ones reserves the heavy job once, not once per lease.
+    #[tokio::test]
+    async fn a_lease_reserves_the_next_heaviest_job_not_the_heaviest_each_time() {
+        let (registry, placement) = light_and_mem();
+        let host = connect(&registry, "h", LAUNCH_VERSION, POOL, 16, 8 << 30);
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let pool = required(POOL);
+        let key = placement
+            .queued_job("octo/app", &pool, 1, Some("octo/app/mem".into()))
+            .expect("pool");
+        for id in 2..=4 {
+            placement.queued_job("octo/app", &pool, id, Some("octo/app/light".into()));
+        }
+        // 3.5 GiB, then 0.5 each. The third lease leaves 4 GiB, which still
+        // holds the heaviest job and its margin; the fourth would not, since
+        // any of the runners may take it.
+        assert_eq!(placement.rebalance(&key).await.accepted, 3);
+        assert_eq!(placement.state().reserved_on("h"), (7 << 29) + (2 << 29));
+        assert_eq!(
+            placement.snapshot().0[0].reason.as_deref(),
+            Some("no_memory_fit")
+        );
+        drop(host);
+    }
+
+    /// Regression guard, from live experiments E4 → E4b → E4c, where one
+    /// scenario got slower every time it ran: heavy samples accumulate round
+    /// after round, and a queue of light jobs is still placed at once, first
+    /// as a job never measured and from then on by its own samples. Short jobs
+    /// that ended leave nothing reserved for the next round.
+    #[tokio::test]
+    async fn a_queue_of_light_jobs_stays_placed_as_heavy_samples_accumulate() {
+        use runner_manager_domain::coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
+
+        const GIB: u64 = 1 << 30;
+        let registry = Arc::new(Registry::default());
+        registry.set_coverage(covering());
+        let (placement, stats) = measured(
+            Placement::with_timings(
+                Arc::clone(&registry),
+                Duration::from_millis(150),
+                Duration::from_secs(300),
+            ),
+            crate::store::Store::open_in_memory().expect("store"),
+        );
+        let host = connect(&registry, "h", LAUNCH_VERSION, POOL, 64, 18 * GIB);
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let pool = required(POOL);
+        let key = JobKey::new("octo/app", &pool);
+        let mut job_id = 0;
+        for round in 0..6 {
+            // Heavy jobs measured elsewhere, under this round's run title.
+            for index in 0..4 {
+                teach(
+                    &stats,
+                    &format!("runner-manager-mem-{round}-{index}"),
+                    "mem",
+                    7 * GIB / 2,
+                );
+            }
+            // Six light jobs: every one placed, none waiting.
+            for _ in 0..6 {
+                job_id += 1;
+                placement.queued_job("octo/app", &pool, job_id, Some("octo/app/light".into()));
+            }
+            let placed = placement.rebalance(&key).await;
+            assert_eq!(placed.accepted, 6, "round {round}");
+            assert!(placement.snapshot().0.is_empty(), "round {round}");
+            let report = stats.report(chrono::Utc::now()).expect("report");
+            let decided = report.decisions.first().expect("decided");
+            if round == 0 {
+                assert_eq!(decided.estimate_source, "repository");
+            } else {
+                assert_eq!(
+                    (decided.estimate_source.as_str(), decided.estimate_bytes),
+                    ("job", GIB / 8),
+                    "round {round}: by its own samples"
+                );
+            }
+            // Their runners take them, run, end, and teach their own weight.
+            let leases: Vec<String> = placement.state().leases.keys().cloned().collect();
+            for (index, lease) in leases.iter().enumerate() {
+                let runner = format!("runner-manager-light-{round}-{index}");
+                placement.attempt_started("h", &started_by(&runner, Some(lease)));
+                let job = job_id - index as u64;
+                placement.dequeued_by("octo/app", &pool, job, Some(&runner));
+                let finished = AttemptFinished {
+                    lease_id: Some(lease.clone()),
+                    runner_name: runner.clone(),
+                    outcome: AttemptOutcomeKind::CompletedJob,
+                    duration_secs: Some(20),
+                    usage: Some(AttemptUsage {
+                        peak_rss_bytes: GIB / 8,
+                        samples: 10,
+                        ..AttemptUsage::default()
+                    }),
+                };
+                stats.job_identified(
+                    &runner,
+                    crate::stats::JobIdentity::new("octo/app", Some("light")).expect("named"),
+                    crate::stats::JobTimes::parse(None, None, Some("2026-11-07T10:10:00Z")),
+                );
+                stats.attempt_finished("h", &finished, None);
+                placement.attempt_finished("h", &finished);
+            }
+            assert_eq!(placement.state().reserved_on("h"), 0, "round {round}");
+        }
         drop(host);
     }
 
@@ -2206,8 +2421,7 @@ mod tests {
             crate::store::Store::open_in_memory().expect("store"),
         );
         // `build` once peaked at 12 GiB.
-        let identity =
-            crate::stats::JobIdentity::new("octo/app", Some("ci"), Some("build")).expect("named");
+        let identity = crate::stats::JobIdentity::new("octo/app", Some("build")).expect("named");
         stats.job_identified(
             "runner-manager-x",
             identity.clone(),
@@ -2322,12 +2536,7 @@ mod tests {
             crate::store::Store::open_in_memory().expect("store"),
         );
         let key = placement
-            .queued_job(
-                "octo/app",
-                &required(POOL),
-                1,
-                Some("octo/app/ci/new".into()),
-            )
+            .queued_job("octo/app", &required(POOL), 1, Some("octo/app/new".into()))
             .expect("pool");
         let mut decision = None;
         let offered = placement.offer(

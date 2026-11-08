@@ -7,6 +7,78 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.48
+
+### Fixed
+
+- **A job's statistics now apply to its next run, whatever the run is called.**
+  A job's key included GitHub's `workflow_name`, which is the run's title, so a
+  workflow with a `run-name` got a new key at every dispatch. Its samples were
+  never found, and almost every queue was estimated at its repository's p90
+  (104 of 106 placements in a live test). The key is now `owner/repo/job`, and
+  existing samples are rekeyed on upgrade, as a best guess where a run title or
+  job name holds a `/`. Jobs with the same name in two workflows of one
+  repository now share their statistics.
+- **A job that ended stops reserving memory.** A lease's estimate stayed reserved
+  on its host for 2 minutes after its runner took a job, even if the job had
+  already finished, so a run of short jobs could keep a host "full" for the next
+  ones. It is released as soon as the job ends.
+- **A launch that cannot start no longer holds its job for 2 minutes.** A host
+  counts its other repositories' open launches against its slots, and refuses a
+  launch it has no slot for. It drops one it can no longer start, or that has no
+  runner after 45 s for any reason, and tells the coordinator at once, which
+  places the job again. Its heartbeat's free slots leave out those its waiting
+  launches have spoken for. Two launches can no longer share one runner.
+- **A launch outlives a runner that took nothing.** When the idle runner serving
+  a launch exits without a job, the host starts another or hands it to another
+  waiting runner, and the lease stays open.
+- **The lease list in a heartbeat is current.** In 0.4.47 a target with nothing
+  running could list a launch that had already ended until its next poll.
+- **A queue no longer reserves its heaviest job for every runner.** Each lease
+  reserves the queue's next heaviest job, so one heavy job among light ones
+  counts once. A host must still hold the heaviest job, since a runner can take
+  any of them.
+- **A pool job is weighed by its own memory use.** A job only the coordinator's
+  sweep had seen counted as its repository's p90, so a light job could be
+  estimated at a heavy neighbour's memory and passed over by a host with room
+  for it. The sweep now names the jobs it lists, as a webhook does.
+- **A repository just added is covered within seconds, not 10 minutes.** The
+  coordinator reads its GitHub App's repositories again (at most every 30 s)
+  when a host advertises one they do not include, or a webhook names one. Until now such a repository stayed in `fallback`: its pool jobs
+  were only woken, and waited for the host's next poll.
+- **`repo add` no longer refuses a repository the coordinator will poll for
+  you.** The REST budget (also in `host show`, `host set-poll-interval` and the
+  TUI) counts a coordinated target at the coordinated interval instead of 60 s.
+  A new repository (not a new organization) on a host whose link is up and whose
+  coordinator runs a sweep is counted the same way, with a printed note. If
+  coordination is lost, a set that no longer fits stretches its charged polls to
+  the interval `repo add` would allow (64 s for 11 repositories) and keeps starting
+  runners. `host set-poll-interval` now also refuses a shorter `--coordinated`
+  that would go over the budget.
+
+### Changed
+
+- **Only a job's own samples can keep it off a host.** A job never measured used
+  to be held back by its repository's p90, so one heavy job could block every new
+  job of that repository. Now such a job is only ranked by that figure, and
+  reserves at most `COORDINATOR_DEFAULT_JOB_RAM`. It may land on a host too small
+  for what it turns out to need, once: from its first sample it is filtered by
+  its own figure.
+
+### Added
+
+- The coordinator's `a pool queue was weighed` log line says how many of the
+  queue's jobs are named, measured and unnamed.
+
+### Upgrade notes
+
+- The coordinator's database moves to schema 5: sample keys lose the run's title.
+  To roll back, stop the service and run
+  `sqlite3 coordinator.db 'PRAGMA user_version = 4'`; 0.4.47 then starts new keys
+  beside these.
+- The launch fixes are on the host, so hosts need 0.4.48 too. An older host keeps
+  working: only the coordinator's fixes apply to it.
+
 ## 0.4.47
 
 ### Fixed
@@ -53,23 +125,6 @@ the version being prepared rather than the version in `Cargo.toml`.
   took 25 s more to start). Now every launch open at that moment is started
   in one go, without polling GitHub. The runners are still created one after
   another under the host's allocation lock, so every capacity ceiling holds.
-- **A pool job is weighed by its own memory use.** A job only the coordinator's
-  sweep had seen counted as its repository's p90, so a light job could be
-  estimated at a heavy neighbour's memory and passed over by a host with room
-  for it. The sweep now names the jobs it lists, as a webhook does.
-- **A repository just added is covered within seconds, not 10 minutes.** The
-  coordinator reads its GitHub App's repositories again (at most every 30 s)
-  when a host advertises one they do not include, or a webhook names one. Until now such a repository stayed in `fallback`: its pool jobs
-  were only woken, and waited for the host's next poll.
-- **`repo add` no longer refuses a repository the coordinator will poll for
-  you.** The REST budget (also in `host show`, `host set-poll-interval` and the
-  TUI) counts a coordinated target at the coordinated interval instead of 60 s.
-  A new repository (not a new organization) on a host whose link is up and whose
-  coordinator runs a sweep is counted the same way, with a printed note. If
-  coordination is lost, a set that no longer fits stretches its charged polls to
-  the interval `repo add` would allow (64 s for 11 repositories) and keeps starting
-  runners. `host set-poll-interval` now also refuses a shorter `--coordinated`
-  that would go over the budget.
 - A test of the runner process fixture could read its readiness file before
   it was written and fail at random.
 

@@ -7,10 +7,10 @@
 //! its process tree used ([`AttemptUsage`]). Which job that runner took, and
 //! when, is GitHub's to say: the `workflow_job` webhooks `in_progress` and
 //! `completed` name the `runner_name` together with the repository, the
-//! workflow, the job (the matrix-expanded name, as GitHub gives it) and the
+//! job (the matrix-expanded name, as GitHub gives it) and the
 //! job's `created_at`, `started_at` and `completed_at`. The [`Correlator`]
 //! joins them in whichever order they arrive, and an attempt that ran a job
-//! becomes one [`JobSample`] under the job key `owner/repo/workflow/job`.
+//! becomes one [`JobSample`] under the job key `owner/repo/job`.
 //!
 //! A sample's duration is the **job's** run time, `started_at` to
 //! `completed_at`: the host's attempt also spans the runner's start, its wait
@@ -39,7 +39,7 @@
 //!
 //! # Logging
 //!
-//! Host ids, byte counts, scores and fixed words. Repository, workflow, job
+//! Host ids, byte counts, scores and fixed words. Repository, job
 //! and runner names came off the wire: they are stored and shown to the
 //! owner by `stats`, never logged.
 
@@ -58,7 +58,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::{JobSample, Store, StoreError};
 
-/// The longest repository, workflow or job name kept.
+/// The longest repository or job name kept.
 const MAX_NAME_CHARS: usize = 120;
 
 /// How long a webhook's runner-to-job mapping waits for its attempt report,
@@ -142,12 +142,18 @@ impl StatsConfig {
 // Job identity and correlation
 // ---------------------------------------------------------------------------
 
-/// Which job a runner took, as GitHub's webhook names it.
+/// Which job a runner took, as GitHub names it.
+///
+/// Deliberately not by workflow. GitHub's `workflow_name` on a job is the
+/// **run's title**, so a workflow with a `run-name` (`load light [1,2] (tag)`)
+/// has a different one at every dispatch: a key holding it never meets its own
+/// samples, and every queue falls back to its repository's p90. Nothing on a
+/// `workflow_job` webhook names the workflow stably. The price: jobs of the same
+/// name in two workflows of one repository share their statistics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JobIdentity {
     /// `owner/name`, lower-cased.
     pub repository: String,
-    pub workflow: String,
     /// The job's name, matrix values included as GitHub expands them:
     /// `build (ubuntu, 3.12)`.
     pub job: String,
@@ -165,25 +171,39 @@ fn clean(raw: &str) -> String {
 }
 
 impl JobIdentity {
-    /// From a webhook's fields; `None` without a workflow or job name.
+    /// From a webhook's or a job listing's fields; `None` without a job name.
     #[must_use]
-    pub fn new(repository: &str, workflow: Option<&str>, job: Option<&str>) -> Option<Self> {
+    pub fn new(repository: &str, job: Option<&str>) -> Option<Self> {
         let identity = Self {
             repository: clean(repository).to_ascii_lowercase(),
-            workflow: clean(workflow?),
             job: clean(job?),
         };
-        (!identity.repository.is_empty()
-            && !identity.workflow.is_empty()
-            && !identity.job.is_empty())
-        .then_some(identity)
+        (!identity.repository.is_empty() && !identity.job.is_empty()).then_some(identity)
     }
 
-    /// `owner/repo/workflow/job`: what samples are kept and aggregated by.
+    /// `owner/repo/job`: what samples are kept and aggregated by.
     #[must_use]
     pub fn key(&self) -> String {
-        format!("{}/{}/{}", self.repository, self.workflow, self.job)
+        format!("{}/{}", self.repository, self.job)
     }
+}
+
+/// Joins a webhook's "runner R took job J" (and when it ran) with the host's
+/// "runner R ended", in either order.
+#[derive(Debug, Default)]
+pub struct Correlator {
+    identities: HashMap<String, (JobIdentity, JobTimes, Instant)>,
+    /// Reports waiting for their job, or for its `completed` webhook.
+    pending: HashMap<String, (String, AttemptFinished, Instant)>,
+}
+
+/// A host's report, now that its job is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Correlated {
+    pub host_id: String,
+    pub identity: JobIdentity,
+    pub times: JobTimes,
+    pub finished: AttemptFinished,
 }
 
 /// When GitHub says a job was queued, started and completed: the
@@ -236,24 +256,6 @@ impl JobTimes {
         self.started_at = newer.started_at.or(self.started_at);
         self.completed_at = newer.completed_at.or(self.completed_at);
     }
-}
-
-/// Joins a webhook's "runner R took job J" (and when it ran) with the host's
-/// "runner R ended", in either order.
-#[derive(Debug, Default)]
-pub struct Correlator {
-    identities: HashMap<String, (JobIdentity, JobTimes, Instant)>,
-    /// Reports waiting for their job, or for its `completed` webhook.
-    pending: HashMap<String, (String, AttemptFinished, Instant)>,
-}
-
-/// A host's report, now that its job is known.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Correlated {
-    pub host_id: String,
-    pub identity: JobIdentity,
-    pub times: JobTimes,
-    pub finished: AttemptFinished,
 }
 
 /// Makes room in `map` for one more entry: the oldest goes when it is full.
@@ -584,6 +586,9 @@ impl EstimateSource {
 pub struct Demand {
     pub estimate: u64,
     pub source: EstimateSource,
+    /// The heaviest queued job with samples of its own: what hosts are filtered
+    /// by. A guess at a job never measured may exceed it, and only ranks.
+    pub measured_job: Option<u64>,
     /// The named job keys queued, for the speed term.
     pub job_keys: Vec<String>,
     /// Any statistics at all for this queue: its keys or its repository.
@@ -606,6 +611,7 @@ impl Aggregates {
             (bytes, EstimateSource::Repository)
         });
         let mut heaviest: Option<(u64, EstimateSource)> = None;
+        let mut measured_job: Option<u64> = None;
         let mut measured = repository_p90.is_some();
         let mut consider = |candidate: (u64, EstimateSource)| {
             if heaviest.is_none_or(|(bytes, _)| candidate.0 > bytes) {
@@ -616,6 +622,7 @@ impl Aggregates {
             match self.job(key).and_then(|figures| figures.p90_peak_rss_bytes) {
                 Some(bytes) => {
                     measured = true;
+                    measured_job = Some(measured_job.map_or(bytes, |known| known.max(bytes)));
                     consider((bytes, EstimateSource::Job));
                 }
                 None => consider(fallback),
@@ -631,9 +638,40 @@ impl Aggregates {
         Demand {
             estimate,
             source,
+            measured_job,
             job_keys,
             measured,
         }
+    }
+}
+
+impl Aggregates {
+    /// What a lease of each queued job reserves, heaviest first: its own p90,
+    /// else the lesser of its repository's and `default_job_ram`, a guess that
+    /// must not hold memory a measured job needs. `unnamed` jobs have no key.
+    /// A lease reserves one of these: five jobs hold one heaviest job, not five.
+    #[must_use]
+    pub fn job_estimates(
+        &self,
+        repository: &str,
+        job_keys: &[String],
+        unnamed: usize,
+        default_job_ram: u64,
+    ) -> Vec<u64> {
+        let fallback = self
+            .repository_p90_rss(repository)
+            .map_or(default_job_ram, |bytes| bytes.min(default_job_ram));
+        let mut estimates: Vec<u64> = job_keys
+            .iter()
+            .map(|key| {
+                self.job(key)
+                    .and_then(|figures| figures.p90_peak_rss_bytes)
+                    .unwrap_or(fallback)
+            })
+            .chain(std::iter::repeat_n(fallback, unnamed))
+            .collect();
+        estimates.sort_unstable_by(|a, b| b.cmp(a));
+        estimates
     }
 }
 
@@ -696,10 +734,10 @@ fn share(part: u64, whole: u64) -> f64 {
 /// Scores `contenders` for `demand`, best first, the ones that do not fit
 /// last (design 4.5, steps 2-4).
 ///
-/// * **Filter**: with a measured estimate (a job key's or its repository's
-///   p90), a host whose free memory, less the estimates of its launches that
-///   have not taken a job yet, cannot hold the estimate plus `margin` does
-///   not fit. An unmeasured queue filters nothing: stage 3 did not either.
+/// * **Filter**: with the job's own samples behind the estimate, a host whose
+///   free memory, less what its launches that have not taken a job yet
+///   reserve, cannot hold the estimate plus `margin` does not fit. A guess (a
+///   repository's p90, or the default) filters nothing, and only ranks.
 /// * **Score** = `cache`·warm + `headroom`·(memory free after this job, as a
 ///   share of the host's memory) + `speed`·(how much faster than usual it
 ///   ran these job keys) − `bigfit`·(1 when a heavier queued job,
@@ -715,20 +753,24 @@ pub fn score(
     aggregates: &Aggregates,
 ) -> Vec<(Contender, HostScore)> {
     let weights = config.weights;
-    // A measured estimate filters, unless no host could ever hold it: then
-    // waiting would be forever, and the job is better run somewhere.
-    let needed = demand.estimate.saturating_add(config.ram_margin);
-    let filtering = demand.source != EstimateSource::Default
-        && contenders
+    // Only a job's own samples filter: its repository's p90 is a guess at a
+    // job never measured, and heavy samples of another job must not keep it
+    // waiting. Nor when no host could ever hold it: waiting would be forever,
+    // and the job is better run somewhere.
+    let required = demand.measured_job.filter(|bytes| {
+        let needed = bytes.saturating_add(config.ram_margin);
+        contenders
             .iter()
-            .any(|contender| contender.total_ram.is_none_or(|total| total >= needed));
+            .any(|contender| contender.total_ram.is_none_or(|total| total >= needed))
+    });
     let ratios: Vec<BTreeMap<String, HostRatio>> = demand
         .job_keys
         .iter()
         .map(|key| aggregates.host_ratios(key))
         .collect();
-    let fits =
-        |contender: &Contender| !filtering || contender.fits(demand.estimate, config.ram_margin);
+    let fits = |contender: &Contender| {
+        required.is_none_or(|bytes| contender.fits(bytes, config.ram_margin))
+    };
     let mut scored: Vec<(Contender, HostScore)> = contenders
         .iter()
         .map(|contender| {
@@ -1177,7 +1219,7 @@ mod tests {
     }
 
     fn identity(job: &str) -> JobIdentity {
-        JobIdentity::new("Octo/App", Some("CI"), Some(job)).expect("named")
+        JobIdentity::new("Octo/App", Some(job)).expect("named")
     }
 
     fn sample(key: &str, host: &str, secs: u64, rss: u64) -> JobSample {
@@ -1242,7 +1284,7 @@ mod tests {
             )
             .expect("matched case-blind");
         assert_eq!(met.host_id, "h1");
-        assert_eq!(met.identity.key(), "octo/app/CI/build (linux, 3.12)");
+        assert_eq!(met.identity.key(), "octo/app/build (linux, 3.12)");
         assert_eq!(
             (met.times.run_secs(), met.times.queue_wait_secs()),
             (Some(14), Some(4))
@@ -1365,13 +1407,52 @@ mod tests {
             finished: finished("runner-manager-l", AttemptOutcomeKind::CompletedJob, GIB),
         });
         let figures = stats
-            .with_aggregates(|aggregates| aggregates.job("octo/app/CI/lost"))
+            .with_aggregates(|aggregates| aggregates.job("octo/app/lost"))
             .expect("recorded");
         assert_eq!(figures.p50_duration_secs, Some(100), "the host's attempt");
         assert_eq!(
             figures.p50_queue_wait_secs,
             Some(4),
             "what is known is kept"
+        );
+    }
+
+    /// A guess can exceed a measured job without hiding it: the queue's own
+    /// samples still filter, and the guess alone does not.
+    #[test]
+    fn a_guess_never_hides_a_measured_heavy_job_from_the_filter() {
+        // `build` is the repository's only job, at 6 GiB; `new` was never run.
+        let aggregates = Aggregates::from_samples(
+            (0..5)
+                .map(|_| sample("octo/app/build", "h", 60, 6 * GIB))
+                .collect(),
+            30,
+        );
+        let contender = |free| Contender {
+            host_id: "small".into(),
+            warm: false,
+            free_ram: Some(free),
+            total_ram: Some(64 * GIB),
+            busy_slots: 0,
+            reserved: 0,
+        };
+        let config = StatsConfig::default();
+        let fits = |job_keys: &[String]| {
+            let demand = aggregates.demand("octo/app", job_keys, false, config.default_job_ram);
+            score(&[contender(GIB)], &demand, None, &config, &aggregates)[0]
+                .1
+                .fits
+        };
+        let (build, new) = ("octo/app/build".to_string(), "octo/app/new".to_string());
+        assert!(
+            !fits(&[new.clone(), build]),
+            "`new` first: `build` still filters"
+        );
+        assert!(fits(&[new]), "a guess alone does not");
+        // A guess reserves at most the default, not the repository's p90.
+        assert_eq!(
+            aggregates.job_estimates("octo/app", &["octo/app/new".into()], 1, 2 * GIB),
+            vec![2 * GIB, 2 * GIB]
         );
     }
 
@@ -1398,12 +1479,13 @@ mod tests {
 
     #[test]
     fn wire_names_are_cleaned_and_a_nameless_job_has_no_identity() {
-        let identity = JobIdentity::new("Octo/App", Some("ci\u{1b}[31m"), Some(&"j".repeat(500)))
-            .expect("named");
-        assert_eq!(identity.workflow, "ci[31m");
+        let identity =
+            JobIdentity::new("Octo/App", Some(&format!("b\u{1b}[31m{}", "j".repeat(500))))
+                .expect("named");
+        assert!(identity.job.starts_with("b[31m"));
         assert_eq!(identity.job.len(), MAX_NAME_CHARS);
-        assert!(JobIdentity::new("octo/app", None, Some("build")).is_none());
-        assert!(JobIdentity::new("octo/app", Some("ci"), Some("  ")).is_none());
+        assert!(JobIdentity::new("octo/app", None).is_none());
+        assert!(JobIdentity::new("octo/app", Some("  ")).is_none());
     }
 
     #[test]
@@ -1412,15 +1494,15 @@ mod tests {
         for (index, rss) in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().enumerate() {
             let host = if index % 2 == 0 { "fast" } else { "slow" };
             let secs = if host == "fast" { 50 } else { 200 };
-            samples.push(sample("octo/app/ci/build", host, secs, rss * GIB));
+            samples.push(sample("octo/app/build", host, secs, rss * GIB));
         }
-        samples.push(sample("octo/app/ci/lint", "fast", 10, GIB / 2));
+        samples.push(sample("octo/app/lint", "fast", 10, GIB / 2));
         let aggregates = Aggregates::from_samples(samples, 30);
-        let build = aggregates.job("octo/app/ci/build").expect("figures");
+        let build = aggregates.job("octo/app/build").expect("figures");
         assert_eq!(build.samples, 10);
         assert_eq!(build.p90_peak_rss_bytes, Some(9 * GIB));
         assert_eq!(build.p50_duration_secs, Some(50));
-        let ratios = aggregates.host_ratios("octo/app/ci/build");
+        let ratios = aggregates.host_ratios("octo/app/build");
         // The usual time is the mean of the two medians, 125 s.
         assert_eq!(ratios["fast"].ratio, Some(400));
         assert_eq!(ratios["slow"].ratio, Some(1600));
@@ -1437,14 +1519,14 @@ mod tests {
     fn a_queue_needs_its_heaviest_job_and_falls_back_to_its_repository_then_the_default() {
         let aggregates = Aggregates::from_samples(
             vec![
-                sample("octo/app/ci/build", "h", 60, 6 * GIB),
-                sample("octo/app/ci/lint", "h", 60, GIB),
+                sample("octo/app/build", "h", 60, 6 * GIB),
+                sample("octo/app/lint", "h", 60, GIB),
             ],
             30,
         );
         let demand = aggregates.demand(
             "octo/app",
-            &["octo/app/ci/lint".into(), "octo/app/ci/build".into()],
+            &["octo/app/lint".into(), "octo/app/build".into()],
             false,
             2 * GIB,
         );
@@ -1454,7 +1536,7 @@ mod tests {
         );
         assert!(demand.measured);
         // A key never measured: the repository's p90.
-        let demand = aggregates.demand("octo/app", &["octo/app/ci/new".into()], false, 2 * GIB);
+        let demand = aggregates.demand("octo/app", &["octo/app/new".into()], false, 2 * GIB);
         assert_eq!(demand.source, EstimateSource::Repository);
         assert_eq!(demand.estimate, 6 * GIB);
         // A repository never measured, and a job only the sweep counted.
@@ -1490,6 +1572,7 @@ mod tests {
         let demand = Demand {
             estimate: 4 * GIB,
             source: EstimateSource::Job,
+            measured_job: Some(4 * GIB),
             job_keys: vec![],
             measured: true,
         };
@@ -1527,6 +1610,7 @@ mod tests {
         let light = Demand {
             estimate: GIB,
             source: EstimateSource::Job,
+            measured_job: Some(GIB),
             job_keys: vec!["k".into()],
             measured: true,
         };
@@ -1592,6 +1676,7 @@ mod tests {
         let demand = Demand {
             estimate: 40 * GIB,
             source: EstimateSource::Job,
+            measured_job: Some(40 * GIB),
             job_keys: vec![],
             measured: true,
         };
@@ -1683,7 +1768,7 @@ mod tests {
         );
         assert_eq!(
             stats.with_aggregates(|a| a
-                .job("octo/app/CI/inflated")
+                .job("octo/app/inflated")
                 .and_then(|j| j.p90_peak_rss_bytes)),
             Some(16 * GIB)
         );
@@ -1705,7 +1790,7 @@ mod tests {
         stats.count_launch();
         stats.count_wakes(4);
         let figures = stats
-            .with_aggregates(|aggregates| aggregates.job("octo/app/CI/build"))
+            .with_aggregates(|aggregates| aggregates.job("octo/app/build"))
             .expect("in memory");
         assert_eq!(figures.p90_peak_rss_bytes, Some(3 * GIB));
         // The job's 14 s, not the host's 100 s attempt; and its 4 s wait.
@@ -1725,7 +1810,7 @@ mod tests {
         let again = Statistics::load(db, StatsConfig::default());
         let report = again.report(Utc::now()).expect("report");
         assert_eq!((report.launches, report.wakes), (1, 4));
-        assert!(again.with_aggregates(|aggregates| aggregates.job("octo/app/CI/build").is_some()));
+        assert!(again.with_aggregates(|aggregates| aggregates.job("octo/app/build").is_some()));
 
         // Placement's live state: the server's own report shows it as of now;
         // the admin CLI reads the copy the server saved.

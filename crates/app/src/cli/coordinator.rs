@@ -1220,11 +1220,22 @@ fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy
 fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
     let busy = ports
         .store
-        .attempts()
+        .uncleaned_attempts()
         .map(|attempts| active_count(attempts.iter()))
         .unwrap_or(0);
+    // A launch with no runner yet has a slot spoken for: said here, the
+    // coordinator offers what this host can really start.
+    let spoken_for = ports.launches.unstarted();
     Heartbeat {
-        free_slots: u32::from(ports.host.host_capacity.get().saturating_sub(busy)),
+        free_slots: u32::from(
+            ports
+                .launches
+                .current_host()
+                .host_capacity
+                .get()
+                .saturating_sub(busy)
+                .saturating_sub(spoken_for),
+        ),
         busy_slots: u32::from(busy),
         cpu_load_percent: runner_manager_platform::host_fitness::cpu_load_percent(),
         free_ram_bytes: runner_manager_platform::host_fitness::available_memory_bytes(),
@@ -1536,6 +1547,8 @@ async fn report_attempts(
 ) -> Result<(), SessionEnd> {
     let directed = version >= LAUNCH_VERSION;
     let open = directed.then(|| ports.launches.open_leases());
+    // A launch dropped is said at once: its job waits on the lease meanwhile.
+    let dropped = ports.launches.take_dropped();
     let policies = ports.store.policies().unwrap_or_default();
     if directed {
         let own: Vec<ScalePolicy> = policies
@@ -1551,7 +1564,7 @@ async fn report_attempts(
             send(socket, &message).await?;
         }
     }
-    if beat || reports.take_released() {
+    if beat || dropped || reports.take_released() {
         send(socket, &HostMessage::Heartbeat(heartbeat(ports, open))).await?;
     }
     Ok(())

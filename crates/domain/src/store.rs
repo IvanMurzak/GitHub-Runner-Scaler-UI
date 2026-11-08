@@ -786,6 +786,17 @@ pub trait Store: fmt::Debug + Send + Sync {
     /// As [`Store::attempt`].
     fn uncleaned_ephemeral_attempts(&self) -> Result<Vec<RunnerAttempt>, StoreError>;
 
+    /// Every attempt not yet cleaned, across every policy: what holds or may
+    /// hold a slot, without reading every attempt this host ever ran.
+    ///
+    /// # Errors
+    /// See [`StoreError`].
+    fn uncleaned_attempts(&self) -> Result<Vec<RunnerAttempt>, StoreError> {
+        let mut attempts = self.attempts()?;
+        attempts.retain(|attempt| attempt.state() != AttemptState::Cleaned);
+        Ok(attempts)
+    }
+
     /// Forget one attempt. Returns whether a row was removed.
     ///
     /// # Errors
@@ -1850,6 +1861,10 @@ impl Store for SqliteStore {
 
     fn uncleaned_ephemeral_attempts(&self) -> Result<Vec<RunnerAttempt>, StoreError> {
         self.attempts_where(&uncleaned_of_kind_sql(WorkspaceKind::Ephemeral), &[])
+    }
+
+    fn uncleaned_attempts(&self) -> Result<Vec<RunnerAttempt>, StoreError> {
+        self.attempts_where(&uncleaned_sql(), &[])
     }
 
     fn remove_attempt(&self, id: AttemptId) -> Result<bool, StoreError> {

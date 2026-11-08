@@ -819,7 +819,7 @@ pub struct OpenLease {
     pub repository: String,
 }
 
-/// One job key (`owner/repo/workflow/job`) and its aggregates.
+/// One job key (`owner/repo/job`) and its aggregates.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JobStats {
@@ -1343,7 +1343,7 @@ mod tests {
                 p50_queue_wait_secs: Some(3),
                 p90_queue_wait_secs: Some(12),
                 jobs: vec![JobStats {
-                    job_key: "octo/app/ci/build (linux)".into(),
+                    job_key: "octo/app/build (linux)".into(),
                     samples: 2,
                     p50_duration_secs: Some(60),
                     p50_queue_wait_secs: Some(3),
@@ -1572,7 +1572,7 @@ mod tests {
             p50_queue_wait_secs: Some(4),
             p90_queue_wait_secs: Some(75),
             jobs: vec![JobStats {
-                job_key: "octo/app/ci/build".into(),
+                job_key: "octo/app/build".into(),
                 samples: 4,
                 p50_duration_secs: Some(372),
                 p50_queue_wait_secs: Some(3),
@@ -1608,7 +1608,7 @@ mod tests {
         report.render(&mut text).expect("renders");
         for expected in [
             "launches accepted 3",
-            "octo/app/ci/build",
+            "octo/app/build",
             "queue wait (queued to started): p50 4s, p90 1m 15s",
             "3.0 GiB  2.15 cores  6m 12s  wait 3s/1m 01s  (4)",
             "linux (h1)",

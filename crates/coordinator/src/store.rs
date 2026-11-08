@@ -16,7 +16,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// The prefix every invite code carries, so one is recognisable in a paste.
 pub const INVITE_PREFIX: &str = "rmc_";
@@ -199,6 +199,10 @@ impl Store {
                 PRAGMA user_version = 4;",
             )?;
         }
+        if version < 5 {
+            rekey_samples(&connection)?;
+            connection.pragma_update(None, "user_version", 5)?;
+        }
         Ok(Self { connection })
     }
 
@@ -375,6 +379,44 @@ impl Store {
     }
 }
 
+/// 0.4.48: a sample's key loses the workflow, which was the run's title: from
+/// `owner/repo/title/job` to `owner/repo/job`, so what was measured counts at
+/// once. A title and a job name may both hold a `/`, so the split is a best
+/// guess: at the last `/` without a space beside it, since GitHub names a
+/// reusable workflow's jobs `caller / job`.
+fn rekey_samples(connection: &Connection) -> Result<(), StoreError> {
+    let rows: Vec<(i64, String, String)> = connection
+        .prepare("SELECT id, job_key, repository FROM job_samples")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let transaction = connection.unchecked_transaction()?;
+    for (id, key, repository) in rows {
+        let Some(rest) = key
+            .strip_prefix(&repository)
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            continue;
+        };
+        let Some(job) = job_after_title(rest) else {
+            continue;
+        };
+        transaction.execute(
+            "UPDATE job_samples SET job_key = ?1 WHERE id = ?2",
+            params![format!("{repository}/{job}"), id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// The job in `title/job`; `None` when `rest` holds no title (already rekeyed).
+fn job_after_title(rest: &str) -> Option<&str> {
+    let split = rest.char_indices().rev().find(|(at, c)| {
+        *c == '/' && !rest[..*at].ends_with(' ') && !rest[at + 1..].starts_with(' ')
+    })?;
+    Some(rest[split.0 + 1..].trim())
+}
+
 /// Whether `table` has a column named `column`.
 fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
     Ok(connection
@@ -385,7 +427,7 @@ fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool
 /// One measured attempt: a job of `job_key` that ran on `host_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSample {
-    /// `owner/repo/workflow/job`, as [`crate::stats::JobIdentity::key`] makes it.
+    /// `owner/repo/job`, as [`crate::stats::JobIdentity::key`] makes it.
     pub job_key: String,
     /// `owner/repo`, lower-cased.
     pub repository: String,
@@ -835,6 +877,50 @@ mod tests {
         assert_eq!(
             store.samples(oldest).expect("read")[0].queue_wait_secs,
             Some(7)
+        );
+    }
+
+    /// Samples keyed by a run's title (`load light [1,2] (e4)`) join under the
+    /// job's name, whichever title they were measured under.
+    #[test]
+    fn samples_keyed_by_a_runs_title_are_rekeyed_by_job() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("coordinator.db");
+        let oldest = now() - chrono::TimeDelta::days(90);
+        {
+            let mut store = Store::open(&path).expect("created");
+            for key in [
+                "octo/app/load light [1,2] (e4b)/light",
+                "octo/app/fix/a slash in a title/light",
+                "octo/app/CI/caller / build",
+                "octo/app/caller / build",
+                "octo/app/already",
+            ] {
+                store
+                    .record_sample(&sample(key, now()), 30, oldest)
+                    .expect("recorded");
+            }
+            store
+                .connection
+                .pragma_update(None, "user_version", 4)
+                .expect("a schema-4 database");
+        }
+        let store = Store::open(&path).expect("upgraded");
+        let keys: Vec<String> = store
+            .samples(oldest)
+            .expect("read")
+            .into_iter()
+            .map(|sample| sample.job_key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "octo/app/light",
+                "octo/app/light",
+                "octo/app/caller / build",
+                "octo/app/caller / build",
+                "octo/app/already",
+            ]
         );
     }
 
