@@ -148,6 +148,14 @@ fn busy_percent(previous: (u64, u64, u64), now: (u64, u64, u64)) -> Option<u32> 
     u32::try_from(busy.saturating_mul(100).saturating_add(total / 2) / total).ok()
 }
 
+/// One field of `/proc/meminfo`'s text, in bytes.
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+fn meminfo_field(text: &str, field: &str) -> Option<u64> {
+    let line = text.lines().find(|line| line.starts_with(field))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
 /// Free plus inactive pages in bytes: memory macOS hands to new work without
 /// paging anything out (the `available` figure `psutil` reports).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1153,10 +1161,7 @@ mod sys {
     /// One `/proc/meminfo` field, in bytes.
     #[cfg(not(target_os = "macos"))]
     fn meminfo_bytes(field: &str) -> Option<u64> {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text.lines().find(|line| line.starts_with(field))?;
-        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        kib.checked_mul(1024)
+        super::meminfo_field(&std::fs::read_to_string("/proc/meminfo").ok()?, field)
     }
 
     /// This task's send right to the host port, taken once: every
@@ -1350,6 +1355,20 @@ mod tests {
         assert_eq!(busy_percent((250, 400, 600), (250, 400, 600)), None);
         assert_eq!(busy_percent((10, 10, 10), (5, 20, 20)), None, "went back");
         assert_eq!(available_pages_bytes(10, 5, 16_384), Some(15 * 16_384));
+    }
+
+    /// Linux reports what new work can have, page cache included: the WSL
+    /// host of the live experiments had 9 GiB free and 18 GiB available.
+    #[test]
+    fn available_memory_is_memavailable_not_memfree() {
+        let meminfo = "MemTotal:       32000000 kB\n\
+                       MemFree:         9000000 kB\n\
+                       MemAvailable:   18000000 kB\n";
+        assert_eq!(
+            meminfo_field(meminfo, "MemAvailable:"),
+            Some(18_000_000 * 1024)
+        );
+        assert_eq!(meminfo_field(meminfo, "SwapFree:"), None);
     }
 
     /// Every OS this ships for reports free memory now (macOS since stage 4).

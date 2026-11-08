@@ -267,7 +267,9 @@ takes a job (the host's `attempt_started`) the lease is held until the webhook t
 of the queue (at most 30 seconds), so the job is not placed twice meanwhile. A lease also closes,
 and its job, if still queued, is placed again at once:
 
-- when its attempt ends (`attempt_finished`);
+- when its attempt ends (`attempt_finished`), unless its runner exited idle: that runner took
+  nothing, so the host keeps the launch and starts another runner, or gives it to another waiting
+  runner;
 - when its host disconnects or connects again (a new link starts with no launch: the host
   dropped its open ones when it lost the old link, even one that never closed cleanly);
 - when its host's heartbeat no longer lists it: a 0.4.47 host names the launches it still
@@ -291,7 +293,10 @@ in the log (`a pool queue is not placed`, with `reason` and, for a refusal, `ref
 A pool profile is **directed** while its target is `coordinated` on a version-3 link: it starts
 runners only for the launches it accepted, never from its own reading of the queue (which every
 host of the pool sees the same way). It accepts a launch only when its own allocator, over its
-own attempts and ceilings, grants one more runner. Accepted launches start their runners at once:
+own attempts and ceilings, grants one more runner, counting the launches its other profiles hold
+open: slots are the host's. A launch it can no longer start (another profile's runner took the
+slot since) is dropped, newest first, and the next heartbeat, sent at once, closes its lease.
+Accepted launches start their runners at once:
 the link signals the target's loop, which starts every launch open at that moment in one go,
 without polling GitHub, so the 5-second gap between polls does not apply; the next full pass
 stays where it was scheduled. The runners themselves are still created one after another under
@@ -380,7 +385,10 @@ and labels), not a single job:
 2. **Filter**: a host whose free memory (by its last heartbeat) less the estimates of its
    launches whose runner has not taken a job yet cannot hold the demand plus
    `COORDINATOR_RAM_MARGIN` (512 MiB) is passed over. A host that reports no free memory is not
-   filtered. When the demand is the global default (nothing measured for that repository),
+   filtered. Each launch reserves the queue's next heaviest job, so one heavy job among light
+   ones counts once; the host must still hold the heaviest job, since a runner can take any of
+   them. "Free memory" is what the OS says new work can have: Linux's `MemAvailable`, Windows'
+   available physical memory, macOS's free plus inactive pages. When the demand is the global default (nothing measured for that repository),
    nothing is filtered: a guess never keeps a job waiting. Nor is anything filtered when the
    demand plus the margin is more than every candidate's total memory: no host could ever hold
    it, so the job runs where the score says. The estimates of a host's launches stay reserved

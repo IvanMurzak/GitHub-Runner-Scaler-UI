@@ -39,7 +39,8 @@
 //!
 //! Stage 4: with [`crate::stats::Statistics`] attached, the queue's demand is
 //! its heaviest queued job's p90 peak memory; a host that cannot hold it
-//! (less the estimates of its launches whose runner took no job yet) is
+//! (less what its launches whose runner took no job yet reserve: each the
+//! queue's next heaviest job, so `n` leases stand for its `n` heaviest) is
 //! passed over, and the rest are ranked by [`crate::stats::score`]. Each
 //! decision is logged with host ids and scores and kept for `stats`. With no
 //! statistics for the queue, the order is stage 3's: a warm workspace for
@@ -66,7 +67,7 @@ use runner_manager_domain::model::Label;
 use tokio::sync::oneshot;
 
 use crate::registry::{Candidate, Registry, is_pool_job};
-use crate::stats::{Aggregates, Contender, Demand, Statistics, score};
+use crate::stats::{Aggregates, Contender, Demand, Statistics, StatsConfig, score};
 
 /// How long a host has to answer a `launch`.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -394,6 +395,25 @@ impl State {
                 "a pool queue is not placed"
             );
         }
+    }
+
+    /// What the next lease of `key` reserves: the heaviest queued job no open
+    /// lease stands for yet. A runner takes any of them, so `n` leases stand
+    /// for the queue's `n` heaviest, whichever each runner ends up with.
+    fn lease_estimate(&self, key: &JobKey, aggregates: &Aggregates, config: &StatsConfig) -> u64 {
+        let (job_keys, _) = self.job_keys(key);
+        let total = self.queues.get(key).map_or(0, Queue::len);
+        let estimates = aggregates.job_estimates(
+            &key.repository,
+            &job_keys,
+            total.saturating_sub(job_keys.len()),
+            config.default_job_ram,
+        );
+        let next = self.leases_for(key).min(estimates.len().saturating_sub(1));
+        estimates
+            .get(next)
+            .copied()
+            .unwrap_or(config.default_job_ram)
     }
 
     /// Launches on `host_id` its heartbeat at `heartbeat_at` cannot have
@@ -1239,7 +1259,7 @@ impl Placement {
             eligible
                 .into_iter()
                 .find(|candidate| candidate.host_id == chosen)
-                .map(|candidate| (candidate, demand.estimate))
+                .map(|candidate| (candidate, state.lease_estimate(key, aggregates, config)))
         })
     }
 
@@ -2149,6 +2169,95 @@ mod tests {
         assert_eq!(
             decide(&placement, &key),
             (12 << 30, "repository".to_string())
+        );
+        drop(host);
+    }
+
+    /// Placement with samples: `light` peaks at 0.5 GiB, `mem` at 3.5 GiB, so
+    /// the repository's p90 is `mem`'s. One host with 8 GiB available.
+    fn light_and_mem() -> (Arc<Registry>, Arc<Placement>) {
+        use runner_manager_domain::coordinator_protocol::{AttemptOutcomeKind, AttemptUsage};
+
+        let registry = Arc::new(Registry::default());
+        registry.set_coverage(covering());
+        let (placement, stats) = measured(
+            Placement::with_timings(
+                Arc::clone(&registry),
+                Duration::from_millis(150),
+                Duration::from_secs(300),
+            ),
+            crate::store::Store::open_in_memory().expect("store"),
+        );
+        for (index, (job, peak)) in std::iter::repeat_n(("light", 1_u64 << 29), 5)
+            .chain(std::iter::repeat_n(("mem", 7_u64 << 29), 5))
+            .enumerate()
+        {
+            let runner = format!("runner-manager-{index}");
+            stats.job_identified(
+                &runner,
+                crate::stats::JobIdentity::new("octo/app", Some("ci"), Some(job)).expect("named"),
+                crate::stats::JobTimes::parse(None, None, Some("2026-11-07T10:10:00Z")),
+            );
+            stats.attempt_finished(
+                "elsewhere",
+                &AttemptFinished {
+                    lease_id: None,
+                    runner_name: runner.clone(),
+                    outcome: AttemptOutcomeKind::CompletedJob,
+                    duration_secs: Some(60),
+                    usage: Some(AttemptUsage {
+                        peak_rss_bytes: peak,
+                        samples: 10,
+                        ..AttemptUsage::default()
+                    }),
+                },
+                None,
+            );
+        }
+        (registry, placement)
+    }
+
+    /// Live experiment E4b's `no_memory_fit`: `mem`'s samples must not block a
+    /// queue of light jobs on a host with room for them.
+    #[tokio::test]
+    async fn a_queue_of_light_jobs_is_not_blocked_by_another_jobs_samples() {
+        let (registry, placement) = light_and_mem();
+        let host = connect(&registry, "h", LAUNCH_VERSION, POOL, 16, 8 << 30);
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let pool = required(POOL);
+        let mut key = None;
+        for id in 1..=8 {
+            key = placement.queued_job("octo/app", &pool, id, Some("octo/app/ci/light".into()));
+        }
+        let key = key.expect("pool");
+        assert_eq!(placement.rebalance(&key).await.accepted, 8);
+        assert_eq!(placement.state().reserved_on("h"), 4 << 30);
+        assert!(placement.snapshot().0.is_empty(), "nothing waits");
+        drop(host);
+    }
+
+    /// A lease reserves one job's memory: a queue holding one heavy job and
+    /// three light ones reserves the heavy job once, not once per lease.
+    #[tokio::test]
+    async fn a_lease_reserves_the_next_heaviest_job_not_the_heaviest_each_time() {
+        let (registry, placement) = light_and_mem();
+        let host = connect(&registry, "h", LAUNCH_VERSION, POOL, 16, 8 << 30);
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let pool = required(POOL);
+        let key = placement
+            .queued_job("octo/app", &pool, 1, Some("octo/app/ci/mem".into()))
+            .expect("pool");
+        for id in 2..=4 {
+            placement.queued_job("octo/app", &pool, id, Some("octo/app/ci/light".into()));
+        }
+        // 3.5 GiB, then 0.5 each. The third lease leaves 4 GiB, which still
+        // holds the heaviest job and its margin; the fourth would not, since
+        // any of the runners may take it.
+        assert_eq!(placement.rebalance(&key).await.accepted, 3);
+        assert_eq!(placement.state().reserved_on("h"), (7 << 29) + (2 << 29));
+        assert_eq!(
+            placement.snapshot().0[0].reason.as_deref(),
+            Some("no_memory_fit")
         );
         drop(host);
     }

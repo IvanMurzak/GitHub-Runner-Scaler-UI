@@ -1432,6 +1432,7 @@ async fn serve(
     let mut watch = tokio::time::interval(ATTEMPT_WATCH);
     watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut reports = AttemptReports::default();
+    let mut listed = Vec::new();
     loop {
         tokio::select! {
             frame = next_text(socket) => {
@@ -1503,13 +1504,13 @@ async fn serve(
                         return end;
                     }
                 }
-                if let Err(end) = report_attempts(socket, ports, meters, &mut reports, version, true).await {
+                if let Err(end) = report_attempts(socket, ports, meters, &mut reports, &mut listed, version, true).await {
                     return end;
                 }
                 recorder.keep_alive();
             }
             _ = watch.tick(), if version >= LAUNCH_VERSION => {
-                if let Err(end) = report_attempts(socket, ports, meters, &mut reports, version, false).await {
+                if let Err(end) = report_attempts(socket, ports, meters, &mut reports, &mut listed, version, false).await {
                     return end;
                 }
             }
@@ -1531,11 +1532,19 @@ async fn report_attempts(
     ports: &LinkPorts,
     meters: &AttemptMeters,
     reports: &mut AttemptReports,
+    listed: &mut Vec<String>,
     version: u32,
     beat: bool,
 ) -> Result<(), SessionEnd> {
     let directed = version >= LAUNCH_VERSION;
     let open = directed.then(|| ports.launches.open_leases());
+    // A launch dropped is said at once: its job waits on the lease meanwhile.
+    let dropped = open
+        .as_ref()
+        .is_some_and(|open| listed.iter().any(|lease| !open.contains(lease)));
+    if let Some(open) = &open {
+        listed.clone_from(open);
+    }
     let policies = ports.store.policies().unwrap_or_default();
     if directed {
         let own: Vec<ScalePolicy> = policies
@@ -1551,7 +1560,7 @@ async fn report_attempts(
             send(socket, &message).await?;
         }
     }
-    if beat || reports.take_released() {
+    if beat || dropped || reports.take_released() {
         send(socket, &HostMessage::Heartbeat(heartbeat(ports, open))).await?;
     }
     Ok(())

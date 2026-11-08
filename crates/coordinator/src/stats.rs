@@ -637,6 +637,36 @@ impl Aggregates {
     }
 }
 
+impl Aggregates {
+    /// What each queued job is expected to need, heaviest first: its own p90,
+    /// else its repository's, else `default_job_ram`. `unnamed` jobs have no
+    /// key and count as the repository. A lease reserves one of these, not the
+    /// heaviest: a queue of five jobs holds one heaviest job, not five.
+    #[must_use]
+    pub fn job_estimates(
+        &self,
+        repository: &str,
+        job_keys: &[String],
+        unnamed: usize,
+        default_job_ram: u64,
+    ) -> Vec<u64> {
+        let fallback = self
+            .repository_p90_rss(repository)
+            .unwrap_or(default_job_ram);
+        let mut estimates: Vec<u64> = job_keys
+            .iter()
+            .map(|key| {
+                self.job(key)
+                    .and_then(|figures| figures.p90_peak_rss_bytes)
+                    .unwrap_or(fallback)
+            })
+            .chain(std::iter::repeat_n(fallback, unnamed))
+            .collect();
+        estimates.sort_unstable_by(|a, b| b.cmp(a));
+        estimates
+    }
+}
+
 /// One host that could take the queue, as placement sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contender {
