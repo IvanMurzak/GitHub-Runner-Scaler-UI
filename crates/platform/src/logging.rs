@@ -192,9 +192,15 @@ pub const ALLOWED_FIELDS: &[&str] = &[
     "mode",
     "os",
     "outcome",
+    "package_copy_ms",
+    "package_downloaded",
+    "package_install_ms",
+    "package_verify_ms",
+    "package_wait_ms",
     "pid",
     "policy_id",
     "policy_state",
+    "prepare_ms",
     "reason",
     "register_ms",
     // GitHub's `x-ratelimit-remaining`: a request count.
@@ -206,6 +212,7 @@ pub const ALLOWED_FIELDS: &[&str] = &[
     "start_mode",
     "state",
     "target",
+    "turn_wait_ms",
     "version",
 ];
 

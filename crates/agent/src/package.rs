@@ -1063,6 +1063,11 @@ impl fmt::Debug for CachePorts {
     }
 }
 
+/// When the published version was last checked: per cache, or shared by the
+/// caches over one package directory.
+#[derive(Debug, Clone, Default)]
+pub struct LastCheck(Arc<Mutex<Option<Timestamp>>>);
+
 /// The versioned, immutable, checksum-verified runner package cache.
 #[derive(Debug)]
 pub struct PackageCache {
@@ -1080,7 +1085,7 @@ pub struct PackageCache {
     /// re-check is the *correct* behaviour — the agent has no idea how long it
     /// was down — so persisting this would only buy the ability to skip a check
     /// that should not be skipped.
-    last_check: Mutex<Option<Timestamp>>,
+    last_check: LastCheck,
 }
 
 impl PackageCache {
@@ -1102,7 +1107,7 @@ impl PackageCache {
             pins: PinnedDigests::new(),
             freshness: Freshness::default(),
             retry_budget: RETRY_BUDGET,
-            last_check: Mutex::new(None),
+            last_check: LastCheck::default(),
         }
     }
 
@@ -1115,6 +1120,13 @@ impl PackageCache {
     #[must_use]
     pub const fn with_freshness(mut self, freshness: Freshness) -> Self {
         self.freshness = freshness;
+        self
+    }
+
+    /// Shares when the published version was last checked with other caches.
+    #[must_use]
+    pub fn with_last_check(mut self, last_check: LastCheck) -> Self {
+        self.last_check = last_check;
         self
     }
 
@@ -1172,8 +1184,9 @@ impl PackageCache {
         }
         let installed = self.install(true).await;
         // Removing ~9,000 files per tree is blocking work, kept off the
-        // daemon's current-thread runtime.
-        let _ = tokio::task::spawn_blocking(move || drop(set_aside)).await;
+        // daemon's current-thread runtime. Not awaited: nothing depends on it,
+        // and the caller has a new tree to fingerprint before a job touches it.
+        tokio::task::spawn_blocking(move || drop(set_aside));
         installed.map(|(package, _)| package)
     }
 
@@ -1232,11 +1245,7 @@ impl PackageCache {
         // network: an unsupported pair has no package and never will.
         host_os::validate(self.os, self.arch)?;
 
-        let now = self.ports.clock.now();
-        if !force
-            && !self.check_is_due(now)?
-            && let Some(entry) = self.newest_installed()?
-        {
+        if !force && let Some(entry) = self.reusable()? {
             return Ok((entry, false));
         }
 
@@ -1246,6 +1255,7 @@ impl PackageCache {
                 Ok(package) => {
                     *self
                         .last_check
+                        .0
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
                         Some(self.ports.clock.now());
@@ -1295,6 +1305,16 @@ impl PackageCache {
         now.signed_duration_since(package.installed_at) > self.freshness.window
     }
 
+    /// The entry an install would return without asking anybody, if no check
+    /// is due: it neither looks anything up nor changes anything.
+    pub(crate) fn reusable(&self) -> Result<Option<InstalledPackage>, PackageError> {
+        host_os::validate(self.os, self.arch)?;
+        if self.check_is_due(self.ports.clock.now())? {
+            return Ok(None);
+        }
+        self.newest_installed()
+    }
+
     /// Whether the published version is due to be re-checked.
     ///
     /// Three ways to answer yes, and the third is the one that matters:
@@ -1318,6 +1338,7 @@ impl PackageCache {
         }
         let last = *self
             .last_check
+            .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(match last {
@@ -1631,7 +1652,7 @@ impl PackageCache {
     }
 
     /// The most recently installed entry, which is the one a cold start reuses.
-    fn newest_installed(&self) -> Result<Option<InstalledPackage>, PackageError> {
+    pub(crate) fn newest_installed(&self) -> Result<Option<InstalledPackage>, PackageError> {
         Ok(self
             .installed()?
             .into_iter()
@@ -1796,7 +1817,7 @@ impl PackageCache {
     /// [`Self::holders`] and *before* it removes the directory, leaving a live
     /// attempt holding a package that is gone. Nothing here detects that.
     ///
-    /// **What makes it safe is `e1`'s host allocation lock, and nothing this
+    /// **What makes it safe is the caller's hold on the trees, and nothing this
     /// module could add.** A `Mutex` of its own would not help, and saying it
     /// was declined merely to avoid "a second ordering to get wrong" overstated
     /// the alternative: a leaf mutex taken and released inside two synchronous
@@ -1805,12 +1826,13 @@ impl PackageCache {
     /// is between *callers*, and only a lock the caller already holds across
     /// both can close it.
     ///
-    /// So the requirement is on the caller: **prune under the same host-wide
-    /// allocation lock a launch is taken under.** That lock already serialises
-    /// the launch that takes a lease, which makes this method's
-    /// read-then-remove indivisible with respect to every lease this agent
-    /// creates. It says nothing about a second agent on the same machine; the
-    /// single-instance lock is what prevents that.
+    /// So the requirement is on the caller: **prune under the exclusive hold of
+    /// the trees, and lease under at least a shared one**
+    /// (`crate::lifecycle::SharedPackages`). A launch keeps its hold from the
+    /// copy through its lease, which makes this method's read-then-remove
+    /// indivisible with respect to every lease this agent creates. It says
+    /// nothing about a second agent on the same machine; the single-instance
+    /// lock is what prevents that.
     ///
     /// Stated rather than silently assumed, and stated here rather than
     /// enforced, which is a weaker position than this module takes at
@@ -4246,6 +4268,144 @@ mod tests {
             .build()
     }
 
+    /// An attempt about to be materialized, with its runner root in place.
+    fn reserved(harness: &Harness, id: u128) -> RunnerAttempt {
+        let attempt = attempt_in(harness, id, AttemptState::Allocated);
+        fs::create_dir_all(attempt.runtime_path().parent().unwrap()).unwrap();
+        attempt
+    }
+
+    /// One daemon's adapter for each of two targets over one package directory.
+    fn two_targets(
+        harness: &Harness,
+    ) -> (
+        crate::lifecycle::CachedRuntimePackages,
+        crate::lifecycle::CachedRuntimePackages,
+        crate::lifecycle::SharedPackages,
+    ) {
+        use crate::lifecycle::{CachedRuntimePackages, SharedPackages};
+        let shared = SharedPackages::default();
+        (
+            CachedRuntimePackages::new(
+                Arc::new(harness.cache().with_last_check(shared.last_check())),
+                shared.clone(),
+            ),
+            CachedRuntimePackages::new(
+                Arc::new(harness.cache().with_last_check(shared.last_check())),
+                shared.clone(),
+            ),
+            shared,
+        )
+    }
+
+    /// The 142 s launch: each target distrusted the tree the other installed,
+    /// so every switch between them downloaded the package again.
+    #[tokio::test]
+    async fn switching_between_targets_does_not_download_the_package_again() {
+        use crate::lifecycle::{PackageTimings, RuntimePackages as _};
+
+        let (harness, _, _) = linux_fixture();
+        let (one, two, _shared) = two_targets(&harness);
+        for (id, packages) in [(1, &one), (2, &two), (3, &one), (4, &two)] {
+            let attempt = reserved(&harness, id);
+            let mut timings = PackageTimings::default();
+            packages
+                .materialize(&attempt, &mut timings)
+                .await
+                .expect("materialized");
+            assert!(attempt.runtime_path().join("run.sh").exists());
+            assert_eq!(timings.downloaded, id == 1, "attempt {id}: {timings:?}");
+        }
+        assert_eq!(harness.fetcher.count(), 1);
+        assert_eq!(harness.catalog.calls(), 1, "one check, not one per target");
+    }
+
+    #[tokio::test]
+    async fn launches_materializing_together_share_one_download() {
+        use crate::lifecycle::{PackageTimings, RuntimePackages as _};
+
+        let (harness, _, _) = linux_fixture();
+        let (one, two, _shared) = two_targets(&harness);
+        let first = reserved(&harness, 1);
+        let second = reserved(&harness, 2);
+
+        let (mut one_timings, mut two_timings) =
+            (PackageTimings::default(), PackageTimings::default());
+        let (a, b) = tokio::join!(
+            one.materialize(&first, &mut one_timings),
+            two.materialize(&second, &mut two_timings)
+        );
+
+        a.expect("the first");
+        b.expect("the second");
+        assert_eq!(harness.fetcher.count(), 1);
+    }
+
+    /// Still replaced when a job edits it, whichever target notices.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tree_a_job_edited_is_replaced_for_every_target() {
+        use crate::lifecycle::{PackageTimings, RuntimePackages as _};
+
+        let (harness, _, _) = linux_fixture();
+        let (one, two, _shared) = two_targets(&harness);
+        one.materialize(&reserved(&harness, 1), &mut PackageTimings::default())
+            .await
+            .expect("materialized");
+        let entry = harness.cache().installed().unwrap().remove(0);
+        fs::write(entry.root().join("planted"), b"from a job").unwrap();
+
+        two.materialize(&reserved(&harness, 2), &mut PackageTimings::default())
+            .await
+            .expect("materialized");
+
+        assert_eq!(harness.fetcher.count(), 2);
+        assert!(!entry.root().join("planted").exists());
+    }
+
+    /// A superseded version goes only when no copy or install is under way.
+    #[tokio::test]
+    async fn a_prune_leaves_the_trees_alone_while_they_are_in_use() {
+        use crate::lifecycle::{PackageTimings, PruneAuthority, RuntimePackages as _};
+        use crate::reconcile::{AllocationLock as _, InProcessAllocationLock};
+
+        let (harness, _, _) = linux_fixture();
+        let (one, _two, shared) = two_targets(&harness);
+        one.materialize(&reserved(&harness, 1), &mut PackageTimings::default())
+            .await
+            .expect("materialized");
+        one.release(AttemptId::from_u128(1)).expect("released");
+        let newer = tar_gz_bytes(&[("run.sh", "newer\n")]);
+        harness.catalog.publish(vec![published(
+            "linux",
+            "x64",
+            "2.340.0",
+            ".tar.gz",
+            Some(&hex_digest(&newer)),
+        )]);
+        harness.fetcher.serve(newer);
+        harness
+            .clock
+            .advance(Elapsed::days(FRESHNESS_WINDOW_DAYS + 1));
+        let cache = harness.cache();
+        cache.ensure_installed().await.expect("the newer install");
+        assert_eq!(cache.installed().unwrap().len(), 2);
+
+        let lock = InProcessAllocationLock::new();
+        let guard = lock.acquire().await.unwrap();
+        {
+            let _copying = shared.copying().await;
+            one.prune_obsolete_guarded(PruneAuthority::for_test(&guard), &[])
+                .expect("nothing to do yet");
+            assert_eq!(cache.installed().unwrap().len(), 2);
+        }
+        one.prune_obsolete_guarded(PruneAuthority::for_test(&guard), &[])
+            .expect("pruned");
+        let left = cache.installed().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].version(), &version("2.340.0"));
+    }
+
     #[tokio::test]
     async fn reinstall_replaces_a_tampered_entry_with_a_verified_download() {
         let (harness, _, _) = linux_fixture();
@@ -4271,13 +4431,19 @@ mod tests {
             1,
             "the reinstalled entry is the only one left"
         );
-        assert!(
+        // Removed in the background.
+        let staged = || {
             fs::read_dir(cache.staging_root())
                 .map(|entries| entries.count())
                 .unwrap_or(0)
-                == 0,
-            "the set-aside tree is removed"
-        );
+        };
+        for _ in 0..500 {
+            if staged() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(staged(), 0, "the set-aside tree is removed");
     }
 
     #[tokio::test]

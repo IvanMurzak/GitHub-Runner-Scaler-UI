@@ -7,6 +7,44 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.49
+
+### Fixed
+
+- **Runners of one host no longer start one at a time.** The host-wide allocation
+  lock was held for a runner's whole start, package copy included, so one slow
+  package held every other target back (live: 143 s, with 40 other launches
+  deferred). The lock now covers only the reservation, which is journalled: every
+  ceiling holds as before, and a daemon that dies before the runner is up leaves an
+  attempt that startup recovery concludes. Runners then prepare at the same time, a
+  quarter of the host's cores at once and at least two, and register in parallel.
+  On a WSL guest the launch fence is shared by the launches in progress: a Windows
+  drain request stops new ones and waits for those.
+- **A host serving two targets no longer downloads the runner package at every
+  switch between them.** Each target kept its own record of the package tree it
+  trusted. One target's reinstall replaced the tree the other had recorded, which
+  then reinstalled in turn. The record is now shared. The first launch after a
+  daemon starts still downloads the package once, by design.
+- **A launch being worked on is no longer dropped.** The 45-second limit dropped
+  launches whose runner was waiting for a turn. It now counts from a start that
+  failed for a real reason. A launch whose runner is coming up keeps its lease past
+  its lifetime, for up to 15 minutes, because the heartbeat that lists it now renews
+  the lease at the coordinator. So does one waiting for its target's loop to finish
+  bringing up other runners of its profile. A launch whose runner is up and took no
+  job expires as before, and one whose runner failed coming up is retried within the
+  45 seconds. Upgrade the coordinator first: an older one does not renew a lease, so
+  a slow runner's job can be placed a second time, leaving a surplus runner.
+- **Launches start oldest first across the targets of a host.** A younger launch
+  lets an older one reserve first, for at most 2 seconds, and runners take their
+  turns to prepare in the order they were reserved.
+
+### Added
+
+- `attempt_launch_slow` and its siblings in the host log say where a start went:
+  `turn_wait_ms`, `package_wait_ms`, `package_install_ms`, `package_verify_ms`,
+  `package_copy_ms`, `package_downloaded` and `prepare_ms`, beside the existing
+  fields.
+
 ## 0.4.48
 
 ### Fixed

@@ -10,7 +10,7 @@
 
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -29,7 +29,7 @@ use runner_manager_domain::attempt::{
 use runner_manager_domain::execution::{AttemptExecution, Backend, ImageReference};
 use runner_manager_domain::model::{AttemptId, Clock, HostId, PolicyId, ScaleTarget};
 use runner_manager_domain::path::LocalAbsolutePath;
-use runner_manager_domain::policy::{RoutingLabels, ScalePolicy};
+use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::{AttemptWorkspace, WorkspacePolicy};
 use runner_manager_github::jit::{
@@ -47,7 +47,7 @@ use secrecy::SecretString;
 
 use crate::dependency_caches::DependencyCaches;
 use crate::oci::OciProcesses;
-use crate::package::{PackageCache, PackageError, RunnerVersion};
+use crate::package::{InstalledPackage, LastCheck, PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
     AllocationGuard, CleanBackoff, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent,
     OutcomeKind, ReplacementIntent, RunnerLauncher, failure_reason_kind,
@@ -259,9 +259,17 @@ impl AttemptEventSink for NoAttemptEvents {
 /// Where one launch spent its time. A step the launch never reached is zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaunchTimings {
-    /// Waiting for the host allocation lock, which another launch may hold.
+    /// Waiting for the host allocation lock, which another launch may hold, and
+    /// for the rest of its pass to be reserved after it.
     pub lock_wait: Duration,
+    /// Waiting for a turn to prepare: see [`preparation_turns`].
+    pub turn_wait: Duration,
     pub materialize: Duration,
+    /// Where `materialize` went.
+    pub package: PackageTimings,
+    /// The execution provider's preparation: its environment, and the checks
+    /// of the host's runner environment and dependency caches.
+    pub prepare: Duration,
     pub register: Duration,
     pub spawn: Duration,
 }
@@ -269,13 +277,36 @@ pub struct LaunchTimings {
 impl LaunchTimings {
     #[must_use]
     pub fn total(&self) -> Duration {
-        self.lock_wait + self.materialize + self.register + self.spawn
+        self.lock_wait
+            + self.turn_wait
+            + self.materialize
+            + self.prepare
+            + self.register
+            + self.spawn
     }
+}
+
+/// Where a launch's package step went, across its retries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackageTimings {
+    /// Waiting for another launch's install, or for copies an install must
+    /// not run under.
+    pub wait: Duration,
+    /// Checking the catalog, and downloading and extracting a package.
+    pub install: Duration,
+    /// Fingerprinting the trees a copy may trust.
+    pub verify: Duration,
+    /// Copying or cloning the tree into the runner's runtime.
+    pub copy: Duration,
+    /// A package was downloaded for this launch.
+    pub downloaded: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum LaunchStep {
+    Turn,
     Materialize,
+    Prepare,
     Register,
     Spawn,
 }
@@ -308,7 +339,9 @@ impl LaunchStopwatch {
     fn finish(&mut self) {
         if let Some((step, since)) = self.running.take() {
             let slot = match step {
+                LaunchStep::Turn => &mut self.timings.turn_wait,
                 LaunchStep::Materialize => &mut self.timings.materialize,
+                LaunchStep::Prepare => &mut self.timings.prepare,
                 LaunchStep::Register => &mut self.timings.register,
                 LaunchStep::Spawn => &mut self.timings.spawn,
             };
@@ -357,7 +390,14 @@ impl AttemptEventSink for TracingAttemptEvents {
                             attempt_id = %attempt,
                             duration_ms = millis(timings.total()),
                             lock_wait_ms = millis(timings.lock_wait),
+                            turn_wait_ms = millis(timings.turn_wait),
                             materialize_ms = millis(timings.materialize),
+                            package_wait_ms = millis(timings.package.wait),
+                            package_install_ms = millis(timings.package.install),
+                            package_verify_ms = millis(timings.package.verify),
+                            package_copy_ms = millis(timings.package.copy),
+                            package_downloaded = timings.package.downloaded,
+                            prepare_ms = millis(timings.prepare),
                             register_ms = millis(timings.register),
                             spawn_ms = millis(timings.spawn),
                         )
@@ -539,12 +579,17 @@ where
 /// Package/cache operations used by one attempt.
 #[async_trait]
 pub trait RuntimePackages: fmt::Debug + Send + Sync {
-    async fn materialize(&self, attempt: &RunnerAttempt) -> Result<RunnerVersion, FailureReason>;
+    /// Copy the package into `attempt`'s runtime, adding where the time went
+    /// to `timings`.
+    async fn materialize(
+        &self,
+        attempt: &RunnerAttempt,
+        timings: &mut PackageTimings,
+    ) -> Result<RunnerVersion, FailureReason>;
     fn release(&self, attempt: AttemptId) -> Result<(), FailureReason>;
     fn prune_obsolete_guarded(
         &self,
         authority: PruneAuthority<'_>,
-        current: &RunnerVersion,
         attempts: &[RunnerAttempt],
     ) -> Result<(), FailureReason>;
 }
@@ -567,6 +612,43 @@ impl<'a> PruneAuthority<'a> {
     fn from_launch_request(guard: &'a AllocationGuard) -> Self {
         Self { _guard: guard }
     }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(guard: &'a AllocationGuard) -> Self {
+        Self { _guard: guard }
+    }
+}
+
+/// What every target of one daemon shares about the one package directory they
+/// all use: which trees this process vouches for, and who may touch them.
+///
+/// Per target, one target's reinstall replaces the tree another target
+/// recorded, whose next launch finds it changed and reinstalls in turn: on a
+/// host serving two targets, every switch between them was a full download.
+#[derive(Debug, Clone, Default)]
+pub struct SharedPackages {
+    /// Held shared to copy from a tree, exclusive to change one. A cache entry
+    /// or seed is not replaced under a copy.
+    trees: Arc<tokio::sync::RwLock<()>>,
+    trusted: Arc<TrustedTrees>,
+    last_check: LastCheck,
+}
+
+impl SharedPackages {
+    /// For each target's [`PackageCache`]: the published version is one fact,
+    /// so one target's check spares the others theirs, and each check holds
+    /// every copy on this host back.
+    #[must_use]
+    pub fn last_check(&self) -> LastCheck {
+        self.last_check.clone()
+    }
+}
+
+#[cfg(test)]
+impl SharedPackages {
+    pub(crate) async fn copying(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.trees.read().await
+    }
 }
 
 /// Production package adapter.  It takes an e2 lease before returning, so a
@@ -574,7 +656,15 @@ impl<'a> PruneAuthority<'a> {
 #[derive(Debug)]
 pub struct CachedRuntimePackages {
     cache: Arc<PackageCache>,
-    trusted: Arc<TrustedTrees>,
+    shared: SharedPackages,
+}
+
+/// Add how long `work` took to `slot`.
+async fn timed<T>(slot: &mut Duration, work: impl std::future::Future<Output = T>) -> T {
+    let began = std::time::Instant::now();
+    let result = work.await;
+    *slot += began.elapsed();
+    result
 }
 
 impl CachedRuntimePackages {
@@ -585,53 +675,122 @@ impl CachedRuntimePackages {
         root: &Path,
         work: impl FnOnce(&TrustedTrees, &Path) -> T + Send + 'static,
     ) -> Result<T, FailureReason> {
-        let trusted = Arc::clone(&self.trusted);
+        let trusted = Arc::clone(&self.shared.trusted);
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || work(&trusted, &root))
             .await
             .map_err(|_| FailureReason::ProcessStartFailed)
     }
 
+    /// One target's view of the package directory the targets of `shared` use.
     #[must_use]
-    pub fn new(cache: Arc<PackageCache>) -> Self {
-        Self {
-            cache,
-            trusted: Arc::default(),
+    pub const fn new(cache: Arc<PackageCache>, shared: SharedPackages) -> Self {
+        Self { cache, shared }
+    }
+
+    /// The tree a runtime can be copied from right now, under nothing more than
+    /// the shared hold: nothing to check for or install, and a tree still as
+    /// this process left it.
+    async fn ready(
+        &self,
+        destination: &Path,
+        timings: &mut PackageTimings,
+    ) -> Result<Option<(InstalledPackage, PathBuf)>, FailureReason> {
+        let Some(installed) = self.cache.reusable().map_err(package_failure)? else {
+            return Ok(None);
+        };
+        let destination = destination.to_path_buf();
+        let verifying = self.blocking(installed.root(), move |trusted, source| {
+            if trusted.holds(source) {
+                copy_origin_ready(source, &destination, trusted)
+            } else {
+                None
+            }
+        });
+        let origin = timed(&mut timings.verify, verifying).await?;
+        Ok(origin.map(|origin| (installed, origin)))
+    }
+
+    /// Under the exclusive hold: a package installed and trusted, and the tree
+    /// to copy it from.
+    async fn install_trusted(
+        &self,
+        destination: &Path,
+        timings: &mut PackageTimings,
+    ) -> Result<(InstalledPackage, PathBuf), FailureReason> {
+        let (mut installed, downloaded) = timed(
+            &mut timings.install,
+            self.cache.ensure_installed_reporting(),
+        )
+        .await
+        .map_err(package_failure)?;
+        timings.downloaded |= downloaded;
+        // A cache entry this process did not install, or one that has changed
+        // since, may hold a job's edits; replace it with one downloaded and
+        // verified now. One this call just downloaded is trusted as it lands.
+        // See `TrustedTrees`.
+        let fresh = downloaded
+            || !timed(
+                &mut timings.verify,
+                self.blocking(installed.root(), TrustedTrees::holds),
+            )
+            .await?;
+        if fresh && !downloaded {
+            installed = timed(&mut timings.install, self.cache.reinstall())
+                .await
+                .map_err(package_failure)?;
+            timings.downloaded = true;
         }
+        let destination = destination.to_path_buf();
+        let origin = timed(
+            &mut timings.verify,
+            self.blocking(installed.root(), move |trusted, source| {
+                if fresh {
+                    trusted.record(source)?;
+                }
+                Ok::<_, std::io::Error>(copy_origin(source, &destination, trusted))
+            }),
+        )
+        .await?
+        .map_err(|_| FailureReason::ProcessStartFailed)?;
+        Ok((installed, origin))
     }
 }
 
 #[async_trait]
 impl RuntimePackages for CachedRuntimePackages {
-    async fn materialize(&self, attempt: &RunnerAttempt) -> Result<RunnerVersion, FailureReason> {
-        let (mut installed, downloaded) = self
-            .cache
-            .ensure_installed_reporting()
-            .await
-            .map_err(package_failure)?;
-        // A cache entry this process did not install, or one that has changed
-        // since, may hold a job's edits; replace it with one downloaded and
-        // verified now. One this call just downloaded is trusted as it lands.
-        // See `TrustedTrees`.
-        let fresh = if downloaded {
-            true
-        } else if self.blocking(installed.root(), TrustedTrees::holds).await? {
-            false
-        } else {
-            installed = self.cache.reinstall().await.map_err(package_failure)?;
-            true
-        };
-        if fresh {
-            self.blocking(installed.root(), TrustedTrees::record)
-                .await?
-                .map_err(|_| FailureReason::ProcessStartFailed)?;
-        }
-        // Off the async thread: the daemon runs a current-thread runtime, and a
-        // copy (or a seed rebuild) can take minutes on a busy disk.
+    async fn materialize(
+        &self,
+        attempt: &RunnerAttempt,
+        timings: &mut PackageTimings,
+    ) -> Result<RunnerVersion, FailureReason> {
         let destination = attempt.runtime_path().to_path_buf();
-        let copied = self
-            .blocking(installed.root(), move |trusted, source| {
-                copy_package_tree(source, &destination, trusted)?;
+        let trees = &self.shared.trees;
+        // Only a launch that has something to change goes exclusive, and it lets
+        // go before it copies, so the launches queued behind it do not wait for
+        // its copy too. Once more if the tree still is not ready: a job edited
+        // it meanwhile, or a seed cannot be made here. Then it copies under what
+        // it just made, which no other launch can change.
+        let mut installs = 0;
+        let (hold, (installed, origin)) = loop {
+            let hold = timed(&mut timings.wait, trees.read()).await;
+            if let Some(ready) = self.ready(&destination, timings).await? {
+                break (hold, ready);
+            }
+            drop(hold);
+            let exclusive = timed(&mut timings.wait, trees.write()).await;
+            let ready = self.install_trusted(&destination, timings).await?;
+            installs += 1;
+            if installs == 2 {
+                break (exclusive.downgrade(), ready);
+            }
+        };
+        // Off the async thread: the daemon runs a current-thread runtime, and a
+        // copy can take minutes on a busy disk.
+        let copied = timed(
+            &mut timings.copy,
+            self.blocking(installed.root(), move |trusted, source| {
+                copy_package_from(source, &origin, &destination, trusted)?;
                 // Checked again after the copy: an edit a job made while it ran
                 // moved the entry's print, and the runtime may hold it.
                 if trusted.holds(source) {
@@ -641,8 +800,9 @@ impl RuntimePackages for CachedRuntimePackages {
                         "the runner package changed while copied",
                     ))
                 }
-            })
-            .await?;
+            }),
+        )
+        .await?;
         if copied.is_err() {
             // Nothing a failed or tainted copy left may reach a retry's copy,
             // which lays out over the same runtime.
@@ -656,6 +816,9 @@ impl RuntimePackages for CachedRuntimePackages {
             let _ = remove_materialized_package(attempt);
             return Err(package_failure(error));
         }
+        // Leased while still holding the trees, so a prune that gets the
+        // exclusive hold finds this runtime's lease.
+        drop(hold);
         Ok(installed.version().clone())
     }
 
@@ -663,14 +826,22 @@ impl RuntimePackages for CachedRuntimePackages {
         self.cache.release(attempt).map_err(package_failure)
     }
 
+    /// Everything but the newest version, when nothing is using the trees: a
+    /// copy from an older version, or an install in progress, makes this a
+    /// no-op, and a later launch prunes what it left, which costs only disk.
     fn prune_obsolete_guarded(
         &self,
         _authority: PruneAuthority<'_>,
-        current: &RunnerVersion,
         attempts: &[RunnerAttempt],
     ) -> Result<(), FailureReason> {
+        let Ok(_exclusive) = self.shared.trees.try_write() else {
+            return Ok(());
+        };
+        let Some(current) = self.cache.newest_installed().map_err(package_failure)? else {
+            return Ok(());
+        };
         for installed in self.cache.installed().map_err(package_failure)? {
-            if installed.version() != current {
+            if installed.version() != current.version() {
                 match self.cache.prune(installed.version(), attempts) {
                     Ok(()) | Err(PackageError::VersionInUse { .. }) => {}
                     Err(error) => return Err(package_failure(error)),
@@ -1434,8 +1605,53 @@ fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
 /// byte copy of the ~9,000-file package across volumes took four minutes on a
 /// host whose runner root shared a busy disk with a build, and a queued job
 /// waits for every second of it.
-fn copy_package_tree(
+/// The tree to copy `source` from, making a seed where one helps; a change to
+/// a tree, so only under the exclusive hold of [`SharedPackages::trees`].
+///
+/// A seed that cannot be made is a slower launch, not a failed one. The seed
+/// sits under the runner root, beside job runtimes, so the refusal is re-checked
+/// on it; a seed that fails it is bypassed.
+fn copy_origin(source: &Path, destination: &Path, seeds: &TrustedTrees) -> PathBuf {
+    #[cfg(unix)]
+    {
+        package_seed(source, destination, seeds)
+            .ok()
+            .filter(|seed| refuse_work_folder(seed).is_ok())
+            .unwrap_or_else(|| source.to_path_buf())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (destination, seeds);
+        source.to_path_buf()
+    }
+}
+
+/// The tree to copy `source` from if it needs no change: `None` is a seed to
+/// rebuild first.
+fn copy_origin_ready(source: &Path, destination: &Path, seeds: &TrustedTrees) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        match seed_location(source, destination) {
+            Ok(None) => Some(source.to_path_buf()),
+            Ok(Some(seeds_root)) => held_seed(source, &seeds_root, seeds)
+                .ok()
+                .flatten()
+                .filter(|seed| refuse_work_folder(seed).is_ok()),
+            Err(_) => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (destination, seeds);
+        Some(source.to_path_buf())
+    }
+}
+
+/// Copy the package at `source` into `destination`, from `origin`: itself or
+/// its seed. Under the shared hold of [`SharedPackages::trees`].
+fn copy_package_from(
     source: &Path,
+    origin: &Path,
     destination: &Path,
     seeds: &TrustedTrees,
 ) -> std::io::Result<()> {
@@ -1443,17 +1659,10 @@ fn copy_package_tree(
 
     #[cfg(unix)]
     {
-        // A seed that cannot be made is a slower launch, not a failed one.
-        // The seed sits under the runner root, beside job runtimes, so the
-        // refusal is re-checked on it; a seed that fails it is bypassed.
-        let origin = package_seed(source, destination, seeds)
-            .ok()
-            .filter(|seed| refuse_work_folder(seed).is_ok())
-            .unwrap_or_else(|| source.to_path_buf());
-        clone_tree(&origin, destination)?;
+        clone_tree(origin, destination)?;
         // A seed a job edited during the clone no longer holds; the caller
         // re-checks the cache entry itself.
-        if origin != source && !seeds.holds(&origin) {
+        if origin != source && !seeds.holds(origin) {
             return Err(std::io::Error::other(
                 "the package seed changed while cloned",
             ));
@@ -1462,7 +1671,7 @@ fn copy_package_tree(
     }
     #[cfg(not(unix))]
     {
-        let _ = seeds;
+        let _ = (origin, seeds);
         copy_package_entries(source, destination, true)
     }
 }
@@ -1490,9 +1699,9 @@ const PACKAGE_SEED_DIR: &str = ".runner-package";
 /// The seed lives at `<runner root>/.runner-package/<version>` and is replaced
 /// whenever its manifest stops matching the cache entry's, which covers both a
 /// new version and a reinstalled one. Superseded versions and interrupted
-/// stagings are removed on that same pass. Launches hold the host allocation
-/// lock for the whole materialization, so no other launch is cloning from a
-/// seed while it is replaced.
+/// stagings are removed on that same pass. A seed is only made under the
+/// exclusive hold of [`SharedPackages::trees`], so no launch is cloning from it
+/// while it is replaced.
 ///
 /// The seed sits one `..` from every job's runtime and is owned by the account
 /// jobs run as, so it is only reused while it is provably the tree this
@@ -1507,18 +1716,27 @@ fn package_seed(
     destination: &Path,
     seeds: &TrustedTrees,
 ) -> std::io::Result<PathBuf> {
+    match seed_location(source, destination)? {
+        Some(root) => refresh_package_seed(source, &root, seeds),
+        None => Ok(source.to_path_buf()),
+    }
+}
+
+/// Where `destination`'s seeds live, if copies to it use one.
+#[cfg(unix)]
+fn seed_location(source: &Path, destination: &Path) -> std::io::Result<Option<PathBuf>> {
     use std::os::unix::fs::MetadataExt as _;
 
     if !cfg!(target_os = "macos") {
-        return Ok(source.to_path_buf());
+        return Ok(None);
     }
     let root = destination
         .parent()
         .ok_or_else(|| std::io::Error::other("a runtime directory has no parent"))?;
     if fs::metadata(source)?.dev() == fs::metadata(root)?.dev() {
-        return Ok(source.to_path_buf());
+        return Ok(None);
     }
-    refresh_package_seed(source, &root.join(PACKAGE_SEED_DIR), seeds)
+    Ok(Some(root.join(PACKAGE_SEED_DIR)))
 }
 
 /// The package trees this process built or installed, and what each looked
@@ -1538,7 +1756,7 @@ fn package_seed(
 #[derive(Debug, Default)]
 pub(crate) struct TrustedTrees {
     #[cfg_attr(not(unix), allow(dead_code))]
-    prints: Mutex<std::collections::HashMap<PathBuf, [u8; 32]>>,
+    prints: Mutex<HashMap<PathBuf, [u8; 32]>>,
 }
 
 impl TrustedTrees {
@@ -1619,25 +1837,42 @@ fn tree_fingerprint(root: &Path) -> std::io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-/// The seed of `source` under `seeds`, rebuilt unless its manifest matches the
-/// cache entry's and its fingerprint the one this process recorded.
+#[cfg(unix)]
+fn seed_path(source: &Path, seeds: &Path) -> std::io::Result<PathBuf> {
+    let version = source
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("a cache entry has no name"))?;
+    Ok(seeds.join(version))
+}
+
+/// The seed of `source` under `seeds`, if its manifest matches the cache
+/// entry's and its fingerprint the one this process recorded.
+#[cfg(unix)]
+fn held_seed(
+    source: &Path,
+    seeds: &Path,
+    trusted: &TrustedTrees,
+) -> std::io::Result<Option<PathBuf>> {
+    use crate::package::MANIFEST_FILE;
+
+    let seed = seed_path(source, seeds)?;
+    let manifest = fs::read(source.join(MANIFEST_FILE))?;
+    let held = fs::read(seed.join(MANIFEST_FILE)).is_ok_and(|held| held == manifest)
+        && trusted.holds(&seed);
+    Ok(held.then_some(seed))
+}
+
+/// The seed of `source` under `seeds`, rebuilt unless [`held_seed`] finds it.
 #[cfg(unix)]
 fn refresh_package_seed(
     source: &Path,
     seeds: &Path,
     trusted: &TrustedTrees,
 ) -> std::io::Result<PathBuf> {
-    use crate::package::MANIFEST_FILE;
-
-    let version = source
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("a cache entry has no name"))?;
-    let seed = seeds.join(version);
-    let manifest = fs::read(source.join(MANIFEST_FILE))?;
-    if fs::read(seed.join(MANIFEST_FILE)).is_ok_and(|held| held == manifest) && trusted.holds(&seed)
-    {
+    if let Some(seed) = held_seed(source, seeds, trusted)? {
         return Ok(seed);
     }
+    let seed = seed_path(source, seeds)?;
 
     // Superseded versions, a stale seed and interrupted stagings all go.
     match remove_runtime_tree(seeds) {
@@ -2937,6 +3172,17 @@ pub struct LifecycleLauncher {
     /// workspace that cannot be removed is not retried and reported on every
     /// pass.
     cleanup_retries: Mutex<CleanBackoff>,
+    turns: Arc<tokio::sync::Semaphore>,
+}
+
+/// How many runners of one host prepare at once, whatever their target: a
+/// quarter of its cores, at least two. A runner's package is ~9,000 files, and
+/// on a disk jobs are using, more at once only make all of them slower. Fair,
+/// so the ones waiting go in the order they were reserved.
+#[must_use]
+pub fn preparation_turns() -> Arc<tokio::sync::Semaphore> {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    Arc::new(tokio::sync::Semaphore::new((cores / 4).max(2)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2973,7 +3219,16 @@ impl LifecycleLauncher {
             versions: Mutex::new(BTreeMap::new()),
             pending_replacements: Mutex::new(BTreeMap::new()),
             cleanup_retries: Mutex::new(CleanBackoff::default()),
+            turns: preparation_turns(),
         }
+    }
+
+    /// Takes turns to prepare with every launcher holding `turns`, rather than
+    /// only with itself: the targets of one host.
+    #[must_use]
+    pub fn with_preparation_turns(mut self, turns: Arc<tokio::sync::Semaphore>) -> Self {
+        self.turns = turns;
+        self
     }
 
     /// Reconcile the entire journal before allowing a launch.  Unknown-policy
@@ -4075,11 +4330,12 @@ impl LifecycleLauncher {
         &self,
         policy: &ScalePolicy,
         attempt: &RunnerAttempt,
+        timings: &mut PackageTimings,
     ) -> Result<RunnerVersion, FailureReason> {
         let mut issued = 0_u32;
         loop {
             issued = issued.saturating_add(1);
-            match self.ports.packages.materialize(attempt).await {
+            match self.ports.packages.materialize(attempt, timings).await {
                 Ok(version) => return Ok(version),
                 Err(reason)
                     if package_failure_is_terminal(&reason)
@@ -4298,7 +4554,7 @@ impl LifecycleLauncher {
     ///
     /// Steps 1 to 6 of `02-target-architecture.md`, "Slot allocation", in order;
     /// step 7 is the journal write [`Self::record_allocation`] owns. All of them
-    /// run under the host allocation lock, because [`Self::launch_attempt`] is
+    /// run under the host allocation lock, because [`Self::reserve_attempt`] is
     /// reachable only through a `LaunchRequest` and that carries the guard.
     ///
     /// **The filesystem is never consulted to decide which slots are taken**
@@ -4405,18 +4661,33 @@ impl LifecycleLauncher {
         }
     }
 
-    async fn launch_attempt(
+    /// Under the allocation lock: what no other launch may decide at the same
+    /// time. The rest is [`Self::finish_attempt`], outside it.
+    fn reserve_attempt(
         &self,
         policy: &ScalePolicy,
         allocation_guard: &AllocationGuard,
+    ) -> Result<RunnerAttempt, LifecycleError> {
+        // What a prune leaves costs only disk, and a tree it cannot remove is one
+        // the launch's install may yet repair: not a reason to refuse the launch.
+        if let Err(error) = self.prune_under_allocation_lock(allocation_guard) {
+            tracing::warn!(
+                event = "package_prune_failed",
+                reason = failure_reason_kind(&error.reason()),
+            );
+        }
+        self.allocate_attempt(policy)
+    }
+
+    async fn finish_attempt(
+        &self,
+        policy: &ScalePolicy,
+        attempt: RunnerAttempt,
         lock_wait: Duration,
     ) -> Result<RunnerAttempt, LifecycleError> {
-        let (attempt, labels) = self.allocate_attempt(policy)?;
         let id = attempt.id;
         let mut stopwatch = LaunchStopwatch::new(lock_wait);
-        let result = self
-            .launch_steps(policy, allocation_guard, attempt, labels, &mut stopwatch)
-            .await;
+        let result = self.launch_steps(policy, attempt, &mut stopwatch).await;
         stopwatch.finish();
         self.ports.events.emit(AttemptEvent::Launched {
             attempt: id,
@@ -4428,10 +4699,7 @@ impl LifecycleLauncher {
 
     /// Place and journal a new attempt: everything before its first external
     /// effect, and so before there is anything to time.
-    fn allocate_attempt<'p>(
-        &self,
-        policy: &'p ScalePolicy,
-    ) -> Result<(RunnerAttempt, &'p RoutingLabels), LifecycleError> {
+    fn allocate_attempt(&self, policy: &ScalePolicy) -> Result<RunnerAttempt, LifecycleError> {
         if !*self
             .recovery_complete
             .lock()
@@ -4474,7 +4742,7 @@ impl LifecycleLauncher {
                 ))
             })?;
         }
-        let labels = policy
+        policy
             .routing_labels()
             .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
         let id = AttemptId::new_random();
@@ -4501,25 +4769,32 @@ impl LifecycleLauncher {
         // before any package or GitHub effect
         // (`02-target-architecture.md`, "Slot allocation", step 7).
         self.record_allocation(&attempt)?;
-        Ok((attempt, labels))
+        Ok(attempt)
     }
 
     async fn launch_steps(
         &self,
         policy: &ScalePolicy,
-        allocation_guard: &AllocationGuard,
         mut attempt: RunnerAttempt,
-        labels: &RoutingLabels,
         stopwatch: &mut LaunchStopwatch,
     ) -> Result<RunnerAttempt, LifecycleError> {
         let id = attempt.id;
         let isolated = !attempt.execution().is_native();
+        let Some(labels) = policy.routing_labels() else {
+            return self.fail_launch(&mut attempt, FailureReason::JitRequestFailed);
+        };
+        stopwatch.begin(LaunchStep::Turn);
+        // Never closed; held through the preparation below.
+        let turn = self.turns.acquire().await.ok();
         stopwatch.begin(LaunchStep::Materialize);
-        let version = match self.materialize_with_retry(policy, &attempt).await {
+        let package_timings = &mut stopwatch.timings.package;
+        let version = match self
+            .materialize_with_retry(policy, &attempt, package_timings)
+            .await
+        {
             Ok(version) => version,
             Err(reason) => return self.fail_launch(&mut attempt, reason),
         };
-        self.prune_under_allocation_lock(allocation_guard, &version)?;
         self.versions
             .lock()
             .map_err(|_| LifecycleError::Journal)?
@@ -4531,7 +4806,19 @@ impl LifecycleLauncher {
                 .map_err(|_| LifecycleError::Transition)?;
             self.record(&attempt)?;
         }
-        let prepared = match self.ports.processes.prepare(&attempt, policy) {
+        stopwatch.begin(LaunchStep::Prepare);
+        // Off the async thread: a provider may pull an image, and every target
+        // of this host shares that thread.
+        let preparing = {
+            let (processes, attempt, policy) = (
+                Arc::clone(&self.ports.processes),
+                attempt.clone(),
+                policy.clone(),
+            );
+            tokio::task::spawn_blocking(move || processes.prepare(&attempt, &policy)).await
+        };
+        drop(turn);
+        let prepared = match preparing.unwrap_or(Err(FailureReason::ProcessStartFailed)) {
             Ok(prepared) => prepared,
             Err(reason) => {
                 let safe_reason = if isolated {
@@ -4664,11 +4951,7 @@ impl LifecycleLauncher {
 
     /// e2's prune guard is invoked only with e1's allocation guard borrowed.
     /// The otherwise-unused argument is a compile-time witness of the ordering.
-    fn prune_under_allocation_lock(
-        &self,
-        guard: &AllocationGuard,
-        version: &RunnerVersion,
-    ) -> Result<(), LifecycleError> {
+    fn prune_under_allocation_lock(&self, guard: &AllocationGuard) -> Result<(), LifecycleError> {
         let attempts = self
             .ports
             .store
@@ -4676,11 +4959,7 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Journal)?;
         self.ports
             .packages
-            .prune_obsolete_guarded(
-                PruneAuthority::from_launch_request(guard),
-                version,
-                &attempts,
-            )
+            .prune_obsolete_guarded(PruneAuthority::from_launch_request(guard), &attempts)
             .map_err(LifecycleError::Failed)?;
         #[cfg(target_os = "macos")]
         self.prune_abandoned_seeds(&attempts);
@@ -4694,10 +4973,9 @@ impl LifecycleLauncher {
     /// The roots ever used are the parents of the journal's runtime paths; the
     /// roots in use are the effective host root and every persistent policy's
     /// root. When the effective host root cannot be resolved nothing is
-    /// removed, because a seed still in use cannot then be told apart. Runs
-    /// under the allocation lock, so no launch is cloning from a seed it
-    /// removes, and it is best-effort: a seed left behind costs disk, never a
-    /// launch.
+    /// removed, because a seed still in use cannot then be told apart. No
+    /// launch clones from a seed under a root no policy uses, and it is
+    /// best-effort: a seed left behind costs disk, never a launch.
     #[cfg(target_os = "macos")]
     fn prune_abandoned_seeds(&self, attempts: &[RunnerAttempt]) {
         let Ok(policies) = self.ports.store.policies() else {
@@ -4764,7 +5042,17 @@ impl RunnerLauncher for LifecycleLauncher {
     }
 
     async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure> {
-        self.launch_attempt(request.policy, request.allocation_guard, request.lock_wait)
+        self.reserve_attempt(request.policy, request.allocation_guard)
+            .map_err(|error| LaunchFailure::new(error.reason()))
+    }
+
+    async fn finish_launch(
+        &self,
+        policy: &ScalePolicy,
+        attempt: RunnerAttempt,
+        lock_wait: Duration,
+    ) -> Result<RunnerAttempt, LaunchFailure> {
+        self.finish_attempt(policy, attempt, lock_wait)
             .await
             .map_err(|error| LaunchFailure::new(error.reason()))
     }
@@ -5243,11 +5531,12 @@ mod tests {
         version: RunnerVersion,
         leases: Mutex<BTreeSet<AttemptId>>,
         materializations: AtomicUsize,
+        materializing: AtomicUsize,
+        peak_materializing: AtomicUsize,
         materialization_failures: AtomicUsize,
         release_failures: AtomicUsize,
         releases: AtomicUsize,
         prunes: AtomicUsize,
-        prune_currents: Mutex<Vec<RunnerVersion>>,
     }
 
     impl Default for FakePackages {
@@ -5256,11 +5545,12 @@ mod tests {
                 version: RunnerVersion::parse("2.330.0").unwrap(),
                 leases: Mutex::new(BTreeSet::new()),
                 materializations: AtomicUsize::new(0),
+                materializing: AtomicUsize::new(0),
+                peak_materializing: AtomicUsize::new(0),
                 materialization_failures: AtomicUsize::new(0),
                 release_failures: AtomicUsize::new(0),
                 releases: AtomicUsize::new(0),
                 prunes: AtomicUsize::new(0),
-                prune_currents: Mutex::new(Vec::new()),
             }
         }
     }
@@ -5280,8 +5570,15 @@ mod tests {
         async fn materialize(
             &self,
             attempt: &RunnerAttempt,
+            _timings: &mut PackageTimings,
         ) -> Result<RunnerVersion, FailureReason> {
             self.materializations.fetch_add(1, Ordering::SeqCst);
+            let now = self.materializing.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_materializing.fetch_max(now, Ordering::SeqCst);
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            self.materializing.fetch_sub(1, Ordering::SeqCst);
             if self
                 .materialization_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -5319,11 +5616,9 @@ mod tests {
         fn prune_obsolete_guarded(
             &self,
             _authority: PruneAuthority<'_>,
-            current: &RunnerVersion,
             _attempts: &[RunnerAttempt],
         ) -> Result<(), FailureReason> {
             self.prunes.fetch_add(1, Ordering::SeqCst);
-            self.prune_currents.lock().unwrap().push(current.clone());
             Ok(())
         }
     }
@@ -5969,13 +6264,37 @@ mod tests {
             &self,
             lock_wait: Duration,
         ) -> Result<RunnerAttempt, LaunchFailure> {
-            let guard = self.allocation_lock.acquire().await.unwrap();
+            let reserved = self.reserve().await?;
             self.launcher
+                .finish_launch(&self.policy, reserved, lock_wait)
+                .await
+        }
+
+        /// A whole launch through `launcher`, as a reconciliation pass makes it.
+        async fn launch_through(
+            &self,
+            launcher: &LifecycleLauncher,
+        ) -> Result<RunnerAttempt, LaunchFailure> {
+            let reserved = self.reserve_through(launcher).await?;
+            launcher
+                .finish_launch(&self.policy, reserved, Duration::ZERO)
+                .await
+        }
+
+        async fn reserve(&self) -> Result<RunnerAttempt, LaunchFailure> {
+            self.reserve_through(&self.launcher).await
+        }
+
+        async fn reserve_through(
+            &self,
+            launcher: &LifecycleLauncher,
+        ) -> Result<RunnerAttempt, LaunchFailure> {
+            let guard = self.allocation_lock.acquire().await.unwrap();
+            launcher
                 .launch(LaunchRequest {
                     host: &self.host,
                     policy: &self.policy,
                     allocation_guard: &guard,
-                    lock_wait,
                 })
                 .await
         }
@@ -6141,14 +6460,8 @@ mod tests {
             .recover_startup(std::slice::from_ref(&harness.policy))
             .await
             .expect("ready");
-        let guard = harness.allocation_lock.acquire().await.unwrap();
-        let attempt = launcher
-            .launch(LaunchRequest {
-                host: &harness.host,
-                policy: &harness.policy,
-                allocation_guard: &guard,
-                lock_wait: Duration::ZERO,
-            })
+        let attempt = harness
+            .launch_through(&launcher)
             .await
             .expect("isolated launch");
         assert_eq!(attempt.state(), AttemptState::Starting);
@@ -6236,16 +6549,7 @@ mod tests {
             .recover_startup(std::slice::from_ref(&harness.policy))
             .await
             .unwrap();
-        let guard = harness.allocation_lock.acquire().await.unwrap();
-        let attempt = launcher
-            .launch(LaunchRequest {
-                host: &harness.host,
-                policy: &harness.policy,
-                allocation_guard: &guard,
-                lock_wait: Duration::ZERO,
-            })
-            .await
-            .unwrap();
+        let attempt = harness.launch_through(&launcher).await.unwrap();
         harness
             .github
             .observe(GithubRunnerObservation::Registered { busy: true });
@@ -6279,14 +6583,8 @@ mod tests {
             .recover_startup(std::slice::from_ref(&harness.policy))
             .await
             .expect("ready");
-        let guard = harness.allocation_lock.acquire().await.unwrap();
-        let failure = launcher
-            .launch(LaunchRequest {
-                host: &harness.host,
-                policy: &harness.policy,
-                allocation_guard: &guard,
-                lock_wait: Duration::ZERO,
-            })
+        let failure = harness
+            .launch_through(&launcher)
             .await
             .expect_err("prepare failed after creating resource");
         assert_eq!(
@@ -6402,14 +6700,8 @@ mod tests {
                 .recover_startup(std::slice::from_ref(&harness.policy))
                 .await
                 .unwrap();
-            let guard = harness.allocation_lock.acquire().await.unwrap();
-            let error = launcher
-                .launch(LaunchRequest {
-                    host: &harness.host,
-                    policy: &harness.policy,
-                    allocation_guard: &guard,
-                    lock_wait: Duration::ZERO,
-                })
+            let error = harness
+                .launch_through(&launcher)
                 .await
                 .expect_err("pre-JIT refusal");
             let expected = if image_failure {
@@ -6438,14 +6730,8 @@ mod tests {
             .recover_startup(std::slice::from_ref(&harness.policy))
             .await
             .unwrap();
-        let guard = harness.allocation_lock.acquire().await.unwrap();
-        let error = launcher
-            .launch(LaunchRequest {
-                host: &harness.host,
-                policy: &harness.policy,
-                allocation_guard: &guard,
-                lock_wait: Duration::ZERO,
-            })
+        let error = harness
+            .launch_through(&launcher)
             .await
             .expect_err("unsupported host must be refused before JIT");
 
@@ -6521,16 +6807,7 @@ mod tests {
             .recover_startup(std::slice::from_ref(&harness.policy))
             .await
             .expect("ready");
-        let guard = harness.allocation_lock.acquire().await.unwrap();
-        let mut attempt = launcher
-            .launch(LaunchRequest {
-                host: &harness.host,
-                policy: &harness.policy,
-                allocation_guard: &guard,
-                lock_wait: Duration::ZERO,
-            })
-            .await
-            .expect("launch");
+        let mut attempt = harness.launch_through(&launcher).await.expect("launch");
         attempt
             .conclude(
                 AttemptOutcome::failed(FailureReason::ProcessStartFailed),
@@ -8900,17 +9177,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reservation_is_journalled_before_any_effect_and_holds_its_slot() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+
+        let reserved = harness.reserve().await.unwrap();
+
+        assert_eq!(reserved.state(), AttemptState::Allocated);
+        assert!(reserved.counts_against_capacity());
+        let journalled = harness.store.attempt(reserved.id).unwrap().unwrap();
+        assert_eq!(journalled.state(), AttemptState::Allocated);
+        assert_eq!(harness.packages.materializations.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+
+        let started = harness
+            .launcher
+            .finish_launch(&harness.policy, reserved, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(started.state(), AttemptState::Starting);
+    }
+
+    /// A daemon that dies between the reservation and the process: the
+    /// journalled attempt is what recovery finds, and the slot comes back.
+    #[tokio::test]
+    async fn a_crash_between_reservation_and_spawn_recovers_the_slot() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let reserved = harness.reserve().await.unwrap();
+        harness.clock.advance_secs(31);
+
+        harness
+            .launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+
+        let recovered = harness.store.attempt(reserved.id).unwrap().unwrap();
+        assert!(
+            !recovered.counts_against_capacity(),
+            "the slot is free again: {:?}",
+            recovered.state()
+        );
+    }
+
+    /// A crash once the package is there, before the process: same result.
+    #[tokio::test]
+    async fn a_crash_after_the_package_is_copied_recovers_the_slot() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let reserved = harness.reserve().await.unwrap();
+        harness
+            .packages
+            .materialize(&reserved, &mut PackageTimings::default())
+            .await
+            .unwrap();
+        harness.clock.advance_secs(31);
+
+        harness
+            .launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+
+        let recovered = harness.store.attempt(reserved.id).unwrap().unwrap();
+        assert!(!recovered.counts_against_capacity());
+    }
+
+    #[tokio::test]
+    async fn runners_prepare_at_once_within_the_bound() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let turns = harness.launcher.turns.available_permits();
+        harness.launcher.turns.forget_permits(turns - 2);
+        let mut reserved = Vec::new();
+        for _ in 0..4 {
+            reserved.push(harness.reserve().await.unwrap());
+        }
+
+        let finished = futures::future::join_all(reserved.into_iter().map(|attempt| {
+            harness
+                .launcher
+                .finish_launch(&harness.policy, attempt, Duration::ZERO)
+        }))
+        .await;
+
+        assert!(finished.iter().all(Result::is_ok));
+        assert_eq!(
+            harness.packages.peak_materializing.load(Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn every_production_launch_prunes_under_the_same_allocation_guard() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         harness.ready().await;
         assert_eq!(harness.packages.prunes.load(Ordering::SeqCst), 0);
         harness.launch().await;
         assert_eq!(harness.packages.prunes.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *harness.packages.prune_currents.lock().unwrap(),
-            vec![harness.packages.version.clone()],
-            "the leased current version is an exclusion, never the prune target"
-        );
+    }
+
+    fn copy_package_tree(
+        source: &Path,
+        destination: &Path,
+        seeds: &TrustedTrees,
+    ) -> std::io::Result<()> {
+        let origin = copy_origin(source, destination, seeds);
+        copy_package_from(source, &origin, destination, seeds)
     }
 
     fn assert_no_jit_file(runtime: &Path) {
@@ -10032,18 +10406,11 @@ mod tests {
 
         // Capacity two, slot one quarantined: the next attempt goes to s2 and
         // never to the slot still holding runner state.
-        let guard = harness.allocation_lock.acquire().await.unwrap();
-        let second = restarted
-            .launch(LaunchRequest {
-                host: &harness.host,
-                policy: &harness.policy,
-                allocation_guard: &guard,
-                lock_wait: Duration::ZERO,
-            })
+        let second = harness
+            .launch_through(&restarted)
             .await
             .expect("the host can still launch");
         assert_eq!(second.workspace(), AttemptWorkspace::persistent_slot(nz(2)));
-        drop(guard);
 
         // And the same cleanup succeeds once the obstruction is gone, which is
         // what "retry through normal recovery" has to mean.
@@ -10824,7 +11191,14 @@ mod tests {
             "retry_in_ms",
             "duration_ms",
             "lock_wait_ms",
+            "turn_wait_ms",
             "materialize_ms",
+            "package_wait_ms",
+            "package_install_ms",
+            "package_verify_ms",
+            "package_copy_ms",
+            "package_downloaded",
+            "prepare_ms",
             "register_ms",
             "spawn_ms",
         ] {

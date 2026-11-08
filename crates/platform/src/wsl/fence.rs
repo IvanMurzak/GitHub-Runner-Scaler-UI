@@ -545,6 +545,23 @@ impl GuestLaunchClaim {
         self.release_now()
     }
 
+    /// Another launch of this process now shares the claim: its age, which a
+    /// claim stuck for too long is told by, restarts from this launch.
+    ///
+    /// # Errors
+    /// The owner record cannot be read or replaced.
+    pub fn renew(&self) -> Result<(), FenceError> {
+        let Some(claim) = &self.claim else {
+            return Ok(());
+        };
+        let path = claim.directory.join(OWNER_FILE);
+        let Some(mut owner) = read_json::<FenceOwner>(&path)? else {
+            return Ok(());
+        };
+        owner.acquired_at = Utc::now();
+        write_json(&path, &owner)
+    }
+
     fn release_now(&mut self) -> Result<(), FenceError> {
         let Some(mut claim) = self.claim.take() else {
             return Ok(());

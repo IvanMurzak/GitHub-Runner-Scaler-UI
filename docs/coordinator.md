@@ -296,13 +296,26 @@ host of the pool sees the same way). It accepts a launch only when its own alloc
 own attempts and ceilings, grants one more runner, counting the launches its other profiles hold
 open: slots are the host's. A launch it can no longer start (another profile's runner took the
 slot since) is dropped, newest first, and the next heartbeat, sent at once, closes its lease; so is
-one still without a runner after 45 seconds, whatever the reason (a warning in the host's log). A
-heartbeat's free slots leave out the ones its launches with no runner yet have spoken for.
+one no runner could be started for since 45 seconds ago (a warning in the host's log). Waiting a turn
+does not count, and neither does a runner still being brought up: the heartbeat goes on listing that
+launch, which renews its lease at the coordinator, for up to 15 minutes. A launch whose runner is up
+and took no job keeps the lease's lifetime. A heartbeat's free slots leave out the ones its launches with no runner yet have spoken for.
 Accepted launches start their runners at once:
 the link signals the target's loop, which starts every launch open at that moment in one go,
 without polling GitHub, so the 5-second gap between polls does not apply; the next full pass
-stays where it was scheduled. The runners themselves are still created one after another under
-the host-wide allocation lock, the same lock every pass takes, so the ceilings hold exactly.
+stays where it was scheduled. Each runner's slot is reserved and journalled one after another under
+the host-wide allocation lock, the same lock every pass takes, so the ceilings hold exactly. The lock
+is then released: runners of all targets of the host get their packages and register at the same time,
+oldest first. A quarter of its cores (at least two) prepare at once; registration is not bounded. A
+younger launch lets an older launch of another target reserve first, for at most 2 seconds. A launch
+accepted while its target's loop brings up a batch starts when that batch is up. A daemon that dies in between leaves a journalled
+attempt, which startup recovery concludes.
+
+A slow launch is a warning in the host's log, `attempt_launch_slow`, saying where the time went:
+`lock_wait_ms`, `turn_wait_ms`, `materialize_ms` (of which `package_wait_ms`, `package_install_ms`,
+`package_verify_ms`, `package_copy_ms`, and `package_downloaded`), `prepare_ms`, `register_ms`,
+`spawn_ms`. The first launch after a daemon starts downloads the package again: a tree this process
+did not install may hold a job's edits. After that, it is shared by every target.
 
 A repository added or removed on a host (`repo add`, `repo remove`, a profile enabled or disabled)
 changes only its own target loop: a new target gets a loop of its own within 30 seconds, a removed

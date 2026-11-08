@@ -15,8 +15,8 @@ use std::time::Duration;
 use runner_manager_agent::lifecycle::NativeProcesses;
 use runner_manager_agent::lifecycle::{
     CachedRuntimePackages, LifecycleGithub, LifecycleGithubObservation, LifecycleLauncher,
-    LifecyclePorts, PersistentDemand, PlatformExecutionProvider, RetryPolicy, TokioRetryDelay,
-    TracingAttemptEvents,
+    LifecyclePorts, PersistentDemand, PlatformExecutionProvider, RetryPolicy, SharedPackages,
+    TokioRetryDelay, TracingAttemptEvents,
 };
 use runner_manager_agent::package::{
     CachePorts, ExponentialBackoff, GatewayCatalog, HttpFetcher, PackageCache,
@@ -375,7 +375,13 @@ async fn run_generation(
     // A repository added or removed changes the set of loops, not the rest
     // of the daemon: the coordinator link, its accepted launches and every
     // other target's loop keep running. See `follow_policy_set`.
+    // The targets of this daemon share one package directory and one bound on
+    // how many runners prepare at once.
+    let shared_packages = SharedPackages::default();
+    let preparation_turns = runner_manager_agent::lifecycle::preparation_turns();
     let build_target = |policies: Vec<ScalePolicy>| {
+        let shared_packages = shared_packages.clone();
+        let preparation_turns = Arc::clone(&preparation_turns);
         let target_paths = context.paths().clone();
         let client = Arc::clone(&client);
         let clock = Arc::clone(&clock);
@@ -398,53 +404,59 @@ async fn run_generation(
                 RestInventory::new(Arc::clone(&client), Arc::clone(&clock)),
                 package_target.clone(),
             ));
-            let cache = Arc::new(PackageCache::new(
-                &target_paths,
-                host.os,
-                host.architecture,
-                CachePorts {
-                    catalog,
-                    fetcher: Arc::new(HttpFetcher::default()),
-                    backoff: Arc::new(ExponentialBackoff::default()),
-                    clock: Arc::clone(&clock),
-                },
-            ));
+            let cache = Arc::new(
+                PackageCache::new(
+                    &target_paths,
+                    host.os,
+                    host.architecture,
+                    CachePorts {
+                        catalog,
+                        fetcher: Arc::new(HttpFetcher::default()),
+                        backoff: Arc::new(ExponentialBackoff::default()),
+                        clock: Arc::clone(&clock),
+                    },
+                )
+                .with_last_check(shared_packages.last_check()),
+            );
             let lifecycle_store = Arc::new(TargetRecoveryStore::new(
                 Arc::clone(&store) as Arc<dyn Store>,
                 &policies,
             ));
-            let launcher = Arc::new(LifecycleLauncher::new(
-                host.id,
-                target_paths.clone(),
-                target_paths.logs_dir(),
-                1,
-                runner_manager_domain::attempt::RecoveryTimeouts::provisional(),
-                RetryPolicy::bounded(3, Duration::from_secs(2), Duration::from_secs(30)),
-                LifecyclePorts {
-                    store: Arc::clone(&lifecycle_store) as Arc<dyn Store>,
-                    github: Arc::clone(&lifecycle_github) as Arc<dyn LifecycleGithub>,
-                    packages: Arc::new(CachedRuntimePackages::new(cache)),
-                    processes: Arc::new(
-                        PlatformExecutionProvider::new(host.id)
-                            .with_runner_env_file(runner_manager_platform::runner_env::path_in(
-                                target_paths.config_dir(),
-                            ))
-                            .with_dependency_caches(dependency_caches.clone())
-                            .with_docker_cleanup(
-                                runner_manager_agent::docker_cleanup::DockerCleanup::new(
-                                    host.id,
+            let launcher = Arc::new(
+                LifecycleLauncher::new(
+                    host.id,
+                    target_paths.clone(),
+                    target_paths.logs_dir(),
+                    1,
+                    runner_manager_domain::attempt::RecoveryTimeouts::provisional(),
+                    RetryPolicy::bounded(3, Duration::from_secs(2), Duration::from_secs(30)),
+                    LifecyclePorts {
+                        store: Arc::clone(&lifecycle_store) as Arc<dyn Store>,
+                        github: Arc::clone(&lifecycle_github) as Arc<dyn LifecycleGithub>,
+                        packages: Arc::new(CachedRuntimePackages::new(cache, shared_packages)),
+                        processes: Arc::new(
+                            PlatformExecutionProvider::new(host.id)
+                                .with_runner_env_file(runner_manager_platform::runner_env::path_in(
                                     target_paths.config_dir(),
-                                    target_paths.state_dir(),
+                                ))
+                                .with_dependency_caches(dependency_caches.clone())
+                                .with_docker_cleanup(
+                                    runner_manager_agent::docker_cleanup::DockerCleanup::new(
+                                        host.id,
+                                        target_paths.config_dir(),
+                                        target_paths.state_dir(),
+                                    ),
                                 ),
-                            ),
-                    ),
-                    clock: Arc::clone(&clock),
-                    demand: Arc::new(PersistentDemand),
-                    delay: Arc::new(TokioRetryDelay),
-                    events: Arc::new(TracingAttemptEvents),
-                    reconcile_events: Arc::clone(&events),
-                },
-            ));
+                        ),
+                        clock: Arc::clone(&clock),
+                        demand: Arc::new(PersistentDemand),
+                        delay: Arc::new(TokioRetryDelay),
+                        events: Arc::new(TracingAttemptEvents),
+                        reconcile_events: Arc::clone(&events),
+                    },
+                )
+                .with_preparation_turns(preparation_turns),
+            );
             launcher
                 .recover_startup(&policies)
                 .await
@@ -3340,13 +3352,15 @@ mod tests {
     struct UnusedPackages;
 
     impl RuntimePackages for UnusedPackages {
-        fn materialize<'life0, 'life1, 'async_trait>(
+        fn materialize<'life0, 'life1, 'life2, 'async_trait>(
             &'life0 self,
             _attempt: &'life1 RunnerAttempt,
+            _timings: &'life2 mut runner_manager_agent::lifecycle::PackageTimings,
         ) -> Pin<Box<dyn Future<Output = Result<RunnerVersion, FailureReason>> + Send + 'async_trait>>
         where
             'life0: 'async_trait,
             'life1: 'async_trait,
+            'life2: 'async_trait,
             Self: 'async_trait,
         {
             Box::pin(async { panic!("startup recovery must not materialize a package") })
@@ -3359,7 +3373,6 @@ mod tests {
         fn prune_obsolete_guarded(
             &self,
             _authority: PruneAuthority<'_>,
-            _current: &RunnerVersion,
             _attempts: &[RunnerAttempt],
         ) -> Result<(), FailureReason> {
             Ok(())

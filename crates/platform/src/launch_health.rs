@@ -40,9 +40,10 @@ pub const BLOCKED_AFTER_DEFERRALS: u32 = 5;
 /// minutes of nothing but refusals is not.
 pub const BLOCKED_AFTER: Duration = Duration::from_secs(5 * 60);
 
-/// How long a launch fence may be held before it counts as stuck. A launch
-/// holds it through a package download, the registration and the spawn, which
-/// take minutes at worst.
+/// How long a launch fence may go without a new launch before it counts as
+/// stuck. A launch holds it through a package download, the registration and
+/// the spawn, which take minutes at worst, and launches in progress share it,
+/// each restarting its age.
 const FENCE_HELD_TOO_LONG: Duration = Duration::from_secs(30 * 60);
 
 /// How long a daemon's record counts after its last refusal. Refusals happen

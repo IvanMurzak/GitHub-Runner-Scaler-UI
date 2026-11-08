@@ -1002,14 +1002,12 @@ impl fmt::Display for OfflineState {
 pub struct LaunchRequest<'a> {
     pub host: &'a Host,
     pub policy: &'a ScalePolicy,
-    /// Proof that e1 still owns the host allocation lock for every package,
-    /// prune, and process-start effect performed by e3.
+    /// Proof that e1 owns the host allocation lock while e3 reserves the
+    /// runner and prunes what is obsolete.
     // Crate-visible so only this allocator can mint the request that reaches
     // package pruning. A caller holding an unrelated public AllocationLock can
     // no longer assemble a LaunchRequest and present that guard as authority.
     pub(crate) allocation_guard: &'a AllocationGuard,
-    /// How long this loop waited for that lock, for the launch's timings.
-    pub lock_wait: Duration,
 }
 
 /// Why one runner could not be started.
@@ -1178,7 +1176,31 @@ pub trait RunnerLauncher: fmt::Debug + Send + Sync {
     ///
     /// # Errors
     /// [`LaunchFailure`], carrying the [`FailureReason`] `e3` recorded.
+    ///
+    /// Called under the allocation lock, so it stops at what must be decided
+    /// there: the attempt, journalled, holding its slot. The runner itself is
+    /// [`Self::finish_launch`], outside the lock.
     async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure>;
+
+    /// Bring up a runner [`Self::launch`] reserved, after the host allocation
+    /// lock was released: its package, its registration and its process, none
+    /// of which decides a ceiling, and all of which may take minutes.
+    ///
+    /// The reservation is what holds the slot, and it is journalled, so another
+    /// allocator counts it from the moment the lock is let go, and a crash at
+    /// any point here leaves a journalled attempt that startup recovery
+    /// concludes. A launcher whose `launch` does everything keeps the default.
+    ///
+    /// # Errors
+    /// [`LaunchFailure`], carrying the [`FailureReason`] recorded.
+    async fn finish_launch(
+        &self,
+        _policy: &ScalePolicy,
+        attempt: RunnerAttempt,
+        _lock_wait: Duration,
+    ) -> Result<RunnerAttempt, LaunchFailure> {
+        Ok(attempt)
+    }
 
     /// Remove a terminal attempt's runtime and mark it `cleaned`.
     ///
@@ -1237,6 +1259,15 @@ impl RunnerLauncher for FitnessGatedLauncher {
         self.inner.launch(request).await
     }
 
+    async fn finish_launch(
+        &self,
+        policy: &ScalePolicy,
+        attempt: RunnerAttempt,
+        lock_wait: Duration,
+    ) -> Result<RunnerAttempt, LaunchFailure> {
+        self.inner.finish_launch(policy, attempt, lock_wait).await
+    }
+
     async fn clean(&self, attempt: AttemptId) -> Result<(), LaunchFailure> {
         self.inner.clean(attempt).await
     }
@@ -1253,6 +1284,7 @@ impl RunnerLauncher for FitnessGatedLauncher {
 /// would eventually branch on it.
 pub struct AllocationGuard {
     _held: Box<dyn std::any::Any + Send + Sync>,
+    launch_hold: LaunchHold,
 }
 
 impl AllocationGuard {
@@ -1261,8 +1293,23 @@ impl AllocationGuard {
     fn new<T: Send + Sync + 'static>(held: T) -> Self {
         Self {
             _held: Box::new(held),
+            launch_hold: LaunchHold::default(),
         }
     }
+
+    /// What a launch keeps after the lock is released; see [`LaunchHold`].
+    fn launch_hold(&self) -> LaunchHold {
+        self.launch_hold.clone()
+    }
+}
+
+/// What must stay held while a runner reserved under the allocation lock is
+/// brought up outside it. Empty, except where a boundary other than the lock
+/// must not be crossed by a launch in progress: see
+/// [`WslRecoveryAllocationLock`].
+#[derive(Clone, Default)]
+struct LaunchHold {
+    _held: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl fmt::Debug for AllocationGuard {
@@ -1389,9 +1436,13 @@ impl AllocationLock for FileAllocationLock {
 /// says on disk when allocations keep being refused.
 ///
 /// A Windows watchdog writes its drain request before attempting the same
-/// atomic directory claim. Therefore either this guard owns the directory and
-/// finishes the one launch already in progress, or Windows owns it and no new
-/// launch can pass. A malformed configured fence fails closed. A guest claim
+/// atomic directory claim. Therefore either this process owns the directory and
+/// finishes the launches already in progress, or Windows owns it and no new
+/// launch can pass. The claim is shared by every launch of this process, from
+/// its reservation until its runner is up ([`LaunchHold`]), and released with
+/// the last: a drain request refuses new reservations, so the launches in
+/// progress run out and Windows gets the directory, as when there was one.
+/// A malformed configured fence fails closed. A guest claim
 /// whose owner is provably gone is reclaimed first; see
 /// [`runner_manager_platform::wsl::fence`].
 ///
@@ -1417,6 +1468,8 @@ pub struct WslRecoveryAllocationLock {
     /// A quiet spell this long between refusals starts a new run.
     streak_gap: Duration,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// The claim the launches in progress share; taking it is serialised.
+    claim: tokio::sync::Mutex<std::sync::Weak<LaunchFenceGuard>>,
     refusals: Mutex<Refusals>,
 }
 
@@ -1484,6 +1537,7 @@ impl WslRecoveryAllocationLock {
             blocked_after: BLOCKED_AFTER,
             streak_gap: BLOCKED_AFTER,
             in_flight: Arc::default(),
+            claim: tokio::sync::Mutex::default(),
             refusals: Mutex::default(),
         }
     }
@@ -1568,60 +1622,82 @@ impl WslRecoveryAllocationLock {
     }
 }
 
+/// Claim the guest launch fence under `root`, or say what holds it.
+fn claim_guest_fence(
+    root: &std::path::Path,
+) -> Result<Arc<LaunchFenceGuard>, runner_manager_platform::launch_health::BlockCause> {
+    use runner_manager_platform::launch_health::BlockCause;
+    use runner_manager_platform::wsl::fence::{
+        FENCE_DIRECTORY, FenceClaim, GuestClaimAttempt, try_claim_guest_launch,
+    };
+
+    match try_claim_guest_launch(root) {
+        Ok(GuestClaimAttempt::Claimed { claim, reclaimed }) => {
+            if let Some(reclaimed) = reclaimed {
+                tracing::warn!(
+                    shared_root = %root.display(),
+                    %reclaimed,
+                    "reclaimed a WSL launch fence claim whose owner is gone"
+                );
+            }
+            // Guarded at once, so a claim let go on the drain path is released
+            // -- and logged when it cannot be -- like any other.
+            Ok(Arc::new(LaunchFenceGuard(Some(claim))))
+        }
+        Ok(GuestClaimAttempt::Busy) => {
+            let directory = root.join(FENCE_DIRECTORY);
+            Err(match FenceClaim::owner(root) {
+                Ok(owner) => BlockCause::FenceHeld { directory, owner },
+                Err(error) => BlockCause::FenceOwnerUnreadable {
+                    directory,
+                    detail: error.to_string(),
+                },
+            })
+        }
+        Err(error) => {
+            // An owner record nobody can decode stops the reclaim the same way
+            // on every pass; name it rather than the config.
+            Err(match FenceClaim::owner(root) {
+                Err(owner_error) => BlockCause::FenceOwnerUnreadable {
+                    directory: root.join(FENCE_DIRECTORY),
+                    detail: owner_error.to_string(),
+                },
+                Ok(_) => BlockCause::FenceUnusable {
+                    detail: error.to_string(),
+                },
+            })
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl AllocationLock for WslRecoveryAllocationLock {
     async fn acquire(&self) -> Result<AllocationGuard, AllocationLockBusy> {
         use runner_manager_platform::launch_health::BlockCause;
-        use runner_manager_platform::wsl::fence::{
-            DrainRequest, FENCE_DIRECTORY, FenceClaim, GuestClaimAttempt, GuestRecoveryConfig,
-            try_claim_guest_launch,
-        };
+        use runner_manager_platform::wsl::fence::{DrainRequest, GuestRecoveryConfig};
 
         let paths = Arc::clone(&self.paths);
+        let mut shared = self.claim.lock().await;
+        let held = shared.upgrade();
         let claim = tokio::task::spawn_blocking(move || {
             let unusable = |error: &dyn fmt::Display| BlockCause::FenceUnusable {
                 detail: error.to_string(),
             };
             let config = match GuestRecoveryConfig::read(&paths) {
                 Ok(Some(config)) => config,
-                Ok(None) => return Ok(LaunchFenceGuard(None)),
+                Ok(None) => return Ok(Arc::new(LaunchFenceGuard(None))),
                 Err(error) => return Err(unusable(&error)),
             };
             let root = config.shared_root;
-            let claim = match try_claim_guest_launch(&root) {
-                Ok(GuestClaimAttempt::Claimed { claim, reclaimed }) => {
-                    if let Some(reclaimed) = reclaimed {
-                        tracing::warn!(
-                            shared_root = %root.display(),
-                            %reclaimed,
-                            "reclaimed a WSL launch fence claim whose owner is gone"
-                        );
+            let claim = match held {
+                // A launch of this process already owns the directory.
+                Some(held) => {
+                    if let Some(Err(error)) = held.0.as_ref().map(|claim| claim.renew()) {
+                        tracing::warn!(%error, "the WSL launch fence's age could not be renewed");
                     }
-                    // Guarded at once, so a claim let go on the drain path below
-                    // is released -- and logged when it cannot be -- like any other.
-                    LaunchFenceGuard(Some(claim))
+                    held
                 }
-                Ok(GuestClaimAttempt::Busy) => {
-                    let directory = root.join(FENCE_DIRECTORY);
-                    return Err(match FenceClaim::owner(&root) {
-                        Ok(owner) => BlockCause::FenceHeld { directory, owner },
-                        Err(error) => BlockCause::FenceOwnerUnreadable {
-                            directory,
-                            detail: error.to_string(),
-                        },
-                    });
-                }
-                Err(error) => {
-                    // An owner record nobody can decode stops the reclaim the
-                    // same way on every pass; name it rather than the config.
-                    return Err(match FenceClaim::owner(&root) {
-                        Err(owner_error) => BlockCause::FenceOwnerUnreadable {
-                            directory: root.join(FENCE_DIRECTORY),
-                            detail: owner_error.to_string(),
-                        },
-                        Ok(_) => unusable(&error),
-                    });
-                }
+                None => claim_guest_fence(&root)?,
             };
             match DrainRequest::read(&root) {
                 Ok(None) => Ok(claim),
@@ -1635,10 +1711,15 @@ impl AllocationLock for WslRecoveryAllocationLock {
         let claim = match claim {
             Ok(claim) => claim,
             Err(cause) => {
+                drop(shared);
                 self.note_refused(&cause);
                 return Err(AllocationLockBusy);
             }
         };
+        if claim.0.is_some() {
+            *shared = Arc::downgrade(&claim);
+        }
+        drop(shared);
         let Ok(inner) = self.inner.acquire().await else {
             self.note_refused(&BlockCause::AllocationLockBusy {
                 path: self
@@ -1650,7 +1731,11 @@ impl AllocationLock for WslRecoveryAllocationLock {
         };
         self.note_granted();
         let in_flight = InFlight::enter(&self.in_flight);
-        Ok(AllocationGuard::new((claim, inner, in_flight)))
+        let mut guard = AllocationGuard::new(inner);
+        guard.launch_hold = LaunchHold {
+            _held: Some(Arc::new((claim, in_flight))),
+        };
+        Ok(guard)
     }
 }
 
@@ -2280,6 +2365,32 @@ pub trait DemandDirector: fmt::Debug + Send + Sync {
     /// A runner was started for `policy` (as soon as it exists, whether or
     /// not its demand was directed).
     fn launched(&self, policy: &ScalePolicy, attempt: AttemptId);
+
+    /// No runner could be started for `policy`, for a real reason: not a
+    /// runner still being brought up. `attempt` is the one reported through
+    /// [`Self::launched`] whose bring-up failed, if it got that far: what it was
+    /// reported for is waiting again, to be retried rather than placed anew.
+    fn start_failed(&self, _policy: &ScalePolicy, _attempt: Option<AttemptId>) {}
+
+    /// Whether an older launch of another policy on this host still has no
+    /// runner, so `policy` should let its target's loop reserve first.
+    fn older_waiting(&self, _policy: &ScalePolicy) -> bool {
+        false
+    }
+}
+
+/// How long a pass lets older launches of other policies reserve first.
+const OLDER_LAUNCH_TURN: Duration = Duration::from_secs(2);
+const OLDER_LAUNCH_POLL: Duration = Duration::from_millis(100);
+
+/// A runner reserved under the allocation lock, to bring up outside it.
+struct Reserved {
+    policy: ScalePolicy,
+    attempt: RunnerAttempt,
+    lock_wait: Duration,
+    reserved_at: std::time::Instant,
+    /// Let go when this runner is up or has failed.
+    _hold: LaunchHold,
 }
 
 /// Every policy's demand is its own reading: no coordinator places runners.
@@ -2641,7 +2752,7 @@ impl Reconciler {
     /// in [`Self::reconcile`]; the next full pass supervises them.
     pub async fn start_directed(&mut self, policies: &[ScalePolicy]) -> ReconcileReport {
         let mut report = ReconcileReport::default();
-        let mut launched: Vec<RunnerAttempt> = Vec::new();
+        let mut reserved: Vec<Reserved> = Vec::new();
         for policy in policies {
             if !policy.owns_runners()
                 || !policy.is_owned_by(self.host.id)
@@ -2650,10 +2761,11 @@ impl Reconciler {
                 continue;
             }
             if let Some(directed) = self.director.directed_demand(policy) {
-                self.start_runners(policy, directed, &mut report, &mut launched)
+                self.start_runners(policy, directed, &mut report, &mut reserved)
                     .await;
             }
         }
+        self.finish_reserved(reserved, &mut report).await;
         report
     }
 
@@ -2675,7 +2787,7 @@ impl Reconciler {
         // Everything this pass has created, carried across policies so that the
         // host-wide total cannot be computed from a set that is missing it. See
         // `RunnerLauncher::launch`.
-        let mut launched: Vec<RunnerAttempt> = Vec::new();
+        let mut reserved: Vec<Reserved> = Vec::new();
 
         // --- Flow 2.1-2.2: who is even asking, and what did GitHub say -------
         let mut pollable: Vec<&ScalePolicy> = Vec::new();
@@ -2780,7 +2892,7 @@ impl Reconciler {
                 // Ownership rule 2 and precedence rule 4. Allocated for with no
                 // demand, so the refusal is reported by name rather than by
                 // absence.
-                match self.allocate_only(policy, 0, &launched).await {
+                match self.allocate_only(policy, 0, &reserved).await {
                     Ok(allocation) => {
                         self.emit_allocation(&allocation);
                         report.allocations.push(allocation);
@@ -2796,7 +2908,7 @@ impl Reconciler {
             // here are the demand, whatever this host's own reading says (or
             // whether it could read at all).
             if let Some(directed) = self.director.directed_demand(policy) {
-                self.start_runners(policy, directed, &mut report, &mut launched)
+                self.start_runners(policy, directed, &mut report, &mut reserved)
                     .await;
                 continue;
             }
@@ -2827,11 +2939,12 @@ impl Reconciler {
                         unresolvable: u32::try_from(tally.unresolvable.len()).unwrap_or(u32::MAX),
                         complete: demand.is_complete(),
                     });
-                    self.start_runners(policy, count, &mut report, &mut launched)
+                    self.start_runners(policy, count, &mut report, &mut reserved)
                         .await;
                 }
             }
         }
+        self.finish_reserved(reserved, &mut report).await;
 
         // --- Flow 2.1 / 3.3: when to come back ------------------------------
         let failure = readings
@@ -2928,7 +3041,7 @@ impl Reconciler {
         &self,
         policy: &ScalePolicy,
         demand: u32,
-        launched: &[RunnerAttempt],
+        reserved: &[Reserved],
     ) -> Result<Allocation, AllocationFailure> {
         // Read again under the shared launch lock, not just at each target's
         // poll boundary: another target must not use an old, higher ceiling.
@@ -2939,7 +3052,7 @@ impl Reconciler {
             .await
             .map_err(AllocationFailure::HostCapacity)?;
         let attempts = self
-            .host_attempts(launched)
+            .host_attempts(reserved)
             .await
             .map_err(AllocationFailure::Attempts)?;
         let mut allocator = HostAllocator::from_attempts(&host, &attempts);
@@ -2972,7 +3085,7 @@ impl Reconciler {
         policy: &ScalePolicy,
         demand: u32,
         report: &mut ReconcileReport,
-        launched: &mut Vec<RunnerAttempt>,
+        reserved: &mut Vec<Reserved>,
     ) {
         // A lock-free pre-check, for one reason only: the host-wide lock should
         // not be taken by a policy that is going to be granted nothing. On an
@@ -2985,10 +3098,11 @@ impl Reconciler {
         // thing it can get wrong in the other direction is refusing a grant that
         // headroom freed a moment later would have allowed, which the next poll
         // picks up.
-        let intent = match self.allocate_only(policy, demand, launched).await {
+        let intent = match self.allocate_only(policy, demand, reserved).await {
             Ok(intent) => intent,
             Err(failure) => {
                 self.report_allocation_failure(report, &failure);
+                self.director.start_failed(policy, None);
                 return;
             }
         };
@@ -2998,8 +3112,16 @@ impl Reconciler {
         // pre-check stands in only when no hold was ever obtained.
         let mut decided: Option<Allocation> = None;
         let mut budget = intent.to_start;
+        let turn_limit = tokio::time::Instant::now() + OLDER_LAUNCH_TURN;
 
         while budget > 0 {
+            // Oldest first across targets. Each target's loop reserves for its
+            // own launches, and may be anywhere in its pass: so a younger launch
+            // lets an older one go first, briefly, and never for long enough to
+            // matter if that one's loop is occupied.
+            while self.director.older_waiting(policy) && tokio::time::Instant::now() < turn_limit {
+                tokio::time::sleep(OLDER_LAUNCH_POLL).await;
+            }
             let waiting_since = std::time::Instant::now();
             let guard = match self.lock.acquire().await {
                 Ok(guard) => guard,
@@ -3011,21 +3133,25 @@ impl Reconciler {
                         policy: policy.id,
                         count: budget,
                     });
+                    // The lock is held briefly now, so this is not a turn: a
+                    // Windows drain, the fence, or another process.
+                    self.director.start_failed(policy, None);
                     break;
                 }
             };
             let lock_wait = waiting_since.elapsed();
 
             // The read and the decision are both inside the hold, and so is the
-            // creation below. Two concurrent passes therefore serialise on the
+            // journalled reservation below. Two concurrent passes therefore serialise on the
             // whole sequence rather than on the decision alone -- reading the
             // headroom outside the lock is the shape in which two policies both
             // find room for the last slot.
-            let allocation = match self.allocate_only(policy, demand, launched).await {
+            let allocation = match self.allocate_only(policy, demand, reserved).await {
                 Ok(allocation) => allocation,
                 Err(failure) => {
                     drop(guard);
                     self.report_allocation_failure(report, &failure);
+                    self.director.start_failed(policy, None);
                     break;
                 }
             };
@@ -3051,34 +3177,31 @@ impl Reconciler {
                     host: &self.host,
                     policy,
                     allocation_guard: &guard,
-                    lock_wait,
                 })
                 .await;
+            let hold = guard.launch_hold();
             drop(guard);
 
             match created {
                 Ok(attempt) => {
                     let id = attempt.id;
+                    // At once, not once it is up: the launch has its runner, and
+                    // the runner's report names the launch it was started for.
+                    self.director.launched(policy, id);
+                    budget -= 1;
                     // Carried across policies for the rest of this pass, so the
                     // host-wide total cannot be computed from a set that is
                     // missing it. See `RunnerLauncher::launch`.
-                    launched.push(attempt);
-                    // At once, not after the pass: the runner may take a job
-                    // while the next one starts, and its report names the
-                    // launch it was started for.
-                    self.director.launched(policy, id);
-                    report.started = report.started.saturating_add(1);
-                    budget -= 1;
-                    self.events.emit(LifecycleEvent::RunnerStarted {
-                        policy: policy.id,
-                        attempt: id,
+                    reserved.push(Reserved {
+                        policy: policy.clone(),
+                        attempt,
+                        lock_wait,
+                        reserved_at: std::time::Instant::now(),
+                        _hold: hold,
                     });
                 }
                 Err(failure) => {
-                    self.events.emit(LifecycleEvent::RunnerStartFailed {
-                        policy: policy.id,
-                        reason: failure_reason_kind(&failure.reason),
-                    });
+                    self.note_start_failed(policy, None, &failure);
                     break;
                 }
             }
@@ -3087,6 +3210,52 @@ impl Reconciler {
         let allocation = decided.unwrap_or(intent);
         self.emit_allocation(&allocation);
         report.allocations.push(allocation);
+    }
+
+    /// Bring up what this pass reserved, together and outside the allocation
+    /// lock, so one slow package holds up neither another runner nor another
+    /// target. How many prepare at once is the launcher's to bound.
+    ///
+    /// Awaited within the pass, because supervision is what would otherwise see
+    /// these attempts half made: one target's attempts are only ever supervised
+    /// by its own loop, which is here.
+    async fn finish_reserved(&self, reserved: Vec<Reserved>, report: &mut ReconcileReport) {
+        let finished = futures::future::join_all(reserved.into_iter().map(|reserved| async move {
+            let id = reserved.attempt.id;
+            let waited = reserved.lock_wait + reserved.reserved_at.elapsed();
+            let result = self
+                .launcher
+                .finish_launch(&reserved.policy, reserved.attempt, waited)
+                .await;
+            // Told here and not after the others are up: the journal already
+            // says this one failed, and the attempt reports read it.
+            match &result {
+                Ok(_) => self.events.emit(LifecycleEvent::RunnerStarted {
+                    policy: reserved.policy.id,
+                    attempt: id,
+                }),
+                Err(failure) => self.note_start_failed(&reserved.policy, Some(id), failure),
+            }
+            result.is_ok()
+        }))
+        .await;
+        let started = finished.into_iter().filter(|started| *started).count();
+        report.started = report
+            .started
+            .saturating_add(u16::try_from(started).unwrap_or(u16::MAX));
+    }
+
+    fn note_start_failed(
+        &self,
+        policy: &ScalePolicy,
+        attempt: Option<AttemptId>,
+        failure: &LaunchFailure,
+    ) {
+        self.events.emit(LifecycleEvent::RunnerStartFailed {
+            policy: policy.id,
+            reason: failure_reason_kind(&failure.reason),
+        });
+        self.director.start_failed(policy, attempt);
     }
 
     /// The attempt set the host holds, plus everything this pass has already
@@ -3103,7 +3272,7 @@ impl Reconciler {
     /// Whatever [`RunnerLauncher::attempts`] reported.
     async fn host_attempts(
         &self,
-        launched: &[RunnerAttempt],
+        reserved: &[Reserved],
     ) -> Result<Vec<RunnerAttempt>, LaunchFailure> {
         let mut attempts = self.launcher.attempts().await?;
 
@@ -3114,12 +3283,12 @@ impl Reconciler {
         // duplicate instead. `RunnerLauncher::launch` states the requirement;
         // this is what makes it findable.
         debug_assert!(
-            launched
+            reserved
                 .iter()
-                .map(|attempt| attempt.id)
+                .map(|reserved| reserved.attempt.id)
                 .collect::<BTreeSet<AttemptId>>()
                 .len()
-                == launched.len(),
+                == reserved.len(),
             "`RunnerLauncher::launch` returned an AttemptId this pass had already seen; \
              the host ceiling is enforced against a set keyed on that identifier, so a \
              duplicate is two runtimes counted as one"
@@ -3127,10 +3296,10 @@ impl Reconciler {
 
         let known: BTreeSet<AttemptId> = attempts.iter().map(|attempt| attempt.id).collect();
         attempts.extend(
-            launched
+            reserved
                 .iter()
-                .filter(|attempt| !known.contains(&attempt.id))
-                .cloned(),
+                .filter(|reserved| !known.contains(&reserved.attempt.id))
+                .map(|reserved| reserved.attempt.clone()),
         );
         Ok(attempts)
     }
@@ -4053,10 +4222,15 @@ mod tests {
     async fn refusals_while_this_process_is_launching_are_its_own_contention() {
         use runner_manager_platform::launch_health::recorded_launches_blocked;
 
-        let (_local, _shared, paths) = guest_paths();
+        use runner_manager_platform::wsl::fence::DrainRequest;
+
+        let (_local, shared, paths) = guest_paths();
         let lock = WslRecoveryAllocationLock::new(Arc::clone(&paths), Arc::new(NoLock))
             .with_blocked_after(1, Duration::ZERO);
         let launching = lock.acquire().await.unwrap();
+        DrainRequest::new(1, chrono::Utc::now())
+            .write(shared.path())
+            .unwrap();
         for _ in 0..3 {
             assert!(lock.acquire().await.is_err());
         }
@@ -4065,6 +4239,61 @@ mod tests {
             None
         );
         drop(launching);
+    }
+
+    /// The launches of this process share the guest claim from reservation to
+    /// runner: the other target's launch is not refused, and Windows gets the
+    /// directory only when the last has ended.
+    #[tokio::test]
+    async fn launches_in_progress_share_the_fence_until_the_last_ends() {
+        use runner_manager_platform::wsl::fence::{DrainRequest, FenceClaim, FenceOwnerKind};
+
+        let (_local, shared, paths) = guest_paths();
+        let lock = WslRecoveryAllocationLock::new(paths, Arc::new(NoLock));
+        let claimed = |root: &std::path::Path| FenceClaim::owner(root).unwrap().is_some();
+
+        let first = lock.acquire().await.unwrap();
+        let first_runner = first.launch_hold();
+        drop(first);
+        assert!(claimed(shared.path()), "held while its runner comes up");
+
+        let claimed_at = FenceClaim::owner(shared.path())
+            .unwrap()
+            .unwrap()
+            .acquired_at;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = lock.acquire().await.expect("this process owns the fence");
+        assert!(
+            FenceClaim::owner(shared.path())
+                .unwrap()
+                .unwrap()
+                .acquired_at
+                > claimed_at,
+            "a claim launches keep sharing is not one stuck for that long"
+        );
+        let second_runner = second.launch_hold();
+        drop(second);
+        drop(first_runner);
+        assert!(claimed(shared.path()), "the other launch is still running");
+
+        // A drain stops new launches and lets the one in progress finish.
+        DrainRequest::new(1, chrono::Utc::now())
+            .write(shared.path())
+            .unwrap();
+        assert!(lock.acquire().await.is_err());
+        assert!(claimed(shared.path()));
+        assert!(
+            FenceClaim::try_claim(shared.path(), FenceOwnerKind::WindowsRecovery, Some(1))
+                .unwrap()
+                .is_none()
+        );
+        drop(second_runner);
+        assert!(!claimed(shared.path()), "the last one lets it go");
+        assert!(
+            FenceClaim::try_claim(shared.path(), FenceOwnerKind::WindowsRecovery, Some(1))
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Refusals separated by quiet spells -- brief contention days apart --
@@ -7212,6 +7441,9 @@ mod tests {
     struct FixedDirector {
         directed: Mutex<BTreeMap<PolicyId, u32>>,
         started: Mutex<Vec<(PolicyId, AttemptId)>>,
+        failed: Mutex<Vec<(PolicyId, Option<AttemptId>)>>,
+        /// How many more times an older launch is said to be waiting.
+        older: AtomicUsize,
     }
 
     impl DemandDirector for FixedDirector {
@@ -7222,6 +7454,224 @@ mod tests {
         fn launched(&self, policy: &ScalePolicy, attempt: AttemptId) {
             self.started.lock().unwrap().push((policy.id, attempt));
         }
+
+        fn start_failed(&self, policy: &ScalePolicy, attempt: Option<AttemptId>) {
+            self.failed.lock().unwrap().push((policy.id, attempt));
+        }
+
+        fn older_waiting(&self, _policy: &ScalePolicy) -> bool {
+            self.older
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+        }
+    }
+
+    /// A launcher that holds every runner in its bring-up until as many others
+    /// (or the test) are at the barrier.
+    #[derive(Debug)]
+    struct HeldBringUp {
+        inner: Arc<FakeLauncher>,
+        barrier: Arc<tokio::sync::Barrier>,
+        fail: Option<FailureReason>,
+    }
+
+    #[async_trait::async_trait]
+    impl RunnerLauncher for HeldBringUp {
+        async fn host_capacity(&self, host: &Host) -> Result<NonZeroU16, HostCapacityError> {
+            self.inner.host_capacity(host).await
+        }
+
+        async fn supervise(
+            &self,
+            policy: &ScalePolicy,
+        ) -> Result<Vec<ReplacementIntent>, LaunchFailure> {
+            self.inner.supervise(policy).await
+        }
+
+        async fn attempts(&self) -> Result<Vec<RunnerAttempt>, LaunchFailure> {
+            self.inner.attempts().await
+        }
+
+        async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure> {
+            self.inner.launch(request).await
+        }
+
+        async fn finish_launch(
+            &self,
+            _policy: &ScalePolicy,
+            attempt: RunnerAttempt,
+            _lock_wait: Duration,
+        ) -> Result<RunnerAttempt, LaunchFailure> {
+            self.barrier.wait().await;
+            match &self.fail {
+                Some(reason) => Err(LaunchFailure::new(reason.clone())),
+                None => Ok(attempt),
+            }
+        }
+
+        async fn clean(&self, attempt: AttemptId) -> Result<(), LaunchFailure> {
+            self.inner.clean(attempt).await
+        }
+    }
+
+    fn directed_reconciler(
+        capacity: u16,
+        launcher: Arc<dyn RunnerLauncher>,
+        lock: Arc<dyn AllocationLock>,
+        director: Arc<FixedDirector>,
+    ) -> Reconciler {
+        Reconciler::new(
+            host_with(capacity),
+            ReconcilerPorts {
+                demand: Arc::new(FakeDemand::ready(0, &repo("acme/app"))),
+                launcher,
+                lock,
+                directory: Arc::new(FakeDirectory::default()),
+                clock: Arc::new(FakeClock::default()),
+                jitter: Arc::new(NoJitter),
+                events: Arc::new(NoEvents),
+            },
+        )
+        .with_director(director as Arc<dyn DemandDirector>)
+    }
+
+    /// Two targets' runners are being brought up at the same time: each is at
+    /// the barrier with the allocation lock released, or neither gets there.
+    #[tokio::test]
+    async fn two_targets_bring_up_their_runners_at_once() {
+        let fake = Arc::new(FakeLauncher::new());
+        let lock: Arc<dyn AllocationLock> = Arc::new(InProcessAllocationLock::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let held = Arc::new(HeldBringUp {
+            inner: Arc::clone(&fake),
+            barrier,
+            fail: None,
+        });
+        let director = Arc::new(FixedDirector::default());
+        let (one, two) = (policy(1, "acme/app", 2), policy(2, "acme/other", 2));
+        director.directed.lock().unwrap().insert(one.id, 1);
+        director.directed.lock().unwrap().insert(two.id, 1);
+        let mut first = directed_reconciler(
+            2,
+            Arc::clone(&held) as _,
+            Arc::clone(&lock),
+            Arc::clone(&director),
+        );
+        let mut second = directed_reconciler(2, held as _, lock, director);
+
+        let (a, b) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                first.start_directed(std::slice::from_ref(&one)),
+                second.start_directed(std::slice::from_ref(&two)),
+            )
+        })
+        .await
+        .expect("neither waits for the other's bring-up");
+        assert_eq!((a.started, b.started), (1, 1));
+    }
+
+    /// No oversubscription: the slot is held from the reservation, while the
+    /// runner is still being brought up and the lock is free.
+    #[tokio::test]
+    async fn a_runner_coming_up_holds_its_slot_against_another_target() {
+        let fake = Arc::new(FakeLauncher::new());
+        let lock: Arc<dyn AllocationLock> = Arc::new(InProcessAllocationLock::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let held = Arc::new(HeldBringUp {
+            inner: Arc::clone(&fake),
+            barrier: Arc::clone(&barrier),
+            fail: None,
+        });
+        let director = Arc::new(FixedDirector::default());
+        let (one, two) = (policy(1, "acme/app", 2), policy(2, "acme/other", 2));
+        director.directed.lock().unwrap().insert(one.id, 1);
+        director.directed.lock().unwrap().insert(two.id, 1);
+        let mut first = directed_reconciler(
+            1,
+            Arc::clone(&held) as _,
+            Arc::clone(&lock),
+            Arc::clone(&director),
+        );
+        let mut second = directed_reconciler(1, held as _, lock, director);
+
+        let (a, b) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(first.start_directed(std::slice::from_ref(&one)), async {
+                while fake.live_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+                let report = second.start_directed(std::slice::from_ref(&two)).await;
+                barrier.wait().await;
+                report
+            })
+        })
+        .await
+        .expect("the first is let go");
+        assert_eq!((a.started, b.started), (1, 0));
+        assert_eq!(fake.live_count(), 1);
+    }
+
+    /// The launch was given its runner at the reservation, and a bring-up that
+    /// fails says so, rather than counting as started.
+    #[tokio::test]
+    async fn a_failed_bring_up_is_a_failed_start() {
+        let fake = Arc::new(FakeLauncher::new());
+        let held = Arc::new(HeldBringUp {
+            inner: fake,
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+            fail: Some(FailureReason::JitRequestFailed),
+        });
+        let director = Arc::new(FixedDirector::default());
+        let pool = policy(1, "acme/app", 2);
+        director.directed.lock().unwrap().insert(pool.id, 1);
+        let mut reconciler = directed_reconciler(
+            2,
+            held as _,
+            Arc::new(InProcessAllocationLock::new()),
+            Arc::clone(&director),
+        );
+
+        let report = reconciler.start_directed(std::slice::from_ref(&pool)).await;
+
+        assert_eq!(report.started, 0);
+        let started = director.started.lock().unwrap()[0].1;
+        assert_eq!(
+            *director.failed.lock().unwrap(),
+            vec![(pool.id, Some(started))]
+        );
+    }
+
+    /// Oldest first across targets: a younger launch waits for an older one to
+    /// get its runner, and not indefinitely when that one's loop is occupied.
+    #[tokio::test(start_paused = true)]
+    async fn a_younger_launch_lets_an_older_one_reserve_first_for_a_bounded_time() {
+        let fake = Arc::new(FakeLauncher::new());
+        let director = Arc::new(FixedDirector::default());
+        let pool = policy(1, "acme/app", 3);
+        director.directed.lock().unwrap().insert(pool.id, 1);
+        let mut reconciler = directed_reconciler(
+            5,
+            Arc::clone(&fake) as _,
+            Arc::new(InProcessAllocationLock::new()),
+            Arc::clone(&director),
+        );
+
+        // The older launch gets its runner after three looks.
+        director.older.store(3, Ordering::SeqCst);
+        let began = tokio::time::Instant::now();
+        let report = reconciler.start_directed(std::slice::from_ref(&pool)).await;
+        assert_eq!(report.started, 1);
+        assert_eq!(began.elapsed(), OLDER_LAUNCH_POLL * 3);
+
+        // It never does.
+        director.directed.lock().unwrap().insert(pool.id, 2);
+        director.older.store(usize::MAX, Ordering::SeqCst);
+        let began = tokio::time::Instant::now();
+        let report = reconciler.start_directed(std::slice::from_ref(&pool)).await;
+        assert_eq!(report.started, 1, "started anyway");
+        assert!(began.elapsed() >= OLDER_LAUNCH_TURN);
+        assert!(began.elapsed() < OLDER_LAUNCH_TURN + Duration::from_secs(1));
     }
 
     /// Coordinated placement: a directed policy starts runners for the
