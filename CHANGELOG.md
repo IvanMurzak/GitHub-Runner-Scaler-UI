@@ -39,6 +39,19 @@ the version being prepared rather than the version in `Cargo.toml`.
   alone, with no migration, and hosts of any version are unaffected. See
   [Job statistics](docs/coordinator.md#job-statistics).
 
+### Security
+
+- **An edit a job makes to the shared runner package no longer reaches later jobs'
+  runners.** 0.4.49 shares a prepared package between attempts, and on Windows did
+  not look at it again. Each launch's copy is now read in full against what the
+  package's digest-verified archive holds, outside the host lock. One that differs is
+  removed and not used, and a shared package that differs too is prepared again
+  (`package_copy_differs`, `package_verify_failed`). Windows now downloads the package
+  at the first launch after a daemon starts, as Linux and macOS already did. Jobs on
+  one account, and above all a boot-mode host whose jobs run as root or LocalSystem, are
+  still not isolated: see
+  [what this does and does not guarantee](docs/coordinator.md#shared-runner-packages).
+
 ### Added
 
 - **The coordinator's log says why a host does not fit a job.** `a pool queue was

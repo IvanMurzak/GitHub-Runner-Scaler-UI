@@ -47,7 +47,9 @@ use secrecy::SecretString;
 
 use crate::dependency_caches::DependencyCaches;
 use crate::oci::OciProcesses;
-use crate::package::{InstalledPackage, LastCheck, PackageCache, PackageError, RunnerVersion};
+use crate::package::{
+    InstalledPackage, LastCheck, PackageCache, PackageContents, PackageError, RunnerVersion,
+};
 use crate::reconcile::{
     AllocationGuard, CleanBackoff, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent,
     OutcomeKind, ReplacementIntent, ReservationWaits, RunnerLauncher, failure_reason_kind,
@@ -643,6 +645,27 @@ pub struct SharedPackages {
 }
 
 impl SharedPackages {
+    /// Stops trusting a shared package, unless a later install has replaced the
+    /// record this launch read: that one is another package's. The next launch
+    /// prepares it again.
+    fn discard(
+        &self,
+        root: &Path,
+        origin: &Path,
+        contents: &Arc<PackageContents>,
+        reason: &'static str,
+    ) {
+        if self.trusted.forget_if_holding(root, contents) {
+            tracing::warn!(
+                event = "package_verify_failed",
+                reason,
+                "a shared runner package does not match its verified archive; it is discarded \
+                 and prepared again"
+            );
+            self.trusted.forget(origin);
+        }
+    }
+
     /// What an install ended in, for the launches queued behind it. A terminal
     /// failure is not shared: it would close each of them, with no retry of its
     /// own, and one that succeeded clears the last failure.
@@ -681,6 +704,17 @@ impl SharedPackages {
     pub(crate) async fn copying(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
         self.trees.read().await
     }
+
+    /// Trusts `root`'s look as it is now, keeping what it must hold: what an edit
+    /// no fingerprint can see leaves behind, as on Windows, or by a superuser.
+    pub(crate) fn blind_to_edits_of(&self, root: &Path) {
+        let contents = self.trusted.contents_of(root);
+        self.trusted.record(root, contents).expect("recorded");
+    }
+
+    pub(crate) fn vouches_for(&self, root: &Path) -> bool {
+        self.trusted.contents_of(root).is_some()
+    }
 }
 
 /// Production package adapter.  It takes an e2 lease before returning, so a
@@ -718,6 +752,42 @@ impl CachedRuntimePackages {
     #[must_use]
     pub const fn new(cache: Arc<PackageCache>, shared: SharedPackages) -> Self {
         Self { cache, shared }
+    }
+
+    /// A copy that cannot be used: removed, and the trees it came from read to see
+    /// whose fault it is. A runtime can be touched by a job, or sit on a disk with a
+    /// fault, and that is no reason to download anything. A tree that differs is
+    /// discarded, and prepared again by the next launch that needs it.
+    async fn reject_copy(
+        &self,
+        attempt: &RunnerAttempt,
+        root: &Path,
+        origin: &Path,
+        contents: &Arc<PackageContents>,
+        timings: &mut PackageTimings,
+    ) -> Result<(), FailureReason> {
+        let (attempt_copy, checking, from) =
+            (attempt.clone(), Arc::clone(contents), origin.to_path_buf());
+        let differs = timed(
+            &mut timings.verify,
+            self.blocking(root, move |_, source| {
+                let _ = remove_materialized_package(&attempt_copy);
+                let shared = checking.verify(source, |_| false);
+                shared.and_then(|()| {
+                    if from == source {
+                        Ok(())
+                    } else {
+                        checking.verify(&from, |_| false)
+                    }
+                })
+            }),
+        )
+        .await?;
+        if let Err(mismatch) = differs {
+            self.shared
+                .discard(root, origin, contents, mismatch.as_str());
+        }
+        Ok(())
     }
 
     /// The tree a runtime can be copied from right now, under nothing more than
@@ -768,17 +838,27 @@ impl CachedRuntimePackages {
             )
             .await?;
         if fresh && !downloaded {
+            // After a restart there is simply no record. With one, this is an edit.
+            if self.shared.trusted.contents_of(installed.root()).is_some() {
+                tracing::warn!(
+                    event = "package_verify_failed",
+                    reason = "changed",
+                    "a shared runner package changed since it was prepared; it is discarded and \
+                     prepared again"
+                );
+            }
             installed = timed(&mut timings.install, self.cache.reinstall())
                 .await
                 .map_err(package_failure)?;
             timings.downloaded = true;
         }
         let destination = destination.to_path_buf();
+        let contents = installed.contents();
         let origin = timed(
             &mut timings.verify,
             self.blocking(installed.root(), move |trusted, source| {
                 if fresh {
-                    trusted.record(source)?;
+                    trusted.record(source, contents)?;
                 }
                 Ok::<_, std::io::Error>(copy_origin(source, &destination, trusted))
             }),
@@ -828,20 +908,30 @@ impl RuntimePackages for CachedRuntimePackages {
                 break (exclusive.downgrade(), ready);
             }
         };
+        // Taken under the hold, so it is the record of the tree this copies. None
+        // vouches for a tree with no record: before it is copied, not after.
+        let Some(contents) = self.shared.trusted.contents_of(installed.root()) else {
+            self.shared.trusted.forget(installed.root());
+            return Err(FailureReason::ProcessStartFailed);
+        };
+        let copied_from = origin.clone();
         // Off the async thread: the daemon runs a current-thread runtime, and a
         // copy can take minutes on a busy disk.
         let copied = timed(
             &mut timings.copy,
-            self.blocking(installed.root(), move |trusted, source| {
-                copy_package_from(source, &origin, &destination, trusted)?;
-                // Checked again after the copy: an edit a job made while it ran
-                // moved the entry's print, and the runtime may hold it.
-                if trusted.holds(source) {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::other(
-                        "the runner package changed while copied",
-                    ))
+            self.blocking(installed.root(), {
+                let destination = destination.clone();
+                move |trusted, source| {
+                    copy_package_from(source, &origin, &destination, trusted)?;
+                    // Checked again after the copy: an edit a job made while it ran
+                    // moved the entry's print, and the runtime may hold it.
+                    if trusted.holds(source) {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other(
+                            "the runner package changed while copied",
+                        ))
+                    }
                 }
             }),
         )
@@ -849,19 +939,48 @@ impl RuntimePackages for CachedRuntimePackages {
         if copied.is_err() {
             // Nothing a failed or tainted copy left may reach a retry's copy,
             // which lays out over the same runtime.
-            let _ = remove_materialized_package(attempt);
+            drop(hold);
+            self.reject_copy(attempt, installed.root(), &copied_from, &contents, timings)
+                .await?;
             return Err(FailureReason::ProcessStartFailed);
         }
         if let Err(error) = self.cache.lease(attempt, installed.version()) {
             // Undoing the copy must not undo the *job* workspace: a persistent
             // slot's `_work` is retained across attempts, and this rollback
             // runs before the attempt that would have owned it ever started.
-            let _ = remove_materialized_package(attempt);
+            drop(hold);
+            self.reject_copy(attempt, installed.root(), &copied_from, &contents, timings)
+                .await?;
             return Err(package_failure(error));
         }
         // Leased while still holding the trees, so a prune that gets the
         // exclusive hold finds this runtime's lease.
         drop(hold);
+        // What runs is this copy, so this copy is what is checked, whatever
+        // happened to the shared trees meanwhile: read in full against the
+        // archive, under neither the host lock nor the trees' hold.
+        let persistent = matches!(attempt.workspace(), AttemptWorkspace::PersistentSlot { .. });
+        let checking = Arc::clone(&contents);
+        let verified = timed(
+            &mut timings.verify,
+            self.blocking(installed.root(), move |_, _| {
+                checking.verify(&destination, |name| persistent && is_work_folder(name))
+            }),
+        )
+        .await?;
+        if let Err(mismatch) = verified {
+            let _ = self.cache.release(attempt.id);
+            tracing::warn!(
+                event = "package_copy_differs",
+                attempt_id = %attempt.id,
+                reason = mismatch.as_str(),
+                "a runner's package copy does not match the package's verified archive; it is \
+                 being removed and will not be used"
+            );
+            self.reject_copy(attempt, installed.root(), &copied_from, &contents, timings)
+                .await?;
+            return Err(FailureReason::ProcessStartFailed);
+        }
         Ok(installed.version().clone())
     }
 
@@ -886,7 +1005,8 @@ impl RuntimePackages for CachedRuntimePackages {
         for installed in self.cache.installed().map_err(package_failure)? {
             if installed.version() != current.version() {
                 match self.cache.prune(installed.version(), attempts) {
-                    Ok(()) | Err(PackageError::VersionInUse { .. }) => {}
+                    Ok(()) => self.shared.trusted.forget(installed.root()),
+                    Err(PackageError::VersionInUse { .. }) => {}
                     Err(error) => return Err(package_failure(error)),
                 }
             }
@@ -1782,61 +1902,93 @@ fn seed_location(source: &Path, destination: &Path) -> std::io::Result<Option<Pa
     Ok(Some(root.join(PACKAGE_SEED_DIR)))
 }
 
-/// The package trees this process built or installed, and what each looked
-/// like right after: the cache entry runtimes are copied from and the seeds
-/// they are cloned from.
+/// The package trees this process built or installed: what each must hold, and
+/// what each looked like right after. They are the cache entry runtimes are copied
+/// from and the seeds they are cloned from.
 ///
-/// Both are owned by the account jobs run as, so a job can edit any file in
-/// them, and nothing on disk can say what they should hold: the published
-/// digest covers the archive, not the extracted tree, and a record kept on disk
-/// could be rewritten by the same account. So a tree is trusted only while its
-/// [`tree_fingerprint`] matches the one recorded here. Every edit, replacement
-/// or rename moves the change time (`ctime`) of the entry or of its directory,
-/// and only the superuser can set a change time. A tree without a record, as
-/// every tree has after a restart, is rebuilt before it is used.
+/// Both are owned by the account jobs run as, so a job can edit any file in them,
+/// and nothing on disk can say what they should hold: the published digest covers
+/// the archive, not the extracted tree, and a record kept on disk could be
+/// rewritten by the same account. So a tree without a record here, as every tree
+/// has after a restart, is rebuilt before it is used.
 ///
-/// Unix only. On Windows every tree is trusted, as before.
+/// Two checks, for two costs. [`PackageContents`] reads every file against the
+/// verified archive, on every runtime a launch is about to run: that is the one
+/// that decides. On Unix the tree's [`tree_fingerprint`] also spots a changed
+/// tree cheaply before any of it is copied, since every edit, replacement or
+/// rename moves the change time (`ctime`) of the entry or of its directory, and
+/// only the superuser can set a change time.
 #[derive(Debug, Default)]
 pub(crate) struct TrustedTrees {
-    #[cfg_attr(not(unix), allow(dead_code))]
-    prints: Mutex<HashMap<PathBuf, [u8; 32]>>,
+    trees: Mutex<HashMap<PathBuf, TrustedTree>>,
+}
+
+#[derive(Debug, Clone)]
+struct TrustedTree {
+    #[cfg(unix)]
+    print: [u8; 32],
+    contents: Option<Arc<PackageContents>>,
 }
 
 impl TrustedTrees {
-    /// Whether `root` is a tree recorded here and still looks as it did.
+    fn trees(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, TrustedTree>> {
+        self.trees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether `root` is a tree recorded here and, where that can be told, still
+    /// looks as it did.
     fn holds(&self, root: &Path) -> bool {
+        let Some(tree) = self.trees().get(root).cloned() else {
+            return false;
+        };
         #[cfg(unix)]
         {
-            let recorded = self
-                .prints
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(root)
-                .copied();
-            recorded.is_some_and(|recorded| {
-                tree_fingerprint(root).is_ok_and(|current| current == recorded)
-            })
+            tree_fingerprint(root).is_ok_and(|current| current == tree.print)
         }
         #[cfg(not(unix))]
         {
-            let _ = root;
+            let _ = tree;
             true
         }
     }
 
+    /// What `root` must hold.
+    fn contents_of(&self, root: &Path) -> Option<Arc<PackageContents>> {
+        self.trees()
+            .get(root)
+            .and_then(|tree| tree.contents.clone())
+    }
+
     /// Trust `root` as it is now; called right after this process made it.
-    fn record(&self, root: &Path) -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            let print = tree_fingerprint(root)?;
-            self.prints
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(root.to_path_buf(), print);
-        }
-        #[cfg(not(unix))]
-        let _ = root;
+    fn record(&self, root: &Path, contents: Option<Arc<PackageContents>>) -> std::io::Result<()> {
+        let tree = TrustedTree {
+            #[cfg(unix)]
+            print: tree_fingerprint(root)?,
+            contents,
+        };
+        self.trees().insert(root.to_path_buf(), tree);
         Ok(())
+    }
+
+    /// Stops trusting `root` if `contents` is still what is recorded for it, and
+    /// answers whether it did.
+    fn forget_if_holding(&self, root: &Path, contents: &Arc<PackageContents>) -> bool {
+        let mut trees = self.trees();
+        let holding = trees
+            .get(root)
+            .and_then(|tree| tree.contents.as_ref())
+            .is_some_and(|current| Arc::ptr_eq(current, contents));
+        if holding {
+            trees.remove(root);
+        }
+        holding
+    }
+
+    /// Stop trusting `root`: its next use rebuilds it.
+    fn forget(&self, root: &Path) {
+        self.trees().remove(root);
     }
 }
 
@@ -1931,7 +2083,7 @@ fn refresh_package_seed(
         return Err(error);
     }
     // After the rename, which itself moves the seed directory's change time.
-    trusted.record(&seed)?;
+    trusted.record(&seed, None)?;
     Ok(seed)
 }
 

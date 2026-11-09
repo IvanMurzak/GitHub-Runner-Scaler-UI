@@ -334,7 +334,9 @@ A slow launch is a warning in the host's log, `attempt_launch_slow`, saying wher
 `order_wait_ms` (older launches reserving first), `lock_wait_ms`, `turn_wait_ms`, `materialize_ms` (of which `package_wait_ms`, `package_install_ms`,
 `package_verify_ms`, `package_copy_ms`, and `package_downloaded`), `prepare_ms`, `register_ms`,
 `spawn_ms`. The first launch after a daemon starts downloads the package again: a tree this process
-did not install may hold a job's edits. After that, it is shared by every target.
+did not install may hold a job's edits. After that, it is shared by every target, and each launch's copy
+is read against the package's archive (see [Shared runner packages](#shared-runner-packages)), which
+`package_verify_ms` counts.
 
 A download that sends nothing for 60 seconds, or cannot connect in 30, fails and is tried again; a slow one
 that keeps sending takes as long as it takes. Its partial file is removed and was never going to be used: an
@@ -629,3 +631,55 @@ A copy from an older version is upgraded when the coordinator opens it. One from
   remote admin endpoint. An enrolled host may only read `stats` over its signed link.
 - Logs carry identifiers, counts and fixed words: never the secret, a code, a key, a signature,
   or text from a webhook body.
+
+### Shared runner packages
+
+A host prepares a runner package once and copies it for each runner, so a package is shared between
+attempts, and between targets. A native runner's job runs under the account that owns that package, with or
+without a coordinator, so it can write to it: permissions cannot stop an account that can change them back.
+So the package is not trusted because it was left alone. It is checked.
+
+When the daemon downloads a package, it reads the archive once into memory (150 to 300 MB, for that step),
+checks those bytes against GitHub's published SHA-256, unpacks them, and records from them what every entry
+must be: file contents (SHA-256) and sizes, symlink targets and, on Linux and macOS, whether what the archive
+marks executable is. That record stays in the daemon's memory, since a file could be rewritten by the same
+account. Then, for every launch, after the package is copied into the runner's own directory and before
+anything is registered, the daemon reads the whole copy against the record, on up to 4 threads, outside the
+host allocation lock and the package's locks. It does hold that launch's preparation turn. `package_verify_ms`
+counts it. On Linux and macOS, a change to the shared tree's `ctime` also discards it before the copy, cheaply.
+
+A copy that differs, by contents, size, a missing entry or an added one, is removed and not used, and
+`package_copy_differs` in the host log gives `reason` (`modified`, `missing`, `unexpected`, `unreadable`). The
+shared package is then read too, as it is when a copy fails outright. If it differs, it is no longer
+trusted (`package_verify_failed`), and the next attempt, the launch's own retry or a later launch, downloads
+it afresh. If it reads clean, it is kept: the copy's disk or another job was at fault. A change that only moved
+the shared tree's `ctime` still costs a download on Linux and macOS (`reason=changed`). Each daemon start has no
+record, so the first launch after one downloads the package, on Windows as on Linux and macOS (Windows from
+0.4.50). There, a process with a handle or its working directory inside the old tree can fail that launch until
+it exits, since the tree is replaced by renaming it.
+
+**What this guarantees:** against a job that can edit the shared package but not the daemon, a runner starts
+only from a copy that matched the digest-verified archive at the moment it was read, by the entries' contents,
+sizes, kinds and names, and an edit to the shared package does not reach a later job's runner. It catches
+what a job did by mistake, or left behind for later, where nothing else would.
+
+**What it does not guarantee:**
+
+- A native job runs under the daemon's own account, so it can usually reach the daemon too: replace its binary,
+  or its configuration, or read its memory where the OS allows. Then no check by the daemon holds. On a
+  boot-mode host that account is root on Linux and macOS and LocalSystem on Windows, so this is certain there.
+  Use an isolated execution policy (containers or VMs) for jobs you do not trust, or do not run them on a shared
+  host. The same goes for `sudo` in a step.
+- A job running under the same account at that moment can edit a runner's copy *after* it was read and
+  before or while it runs, and can edit the workspaces, tool caches and dependency caches other jobs use,
+  or read their files. Nothing here isolates jobs on one account from each other. Use an isolated execution
+  policy (containers or VMs) for jobs you do not trust, or do not run them on a shared host.
+- A boot-mode service runs as root on Linux and macOS and as LocalSystem on Windows, and its native runners run
+  with it, so a job on such a host can change the daemon itself, its memory, or what it downloads. No check by
+  the daemon holds against that: this protects a host in practice only when jobs run under an account that
+  cannot reach the daemon's process, which means an isolated execution policy. The same goes for `sudo` in a step.
+- Extended attributes, NTFS alternate streams, ACLs, owners, times and mode bits other than a file being
+  executable are not compared.
+- The check starts from GitHub's published digest, so it trusts GitHub.
+- A persistent slot's retained `_work` is the job's own and is not checked.
+
