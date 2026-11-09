@@ -1096,11 +1096,12 @@ impl Sim {
                 }
                 for index in 0..self.jobs.len() {
                     let job = &mut self.jobs[index];
-                    if job.host == host && job.started_at.is_some() && !job.done {
+                    if let Some(started) = job.started_at.filter(|_| job.host == host && !job.done)
+                    {
                         job.done = true;
                         job.lost = true;
                         // What it ran until it was lost is all it used.
-                        job.run_ms = now - job.started_at.expect("started");
+                        job.run_ms = now - started;
                         self.at(now + LOST_RUNNER_MS, Event::CompletedWebhook(index));
                     }
                 }
@@ -1276,7 +1277,7 @@ impl Sim {
             .iter()
             .filter(|job| {
                 job.started_at
-                    .map_or(true, |at| at - job.queued_at > STARVED_MS)
+                    .is_none_or(|at| at - job.queued_at > STARVED_MS)
             })
             .count() as u32;
         let mean_run = if ran.is_empty() {
