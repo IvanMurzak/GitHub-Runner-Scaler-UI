@@ -30,10 +30,10 @@ deterministic simulation of the real placement code over several hosts
   it: its runner would otherwise take that job.
 - **A job that turned heavy is seen at its next run**, not after four. What it is expected to need is
   its p90, or more if one of its 3 newest samples needed more.
-- **Placement now finds out which host is faster.** A host that never ran a job other hosts have run is
-  tried once for it. The host with the most memory otherwise kept every job for good: a job twice as
+- **Placement now finds out which host is faster.** A host that never ran a job other hosts have run scores
+  as fastest for it until its first run finishes. The host with the most memory otherwise kept every job for good: a job twice as
   fast on a smaller host ran on the bigger one for ever. Simulated: mean run 595 s to 238 s.
-- **A warm workspace no longer beats a measured result.** A host measured more than 10% slower than usual
+- **A warm workspace no longer beats a measured result.** A host measured over at least 3 runs as more than 10% slower than usual
   at a job loses its `cache` points for it, since its measured times already hold what the checkout saves.
   Simulated: mean run 177 s to 155 s with a warm workspace on a slow host.
 

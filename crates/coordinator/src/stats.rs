@@ -74,6 +74,10 @@ const ENOUGH_OF_ITS_OWN: usize = 3;
 /// may run a job and keep the cache term.
 const WARM_NOT_WORTH_IT: f64 = -0.1;
 
+/// How many runs of a job a warm host must have before they judge it: its first is
+/// likely a full clone.
+const WARM_JUDGED_AFTER: usize = 3;
+
 /// How many of a job's newest samples its expected memory never falls below.
 const RECENT_SAMPLES: usize = 3;
 
@@ -572,7 +576,8 @@ pub fn speed(ratios: &[BTreeMap<String, HostRatio>], host: &str) -> Option<f64> 
 /// [`speed`] for a placement to go by: a host that never ran a key other hosts
 /// have run counts as the fastest there could be for that key. Otherwise the host
 /// with the most headroom keeps every job, and how the others compare is never
-/// found out. One run settles it, so this costs at most one job per key and host.
+/// found out. Its first finished run settles it. A bonus, not a rule: a warm host,
+/// or much more headroom, can still outscore it.
 #[must_use]
 pub fn speed_to_try(ratios: &[BTreeMap<String, HostRatio>], host: &str) -> f64 {
     let terms: Vec<f64> = ratios
@@ -676,22 +681,15 @@ impl Aggregates {
     /// out-of-memory killer finds.
     #[must_use]
     pub fn expected_peak(&self, key: &str) -> Option<u64> {
-        let mut measured: Vec<(DateTime<Utc>, u64)> = self
-            .speaking_for(key)
+        let mut samples = self.speaking_for(key);
+        let p90 = field_percentile(&samples, |sample| sample.peak_rss_bytes, 90)?;
+        samples.sort_unstable_by_key(|sample| std::cmp::Reverse(sample.finished_at));
+        samples
             .iter()
-            .filter_map(|sample| Some((sample.finished_at, sample.peak_rss_bytes?)))
-            .collect();
-        let p90 = percentile(
-            &measured.iter().map(|(_, peak)| *peak).collect::<Vec<_>>(),
-            90,
-        )?;
-        measured.sort_unstable_by_key(|(at, _)| std::cmp::Reverse(*at));
-        let recent = measured
-            .iter()
+            .filter_map(|sample| sample.peak_rss_bytes)
             .take(RECENT_SAMPLES)
-            .map(|(_, peak)| *peak)
-            .max();
-        Some(recent.map_or(p90, |peak| peak.max(p90)))
+            .chain([p90])
+            .max()
     }
 
     /// What placement weighs `key` by. See [`Self::speaking_for`].
@@ -837,6 +835,9 @@ impl Aggregates {
         unnamed: bool,
         default_job_ram: u64,
     ) -> Demand {
+        let mut job_keys = job_keys.to_vec();
+        job_keys.sort();
+        job_keys.dedup();
         let repository_p90 = self.repository_p90_rss(repository);
         let fallback = repository_p90.map_or((default_job_ram, EstimateSource::Default), |bytes| {
             (bytes, EstimateSource::Repository)
@@ -849,7 +850,7 @@ impl Aggregates {
                 heaviest = Some(candidate);
             }
         };
-        for key in job_keys {
+        for key in &job_keys {
             match self.expected_peak(key) {
                 Some(bytes) => {
                     measured = true;
@@ -863,9 +864,6 @@ impl Aggregates {
             consider(fallback);
         }
         let (estimate, source) = heaviest.unwrap_or(fallback);
-        let mut job_keys = job_keys.to_vec();
-        job_keys.sort();
-        job_keys.dedup();
         Demand {
             estimate,
             source,
@@ -992,6 +990,21 @@ impl Contender {
     }
 }
 
+/// Whether `host` has run these jobs enough to be judged, and came out slower than
+/// usual by more than its checkout is worth.
+fn warm_not_worth_it(ratios: &[BTreeMap<String, HostRatio>], host: &str) -> bool {
+    let judged: Vec<BTreeMap<String, HostRatio>> = ratios
+        .iter()
+        .filter(|by_host| {
+            by_host
+                .get(host)
+                .is_some_and(|figures| figures.samples >= WARM_JUDGED_AFTER)
+        })
+        .cloned()
+        .collect();
+    speed(&judged, host).is_some_and(|speed| speed < WARM_NOT_WORTH_IT)
+}
+
 /// Stage 3's order: a warm workspace, the most free memory, the fewest busy
 /// slots, then the host id so the order is stable.
 fn stage_three_order(a: &Contender, b: &Contender) -> std::cmp::Ordering {
@@ -1070,7 +1083,7 @@ pub fn score(
             let speed = speed_to_try(&ratios, &contender.host_id);
             // Measured durations already hold what its checkout saves: a warm host
             // measured slower than usual is not worth waiting out for its cache.
-            let cache = if contender.warm && speed >= WARM_NOT_WORTH_IT {
+            let cache = if contender.warm && !warm_not_worth_it(&ratios, &contender.host_id) {
                 1.0
             } else {
                 0.0
@@ -2446,23 +2459,21 @@ mod tests {
             },
             contender("cold", 60 * GIB, 64 * GIB),
         ];
-        let best = |warm: u64, cold: u64| {
-            let aggregates = Aggregates::from_samples(
-                vec![
-                    sample("octo/app/build", "warm", warm, GIB),
-                    sample("octo/app/build", "cold", cold, GIB),
-                ],
-                30,
-            );
+        let best = |warm: u64, cold: u64, runs: usize| {
+            let mut samples = vec![sample("octo/app/build", "cold", cold, GIB)];
+            samples.extend(vec![sample("octo/app/build", "warm", warm, GIB); runs]);
+            let aggregates = Aggregates::from_samples(samples, 30);
             score(&hosts, &demand, None, &config, &aggregates)[0]
                 .0
                 .host_id
                 .clone()
         };
-        assert_eq!(best(200, 240), "warm");
+        assert_eq!(best(200, 240, 3), "warm");
         // A little slower is noise; the checkout still counts.
-        assert_eq!(best(250, 240), "warm");
-        assert_eq!(best(360, 240), "cold");
+        assert_eq!(best(250, 240, 3), "warm");
+        assert_eq!(best(360, 240, 3), "cold");
+        // Too few runs to judge by: the first is likely a full clone.
+        assert_eq!(best(360, 240, 2), "warm");
     }
 
     /// Thirty samples: a p90 would not see this for four runs.

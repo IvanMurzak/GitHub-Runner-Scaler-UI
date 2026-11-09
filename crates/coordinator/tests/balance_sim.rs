@@ -2,8 +2,8 @@
 //!
 //! Live load experiments can use one host per pool at most, so choosing between
 //! hosts is measured here: the **real** [`Placement`] and [`Statistics`], fed the
-//! messages and webhooks `server.rs` feeds them and in the same order, on tokio's
-//! paused clock. Only the hosts and GitHub are fake.
+//! messages and webhooks `server.rs` feeds them, in its order as copied by hand
+//! here (nothing keeps the two in step), on tokio's paused clock. Only the hosts and GitHub are fake.
 //!
 //! A host has memory, slots and a speed. It sends a heartbeat every 15 s and right
 //! after an attempt ends, brings a runner up in 15 s, and frees a slot 5 s after a
@@ -326,7 +326,7 @@ fn scenarios() -> Vec<Scenario> {
         Scenario {
             name: "4 repositories, warm",
             hosts: vec![host("big-64", 64, 8, 1.0, LINUX), warm_mid, warm_slow],
-            rounds: 4,
+            rounds: 6,
             jobs: several_repositories,
             vanishes: None,
             history: &[],
@@ -400,8 +400,6 @@ struct Metrics {
 struct Job {
     id: u64,
     spec: JobSpec,
-    secs: f64,
-    peak: u64,
     key: JobKey,
     required: Vec<Label>,
     queued_at: u64,
@@ -429,8 +427,6 @@ struct Runner {
     host: usize,
     key: JobKey,
     lease: Option<String>,
-    /// It took a job.
-    claimed: bool,
     /// Its host said so (`attempt_started`): that launch is no longer among the
     /// open ones its heartbeats list.
     reported: bool,
@@ -470,7 +466,6 @@ struct Sim {
     hosts: Vec<Host>,
     repos: Vec<&'static str>,
     epoch: Instant,
-    round_start: u64,
     events: BTreeMap<(u64, u64), Event>,
     seq: u64,
     rng: Rng,
@@ -555,7 +550,6 @@ impl Sim {
             hosts: Vec::new(),
             repos: repos.into_iter().collect(),
             epoch: Instant::now(),
-            round_start: 0,
             events: BTreeMap::new(),
             seq: 0,
             rng: Rng::new(seed),
@@ -658,7 +652,7 @@ impl Sim {
         }
         let ramp = (job.run_ms as f64 * RAMP_SHARE).clamp(1.0, RAMP_MAX_MS);
         let share = ((now - started) as f64 / ramp).min(1.0);
-        (job.peak as f64 * share) as u64
+        (job.spec.peak as f64 * share) as u64
     }
 
     fn used_ram(&self, host: usize, now: u64) -> u64 {
@@ -730,7 +724,6 @@ impl Sim {
             host,
             key,
             lease,
-            claimed: false,
             reported: false,
             state: RunnerState::Booting,
         });
@@ -825,7 +818,6 @@ impl Sim {
                 .iter()
                 .filter(|runner| {
                     runner.key == key
-                        && !runner.claimed
                         && matches!(runner.state, RunnerState::Booting | RunnerState::Idle)
                 })
                 .count();
@@ -876,13 +868,12 @@ impl Sim {
         } else {
             1.0
         };
-        job.run_ms = (job.secs * 1000.0 * warm / spec.speed) as u64;
+        job.run_ms = (job.spec.secs * 1000.0 * warm / spec.speed) as u64;
         job.started_at = Some(now);
         job.host = host_index;
         job.runner = runner_index;
         let run_ms = job.run_ms;
         self.runners[runner_index].state = RunnerState::Running;
-        self.runners[runner_index].claimed = true;
         self.hosts[host_index].busy_ms += run_ms;
         let in_progress = self.webhook_delay();
         self.after(in_progress, Event::InProgressWebhook(job_index));
@@ -893,6 +884,31 @@ impl Sim {
 
     fn identity_of(job: &Job) -> JobIdentity {
         JobIdentity::new(job.spec.repo, Some(job.spec.name)).expect("named")
+    }
+
+    /// A `workflow_job` webhook for a job a runner took: `in_progress`, or
+    /// `completed`.
+    fn webhook(&mut self, index: usize, in_progress: bool) {
+        let job = &self.jobs[index];
+        let runner = self.runners[job.runner].name.clone();
+        let key = job.key.clone();
+        let identity = Self::identity_of(job);
+        let times = JobTimes {
+            created_at: Some(wall(job.queued_at)),
+            started_at: job.started_at.map(wall),
+            completed_at: job
+                .started_at
+                .filter(|_| !in_progress)
+                .map(|started| wall(started + job.run_ms)),
+        };
+        let took = in_progress.then_some(runner.as_str());
+        if let Some(placement) = &self.placement {
+            placement.dequeued_by(job.spec.repo, &job.required, job.id, took);
+            self.after(CLAIM_GRACE.as_millis() as u64, Event::Rebalance(key));
+        }
+        if let Some(stats) = &self.stats {
+            stats.job_identified(&runner, identity, times);
+        }
     }
 
     async fn handle(&mut self, event: Event) {
@@ -972,25 +988,7 @@ impl Sim {
                     self.after(SLOT_RELEASE_MS, Event::SlotRelease(index));
                 }
             }
-            Event::InProgressWebhook(index) => {
-                let job = &self.jobs[index];
-                let runner = self.runners[job.runner].name.clone();
-                let key = job.key.clone();
-                let identity = Self::identity_of(job);
-                let times = JobTimes {
-                    created_at: Some(wall(job.queued_at)),
-                    started_at: job.started_at.map(wall),
-                    completed_at: None,
-                };
-                let (repo, required, id) = (job.spec.repo, job.required.clone(), job.id);
-                if let Some(placement) = &self.placement {
-                    placement.dequeued_by(repo, &required, id, Some(&runner));
-                    self.after(CLAIM_GRACE.as_millis() as u64, Event::Rebalance(key));
-                }
-                if let Some(stats) = &self.stats {
-                    stats.job_identified(&runner, identity, times);
-                }
-            }
+            Event::InProgressWebhook(index) => self.webhook(index, true),
             Event::AttemptStarted(index) => {
                 self.runners[index].reported = true;
                 let runner = &self.runners[index];
@@ -1024,26 +1022,7 @@ impl Sim {
                 self.runners[runner].state = RunnerState::Exiting;
                 self.after(SLOT_RELEASE_MS, Event::SlotRelease(runner));
             }
-            Event::CompletedWebhook(index) => {
-                let job = &self.jobs[index];
-                let runner = self.runners[job.runner].name.clone();
-                let key = job.key.clone();
-                let identity = Self::identity_of(job);
-                let started = job.started_at.expect("started");
-                let times = JobTimes {
-                    created_at: Some(wall(job.queued_at)),
-                    started_at: Some(wall(started)),
-                    completed_at: Some(wall(started + job.run_ms)),
-                };
-                let (repo, required, id) = (job.spec.repo, job.required.clone(), job.id);
-                if let Some(placement) = &self.placement {
-                    placement.dequeued_by(repo, &required, id, None);
-                    self.after(CLAIM_GRACE.as_millis() as u64, Event::Rebalance(key));
-                }
-                if let Some(stats) = &self.stats {
-                    stats.job_identified(&runner, identity, times);
-                }
-            }
+            Event::CompletedWebhook(index) => self.webhook(index, false),
             Event::SlotRelease(index) => {
                 let runner = &self.runners[index];
                 let host = runner.host;
@@ -1057,7 +1036,7 @@ impl Sim {
                     job.started_at.is_some() && job.runner == index && job.host == host
                 });
                 let usage = finished.map(|job| AttemptUsage {
-                    peak_rss_bytes: job.peak,
+                    peak_rss_bytes: job.spec.peak,
                     cpu_avg_millicores: 1000,
                     cpu_peak_millicores: 2000,
                     samples: 10,
@@ -1073,11 +1052,7 @@ impl Sim {
                 self.after(0, Event::RetryAll);
                 self.send_heartbeat(host);
             }
-            Event::Rebalance(key) => {
-                if self.placement.is_some() {
-                    self.rebalance(&key).await;
-                }
-            }
+            Event::Rebalance(key) => self.rebalance(&key).await,
             Event::RetryAll => self.retry_all().await,
             Event::Vanish(host) => {
                 let now = self.now();
@@ -1145,7 +1120,6 @@ impl Sim {
     /// Runs one round from idle hosts and returns what it measured.
     async fn round(&mut self, scenario: &Scenario, round: usize) -> Metrics {
         advance(Duration::from_millis(ROUND_GAP_MS)).await;
-        self.round_start = self.now();
         self.events.clear();
         self.jobs.clear();
         self.runners.clear();
@@ -1168,22 +1142,20 @@ impl Sim {
         self.after(TICK.as_millis() as u64, Event::Tick);
         let start = self.now();
         let specs = (scenario.jobs)(round);
-        for (index, spec) in specs.into_iter().enumerate() {
+        for (index, mut spec) in specs.into_iter().enumerate() {
             let mut draw = Rng::new(
                 self.seed
                     ^ (round as u64).wrapping_mul(0x1000_0000_01b3)
                     ^ (index as u64 + 1).wrapping_mul(0x0100_0193_0000_0001),
             );
-            let secs = draw.jitter(spec.secs, 5);
-            let peak = draw.jitter(spec.peak as f64, 3) as u64;
+            spec.secs = draw.jitter(spec.secs, 5);
+            spec.peak = draw.jitter(spec.peak as f64, 3) as u64;
             let required = required_of(spec.pool);
             let key = JobKey::new(spec.repo, &required);
             self.at(start + spec.at_ms, Event::Queued(index));
             self.jobs.push(Job {
                 id: self.next_job_id,
                 spec,
-                secs,
-                peak,
                 key,
                 required,
                 queued_at: 0,
@@ -1222,8 +1194,7 @@ impl Sim {
     fn finish_round(&mut self, start: u64) -> Metrics {
         let now = self.now();
         // Whatever never ran is forgotten, so it does not haunt the next round.
-        let leftovers: Vec<usize> = self.github.values().flatten().copied().collect();
-        for index in &leftovers {
+        for index in self.github.values().flatten() {
             let job = &self.jobs[*index];
             if let Some(placement) = &self.placement {
                 placement.dequeued(job.spec.repo, &job.required, job.id);
@@ -1250,21 +1221,12 @@ impl Sim {
         let mut misfits_measured = 0;
         for job in self.jobs.iter().filter(|job| job.started_at.is_some()) {
             let spec = &self.hosts[job.host].spec;
-            if job.peak + spec.os_ram > spec.ram {
+            if job.spec.peak + spec.os_ram > spec.ram {
                 misfits += 1;
-            }
-        }
-        for (job, seen) in self.jobs.iter().filter_map(|job| {
-            job.started_at?;
-            Some((
-                job,
-                self.seen
-                    .contains(&(job.spec.repo.into(), job.spec.name.into())),
-            ))
-        }) {
-            let spec = &self.hosts[job.host].spec;
-            if seen && job.peak + spec.os_ram > spec.ram {
-                misfits_measured += 1;
+                let key = (job.spec.repo.to_string(), job.spec.name.to_string());
+                if self.seen.contains(&key) {
+                    misfits_measured += 1;
+                }
             }
         }
         let shares: Vec<u64> = self
@@ -1387,54 +1349,62 @@ fn table(results: &[ScenarioResult]) -> String {
          Over RAM (time / GiB·s / peak GiB) | Misfits (measured) | Spread pts | Starved | Lost |\n\
          |---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|\n",
     );
+    let mut add = |name: &str, policy: &str, round: &str, metrics: &Metrics| {
+        writeln!(table, "{}", row(name, policy, round, metrics)).expect("a string");
+    };
     for result in results {
         let name = result.name;
-        writeln!(
-            table,
-            "{}",
-            row(name, "round-robin", "all", &result.round_robin)
-        )
-        .expect("a string");
-        writeln!(
-            table,
-            "{}",
-            row(name, "no statistics", "all", &result.no_statistics)
-        )
-        .expect("a string");
+        add(name, "round-robin", "all", &result.round_robin);
+        add(name, "no statistics", "all", &result.no_statistics);
         for (index, metrics) in result.weighted.iter().enumerate() {
-            writeln!(
-                table,
-                "{}",
-                row(name, "statistics", &(index + 1).to_string(), metrics)
-            )
-            .expect("a string");
+            add(name, "statistics", &(index + 1).to_string(), metrics);
         }
     }
     table
 }
 
-async fn simulate() -> Vec<ScenarioResult> {
-    let mut results = Vec::new();
-    for scenario in scenarios() {
-        let mut round_robin = Vec::new();
-        let mut no_statistics = Vec::new();
-        let mut per_round = vec![Vec::new(); scenario.rounds];
-        for seed in SEEDS {
-            round_robin.extend(run(&scenario, Policy::RoundRobin, seed).await);
-            no_statistics.extend(run(&scenario, Policy::NoStatistics, seed).await);
-            let weighted = run(&scenario, Policy::Weighted, seed).await;
-            for (index, metrics) in weighted.into_iter().enumerate() {
-                per_round[index].push(metrics);
-            }
+async fn simulate(scenario: &Scenario) -> ScenarioResult {
+    let mut round_robin = Vec::new();
+    let mut no_statistics = Vec::new();
+    let mut per_round = vec![Vec::new(); scenario.rounds];
+    for seed in SEEDS {
+        round_robin.extend(run(scenario, Policy::RoundRobin, seed).await);
+        no_statistics.extend(run(scenario, Policy::NoStatistics, seed).await);
+        let weighted = run(scenario, Policy::Weighted, seed).await;
+        for (index, metrics) in weighted.into_iter().enumerate() {
+            per_round[index].push(metrics);
         }
-        results.push(ScenarioResult {
-            name: scenario.name,
-            round_robin: merged(&round_robin),
-            no_statistics: merged(&no_statistics),
-            weighted: per_round.iter().map(|rounds| merged(rounds)).collect(),
-        });
     }
-    results
+    ScenarioResult {
+        name: scenario.name,
+        round_robin: merged(&round_robin),
+        no_statistics: merged(&no_statistics),
+        weighted: per_round.iter().map(|rounds| merged(rounds)).collect(),
+    }
+}
+
+/// Every scenario on a thread and a paused clock of its own: they share nothing.
+fn simulate_all() -> Vec<ScenarioResult> {
+    let scenarios = scenarios();
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = scenarios
+            .iter()
+            .map(|scenario| {
+                scope.spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .start_paused(true)
+                        .build()
+                        .expect("a runtime")
+                        .block_on(simulate(scenario))
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().expect("a scenario"))
+            .collect()
+    })
 }
 
 /// What every placement here must do. Tolerances leave room for the seeds, not
@@ -1569,7 +1539,8 @@ fn check(results: &[ScenarioResult]) -> Vec<String> {
 
     // Scenario 4: a warm host wins, unless measured slower than a cold one.
     let warm = of("4");
-    let learned = warm.weighted_from(3);
+    // A warm host is judged after 3 runs of a job of its own.
+    let learned = warm.weighted_from(5);
     expect(
         learned.mean_run_s * 100 <= warm.no_statistics.mean_run_s * 92,
         format!(
@@ -1633,9 +1604,9 @@ fn check(results: &[ScenarioResult]) -> Vec<String> {
     failures
 }
 
-#[tokio::test(start_paused = true)]
-async fn placement_balances_load_across_hosts() {
-    let results = simulate().await;
+#[test]
+fn placement_balances_load_across_hosts() {
+    let results = simulate_all();
     let table = table(&results);
     // Past the test harness's capture: the numbers are the point of this test.
     writeln!(std::io::stderr().lock(), "\n{table}").expect("stderr");

@@ -458,12 +458,13 @@ and labels), not a single job:
    host's total memory, since a build's peak can come after those 2 minutes with its host's heartbeat
    showing that memory free until then. Once a webhook names the job a launch's runner took, the launch
    reserves that job's expected peak rather than the queue's next heaviest.
-3. **Score** = `cache` x warm workspace (0 or 1; 0 when this host is measured more than 10% slower
-   than usual at these jobs, since measured durations already hold what its checkout saves) +
+3. **Score** = `cache` x warm workspace (0 or 1; 0 when, after at least 3 runs of a job, this host is measured more than 10% slower
+   than usual at it, since measured durations already hold what its checkout saves) +
    `headroom` x (memory free after the job, as a share of the host's memory) + `speed` x (how much
    faster than usual this host ran these jobs, -1 to 1; a host that never ran a job other hosts have
-   run counts as 1 for it, or the host with the most headroom would keep every job and the others
-   would never be compared, which costs at most one run per job and host) - `bigfit` x (1 when the
+   run counts as 1 for it until its first run finishes, or the host with the most headroom would keep
+   every job and the others would never be compared; a warm host, or much more headroom, still outscores
+   this) - `bigfit` x (1 when the
    heaviest measured queue waiting elsewhere needs at least twice this one's memory and fits only
    this host of this queue's candidates, and this queue fits another).
 4. **Order**: the best score first, ties in stage 3's order. With no statistics at all for the
