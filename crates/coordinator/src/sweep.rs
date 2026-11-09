@@ -332,7 +332,7 @@ impl Sweeper {
         repository: &OwnerRepo,
         report: &mut SweepReport,
     ) -> Result<(), InventoryError> {
-        let read_at = Instant::now();
+        let read_at = crate::clock::now();
         let demand = installation
             .demand
             .queued_demand(

@@ -415,7 +415,8 @@ back, nothing needs doing: an older coordinator reads a key with a workflow as a
 queued, and goes on from the samples under the job alone.
 
 A sample's **duration** is the job's own run time, `started_at` to `completed_at`, so a 14-second
-job reads 14 seconds and not the minute its runner lived. Its **queue wait** is `created_at` to
+job reads 14 seconds and not the minute its runner lived. A job that did not succeed has none, since how
+fast it failed says nothing of its host; its memory still counts. Its **queue wait** is `created_at` to
 `started_at`: how long the job waited for a runner, which placement exists to keep short. A report
 whose job is named waits 2 to 3 minutes for the `completed` webhook (normally seconds away, in
 either direction); if it never comes, the sample is recorded with the host's attempt duration
@@ -432,7 +433,9 @@ median).
 A runner takes any queued job its labels cover, so placement weighs a pool **queue** (repository
 and labels), not a single job:
 
-1. **Demand**: the heaviest p90 peak memory among the jobs queued there. A job never measured
+1. **Demand**: the heaviest expected peak memory among the jobs queued there. A job's expected peak
+   is its p90, or more if one of its 3 newest samples needed more: over 30 samples a p90 alone would
+   go on reading a job that turned heavy as light for three more runs. A job never measured
    counts as its repository's p90 (over all its samples); a repository never measured as
    `COORDINATOR_DEFAULT_JOB_RAM` (2 GiB). The sweep names the jobs it lists just as a webhook
    does (same job id and name), so a job only the sweep saw is weighed by its own
@@ -447,17 +450,40 @@ and labels), not a single job:
    available physical memory, macOS's free plus inactive pages. Only the jobs' own samples filter: a job never measured counts for the estimate and the ranking,
    not the filter, so another job's heavy samples never keep it waiting, though it may land on a host
    too small for what it turns out to need. It reserves at most `COORDINATOR_DEFAULT_JOB_RAM`. Nor is anything filtered when the
-   demand plus the margin is more than every candidate's total memory: no host could ever hold
-   it, so the job runs where the score says. The estimates of a host's launches stay reserved
+   demand plus the margin is more than the total memory of every host that serves the queue, a host
+   with no slot free just now or whose refusal says only that its slots are taken included: no host could
+   ever hold it, so the job runs where the score says. When the biggest hosts are all free to take it, idle and still too
+   short, what holds their memory is nothing placement can wait out, and the job runs on one of them.
+   Otherwise the job waits for a host big enough, and does not start on one too small because that
+   host's slots are taken. The estimates of a host's launches stay reserved
    for 2 minutes after their runner took its job, while the build's memory ramps up, or until
-   that job ends, whichever is first.
-3. **Score** = `cache` x warm workspace (0 or 1) + `headroom` x (memory free after the job, as a
-   share of the host's memory) + `speed` x (how much faster than usual this host ran these jobs,
-   -1 to 1) - `bigfit` x (1 when the heaviest measured queue waiting elsewhere needs at least
-   twice this one's memory and fits only this host of this queue's candidates, and this queue
-   fits another).
+   that job ends, whichever is first; and until that job ends they count against the host's total
+   memory, since a build's peak can come after those 2 minutes with its host's heartbeat showing that
+   memory free until then. That survives a broken link, and ends at the attempt's report, when the host's
+   heartbeat says it runs fewer jobs than are held for it (the largest are kept), or after 6 hours. Once a webhook names the job a launch's runner took,
+   the launch reserves that job's expected peak rather than the queue's next heaviest, and a runner with
+   no lease left counts for the job it took.
+3. **Score** = `cache` x warm workspace (0 or 1; 0 when, after at least 3 runs of a job, this host is measured more than 10% slower
+   than usual at it, since measured durations already hold what its checkout saves) +
+   `headroom` x (memory free after the job, as a share of the host's memory) + `speed` x (how much
+   faster than usual this host ran these jobs, -1 to 1; a host that never ran a job other hosts have
+   run counts as 1 for it until its first run finishes, or the host with the most headroom would keep
+   every job and the others would never be compared; a warm host, or much more headroom, still outscores
+   this, and a host whose samples have aged out of the 30 kept counts as not having run it) - `bigfit` x (1 when the
+   heaviest measured queue waiting elsewhere needs at least twice this one's memory and fits only
+   this host of this queue's candidates, and this queue fits another).
 4. **Order**: the best score first, ties in stage 3's order. With no statistics at all for the
    queue, stage 3's order alone: warm workspace, most free memory, fewest busy slots.
+
+A runner takes any job of its queue, so a runner started for a light job can take a heavy one queued
+after it, and a host starts a launch's runner at once, so cancelling the launch does not stop it. For the
+same reason a queue's light jobs wait with its heaviest: while a heavy job waits for memory, a runner
+started for a light one elsewhere could take the heavy one instead. A job waiting for a big host has no
+priority over what else that host is given, so a busy host of another queue can keep it waiting. Jobs that
+are much heavier than their neighbours do best with **a label of their own**
+(`runs-on: [rm-pool-linux, heavy]`), which makes them a queue of their own: in the simulation in
+`crates/coordinator/tests/balance_sim.rs`, the light jobs' median wait falls from up to minutes to the 15
+seconds a runner takes to come up, and no heavy job lands on a host too small once measured.
 
 Weights are set with `COORDINATOR_PLACEMENT_WEIGHTS` (`--placement-weights`), any subset of
 `cache=4,headroom=2,speed=1,bigfit=1.5`, each 0 to 100. For example, a fleet where checkouts are
@@ -475,9 +501,10 @@ Every decision is logged with host ids, the estimate in bytes, where it came fro
 (per host at `debug`), never a repository, workflow, job or runner name, and the last 50 are kept
 in the database. `a pool queue was weighed`, and `a pool queue is not placed` with `no_memory_fit`, say
 what decided the fit for the candidate nearest to fitting: `free_ram_bytes` (its last heartbeat),
-`reserved_bytes` (its open launches), `ram_margin_bytes`, `required_bytes` (absent when no job is measured,
+`reserved_bytes` (its open launches), `committed_bytes`, `ram_margin_bytes`, `required_bytes` (absent when no job is measured,
 or no host could ever hold it, so nothing is filtered) and `total_ram_bytes`. A host fits when free less
-reserved holds required plus margin, so a low or stale free figure can be told from memory spoken for.
+reserved, and total less `committed_bytes` (every launch and job on it not yet ended), both hold required plus
+margin, so a low or stale free figure can be told from memory spoken for.
 
 ### Reading `stats`
 

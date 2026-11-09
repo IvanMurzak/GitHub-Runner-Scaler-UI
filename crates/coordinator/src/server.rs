@@ -391,11 +391,18 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                     && let (Some(runner), Some(identity)) =
                         (job.workflow_job.runner_name.as_deref(), identity)
                 {
-                    let times = JobTimes::parse(
-                        job.workflow_job.created_at.as_deref(),
-                        job.workflow_job.started_at.as_deref(),
-                        job.workflow_job.completed_at.as_deref(),
-                    );
+                    let times = JobTimes {
+                        failed: job
+                            .workflow_job
+                            .conclusion
+                            .as_deref()
+                            .is_some_and(|conclusion| conclusion != "success"),
+                        ..JobTimes::parse(
+                            job.workflow_job.created_at.as_deref(),
+                            job.workflow_job.started_at.as_deref(),
+                            job.workflow_job.completed_at.as_deref(),
+                        )
+                    };
                     state.statistics.job_identified(runner, identity, times);
                 }
                 // Recorded for later stages (statistics, lease confirmation).

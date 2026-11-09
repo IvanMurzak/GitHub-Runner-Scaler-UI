@@ -106,6 +106,9 @@ pub struct WorkflowJob {
     /// `null` until `completed`.
     #[serde(default)]
     pub completed_at: Option<String>,
+    /// `success`, `failure`, `cancelled`, ...; `null` until `completed`.
+    #[serde(default)]
+    pub conclusion: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

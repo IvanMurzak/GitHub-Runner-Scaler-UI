@@ -30,8 +30,9 @@
 //! # How placement uses it
 //!
 //! A runner takes *any* queued job its labels cover (design 4.4), so the
-//! demand of a pool queue is its **heaviest** queued job: the largest p90
-//! peak memory among the job keys queued there. A key never measured counts
+//! demand of a pool queue is its **heaviest** queued job: the largest expected
+//! peak memory ([`Aggregates::expected_peak`]) among the job keys queued there.
+//! A key never measured counts
 //! as its repository's p90 (every sample of that repository), and a
 //! repository never measured as [`StatsConfig::default_job_ram`]. See
 //! [`score`] for the filter and the weights. With no statistics at all for a
@@ -68,6 +69,17 @@ const RUN_MEMORY: usize = 20_000;
 /// How many samples with memory figures a workflow's job needs before they alone
 /// stand for it.
 const ENOUGH_OF_ITS_OWN: usize = 3;
+
+/// How much slower than usual, in [`speed`]'s terms, a host with a warm checkout
+/// may run a job and keep the cache term.
+const WARM_NOT_WORTH_IT: f64 = -0.1;
+
+/// How many runs of a job a warm host must have before they judge it: its first is
+/// likely a full clone.
+const WARM_JUDGED_AFTER: usize = 3;
+
+/// How many of a job's newest samples its expected memory never falls below.
+const RECENT_SAMPLES: usize = 3;
 
 /// How long a webhook's runner-to-job mapping waits for its attempt report,
 /// and the other way round.
@@ -331,6 +343,9 @@ pub struct JobTimes {
     pub created_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// GitHub says the job did not succeed: how long it took says nothing of how
+    /// fast its host is.
+    pub failed: bool,
 }
 
 /// Whole seconds from `from` to `to`; `None` unless both are known and in
@@ -353,6 +368,7 @@ impl JobTimes {
             created_at: at(created),
             started_at: at(started),
             completed_at: at(completed),
+            failed: false,
         }
     }
 
@@ -373,6 +389,7 @@ impl JobTimes {
         self.created_at = newer.created_at.or(self.created_at);
         self.started_at = newer.started_at.or(self.started_at);
         self.completed_at = newer.completed_at.or(self.completed_at);
+        self.failed |= newer.failed;
     }
 }
 
@@ -543,6 +560,8 @@ pub struct HostRatio {
     /// Its median duration over the usual one, in thousandths.
     pub ratio: Option<u32>,
     pub samples: usize,
+    /// Those with a duration: a failed job has none.
+    pub timed: usize,
     pub median_secs: Option<u64>,
 }
 
@@ -559,6 +578,33 @@ pub fn speed(ratios: &[BTreeMap<String, HostRatio>], host: &str) -> Option<f64> 
     #[allow(clippy::cast_precision_loss, reason = "a handful of terms")]
     let count = terms.len() as f64;
     (!terms.is_empty()).then(|| terms.iter().sum::<f64>() / count)
+}
+
+/// [`speed`] for a placement to go by: a host that never ran a key other hosts
+/// have run counts as the fastest there could be for that key. Otherwise the host
+/// with the most headroom keeps every job, and how the others compare is never
+/// found out. Its first finished run settles it. A bonus, not a rule: a warm host,
+/// or much more headroom, can still outscore it.
+#[must_use]
+pub fn speed_to_try(ratios: &[BTreeMap<String, HostRatio>], host: &str) -> f64 {
+    let terms: Vec<f64> = ratios
+        .iter()
+        .filter(|by_host| by_host.values().any(|figures| figures.ratio.is_some()))
+        .map(|by_host| {
+            if by_host.contains_key(host) {
+                speed(std::slice::from_ref(by_host), host).unwrap_or(0.0)
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    #[allow(clippy::cast_precision_loss, reason = "a handful of terms")]
+    let count = terms.len() as f64;
+    if terms.is_empty() {
+        0.0
+    } else {
+        terms.iter().sum::<f64>() / count
+    }
 }
 
 /// The samples kept, grouped for the questions placement and `stats` ask.
@@ -639,6 +685,24 @@ impl Aggregates {
                 .flat_map(|(_, samples)| samples),
         )
         .collect()
+    }
+
+    /// The memory `key` is expected to need: its p90 peak, or more if one of its
+    /// newest [`RECENT_SAMPLES`] needed more. A p90 over a long history answers
+    /// slowly: with 30 samples kept, a job that turned heavy goes on being placed
+    /// as light for three more runs, and each of those is what the host's
+    /// out-of-memory killer finds.
+    #[must_use]
+    pub fn expected_peak(&self, key: &str) -> Option<u64> {
+        let mut samples = self.speaking_for(key);
+        let p90 = field_percentile(&samples, |sample| sample.peak_rss_bytes, 90)?;
+        samples.sort_unstable_by_key(|sample| std::cmp::Reverse(sample.finished_at));
+        samples
+            .iter()
+            .filter_map(|sample| sample.peak_rss_bytes)
+            .take(RECENT_SAMPLES)
+            .chain([p90])
+            .max()
     }
 
     /// What placement weighs `key` by. See [`Self::speaking_for`].
@@ -723,6 +787,7 @@ fn ratios_of(samples: &[&JobSample]) -> BTreeMap<String, HostRatio> {
                 HostRatio {
                     ratio,
                     samples: count,
+                    timed: by_host.get(host).map_or(0, Vec::len),
                     median_secs: median,
                 },
             )
@@ -768,6 +833,9 @@ pub struct Demand {
     pub job_keys: Vec<String>,
     /// Any statistics at all for this queue: its keys or its repository.
     pub measured: bool,
+    /// The most memory of any host that could serve this queue but is no contender
+    /// now, its slots taken (`u64::MAX` when one's memory is unknown).
+    pub fleet_ram: Option<u64>,
 }
 
 impl Aggregates {
@@ -781,6 +849,9 @@ impl Aggregates {
         unnamed: bool,
         default_job_ram: u64,
     ) -> Demand {
+        let mut job_keys = job_keys.to_vec();
+        job_keys.sort();
+        job_keys.dedup();
         let repository_p90 = self.repository_p90_rss(repository);
         let fallback = repository_p90.map_or((default_job_ram, EstimateSource::Default), |bytes| {
             (bytes, EstimateSource::Repository)
@@ -793,8 +864,8 @@ impl Aggregates {
                 heaviest = Some(candidate);
             }
         };
-        for key in job_keys {
-            match self.job(key).and_then(|figures| figures.p90_peak_rss_bytes) {
+        for key in &job_keys {
+            match self.expected_peak(key) {
                 Some(bytes) => {
                     measured = true;
                     measured_job = Some(measured_job.map_or(bytes, |known| known.max(bytes)));
@@ -807,21 +878,19 @@ impl Aggregates {
             consider(fallback);
         }
         let (estimate, source) = heaviest.unwrap_or(fallback);
-        let mut job_keys = job_keys.to_vec();
-        job_keys.sort();
-        job_keys.dedup();
         Demand {
             estimate,
             source,
             measured_job,
             job_keys,
             measured,
+            fleet_ram: None,
         }
     }
 }
 
 impl Aggregates {
-    /// What a lease of each queued job reserves, heaviest first: its own p90,
+    /// What a lease of each queued job reserves, heaviest first: its expected peak,
     /// else the lesser of its repository's and `default_job_ram`, a guess that
     /// must not hold memory a measured job needs. `unnamed` jobs have no key.
     /// A lease reserves one of these: five jobs hold one heaviest job, not five.
@@ -838,11 +907,7 @@ impl Aggregates {
             .map_or(default_job_ram, |bytes| bytes.min(default_job_ram));
         let mut estimates: Vec<u64> = job_keys
             .iter()
-            .map(|key| {
-                self.job(key)
-                    .and_then(|figures| figures.p90_peak_rss_bytes)
-                    .unwrap_or(fallback)
-            })
+            .map(|key| self.expected_peak(key).unwrap_or(fallback))
             .chain(std::iter::repeat_n(fallback, unnamed))
             .collect();
         estimates.sort_unstable_by(|a, b| b.cmp(a));
@@ -853,25 +918,51 @@ impl Aggregates {
 /// The memory a host must have free for a queue. Only a job's own samples filter:
 /// its repository's p90 is a guess at a job never measured, and heavy samples of
 /// another job must not keep it waiting. Nor when no host could ever hold it:
-/// waiting would be forever, and the job is better run somewhere.
+/// waiting would be forever, and the job is better run somewhere. A host big enough
+/// with every slot taken still holds it, soon: its job waits for that host rather
+/// than start on one too small.
 fn required_memory(contenders: &[Contender], demand: &Demand, config: &StatsConfig) -> Option<u64> {
-    demand.measured_job.filter(|bytes| {
-        let needed = bytes.saturating_add(config.ram_margin);
+    let bytes = demand.measured_job?;
+    let needed = bytes.saturating_add(config.ram_margin);
+    let totals = contenders
+        .iter()
+        .map(|contender| contender.total_ram.unwrap_or(u64::MAX));
+    let biggest = demand.fleet_ram.into_iter().chain(totals).max()?;
+    if biggest < needed {
+        return None;
+    }
+    // The biggest hosts all here, doing nothing and still too short: what holds their
+    // memory is nothing placement can wait out, and a job that never starts never
+    // says it has grown lighter. It asks for what they have, so it runs on one of
+    // them; if that is less than the margin, on whichever the score says.
+    let biggest_hosts = || {
         contenders
             .iter()
-            .any(|contender| contender.total_ram.is_none_or(|total| total >= needed))
-    })
+            .filter(move |contender| contender.total_ram == Some(biggest))
+    };
+    if demand.fleet_ram.is_none_or(|ram| ram < biggest)
+        && biggest_hosts().next().is_some()
+        && biggest_hosts().all(|host| host.idle() && !host.fits(bytes, config.ram_margin))
+    {
+        return biggest_hosts()
+            .filter_map(Contender::available)
+            .max()
+            .and_then(|available| available.checked_sub(config.ram_margin));
+    }
+    Some(bytes)
 }
 
 /// The figures behind a fit, for the log: a host fits when `free_ram` less
-/// `reserved` holds `required` and `ram_margin`. So a reading can tell a stale or
-/// low `free_ram` from memory spoken for by open launches.
+/// `reserved`, and `total_ram` less `committed`, both hold `required` and
+/// `ram_margin`. So a reading can tell a stale or low `free_ram` from memory spoken
+/// for by open launches and running jobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FitFigures {
     pub host_id: String,
     pub free_ram: Option<u64>,
     pub total_ram: Option<u64>,
     pub reserved: u64,
+    pub committed: u64,
     pub ram_margin: u64,
     pub required: Option<u64>,
 }
@@ -893,6 +984,7 @@ pub fn roomiest(
             free_ram: contender.free_ram,
             total_ram: contender.total_ram,
             reserved: contender.reserved,
+            committed: contender.committed,
             ram_margin: config.ram_margin,
             required,
         })
@@ -911,17 +1003,48 @@ pub struct Contender {
     /// The estimates of the launches it accepted whose runner took no job
     /// yet: memory its heartbeat still shows free but that is spoken for.
     pub reserved: u64,
+    /// The estimates of every launch on it whose job has not ended: what its
+    /// total memory is spoken for by, whatever its jobs have grown to so far.
+    pub committed: u64,
 }
 
 impl Contender {
+    /// What a new job can count on: what the host says is free, less what is
+    /// still to come of its launches, and no more than its memory less all of
+    /// them. A build's peak can come long after its reservation lapses, with the
+    /// host's heartbeat showing that memory free until then.
     fn available(&self) -> Option<u64> {
-        self.free_ram.map(|free| free.saturating_sub(self.reserved))
+        self.free_ram.map(|free| {
+            let unclaimed = free.saturating_sub(self.reserved);
+            self.total_ram.map_or(unclaimed, |total| {
+                unclaimed.min(total.saturating_sub(self.committed))
+            })
+        })
+    }
+
+    const fn idle(&self) -> bool {
+        self.busy_slots == 0 && self.reserved == 0 && self.committed == 0
     }
 
     fn fits(&self, bytes: u64, margin: u64) -> bool {
         self.available()
             .is_none_or(|available| available >= bytes.saturating_add(margin))
     }
+}
+
+/// Whether `host` has run these jobs enough to be judged, and came out slower than
+/// usual by more than its checkout is worth.
+fn warm_not_worth_it(ratios: &[BTreeMap<String, HostRatio>], host: &str) -> bool {
+    let judged: Vec<BTreeMap<String, HostRatio>> = ratios
+        .iter()
+        .filter(|by_host| {
+            by_host
+                .get(host)
+                .is_some_and(|figures| figures.timed >= WARM_JUDGED_AFTER)
+        })
+        .cloned()
+        .collect();
+    speed(&judged, host).is_some_and(|speed| speed < WARM_NOT_WORTH_IT)
 }
 
 /// Stage 3's order: a warm workspace, the most free memory, the fewest busy
@@ -958,11 +1081,12 @@ fn share(part: u64, whole: u64) -> f64 {
 /// last (design 4.5, steps 2-4).
 ///
 /// * **Filter**: with the job's own samples behind the estimate, a host whose
-///   free memory, less what its launches that have not taken a job yet
-///   reserve, cannot hold the estimate plus `margin` does not fit. A guess (a
-///   repository's p90, or the default) filters nothing, and only ranks.
-/// * **Score** = `cache`·warm + `headroom`·(memory free after this job, as a
-///   share of the host's memory) + `speed`·(how much faster than usual it
+///   [available memory](Contender) cannot hold the estimate plus `margin` does not
+///   fit. A guess (a repository's p90, or the default) filters nothing, and only
+///   ranks.
+/// * **Score** = `cache`·warm (unless measured slower than usual) +
+///   `headroom`·(memory free after this job, as a share of the host's memory) +
+///   `speed`·([`speed_to_try`]: how much faster than usual it
 ///   ran these job keys) − `bigfit`·(1 when a heavier queued job,
 ///   `heavier`, fits this host and no other, and this queue fits another).
 /// * **Order**: by score, then stage 3's order. With no statistics for this
@@ -998,8 +1122,14 @@ pub fn score(
                 .map(|available| available.saturating_sub(demand.estimate));
             let whole = contender.total_ram.or(contender.available()).unwrap_or(0);
             let headroom = free_after.map_or(0.0, |free| share(free, whole));
-            let speed = speed(&ratios, &contender.host_id).unwrap_or(0.0);
-            let cache = if contender.warm { 1.0 } else { 0.0 };
+            let speed = speed_to_try(&ratios, &contender.host_id);
+            // Measured durations already hold what its checkout saves: a warm host
+            // measured slower than usual is not worth waiting out for its cache.
+            let cache = if contender.warm && !warm_not_worth_it(&ratios, &contender.host_id) {
+                1.0
+            } else {
+                0.0
+            };
             let others_fit_this = contenders
                 .iter()
                 .any(|other| other.host_id != contender.host_id && fits(other));
@@ -1117,7 +1247,7 @@ impl Statistics {
     /// `completed` webhook, and adds the counted launches and wakes to the
     /// database.
     pub fn flush(&self) {
-        let overdue = lock(&self.correlator).overdue(Instant::now());
+        let overdue = lock(&self.correlator).overdue(crate::clock::now());
         for correlated in overdue {
             self.record(correlated);
         }
@@ -1136,7 +1266,8 @@ impl Statistics {
     /// A webhook said `runner` took (or finished) the job `identity`, at
     /// `times`.
     pub fn job_identified(&self, runner: &str, identity: JobIdentity, times: JobTimes) {
-        let correlated = lock(&self.correlator).identified(runner, identity, times, Instant::now());
+        let correlated =
+            lock(&self.correlator).identified(runner, identity, times, crate::clock::now());
         if let Some(correlated) = correlated {
             self.record(correlated);
         }
@@ -1156,7 +1287,7 @@ impl Statistics {
         if let (Some(usage), Some(ram)) = (finished.usage.as_mut(), host_ram) {
             usage.peak_rss_bytes = usage.peak_rss_bytes.min(ram);
         }
-        let correlated = lock(&self.correlator).finished(host_id, finished, Instant::now());
+        let correlated = lock(&self.correlator).finished(host_id, finished, crate::clock::now());
         if let Some(correlated) = correlated {
             self.record(correlated);
         }
@@ -1176,6 +1307,9 @@ impl Statistics {
         // The job's own run time; the host's attempt (start, wait for a job,
         // cleanup) only when GitHub's times are missing.
         let (duration_secs, duration_source) = match times.run_secs() {
+            // Its memory still counts, and a failure may be why it ended. Its time
+            // does not: one that fails at once would read as the fastest host there is.
+            _ if times.failed || finished.outcome == AttemptOutcomeKind::Failed => (None, "failed"),
             Some(secs) => (Some(secs), "webhook"),
             None => (finished.duration_secs, "host"),
         };
@@ -1222,7 +1356,7 @@ impl Statistics {
         if decision.chosen.is_none() {
             let key = format!("{}|{}", decision.repository, decision.labels);
             let mut unplaced = lock(&self.unplaced);
-            let now = Instant::now();
+            let now = crate::clock::now();
             unplaced.retain(|_, at| now.saturating_duration_since(*at) < UNPLACED_DECISION_EVERY);
             if unplaced.contains_key(&key) {
                 return;
@@ -1518,8 +1652,9 @@ mod tests {
             warm: false,
             free_ram: free,
             total_ram: Some(32 * GIB),
-            busy_slots: 0,
+            busy_slots: 1,
             reserved,
+            committed: 0,
         };
         let config = StatsConfig::default();
         let demand = Demand {
@@ -1528,6 +1663,7 @@ mod tests {
             measured_job: Some(4 * GIB),
             job_keys: vec![],
             measured: true,
+            fleet_ram: None,
         };
         let figures = roomiest(
             &[
@@ -1817,8 +1953,9 @@ mod tests {
             warm: false,
             free_ram: Some(free),
             total_ram: Some(64 * GIB),
-            busy_slots: 0,
+            busy_slots: 1,
             reserved: 0,
+            committed: 0,
         };
         let config = StatsConfig::default();
         let fits = |job_keys: &[String]| {
@@ -1940,6 +2077,7 @@ mod tests {
             total_ram: Some(total),
             busy_slots: 0,
             reserved: 0,
+            committed: 0,
         }
     }
 
@@ -1959,6 +2097,7 @@ mod tests {
             measured_job: Some(4 * GIB),
             job_keys: vec![],
             measured: true,
+            fleet_ram: None,
         };
         let mut leased = contender("leased", 8 * GIB, 64 * GIB);
         leased.reserved = 4 * GIB;
@@ -1997,6 +2136,7 @@ mod tests {
             measured_job: Some(GIB),
             job_keys: vec!["k".into()],
             measured: true,
+            fleet_ram: None,
         };
         // A warm workspace outweighs more headroom.
         let mut warm = contender("warm", 6 * GIB, 16 * GIB);
@@ -2063,6 +2203,7 @@ mod tests {
             measured_job: Some(40 * GIB),
             job_keys: vec![],
             measured: true,
+            fleet_ram: None,
         };
         let scored = score(
             &[
@@ -2079,7 +2220,10 @@ mod tests {
         let scored = score(
             &[
                 contender("a", 10 * GIB, 16 * GIB),
-                contender("big", 12 * GIB, 64 * GIB),
+                Contender {
+                    busy_slots: 1,
+                    ..contender("big", 12 * GIB, 64 * GIB)
+                },
             ],
             &demand,
             None,
@@ -2254,5 +2398,293 @@ mod tests {
         let fitted = fit_report(huge);
         assert!(ServerMessage::Stats(fitted.clone()).encode().len() < MAX_MESSAGE_BYTES);
         assert!(fitted.decisions.is_empty() && !fitted.jobs.is_empty());
+    }
+
+    fn heavy_demand(fleet_ram: Option<u64>) -> Demand {
+        Demand {
+            estimate: 28 * GIB,
+            source: EstimateSource::Job,
+            measured_job: Some(28 * GIB),
+            job_keys: vec!["octo/app/build".into()],
+            measured: true,
+            fleet_ram,
+        }
+    }
+
+    /// The only host big enough has no slot free, so it is no contender: the job
+    /// waits for it. It runs where it can only when no host could ever hold it.
+    #[test]
+    fn a_heavy_job_waits_for_a_big_host_with_no_slot_free_rather_than_start_too_small() {
+        let config = StatsConfig::default();
+        let aggregates = Aggregates::default();
+        let small = [contender("small", 20 * GIB, 23 * GIB)];
+        let fits = |fleet_ram| {
+            score(&small, &heavy_demand(fleet_ram), None, &config, &aggregates)[0]
+                .1
+                .fits
+        };
+        assert!(!fits(Some(64 * GIB)));
+        assert!(fits(Some(23 * GIB)));
+        assert!(fits(None));
+    }
+
+    /// A build's peak can come long after its reservation lapsed, with the host's
+    /// heartbeat showing that memory free until then.
+    #[test]
+    fn memory_spoken_for_counts_against_the_hosts_total_whatever_it_shows_free() {
+        let mut host = contender("h", 40 * GIB, 64 * GIB);
+        assert_eq!(host.available(), Some(40 * GIB));
+        host.committed = 56 * GIB;
+        assert_eq!(host.available(), Some(8 * GIB));
+        host.reserved = 35 * GIB;
+        assert_eq!(host.available(), Some(5 * GIB));
+        // A host that reports no free memory is never filtered.
+        host.free_ram = None;
+        assert_eq!(host.available(), None);
+    }
+
+    /// The host with the most headroom would otherwise keep every job, and how
+    /// the others compare would never be found out.
+    #[test]
+    fn a_host_that_never_ran_a_job_is_tried_once_and_then_judged_by_its_runs() {
+        let config = StatsConfig::default();
+        let demand = Demand {
+            estimate: 4 * GIB,
+            source: EstimateSource::Job,
+            measured_job: Some(4 * GIB),
+            job_keys: vec!["octo/app/build".into()],
+            measured: true,
+            fleet_ram: None,
+        };
+        let hosts = [
+            contender("big", 60 * GIB, 64 * GIB),
+            contender("small", 20 * GIB, 23 * GIB),
+        ];
+        let best = |samples: Vec<JobSample>| {
+            let aggregates = Aggregates::from_samples(samples, 30);
+            score(&hosts, &demand, None, &config, &aggregates)[0]
+                .0
+                .host_id
+                .clone()
+        };
+        // Nothing measured anywhere: nothing to compare, headroom decides.
+        assert_eq!(best(vec![]), "big");
+        assert_eq!(
+            best(vec![sample("octo/app/build", "big", 600, 4 * GIB)]),
+            "small"
+        );
+        assert_eq!(
+            best(vec![
+                sample("octo/app/build", "big", 600, 4 * GIB),
+                sample("octo/app/build", "small", 240, 4 * GIB),
+            ]),
+            "small"
+        );
+        assert_eq!(
+            best(vec![
+                sample("octo/app/build", "big", 240, 4 * GIB),
+                sample("octo/app/build", "small", 600, 4 * GIB),
+            ]),
+            "big"
+        );
+    }
+
+    #[test]
+    fn a_warm_host_measured_slower_than_usual_is_not_kept_for_its_checkout() {
+        let config = StatsConfig::default();
+        let demand = Demand {
+            estimate: GIB,
+            source: EstimateSource::Job,
+            measured_job: Some(GIB),
+            job_keys: vec!["octo/app/build".into()],
+            measured: true,
+            fleet_ram: None,
+        };
+        let hosts = [
+            Contender {
+                warm: true,
+                ..contender("warm", 6 * GIB, 8 * GIB)
+            },
+            contender("cold", 60 * GIB, 64 * GIB),
+        ];
+        let best = |warm: u64, cold: u64, runs: usize| {
+            let mut samples = vec![sample("octo/app/build", "cold", cold, GIB)];
+            samples.extend(vec![sample("octo/app/build", "warm", warm, GIB); runs]);
+            let aggregates = Aggregates::from_samples(samples, 30);
+            score(&hosts, &demand, None, &config, &aggregates)[0]
+                .0
+                .host_id
+                .clone()
+        };
+        assert_eq!(best(200, 240, 3), "warm");
+        // A little slower is noise; the checkout still counts.
+        assert_eq!(best(250, 240, 3), "warm");
+        assert_eq!(best(360, 240, 3), "cold");
+        // Too few runs to judge by: the first is likely a full clone.
+        assert_eq!(best(360, 240, 2), "warm");
+    }
+
+    /// One spike among a job's newest samples, above what its host has free even
+    /// with nothing running: waiting would never end, and without a run the spike
+    /// would never leave the newest samples.
+    #[test]
+    fn a_job_runs_on_the_biggest_host_idle_and_still_short_rather_than_wait_for_ever() {
+        let config = StatsConfig::default();
+        let fits = |busy_slots| {
+            score(
+                &[Contender {
+                    busy_slots,
+                    ..contender("h", 58 * GIB, 64 * GIB)
+                }],
+                &Demand {
+                    estimate: 61 * GIB,
+                    measured_job: Some(61 * GIB),
+                    ..heavy_demand(None)
+                },
+                None,
+                &config,
+                &Aggregates::default(),
+            )[0]
+            .1
+            .fits
+        };
+        assert!(!fits(2), "it has jobs to wait out");
+        assert!(fits(0));
+        // It runs on that host, not on whatever else scores best with no filter.
+        let scored = |big: Contender| {
+            score(
+                &[big, contender("small", 14 * GIB, 16 * GIB)],
+                &Demand {
+                    estimate: 61 * GIB,
+                    measured_job: Some(61 * GIB),
+                    ..heavy_demand(None)
+                },
+                None,
+                &config,
+                &Aggregates::default(),
+            )
+        };
+        let hosts = scored(contender("big", 58 * GIB, 64 * GIB));
+        assert_eq!(hosts[0].0.host_id, "big");
+        assert!(hosts[0].1.fits);
+        assert!(!hosts[1].1.fits);
+        // Another as big, its slots taken: the job waits for it.
+        assert!(
+            required_memory(
+                &[contender("idle", 58 * GIB, 64 * GIB)],
+                &Demand {
+                    measured_job: Some(61 * GIB),
+                    ..heavy_demand(Some(64 * GIB))
+                },
+                &config,
+            ) == Some(61 * GIB)
+        );
+        // Another as big as it that would hold the job: nothing is relaxed.
+        let required = required_memory(
+            &[
+                contender("idle", 50 * GIB, 64 * GIB),
+                Contender {
+                    busy_slots: 2,
+                    ..contender("busy", 62 * GIB, 64 * GIB)
+                },
+            ],
+            &Demand {
+                measured_job: Some(58 * GIB),
+                ..heavy_demand(None)
+            },
+            &config,
+        );
+        assert_eq!(required, Some(58 * GIB));
+    }
+
+    /// A job that fails at once says nothing of how fast its host is, or that host
+    /// would take every job. Its memory still counts.
+    #[test]
+    fn a_failed_job_keeps_its_memory_figure_and_gives_no_speed() {
+        let db = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let stats = Statistics::load(db, StatsConfig::default());
+        let times = JobTimes {
+            failed: true,
+            ..JobTimes::parse(
+                Some("2026-11-07T10:00:00Z"),
+                Some("2026-11-07T10:00:00Z"),
+                Some("2026-11-07T10:00:05Z"),
+            )
+        };
+        stats.job_identified(
+            "runner-manager-1",
+            JobIdentity::new("octo/app", Some("build")).expect("named"),
+            times,
+        );
+        stats.attempt_finished(
+            "broken",
+            &AttemptFinished {
+                lease_id: None,
+                runner_name: "runner-manager-1".into(),
+                outcome: AttemptOutcomeKind::CompletedJob,
+                duration_secs: Some(9),
+                usage: Some(AttemptUsage {
+                    peak_rss_bytes: GIB,
+                    samples: 3,
+                    ..AttemptUsage::default()
+                }),
+            },
+            None,
+        );
+        stats.with_aggregates(|aggregates| {
+            let key = "octo/app/build";
+            let figures = aggregates.job(key).expect("a sample");
+            assert_eq!(figures.p50_duration_secs, None);
+            assert_eq!(figures.p90_peak_rss_bytes, Some(GIB));
+            // No other host's time to weigh it against, and it has been tried.
+            let ratios = [aggregates.host_ratios(key)];
+            assert!((speed_to_try(&ratios, "broken") - 0.0).abs() < 1e-9);
+        });
+        let ratios = [Aggregates::from_samples(
+            vec![
+                JobSample {
+                    duration_secs: None,
+                    ..sample("octo/app/build", "broken", 5, GIB)
+                },
+                sample("octo/app/build", "good", 60, GIB),
+            ],
+            30,
+        )
+        .host_ratios("octo/app/build")];
+        assert!((speed_to_try(&ratios, "broken") - 0.0).abs() < 1e-9);
+        assert!((speed_to_try(&ratios, "unknown") - 1.0).abs() < 1e-9);
+    }
+
+    /// Thirty samples: a p90 would not see this for three more runs.
+    #[test]
+    fn a_job_that_turned_heavy_is_expected_heavy_from_its_next_run() {
+        let at = |seconds| Utc::now() + chrono::TimeDelta::seconds(seconds);
+        let mut samples: Vec<JobSample> = (0..29)
+            .map(|index| JobSample {
+                finished_at: at(index),
+                ..sample("octo/app/build", "h", 60, 6 * GIB)
+            })
+            .collect();
+        samples.push(JobSample {
+            finished_at: at(100),
+            ..sample("octo/app/build", "h", 60, 30 * GIB)
+        });
+        let aggregates = Aggregates::from_samples(samples.clone(), 30);
+        let key = "octo/app/build";
+        assert_eq!(
+            aggregates.job(key).and_then(|job| job.p90_peak_rss_bytes),
+            Some(6 * GIB)
+        );
+        assert_eq!(aggregates.expected_peak(key), Some(30 * GIB));
+        // Three light runs later, a single spike has had its say.
+        for index in 0..3 {
+            samples.push(JobSample {
+                finished_at: at(200 + index),
+                ..sample(key, "h", 60, 6 * GIB)
+            });
+        }
+        let aggregates = Aggregates::from_samples(samples, 30);
+        assert_eq!(aggregates.expected_peak(key), Some(6 * GIB));
+        assert_eq!(aggregates.expected_peak("octo/app/unknown"), None);
     }
 }
