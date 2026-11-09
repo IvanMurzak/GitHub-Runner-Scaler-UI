@@ -52,3 +52,6 @@ runner-manager-testkit = { workspace = true }
 serial_test = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

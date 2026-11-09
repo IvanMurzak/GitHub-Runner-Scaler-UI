@@ -48,8 +48,7 @@ use secrecy::SecretString;
 use crate::dependency_caches::DependencyCaches;
 use crate::oci::OciProcesses;
 use crate::package::{
-    ContentsMismatch, InstalledPackage, LastCheck, PackageCache, PackageContents, PackageError,
-    RunnerVersion,
+    InstalledPackage, LastCheck, PackageCache, PackageContents, PackageError, RunnerVersion,
 };
 use crate::reconcile::{
     AllocationGuard, CleanBackoff, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent,
@@ -646,6 +645,34 @@ pub struct SharedPackages {
 }
 
 impl SharedPackages {
+    /// Stops trusting a shared package, unless a later install has replaced the
+    /// record this launch read: that one is another package's. The next launch
+    /// prepares it again.
+    fn discard(
+        &self,
+        root: &Path,
+        origin: &Path,
+        contents: Option<&Arc<PackageContents>>,
+        reason: &'static str,
+    ) {
+        let current = self.trusted.contents_of(root);
+        let same = match (contents, current.as_ref()) {
+            (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            tracing::warn!(
+                event = "package_verify_failed",
+                reason,
+                "a shared runner package does not match its verified archive; it is discarded \
+                 and prepared again"
+            );
+            self.trusted.forget(root);
+            self.trusted.forget(origin);
+        }
+    }
+
     /// What an install ended in, for the launches queued behind it. A terminal
     /// failure is not shared: it would close each of them, with no retry of its
     /// own, and one that succeeded clears the last failure.
@@ -867,10 +894,20 @@ impl RuntimePackages for CachedRuntimePackages {
             }),
         )
         .await?;
-        if copied.is_err() {
+        if let Err(error) = copied {
             // Nothing a failed or tainted copy left may reach a retry's copy,
             // which lays out over the same runtime.
             let _ = remove_materialized_package(attempt);
+            // A tree that cannot be copied may be one a job broke, on Windows with
+            // nothing else to tell. A full disk says nothing about the tree.
+            if error.kind() != std::io::ErrorKind::StorageFull {
+                self.shared.discard(
+                    installed.root(),
+                    &copied_from,
+                    contents.as_ref(),
+                    "copy_failed",
+                );
+            }
             return Err(FailureReason::ProcessStartFailed);
         }
         if let Err(error) = self.cache.lease(attempt, installed.version()) {
@@ -878,6 +915,12 @@ impl RuntimePackages for CachedRuntimePackages {
             // slot's `_work` is retained across attempts, and this rollback
             // runs before the attempt that would have owned it ever started.
             let _ = remove_materialized_package(attempt);
+            self.shared.discard(
+                installed.root(),
+                &copied_from,
+                contents.as_ref(),
+                "lease_failed",
+            );
             return Err(package_failure(error));
         }
         // Leased while still holding the trees, so a prune that gets the
@@ -887,30 +930,46 @@ impl RuntimePackages for CachedRuntimePackages {
         // happened to the shared trees meanwhile: read in full against the
         // archive, under neither the host lock nor the trees' hold. A tree with no
         // record has nothing vouching for it, and fails like one that differs.
-        let verified = match contents {
-            Some(contents) => {
-                timed(
-                    &mut timings.verify,
-                    self.blocking(installed.root(), move |_, _| {
-                        contents.verify(&destination, &[DEFAULT_WORK_FOLDER])
-                    }),
-                )
-                .await?
-            }
-            None => Err(ContentsMismatch::Unreadable),
-        };
-        if let Err(mismatch) = verified {
-            tracing::warn!(
-                event = "package_verify_failed",
-                attempt_id = %attempt.id,
-                reason = mismatch.as_str(),
-                "a runner package copy does not match its verified archive; the shared package \
-                 is discarded and prepared again"
-            );
-            self.shared.trusted.forget(installed.root());
-            self.shared.trusted.forget(&copied_from);
+        let Some(contents) = contents else {
             let _ = self.cache.release(attempt.id);
             let _ = remove_materialized_package(attempt);
+            return Err(FailureReason::ProcessStartFailed);
+        };
+        let persistent = matches!(attempt.workspace(), AttemptWorkspace::PersistentSlot { .. });
+        let source = installed.root().to_path_buf();
+        let checking = Arc::clone(&contents);
+        let copy = timed(
+            &mut timings.verify,
+            self.blocking(installed.root(), move |_, _| {
+                let verified =
+                    checking.verify(&destination, |name| persistent && is_work_folder(name));
+                // Who is to blame: a runtime can be touched by a job, or sit on a
+                // disk with a fault, and that is no reason to download anything.
+                let shared = verified
+                    .is_err()
+                    .then(|| checking.verify(&source, |_| false));
+                (verified, shared)
+            }),
+        )
+        .await?;
+        if let (Err(mismatch), shared) = copy {
+            let _ = self.cache.release(attempt.id);
+            let _ = remove_materialized_package(attempt);
+            tracing::warn!(
+                event = "package_copy_differs",
+                attempt_id = %attempt.id,
+                reason = mismatch.as_str(),
+                "a runner's package copy does not match the package's verified archive; it was \
+                 removed and not used"
+            );
+            if let Some(Err(mismatch)) = shared {
+                self.shared.discard(
+                    installed.root(),
+                    &copied_from,
+                    Some(&contents),
+                    mismatch.as_str(),
+                );
+            }
             return Err(FailureReason::ProcessStartFailed);
         }
         Ok(installed.version().clone())
@@ -937,7 +996,8 @@ impl RuntimePackages for CachedRuntimePackages {
         for installed in self.cache.installed().map_err(package_failure)? {
             if installed.version() != current.version() {
                 match self.cache.prune(installed.version(), attempts) {
-                    Ok(()) | Err(PackageError::VersionInUse { .. }) => {}
+                    Ok(()) => self.shared.trusted.forget(installed.root()),
+                    Err(PackageError::VersionInUse { .. }) => {}
                     Err(error) => return Err(package_failure(error)),
                 }
             }
@@ -2000,7 +2060,7 @@ fn refresh_package_seed(
         return Err(error);
     }
     // After the rename, which itself moves the seed directory's change time.
-    trusted.record(&seed, trusted.contents_of(source))?;
+    trusted.record(&seed, None)?;
     Ok(seed)
 }
 
