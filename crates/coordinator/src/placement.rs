@@ -309,7 +309,7 @@ impl State {
     /// The estimates of `host_id`'s leases whose runner took no job yet:
     /// memory its heartbeat still shows free.
     fn reserved_on(&self, host_id: &str) -> u64 {
-        let now = Instant::now();
+        let now = crate::clock::now();
         let leased = self
             .leases
             .values()
@@ -388,7 +388,7 @@ impl State {
 
     /// Records why `key` is short of runners; logs it at most once a minute.
     fn note_unplaced(&mut self, key: &JobKey, reason: Unplaced) {
-        let now = Instant::now();
+        let now = crate::clock::now();
         let entry = self.unplaced.entry(key.clone()).or_insert((reason, None));
         let due = entry
             .1
@@ -580,7 +580,7 @@ impl Placement {
             tracing::warn!("too many queued pool jobs are remembered; this one is not placed");
             return None;
         }
-        let now = Instant::now();
+        let now = crate::clock::now();
         state.touched.insert(key.clone(), now);
         let queue = state.queues.entry(key.clone()).or_default();
         if queue.jobs.insert(job_id, (now, job_key)).is_none() && queue.unnamed > 0 {
@@ -611,7 +611,7 @@ impl Placement {
             return None;
         }
         let key = JobKey::new(repository, required);
-        let now = Instant::now();
+        let now = crate::clock::now();
         let mut state = self.state();
         state.touched.insert(key.clone(), now);
         if let Some(queue) = state.queues.get_mut(&key) {
@@ -698,7 +698,7 @@ impl Placement {
                 let known = queue
                     .jobs
                     .entry(*id)
-                    .or_insert_with(|| (Instant::now(), None));
+                    .or_insert_with(|| (crate::clock::now(), None));
                 // Not back to the job alone from a key that names its workflow.
                 if job_key.as_ref().is_some_and(|new| {
                     known.1.as_ref().is_none_or(|old| {
@@ -783,7 +783,7 @@ impl Placement {
                 Runner {
                     host_id: host_id.to_string(),
                     queue,
-                    at: Instant::now(),
+                    at: crate::clock::now(),
                 },
             );
         }
@@ -798,7 +798,7 @@ impl Placement {
             match (started.lease_id.as_deref(), lease_key) {
                 // Its own lease's job: that lease is done.
                 (Some(lease_id), Some(key)) if key == taken => {
-                    state.release_claimed(lease_id, Instant::now());
+                    state.release_claimed(lease_id, crate::clock::now());
                 }
                 // Another queue's job, or a runner of no lease: the host's
                 // oldest lease for that queue is not coming to anything.
@@ -823,9 +823,9 @@ impl Placement {
             .and_then(VecDeque::pop_front)
             .is_some();
         if credited {
-            state.release_claimed(lease_id, Instant::now());
+            state.release_claimed(lease_id, crate::clock::now());
         } else if let Some(lease) = state.leases.get_mut(lease_id) {
-            lease.state = LeaseState::Claimed(Instant::now());
+            lease.state = LeaseState::Claimed(crate::clock::now());
         }
     }
 
@@ -870,7 +870,7 @@ impl Placement {
     /// it, when the host already held the launch.
     pub fn reconcile_leases(&self, host_id: &str, held: &[String]) -> usize {
         let held: HashSet<&str> = held.iter().map(String::as_str).collect();
-        let renewed = Instant::now() + self.lease_ttl;
+        let renewed = crate::clock::now() + self.lease_ttl;
         let mut state = self.state();
         for (id, lease) in &mut state.leases {
             if lease.host_id == host_id
@@ -966,7 +966,7 @@ impl Placement {
     /// The queues short of runners and the open leases, for `stats`.
     #[must_use]
     pub fn snapshot(&self) -> (Vec<PendingQueue>, Vec<OpenLease>) {
-        let now = Instant::now();
+        let now = crate::clock::now();
         let state = self.state();
         let mut open: HashMap<&JobKey, usize> = HashMap::new();
         for lease in state.leases.values() {
@@ -1032,7 +1032,7 @@ impl Placement {
 
     /// Expires leases, then places every job still short of one.
     pub async fn retry_all(&self) {
-        for key in self.expire(Instant::now()) {
+        for key in self.expire(crate::clock::now()) {
             self.rebalance(&key).await;
         }
     }
@@ -1209,7 +1209,7 @@ impl Placement {
             return None;
         };
         let lease_id = uuid::Uuid::new_v4().simple().to_string();
-        let now = Instant::now();
+        let now = crate::clock::now();
         let ttl = self.lease_ttl;
         state.leases.insert(
             lease_id.clone(),

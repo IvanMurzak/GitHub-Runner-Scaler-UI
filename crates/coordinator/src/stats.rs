@@ -1117,7 +1117,7 @@ impl Statistics {
     /// `completed` webhook, and adds the counted launches and wakes to the
     /// database.
     pub fn flush(&self) {
-        let overdue = lock(&self.correlator).overdue(Instant::now());
+        let overdue = lock(&self.correlator).overdue(crate::clock::now());
         for correlated in overdue {
             self.record(correlated);
         }
@@ -1136,7 +1136,7 @@ impl Statistics {
     /// A webhook said `runner` took (or finished) the job `identity`, at
     /// `times`.
     pub fn job_identified(&self, runner: &str, identity: JobIdentity, times: JobTimes) {
-        let correlated = lock(&self.correlator).identified(runner, identity, times, Instant::now());
+        let correlated = lock(&self.correlator).identified(runner, identity, times, crate::clock::now());
         if let Some(correlated) = correlated {
             self.record(correlated);
         }
@@ -1156,7 +1156,7 @@ impl Statistics {
         if let (Some(usage), Some(ram)) = (finished.usage.as_mut(), host_ram) {
             usage.peak_rss_bytes = usage.peak_rss_bytes.min(ram);
         }
-        let correlated = lock(&self.correlator).finished(host_id, finished, Instant::now());
+        let correlated = lock(&self.correlator).finished(host_id, finished, crate::clock::now());
         if let Some(correlated) = correlated {
             self.record(correlated);
         }
@@ -1222,7 +1222,7 @@ impl Statistics {
         if decision.chosen.is_none() {
             let key = format!("{}|{}", decision.repository, decision.labels);
             let mut unplaced = lock(&self.unplaced);
-            let now = Instant::now();
+            let now = crate::clock::now();
             unplaced.retain(|_, at| now.saturating_duration_since(*at) < UNPLACED_DECISION_EVERY);
             if unplaced.contains_key(&key) {
                 return;

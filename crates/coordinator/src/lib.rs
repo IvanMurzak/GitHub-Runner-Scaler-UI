@@ -15,6 +15,18 @@
 //! Design: `.taskflow/2026-11-07-coordinator-server/README.md`. Deployment:
 //! `docs/coordinator.md`.
 
+/// The clock placement and statistics read.
+///
+/// Tokio's, as a [`std::time::Instant`]: the system's in service, and a virtual
+/// one under `tokio::time::pause()`, which is what lets the balance simulation
+/// (`tests/balance_sim.rs`) run hours of placement in a moment.
+pub(crate) mod clock {
+    #[must_use]
+    pub fn now() -> std::time::Instant {
+        tokio::time::Instant::now().into_std()
+    }
+}
+
 pub mod github_app;
 pub mod placement;
 pub mod registry;

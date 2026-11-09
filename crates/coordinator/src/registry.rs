@@ -237,7 +237,7 @@ impl Registry {
                 sender,
                 hello: None,
                 heartbeat: None,
-                heartbeat_at: Instant::now(),
+                heartbeat_at: crate::clock::now(),
                 acked: None,
             },
         );
@@ -452,7 +452,7 @@ impl Registry {
             .as_ref()
             .is_none_or(|last| heartbeat.free_slots > last.free_slots);
         current.heartbeat = Some(heartbeat);
-        current.heartbeat_at = Instant::now();
+        current.heartbeat_at = crate::clock::now();
         freed
     }
 
