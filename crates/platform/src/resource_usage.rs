@@ -446,6 +446,35 @@ mod tests {
         assert_eq!(cut[&10].processes, 1);
     }
 
+    /// A runner that exited stays in the process table until its parent reaps
+    /// it, and nothing reaps it but the pass this look exists to bring forward. So
+    /// it has to read as gone, or a slot waits for the next scheduled poll.
+    #[test]
+    fn a_process_that_exited_and_was_not_reaped_is_gone() {
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("sh starts");
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("cmd starts");
+        let root = child.id();
+        let mut gone = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if sample_tree(root).is_none() {
+                gone = true;
+                break;
+            }
+        }
+        let reaped = child.wait();
+        assert!(reaped.is_ok(), "it was still ours to reap: {reaped:?}");
+        assert!(gone, "an exited process still reads as running");
+    }
+
     /// A real child tree of this process: the measurement on the current OS.
     #[cfg(unix)]
     #[test]

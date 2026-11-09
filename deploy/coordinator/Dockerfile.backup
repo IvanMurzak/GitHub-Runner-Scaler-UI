@@ -1,0 +1,12 @@
+# The coordinator's daily database backup: see backup.sh.
+#
+# Same account as the coordinator image, to read its database; an empty named
+# volume takes /backups' owner from here.
+FROM alpine:3.21
+RUN apk add --no-cache sqlite \
+    && mkdir /backups \
+    && chown 10001:10001 /backups
+COPY deploy/coordinator/backup.sh /usr/local/bin/backup.sh
+USER 10001:10001
+VOLUME ["/backups"]
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/backup.sh"]

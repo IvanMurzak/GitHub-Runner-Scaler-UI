@@ -32,7 +32,7 @@ use runner_manager_github::rest::{ActivityScope, CancelToken, InventoryError};
 use crate::github_app::{AppError, GithubApp};
 use crate::placement::{Placement, SweptQueue};
 use crate::registry::{Coverage, Inventory, Registry, is_pool_job};
-use crate::stats::JobIdentity;
+use crate::stats::{JobIdentity, RunWorkflows};
 
 /// The shortest sweep interval accepted.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(30);
@@ -127,6 +127,9 @@ pub struct Sweeper {
     inventory_tried_at: Option<tokio::time::Instant>,
     /// Stage 3: told how many pool jobs each repository read has queued.
     placement: Option<Arc<Placement>>,
+    /// Told which workflow each run it lists belongs to, and asks for the ones
+    /// webhooks named before a sweep listed them.
+    workflows: Arc<RunWorkflows>,
 }
 
 impl Sweeper {
@@ -141,7 +144,15 @@ impl Sweeper {
             inventory_at: None,
             inventory_tried_at: None,
             placement: None,
+            workflows: Arc::new(RunWorkflows::default()),
         }
+    }
+
+    /// Shares what is known of runs' workflows with the webhook's statistics.
+    #[must_use]
+    pub fn with_workflows(mut self, workflows: Arc<RunWorkflows>) -> Self {
+        self.workflows = workflows;
+        self
     }
 
     /// Also counts every read repository's queued pool jobs for `placement`,
@@ -157,11 +168,16 @@ impl Sweeper {
     /// the one it has may be out of date. Forever.
     pub async fn run(mut self) {
         let registry = Arc::clone(&self.registry);
+        let workflows = Arc::clone(&self.workflows);
         let mut ticks = tokio::time::interval(self.interval);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = ticks.tick() => {}
+                () = workflows.asked() => {
+                    self.answer_wanted_runs().await;
+                    continue;
+                }
                 () = registry.inventory_wanted() => {
                     if let Some(tried) = self.inventory_tried_at {
                         tokio::time::sleep_until(tried + INVENTORY_DEBOUNCE).await;
@@ -270,6 +286,34 @@ impl Sweeper {
         report
     }
 
+    /// Asks GitHub which workflow the runs webhooks named belong to, one request
+    /// each. A short job comes and goes between two sweeps, and its sample would
+    /// otherwise be kept under its job alone. Best effort, and asked once: a run
+    /// not answered keeps that.
+    pub async fn answer_wanted_runs(&mut self) {
+        let installations = self.reach.installations();
+        for (repository, run_id) in self.workflows.take_wanted() {
+            let installation = installations.iter().find(|installation| {
+                installation
+                    .repositories
+                    .iter()
+                    .any(|known| known.to_string().eq_ignore_ascii_case(&repository))
+            });
+            let (Some(installation), Ok(owner_repo)) =
+                (installation, OwnerRepo::parse(&repository))
+            else {
+                continue;
+            };
+            let answer = installation
+                .demand
+                .run_workflow(&owner_repo, run_id, &CancelToken::new())
+                .await;
+            if let Ok(Some(workflow)) = answer {
+                self.workflows.learn(run_id, workflow);
+            }
+        }
+    }
+
     async fn read(
         &self,
         installation: &Reachable,
@@ -286,6 +330,11 @@ impl Sweeper {
             .await?;
         report.repositories += 1;
         let name = repository.to_string();
+        if let Some(runs) = demand.run_workflows_for(repository) {
+            for (run_id, workflow) in runs {
+                self.workflows.learn(*run_id, workflow.clone());
+            }
+        }
         let mut pool: HashMap<BTreeSet<Label>, SweptQueue> = HashMap::new();
         for (job, identity) in demand.identified_jobs_for(repository) {
             let Ok(required) = job.required_labels() else {
@@ -298,7 +347,7 @@ impl Sweeper {
                     Some((id, identity)) => queue.jobs.push((
                         id,
                         JobIdentity::new(&name, identity.name.as_deref())
-                            .map(|identity| identity.key()),
+                            .map(|named| named.in_workflow(identity.workflow.as_deref()).key()),
                     )),
                     None => queue.unnamed += 1,
                 }
@@ -543,10 +592,12 @@ mod tests {
             repository,
             vec![
                 QueuedJobIdentity {
+                    workflow: None,
                     id: Some(11),
                     name: Some("light".into()),
                 },
                 QueuedJobIdentity {
+                    workflow: None,
                     id: Some(12),
                     name: None,
                 },
@@ -571,6 +622,115 @@ mod tests {
             placement.queued_job_keys(&key),
             (vec!["octo/app/light".to_string()], true),
             "named from the listing; the other has no job name, so no key"
+        );
+    }
+
+    /// What webhooks named before a sweep listed it is asked for, once, and what
+    /// a sweep lists is learned and on the keys it hands to placement.
+    #[tokio::test]
+    async fn a_jobs_workflow_is_learned_from_the_listing_and_on_request() {
+        use runner_manager_github::demand::{QueuedDemand, QueuedJobIdentity};
+
+        #[derive(Debug)]
+        struct Named(QueuedDemand, std::sync::atomic::AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl DemandGateway for Named {
+            async fn queued_demand(
+                &self,
+                _scope: &ActivityScope,
+                _cancel: &CancelToken,
+            ) -> Result<QueuedDemand, InventoryError> {
+                Ok(self.0.clone())
+            }
+
+            async fn run_workflow(
+                &self,
+                _repository: &OwnerRepo,
+                run_id: u64,
+                _cancel: &CancelToken,
+            ) -> Result<Option<String>, InventoryError> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok((run_id == 7).then(|| ".github/workflows/asked.yml".to_string()))
+            }
+
+            fn now(&self) -> runner_manager_domain::model::Timestamp {
+                chrono::Utc::now()
+            }
+        }
+
+        struct One(Arc<Named>);
+
+        #[async_trait::async_trait]
+        impl Reach for One {
+            async fn refresh(&mut self, _inventory: bool) -> Result<(), AppError> {
+                Ok(())
+            }
+
+            fn installations(&self) -> Vec<Reachable> {
+                vec![Reachable {
+                    id: 1,
+                    account: "octo".into(),
+                    all_repositories: false,
+                    repositories: vec![OwnerRepo::parse("octo/app").expect("repo")],
+                    demand: Arc::clone(&self.0) as Arc<dyn DemandGateway>,
+                }]
+            }
+
+            fn forget(&mut self, _id: u64) {}
+        }
+
+        let repository = OwnerRepo::parse("octo/app").expect("repo");
+        let demand = QueuedDemand::of(repository.clone(), [job(&["rm-pool-linux"])])
+            .with_identities(
+                repository,
+                vec![QueuedJobIdentity {
+                    workflow: Some(".github/workflows/ci.yml".into()),
+                    id: Some(11),
+                    name: Some("build".into()),
+                }],
+            );
+        let named = Arc::new(Named(demand, std::sync::atomic::AtomicUsize::new(0)));
+        let registry = Arc::new(Registry::default());
+        let _rx = host(&registry, "h", TargetScope::Repo, "octo/app");
+        let placement = Arc::new(Placement::new(Arc::clone(&registry)));
+        let workflows = Arc::new(RunWorkflows::default());
+        let mut sweeper = Sweeper::new(
+            Duration::from_secs(120),
+            Box::new(One(Arc::clone(&named))),
+            Arc::clone(&registry),
+        )
+        .with_placement(Arc::clone(&placement))
+        .with_workflows(Arc::clone(&workflows));
+
+        sweeper.sweep_once().await;
+        let key = crate::placement::JobKey::new(
+            "octo/app",
+            &[Label::new("rm-pool-linux").expect("label")],
+        );
+        assert_eq!(
+            placement.queued_job_keys(&key).0,
+            vec![
+                JobIdentity::new("octo/app", Some("build"))
+                    .expect("named")
+                    .in_workflow(Some(".github/workflows/ci.yml"))
+                    .key()
+            ]
+        );
+
+        workflows.want("octo/app", 7);
+        workflows.want("octo/app", 8);
+        workflows.want("not/served", 9);
+        sweeper.answer_wanted_runs().await;
+        assert_eq!(
+            workflows.of(7).as_deref(),
+            Some(".github/workflows/asked.yml")
+        );
+        assert_eq!(workflows.of(8), None);
+        assert_eq!(
+            named.1.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "no installation reads the third"
         );
     }
 

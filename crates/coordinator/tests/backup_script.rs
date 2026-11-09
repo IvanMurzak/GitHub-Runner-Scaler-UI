@@ -1,0 +1,101 @@
+//! `deploy/coordinator/backup.sh`, against a database in use: what the copy
+//! holds, and what is kept. Needs the `sqlite3` command, which the backup image
+//! installs; where a machine has none there is nothing to run it with.
+
+#![cfg(unix)]
+
+use std::path::Path;
+use std::process::Command;
+
+use rusqlite::Connection;
+
+fn run_backup(database: &Path, backups: &Path) -> std::process::Output {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/coordinator/backup.sh");
+    Command::new("sh")
+        .arg(script)
+        .arg("once")
+        .env("COORDINATOR_DB", database)
+        .env("COORDINATOR_BACKUP_DIR", backups)
+        .output()
+        .expect("sh runs")
+}
+
+fn copies(backups: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(backups)
+        .expect("listed")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("utf-8")
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_database_in_use_is_copied_whole_and_the_last_seven_are_kept() {
+    if Command::new("sqlite3").arg("-version").output().is_err() {
+        eprintln!("skipped: no sqlite3 command");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a directory");
+    let database = dir.path().join("coordinator.db");
+    let backups = dir.path().join("backups");
+    std::fs::create_dir(&backups).expect("created");
+    // Open throughout, as the coordinator's is, with rows only in its WAL.
+    let live = Connection::open(&database).expect("opened");
+    live.pragma_update(None, "journal_mode", "WAL")
+        .expect("WAL");
+    live.pragma_update(None, "wal_autocheckpoint", 0)
+        .expect("no checkpoint");
+    live.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1), (2), (3);")
+        .expect("written");
+    for day in 1..=8 {
+        std::fs::write(
+            backups.join(format!("coordinator-202001{day:02}T000000Z.db")),
+            "old",
+        )
+        .expect("written");
+    }
+
+    let output = run_backup(&database, &backups);
+
+    assert!(output.status.success(), "{output:?}");
+    let kept = copies(&backups);
+    assert_eq!(kept.len(), 7, "{kept:?}");
+    assert!(!kept.contains(&"coordinator-20200101T000000Z.db".to_string()));
+    assert!(!kept.contains(&"coordinator-20200102T000000Z.db".to_string()));
+    let copy = Connection::open(backups.join(kept.last().expect("the newest"))).expect("opened");
+    let rows: i64 = copy
+        .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+        .expect("read");
+    assert_eq!(rows, 3, "what the WAL held is in the copy");
+    live.execute("INSERT INTO t VALUES (4)", [])
+        .expect("still writable");
+}
+
+#[test]
+fn a_failed_backup_removes_nothing_and_leaves_nothing_that_looks_like_one() {
+    if Command::new("sqlite3").arg("-version").output().is_err() {
+        eprintln!("skipped: no sqlite3 command");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a directory");
+    let backups = dir.path().join("backups");
+    std::fs::create_dir(&backups).expect("created");
+    for day in 1..=8 {
+        std::fs::write(
+            backups.join(format!("coordinator-202001{day:02}T000000Z.db")),
+            "old",
+        )
+        .expect("written");
+    }
+
+    let output = run_backup(&dir.path().join("missing.db"), &backups);
+
+    assert!(!output.status.success());
+    assert_eq!(copies(&backups).len(), 8);
+}

@@ -50,7 +50,7 @@ use crate::oci::OciProcesses;
 use crate::package::{InstalledPackage, LastCheck, PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
     AllocationGuard, CleanBackoff, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent,
-    OutcomeKind, ReplacementIntent, RunnerLauncher, failure_reason_kind,
+    OutcomeKind, ReplacementIntent, ReservationWaits, RunnerLauncher, failure_reason_kind,
 };
 
 mod windows_hyperv;
@@ -259,6 +259,8 @@ impl AttemptEventSink for NoAttemptEvents {
 /// Where one launch spent its time. A step the launch never reached is zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaunchTimings {
+    /// Waiting for older launches of this host to reserve first.
+    pub order_wait: Duration,
     /// Waiting for the host allocation lock, which another launch may hold, and
     /// for the rest of its pass to be reserved after it.
     pub lock_wait: Duration,
@@ -277,7 +279,8 @@ pub struct LaunchTimings {
 impl LaunchTimings {
     #[must_use]
     pub fn total(&self) -> Duration {
-        self.lock_wait
+        self.order_wait
+            + self.lock_wait
             + self.turn_wait
             + self.materialize
             + self.prepare
@@ -321,10 +324,11 @@ struct LaunchStopwatch {
 }
 
 impl LaunchStopwatch {
-    fn new(lock_wait: Duration) -> Self {
+    fn new(waits: ReservationWaits) -> Self {
         Self {
             timings: LaunchTimings {
-                lock_wait,
+                order_wait: waits.order,
+                lock_wait: waits.lock,
                 ..LaunchTimings::default()
             },
             running: None,
@@ -389,6 +393,7 @@ impl AttemptEventSink for TracingAttemptEvents {
                             event = $name,
                             attempt_id = %attempt,
                             duration_ms = millis(timings.total()),
+                            order_wait_ms = millis(timings.order_wait),
                             lock_wait_ms = millis(timings.lock_wait),
                             turn_wait_ms = millis(timings.turn_wait),
                             materialize_ms = millis(timings.materialize),
@@ -632,9 +637,31 @@ pub struct SharedPackages {
     trees: Arc<tokio::sync::RwLock<()>>,
     trusted: Arc<TrustedTrees>,
     last_check: LastCheck,
+    /// The last install that failed, and when: the launches queued behind it
+    /// get its answer. See [`CachedRuntimePackages::materialize`].
+    failed_install: Arc<Mutex<Option<(std::time::Instant, FailureReason)>>>,
 }
 
 impl SharedPackages {
+    fn note_failed_install(&self, reason: &FailureReason) {
+        *self
+            .failed_install
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((std::time::Instant::now(), reason.clone()));
+    }
+
+    /// What an install that failed while a launch queued since `queued` for it
+    /// answered.
+    fn install_failed_since(&self, queued: std::time::Instant) -> Option<FailureReason> {
+        self.failed_install
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|(at, _)| *at >= queued)
+            .map(|(_, reason)| reason.clone())
+    }
+
     /// For each target's [`PackageCache`]: the published version is one fact,
     /// so one target's check spares the others theirs, and each check holds
     /// every copy on this host back.
@@ -773,13 +800,28 @@ impl RuntimePackages for CachedRuntimePackages {
         // it just made, which no other launch can change.
         let mut installs = 0;
         let (hold, (installed, origin)) = loop {
+            let queued = std::time::Instant::now();
             let hold = timed(&mut timings.wait, trees.read()).await;
             if let Some(ready) = self.ready(&destination, timings).await? {
                 break (hold, ready);
             }
             drop(hold);
+            // An install that failed while this launch queued for it answers
+            // this launch too. Trying again at once, one queued launch after
+            // another, would hold every copy of the package back for as many
+            // stalled downloads as there are launches; the launch's own retry,
+            // after its back-off, may try the download.
             let exclusive = timed(&mut timings.wait, trees.write()).await;
-            let ready = self.install_trusted(&destination, timings).await?;
+            if let Some(reason) = self.shared.install_failed_since(queued) {
+                return Err(reason);
+            }
+            let ready = match self.install_trusted(&destination, timings).await {
+                Ok(ready) => ready,
+                Err(reason) => {
+                    self.shared.note_failed_install(&reason);
+                    return Err(reason);
+                }
+            };
             installs += 1;
             if installs == 2 {
                 break (exclusive.downgrade(), ready);
@@ -3173,6 +3215,25 @@ pub struct LifecycleLauncher {
     /// pass.
     cleanup_retries: Mutex<CleanBackoff>,
     turns: Arc<tokio::sync::Semaphore>,
+    /// The attempts reserved and not yet up or failed: their bring-up is writing
+    /// their journal entries, and it runs while the target's pass supervises.
+    bringing_up: Mutex<BTreeSet<AttemptId>>,
+}
+
+/// Takes an attempt out of [`LifecycleLauncher::bringing_up`], however its
+/// bring-up ends.
+struct BroughtUpOnDrop<'a> {
+    attempts: &'a Mutex<BTreeSet<AttemptId>>,
+    id: AttemptId,
+}
+
+impl Drop for BroughtUpOnDrop<'_> {
+    fn drop(&mut self) {
+        self.attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
 }
 
 /// How many runners of one host prepare at once, whatever their target: a
@@ -3220,6 +3281,7 @@ impl LifecycleLauncher {
             pending_replacements: Mutex::new(BTreeMap::new()),
             cleanup_retries: Mutex::new(CleanBackoff::default()),
             turns: preparation_turns(),
+            bringing_up: Mutex::default(),
         }
     }
 
@@ -3361,12 +3423,26 @@ impl LifecycleLauncher {
                     true
                 }
             });
-        let attempts = self
-            .ports
-            .store
-            .attempts_for_policy(policy.id)
-            .map_err(|_| LifecycleError::Journal)?;
+        // Read under the set a reservation joins before it is journalled, so
+        // every attempt read here that a bring-up may write to is known to be
+        // one: it has no process yet and no registration, which this pass would
+        // read as a runner gone, and what was read of it is out of date at once.
+        let (attempts, bringing_up) = {
+            let bringing_up = self
+                .bringing_up
+                .lock()
+                .map_err(|_| LifecycleError::Journal)?;
+            let attempts = self
+                .ports
+                .store
+                .attempts_for_policy(policy.id)
+                .map_err(|_| LifecycleError::Journal)?;
+            (attempts, bringing_up.clone())
+        };
         for attempt in attempts {
+            if bringing_up.contains(&attempt.id) {
+                continue;
+            }
             authorize(self.host_id, policy, &attempt).map_err(|_| LifecycleError::Journal)?;
             if let ReconcileProgress::Replacement { attempt, operation } =
                 self.reconcile_one(policy, attempt).await?
@@ -4683,10 +4759,14 @@ impl LifecycleLauncher {
         &self,
         policy: &ScalePolicy,
         attempt: RunnerAttempt,
-        lock_wait: Duration,
+        waits: ReservationWaits,
     ) -> Result<RunnerAttempt, LifecycleError> {
         let id = attempt.id;
-        let mut stopwatch = LaunchStopwatch::new(lock_wait);
+        let _bringing_up = BroughtUpOnDrop {
+            attempts: &self.bringing_up,
+            id,
+        };
+        let mut stopwatch = LaunchStopwatch::new(waits);
         let result = self.launch_steps(policy, attempt, &mut stopwatch).await;
         stopwatch.finish();
         self.ports.events.emit(AttemptEvent::Launched {
@@ -4768,7 +4848,17 @@ impl LifecycleLauncher {
         // for a persistent attempt it is also what makes the slot lease durable
         // before any package or GitHub effect
         // (`02-target-architecture.md`, "Slot allocation", step 7).
-        self.record_allocation(&attempt)?;
+        self.bringing_up
+            .lock()
+            .map_err(|_| LifecycleError::Journal)?
+            .insert(id);
+        if let Err(error) = self.record_allocation(&attempt) {
+            self.bringing_up
+                .lock()
+                .map_err(|_| LifecycleError::Journal)?
+                .remove(&id);
+            return Err(error);
+        }
         Ok(attempt)
     }
 
@@ -5050,9 +5140,9 @@ impl RunnerLauncher for LifecycleLauncher {
         &self,
         policy: &ScalePolicy,
         attempt: RunnerAttempt,
-        lock_wait: Duration,
+        waits: ReservationWaits,
     ) -> Result<RunnerAttempt, LaunchFailure> {
-        self.finish_attempt(policy, attempt, lock_wait)
+        self.finish_attempt(policy, attempt, waits)
             .await
             .map_err(|error| LaunchFailure::new(error.reason()))
     }
@@ -6266,7 +6356,14 @@ mod tests {
         ) -> Result<RunnerAttempt, LaunchFailure> {
             let reserved = self.reserve().await?;
             self.launcher
-                .finish_launch(&self.policy, reserved, lock_wait)
+                .finish_launch(
+                    &self.policy,
+                    reserved,
+                    ReservationWaits {
+                        lock: lock_wait,
+                        order: Duration::from_secs(2),
+                    },
+                )
                 .await
         }
 
@@ -6277,7 +6374,7 @@ mod tests {
         ) -> Result<RunnerAttempt, LaunchFailure> {
             let reserved = self.reserve_through(launcher).await?;
             launcher
-                .finish_launch(&self.policy, reserved, Duration::ZERO)
+                .finish_launch(&self.policy, reserved, ReservationWaits::default())
                 .await
         }
 
@@ -7360,8 +7457,9 @@ mod tests {
             })
             .expect("a launch that failed at registration reports its timings");
         assert_eq!(timings.lock_wait, Duration::from_secs(90));
+        assert_eq!(timings.order_wait, Duration::from_secs(2));
         assert_eq!(timings.spawn, Duration::ZERO, "spawn was never reached");
-        assert!(timings.total() >= Duration::from_secs(90));
+        assert!(timings.total() >= Duration::from_secs(92));
     }
 
     #[cfg(target_os = "macos")]
@@ -9192,10 +9290,42 @@ mod tests {
 
         let started = harness
             .launcher
-            .finish_launch(&harness.policy, reserved, Duration::ZERO)
+            .finish_launch(&harness.policy, reserved, ReservationWaits::default())
             .await
             .unwrap();
         assert_eq!(started.state(), AttemptState::Starting);
+    }
+
+    /// A launch runs beside its target's pass: the pass does not read a runner
+    /// still coming up as one that is gone. It has no process and no registration
+    /// yet, and the bring-up is writing its journal entry.
+    #[tokio::test]
+    async fn a_pass_leaves_a_runner_coming_up_alone_and_supervises_it_once_up() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let reserved = harness.reserve().await.unwrap();
+        let looks_left = || harness.github.observations.lock().unwrap().len();
+        harness
+            .github
+            .observations
+            .lock()
+            .unwrap()
+            .push_back(LifecycleGithubObservation::not_registered());
+
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(looks_left(), 1, "it did not look");
+        let journalled = harness.store.attempt(reserved.id).unwrap().unwrap();
+        assert_eq!(journalled.state(), AttemptState::Allocated);
+
+        harness
+            .launcher
+            .finish_launch(&harness.policy, reserved, ReservationWaits::default())
+            .await
+            .unwrap();
+        assert!(harness.launcher.bringing_up.lock().unwrap().is_empty());
+
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(looks_left(), 0, "up, it is this pass's to supervise");
     }
 
     /// A daemon that dies between the reservation and the process: the
@@ -9258,7 +9388,7 @@ mod tests {
         let finished = futures::future::join_all(reserved.into_iter().map(|attempt| {
             harness
                 .launcher
-                .finish_launch(&harness.policy, attempt, Duration::ZERO)
+                .finish_launch(&harness.policy, attempt, ReservationWaits::default())
         }))
         .await;
 
@@ -11190,6 +11320,7 @@ mod tests {
             "reason",
             "retry_in_ms",
             "duration_ms",
+            "order_wait_ms",
             "lock_wait_ms",
             "turn_wait_ms",
             "materialize_ms",

@@ -191,11 +191,13 @@ async fn the_sweep_and_a_webhook_key_a_titled_matrix_job_alike() {
         event.workflow_job.name.as_deref(),
     )
     .expect("named")
+    .in_workflow(Some(".github/workflows/load.yml"))
     .key();
 
     let queue = JobKey::new("octo/app", &[Label::new("rm-pool-linux").expect("label")]);
     let (listed, unnamed) = placement.queued_job_keys(&queue);
     assert_eq!(listed, vec![sampled; 4], "four matrix jobs, one key");
+    assert!(!listed.iter().any(|key| key.contains("load light")));
     assert!(!unnamed);
 }
 

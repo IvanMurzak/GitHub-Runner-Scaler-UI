@@ -336,6 +336,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                             Arc::clone(&state.registry),
                         )
                         .with_placement(Arc::clone(&state.placement))
+                        .with_workflows(state.statistics.run_workflows())
                         .run(),
                     );
                 } else {

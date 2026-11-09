@@ -256,7 +256,13 @@ A host frees a native runner's slot when it concludes the attempt, before it del
 files: cleanup never holds a slot. It concludes the attempt on its target's next pass, and while
 it is joined the host checks every 2 seconds whether a live runner's process has exited and, if
 so, runs that pass at once (at most 5 seconds after the previous one) instead of at the target's
-next scheduled poll (up to 60 seconds later). A runner in a container, a VM or a WSL distribution
+next scheduled poll (up to 60 seconds later). So a slot frees within about 5 to 10 seconds of the runner's
+process exiting, and `attempt_slot_released` in the host's log says how long it took from when that was
+seen (`exit_to_report_ms`; `attempt_slot_release_slow` above 15 seconds). Two things still delay it: a
+target GitHub has asked to slow down, whose pass waits for that, and a target with a profile outside
+coordinated placement, whose pass waits while it brings up the runners it decided to start itself. A pass
+waits for no coordinator launch. The host cannot see when a job ended, only when its runner exited; a runner
+that outlives its job for a while holds its slot for that while. A runner in a container, a VM or a WSL distribution
 keeps its slot until its environment is proven gone and cleaned up, deliberately: until then it
 may still be running. Its host sends a heartbeat as soon as that cleanup is done.
 
@@ -307,15 +313,33 @@ stays where it was scheduled. Each runner's slot is reserved and journalled one 
 the host-wide allocation lock, the same lock every pass takes, so the ceilings hold exactly. The lock
 is then released: runners of all targets of the host get their packages and register at the same time,
 oldest first. A quarter of its cores (at least two) prepare at once; registration is not bounded. A
-younger launch lets an older launch of another target reserve first, for at most 2 seconds. A launch
-accepted while its target's loop brings up a batch starts when that batch is up. A daemon that dies in between leaves a journalled
-attempt, which startup recovery concludes.
+daemon that dies in between leaves a journalled attempt, which startup recovery concludes.
+
+Launches do not wait for their target's pass. Each target serves its launches beside its passes, so one
+accepted while the pass polls GitHub or brings up a batch is reserved and brought up at once, through the
+same lock and the same journal, so every ceiling and the per-repository counts hold as before. A pass does
+not supervise a runner still coming up: it has no process and no registration yet, and supervision starts
+at the first pass after it is up or has failed. Draining stops new launches and waits for those coming up.
+
+Launches reserve in the order this host accepted them, across its targets and profiles: a launch reserves
+after the older launches of the host that may still reserve. A reservation is a lock hold and a journal
+write, and everything slow comes after it and runs at the same time, so this order costs a burst only those
+writes, however large the burst. The older launch does not hold a younger one up for long if it cannot
+reserve at all (a target added a moment ago that has no loop yet, a profile the host cannot start now): 2
+seconds with no older launch reserving passes it over, once (`older_launch_passed_over` in the log), and a
+launch whose start failed is not waited for. A launch whose runner exited idle waits again behind those
+already waiting.
 
 A slow launch is a warning in the host's log, `attempt_launch_slow`, saying where the time went:
-`lock_wait_ms`, `turn_wait_ms`, `materialize_ms` (of which `package_wait_ms`, `package_install_ms`,
+`order_wait_ms` (older launches reserving first), `lock_wait_ms`, `turn_wait_ms`, `materialize_ms` (of which `package_wait_ms`, `package_install_ms`,
 `package_verify_ms`, `package_copy_ms`, and `package_downloaded`), `prepare_ms`, `register_ms`,
 `spawn_ms`. The first launch after a daemon starts downloads the package again: a tree this process
 did not install may hold a job's edits. After that, it is shared by every target.
+
+A download that sends nothing for 60 seconds, or cannot connect in 30, fails and is tried again; a slow one
+that keeps sending takes as long as it takes. Its partial file is removed and was never going to be used: an
+archive is only unpacked once its digest matches. The launches queued behind a download that failed get its
+failure, and retry on their own back-off, rather than each spending another stall in turn.
 
 A repository added or removed on a host (`repo add`, `repo remove`, a profile enabled or disabled)
 changes only its own target loop: a new target gets a loop of its own within 30 seconds, a removed
@@ -370,13 +394,23 @@ coordinator remembers that only for runner names `runner-manager` registers
 order they arrive (a report waits up to 15 minutes for its job to be named, a webhook 6 hours for
 its report, 10,000 of each at most, the oldest dropped first), and stores one sample per attempt
 that ran a job, completed or failed (an out-of-memory kill is what placement must learn), under
-the key `owner/repo/job` with the host that ran it. An attempt that exited idle is not
-a sample.
+the job's key with the host that ran it. An attempt that exited idle is not a sample.
 
-The key has no workflow in it. GitHub's `workflow_name` on a job is the run's title, so a workflow
-with a `run-name` has a different one at every dispatch, and nothing on a webhook names the workflow
-stably. Jobs of the same name in two workflows of one repository therefore share their statistics:
-give them different names if their weight differs.
+A job's key is `owner/repo/job`, and the workflow file (`.github/workflows/ci.yml`) of its run when
+that is known, so jobs of the same name in two workflows keep apart. GitHub's `workflow_name` on a job
+is the run's title, which a `run-name` changes at every dispatch, and nothing else on a webhook names
+the workflow, so the file comes from the run: from the sweep's listing, or from one request per run
+(`GET .../actions/runs/{id}`) the first time a webhook names a run of a pool job or of a
+`runner-manager` runner and no sweep has listed it. So it needs the GitHub App; without one every key
+is the job alone, as it was. A request that fails is not repeated, and that run's samples are kept
+under the job alone, which is also where samples from before 0.4.50 stay, with no migration.
+
+What weighs a job: its workflow's samples, or while it has none, those kept under the job alone. A
+queued job whose workflow is not known yet counts every sample of its name, in any workflow, so it
+does not read as never measured; it can then be estimated from the other workflow's job, until a sweep
+names it. `stats` lists each key as it was kept: `octo/app/build [.github/workflows/ci.yml]`. To roll
+back, nothing needs doing: an older coordinator reads a key with a workflow as a job it never sees
+queued, and goes on from the samples under the job alone.
 
 A sample's **duration** is the job's own run time, `started_at` to `completed_at`, so a 14-second
 job reads 14 seconds and not the minute its runner lived. Its **queue wait** is `created_at` to
@@ -531,6 +565,47 @@ and, when it moved, closes the connections of hosts that are no longer active. T
 endpoint to signal it, on purpose: see the security notes.
 To move a host to a new key, revoke it, issue a new invite, then on the host run
 `runner-manager coordinator leave` and `join` again.
+
+## Back up and restore
+
+The compose file runs a `backup` service: at its start and then once a day it copies the database with
+`VACUUM INTO`, which is safe while the coordinator is writing, checks the copy with `PRAGMA
+integrity_check`, and keeps the last 7 as `coordinator-<UTC time>.db`, mode `0600`, in the
+`coordinator-backups` volume. A failed run says so in `docker compose logs backup`, removes no earlier
+copy, and tries again the next day; the time of the newest file is the way to check it is working.
+
+That volume is on the same disk as the database, which protects against a bad upgrade or a damaged
+database and not against losing the disk. To keep the copies elsewhere, replace the volume with a path on
+another disk, owned by account 10001 (`sudo chown 10001:10001 /mnt/backups/coordinator`), in
+`docker-compose.override.yml`, or copy them off the machine:
+
+```yaml
+services:
+  backup:
+    volumes:
+      - coordinator-data:/data
+      - /mnt/backups/coordinator:/backups
+```
+
+The copies hold what the database holds: enrolled hosts' names and public keys, hashes of invites, job
+names and statistics. No GitHub credential is in there. Treat them as private all the same.
+
+To restore, stop the writers, put the copy in place, remove the old database's WAL files, and start again.
+Hosts reconnect on their own; a host enrolled after that copy was made must `coordinator leave` and join
+again with a new invite. Samples and counters since the copy are lost.
+
+```bash
+docker compose stop coordinator backup
+docker compose run --rm --no-deps --entrypoint sh backup -c 'ls -1 /backups'
+docker compose run --rm --no-deps --entrypoint sh backup -c '
+    cp /backups/coordinator-20261109T030000Z.db /data/coordinator.db \
+        && rm -f /data/coordinator.db-wal /data/coordinator.db-shm \
+        && sqlite3 /data/coordinator.db "PRAGMA integrity_check"'
+docker compose up -d
+```
+
+A copy from an older version is upgraded when the coordinator opens it. One from a newer version is refused
+(`written by a newer coordinator`): see the rollback notes under [Poll modes](#poll-modes).
 
 ## Security notes
 

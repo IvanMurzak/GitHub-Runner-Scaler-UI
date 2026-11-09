@@ -34,6 +34,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use tokio::sync::mpsc;
 
 use crate::placement::{CLAIM_GRACE, Placement};
+use crate::registry::is_pool_job;
 use crate::registry::{OUTBOUND_QUEUE, Outbound, Registry};
 use crate::stats::{JobIdentity, JobTimes, LiveState, Statistics, StatsConfig};
 use crate::store::{EnrollError, Store};
@@ -41,6 +42,7 @@ use crate::webhook::{
     DELIVERY_MEMORY, DeliveryLog, MAX_BODY_BYTES, WorkflowJobEvent, action_name, required_labels,
     signature_valid, valid_delivery_id,
 };
+use runner_manager_domain::coordinator_protocol::is_managed_runner_name;
 
 /// Largest enrollment request body.
 const MAX_ENROLL_BYTES: usize = 16 * 1024;
@@ -321,7 +323,20 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             let required = required_labels(&job.workflow_job.labels);
             let repository = &job.repository.full_name;
             state.registry.repository_seen(repository);
-            let identity = JobIdentity::new(repository, job.workflow_job.name.as_deref());
+            let workflows = state.statistics.run_workflows();
+            let run_id = job.workflow_job.run_id;
+            // Worth a request only for a job this coordinator keeps figures on.
+            let measured = required.as_deref().is_some_and(is_pool_job)
+                || job
+                    .workflow_job
+                    .runner_name
+                    .as_deref()
+                    .is_some_and(is_managed_runner_name);
+            if measured {
+                workflows.want(repository, run_id);
+            }
+            let identity = JobIdentity::new(repository, job.workflow_job.name.as_deref())
+                .map(|identity| identity.in_workflow(workflows.of(run_id).as_deref()));
             if action == "queued" {
                 let woken = required.as_ref().map_or(0, |required| {
                     state

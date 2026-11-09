@@ -1197,7 +1197,7 @@ pub trait RunnerLauncher: fmt::Debug + Send + Sync {
         &self,
         _policy: &ScalePolicy,
         attempt: RunnerAttempt,
-        _lock_wait: Duration,
+        _waits: ReservationWaits,
     ) -> Result<RunnerAttempt, LaunchFailure> {
         Ok(attempt)
     }
@@ -1263,9 +1263,9 @@ impl RunnerLauncher for FitnessGatedLauncher {
         &self,
         policy: &ScalePolicy,
         attempt: RunnerAttempt,
-        lock_wait: Duration,
+        waits: ReservationWaits,
     ) -> Result<RunnerAttempt, LaunchFailure> {
-        self.inner.finish_launch(policy, attempt, lock_wait).await
+        self.inner.finish_launch(policy, attempt, waits).await
     }
 
     async fn clean(&self, attempt: AttemptId) -> Result<(), LaunchFailure> {
@@ -2372,21 +2372,50 @@ pub trait DemandDirector: fmt::Debug + Send + Sync {
     /// reported for is waiting again, to be retried rather than placed anew.
     fn start_failed(&self, _policy: &ScalePolicy, _attempt: Option<AttemptId>) {}
 
-    /// Whether an older launch of another policy on this host still has no
-    /// runner, so `policy` should let its target's loop reserve first.
-    fn older_waiting(&self, _policy: &ScalePolicy) -> bool {
-        false
+    /// Where `policy`'s oldest launch without a runner stands among this host's
+    /// launches: lower goes first. `None` when it has none.
+    fn next_waiting(&self, _policy: &ScalePolicy) -> Option<u64> {
+        None
     }
+
+    /// How many launches of other targets of this host are older than
+    /// `policy`'s oldest without a runner and may yet reserve: `policy`'s
+    /// launch lets them go first.
+    fn older_waiting(&self, _policy: &ScalePolicy) -> usize {
+        0
+    }
+
+    /// Those older launches did not reserve in [`OLDER_LAUNCH_TURN`], so nothing
+    /// waits for them any more, unless they start waiting afresh.
+    fn pass_over_older(&self, _policy: &ScalePolicy) {}
 }
 
-/// How long a pass lets older launches of other policies reserve first.
+/// How long a launch waits for older launches of other targets while none of
+/// them reserves. Every target's loop reserves as soon as it is told of a launch
+/// (see [`Reconciler::serve_launches`]), so this is not a turn anyone is expected
+/// to use up: it is for a loop that cannot reserve at all, a target added a moment
+/// ago that has no loop yet, or a host-wide lock refused. It starts over whenever
+/// one of them reserves, and costs one launch that one wait, not one per launch.
 const OLDER_LAUNCH_TURN: Duration = Duration::from_secs(2);
-const OLDER_LAUNCH_POLL: Duration = Duration::from_millis(100);
+const OLDER_LAUNCH_POLL: Duration = Duration::from_millis(10);
+
+/// How soon an accepted launch that did not start is tried again.
+const LAUNCH_RETRY: Duration = Duration::from_secs(30);
+
+/// Where a reservation's wait went, for its launch's timings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReservationWaits {
+    /// Letting older launches of this host reserve first.
+    pub order: Duration,
+    /// For the allocation lock, and from the reservation to its bring-up.
+    pub lock: Duration,
+}
 
 /// A runner reserved under the allocation lock, to bring up outside it.
 struct Reserved {
     policy: ScalePolicy,
     attempt: RunnerAttempt,
+    order_wait: Duration,
     lock_wait: Duration,
     reserved_at: std::time::Instant,
     /// Let go when this runner is up or has failed.
@@ -2410,6 +2439,7 @@ impl DemandDirector for OwnDemand {
 /// A struct rather than seven positional arguments, for the reason `b1` gives at
 /// `PersistedAttempt`: several of these are `Arc<dyn …>` and transposing two of
 /// them type-checks. Construct it with a struct literal so every port is named.
+#[derive(Clone)]
 pub struct ReconcilerPorts {
     pub demand: Arc<dyn DemandSource>,
     pub launcher: Arc<dyn RunnerLauncher>,
@@ -2686,6 +2716,9 @@ pub struct Reconciler {
     schedule: PollSchedule,
     clean_backoff: CleanBackoff,
     director: Arc<dyn DemandDirector>,
+    /// What serves this target's launches beside its passes, when something
+    /// does: see [`Self::with_launch_side`].
+    launch_side: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Reconciler {
@@ -2710,7 +2743,18 @@ impl Reconciler {
             schedule: PollSchedule::new(interval),
             clean_backoff: CleanBackoff::default(),
             director: Arc::new(OwnDemand),
+            launch_side: None,
         }
+    }
+
+    /// Leaves this reconciler's directed launches to whatever `signal` wakes
+    /// ([`Self::serve_launches`]). A pass then only reports on them. A pass that
+    /// brought one up itself would be held for as long as its package takes, and
+    /// a pass is what concludes a runner that exited and frees its slot.
+    #[must_use]
+    pub fn with_launch_side(mut self, signal: Arc<tokio::sync::Notify>) -> Self {
+        self.launch_side = Some(signal);
+        self
     }
 
     /// Lets `director` replace a policy's polled demand with the launches the
@@ -2744,29 +2788,137 @@ impl Reconciler {
     }
 
     /// Starts the runners of `policies`' coordinator launches, and nothing
-    /// else: no GitHub poll, no supervision. A launch the coordinator placed
-    /// here (`DemandDirector::directed_demand`) needs no reading of the queue,
-    /// so this runs as soon as one is accepted rather than at the next poll,
-    /// and every launch open at that moment is served by one call. The
-    /// runners go through the same allocator, ceilings and host-wide lock as
-    /// in [`Self::reconcile`]; the next full pass supervises them.
-    pub async fn start_directed(&mut self, policies: &[ScalePolicy]) -> ReconcileReport {
+    /// else: no GitHub poll, no supervision. Every launch open at that moment is
+    /// served by one call. See [`Self::serve_launches`].
+    pub async fn start_directed(&self, policies: &[ScalePolicy]) -> ReconcileReport {
         let mut report = ReconcileReport::default();
-        let mut reserved: Vec<Reserved> = Vec::new();
-        for policy in policies {
-            if !policy.owns_runners()
-                || !policy.is_owned_by(self.host.id)
-                || !policy.may_start_runners()
-            {
-                continue;
-            }
-            if let Some(directed) = self.director.directed_demand(policy) {
-                self.start_runners(policy, directed, &mut report, &mut reserved)
-                    .await;
-            }
-        }
+        let reserved = self.reserve_open_launches(policies, &mut report).await;
         self.finish_reserved(reserved, &mut report).await;
         report
+    }
+
+    /// Serves a target's coordinator launches until `stop`: on `signal`, and
+    /// [`LAUNCH_RETRY`] after one that did not start, it reserves a runner for
+    /// every launch open at that moment and brings them up. A launch the
+    /// coordinator placed here needs no reading of the queue, so this runs
+    /// beside the target's passes: a launch accepted while one is polling GitHub,
+    /// or while runners already reserved are coming up (here or in that pass), is
+    /// reserved and brought up at once rather than after them.
+    ///
+    /// It goes through the same allocator, ceilings and host-wide lock as
+    /// [`Self::reconcile`]. Neither needs to know of the other's runners: each
+    /// reads the journal under the lock, which holds every reservation. What it
+    /// reserves is the launcher's to keep apart from supervision while it comes
+    /// up (`LifecycleLauncher::supervise`), and the next full pass supervises it.
+    /// After `stop` it reserves nothing more and returns once what it reserved is
+    /// up or has failed.
+    pub async fn serve_launches(
+        &self,
+        policies: &(dyn Fn() -> Vec<ScalePolicy> + Send + Sync),
+        signal: &tokio::sync::Notify,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) {
+        use futures::StreamExt as _;
+        type Reserving<'a> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Reserved>> + Send + 'a>>;
+
+        let reserve = || -> Reserving<'_> {
+            let policies = policies();
+            Box::pin(async move {
+                let mut report = ReconcileReport::default();
+                let reserved = self.reserve_open_launches(&policies, &mut report).await;
+                if !reserved.is_empty() {
+                    tracing::info!(
+                        event = "coordinator_launches_reserved",
+                        count = reserved.len(),
+                    );
+                }
+                reserved
+            })
+        };
+        let mut bringing_up = futures::stream::FuturesUnordered::new();
+        let mut reserving: Option<Reserving<'_>> = None;
+        let mut retry_at: Option<tokio::time::Instant> = None;
+        let mut stopping = *stop.borrow();
+        loop {
+            if stopping && reserving.is_none() && bringing_up.is_empty() {
+                return;
+            }
+            tokio::select! {
+                () = signal.notified(), if !stopping && reserving.is_none() => {
+                    reserving = Some(reserve());
+                }
+                () = async {
+                    match retry_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                }, if !stopping && reserving.is_none() => {
+                    retry_at = None;
+                    reserving = Some(reserve());
+                }
+                reserved = async {
+                    match reserving.as_mut() {
+                        Some(reserving) => reserving.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    reserving = None;
+                    bringing_up.extend(reserved.into_iter().map(|reserved| self.bring_up(reserved)));
+                }
+                Some(_) = bringing_up.next(), if !bringing_up.is_empty() => {}
+                changed = stop.changed(), if !stopping => {
+                    stopping = changed.is_err() || *stop.borrow();
+                }
+            }
+            // One that did not start, a registration that failed, is tried again
+            // well inside its lease's lifetime.
+            if reserving.is_none() && retry_at.is_none() {
+                let waiting = policies()
+                    .iter()
+                    .any(|policy| self.director.next_waiting(policy).is_some());
+                if waiting {
+                    retry_at = Some(tokio::time::Instant::now() + LAUNCH_RETRY);
+                }
+            }
+        }
+    }
+
+    /// Reserves one runner at a time for `policies`' open launches, whichever is
+    /// oldest next: a target's own profiles keep the order too. Slow work comes
+    /// after this, in [`Self::bring_up`], so no launch's package holds up another
+    /// launch's reservation.
+    async fn reserve_open_launches(
+        &self,
+        policies: &[ScalePolicy],
+        report: &mut ReconcileReport,
+    ) -> Vec<Reserved> {
+        let mut reserved: Vec<Reserved> = Vec::new();
+        let mut candidates: Vec<&ScalePolicy> = policies
+            .iter()
+            .filter(|policy| {
+                policy.owns_runners()
+                    && policy.is_owned_by(self.host.id)
+                    && policy.may_start_runners()
+            })
+            .collect();
+        loop {
+            let Some(&policy) = candidates.iter().min_by_key(|policy| {
+                self.director
+                    .next_waiting(policy)
+                    .map_or(u64::MAX, |next| next)
+            }) else {
+                return reserved;
+            };
+            let before = reserved.len();
+            if let Some(directed) = self.director.directed_demand(policy) {
+                self.start_runners(policy, directed, 1, report, &mut reserved)
+                    .await;
+            }
+            if reserved.len() == before {
+                candidates.retain(|candidate| candidate.id != policy.id);
+            }
+        }
     }
 
     /// One reconciliation pass over `policies`.
@@ -2908,8 +3060,20 @@ impl Reconciler {
             // here are the demand, whatever this host's own reading says (or
             // whether it could read at all).
             if let Some(directed) = self.director.directed_demand(policy) {
-                self.start_runners(policy, directed, &mut report, &mut reserved)
-                    .await;
+                let Some(launch_side) = &self.launch_side else {
+                    self.start_runners(policy, directed, u16::MAX, &mut report, &mut reserved)
+                        .await;
+                    continue;
+                };
+                match self.allocate_only(policy, directed, &reserved).await {
+                    Ok(allocation) => {
+                        if !allocation.starts_nothing() {
+                            launch_side.notify_one();
+                        }
+                        report.allocations.push(allocation);
+                    }
+                    Err(failure) => self.report_allocation_failure(&mut report, &failure),
+                }
                 continue;
             }
             let Some(reading) = readings.get(&policy.target) else {
@@ -2939,7 +3103,7 @@ impl Reconciler {
                         unresolvable: u32::try_from(tally.unresolvable.len()).unwrap_or(u32::MAX),
                         complete: demand.is_complete(),
                     });
-                    self.start_runners(policy, count, &mut report, &mut reserved)
+                    self.start_runners(policy, count, u16::MAX, &mut report, &mut reserved)
                         .await;
                 }
             }
@@ -3080,10 +3244,13 @@ impl Reconciler {
     /// reconciliation loop is the one place in this product that must not be
     /// able to wedge, so the bound is structural rather than a consequence of
     /// every input being well behaved.
+    ///
+    /// At most `limit` runners: one, when the caller decides who is next.
     async fn start_runners(
         &self,
         policy: &ScalePolicy,
         demand: u32,
+        limit: u16,
         report: &mut ReconcileReport,
         reserved: &mut Vec<Reserved>,
     ) {
@@ -3111,17 +3278,10 @@ impl Reconciler {
         // a lock was taken, because that is the one that decided anything. The
         // pre-check stands in only when no hold was ever obtained.
         let mut decided: Option<Allocation> = None;
-        let mut budget = intent.to_start;
-        let turn_limit = tokio::time::Instant::now() + OLDER_LAUNCH_TURN;
+        let mut budget = intent.to_start.min(limit);
 
         while budget > 0 {
-            // Oldest first across targets. Each target's loop reserves for its
-            // own launches, and may be anywhere in its pass: so a younger launch
-            // lets an older one go first, briefly, and never for long enough to
-            // matter if that one's loop is occupied.
-            while self.director.older_waiting(policy) && tokio::time::Instant::now() < turn_limit {
-                tokio::time::sleep(OLDER_LAUNCH_POLL).await;
-            }
+            let order_wait = self.let_older_launches_reserve(policy).await;
             let waiting_since = std::time::Instant::now();
             let guard = match self.lock.acquire().await {
                 Ok(guard) => guard,
@@ -3195,6 +3355,7 @@ impl Reconciler {
                     reserved.push(Reserved {
                         policy: policy.clone(),
                         attempt,
+                        order_wait,
                         lock_wait,
                         reserved_at: std::time::Instant::now(),
                         _hold: hold,
@@ -3212,6 +3373,35 @@ impl Reconciler {
         report.allocations.push(allocation);
     }
 
+    /// Oldest first across targets: `policy`'s launch reserves after the older
+    /// launches of this host's other targets, whose loops are told of them as
+    /// soon as they are accepted. A reservation is a lock hold and a journal
+    /// write, so this is short, and only a loop that cannot reserve at all makes
+    /// it long: see [`OLDER_LAUNCH_TURN`]. Answers how long it waited.
+    async fn let_older_launches_reserve(&self, policy: &ScalePolicy) -> Duration {
+        let began = tokio::time::Instant::now();
+        let mut older = self.director.older_waiting(policy);
+        let mut limit = began + OLDER_LAUNCH_TURN;
+        while older > 0 {
+            if tokio::time::Instant::now() >= limit {
+                tracing::warn!(
+                    event = "older_launch_passed_over",
+                    policy_id = %policy.id,
+                    count = older,
+                );
+                self.director.pass_over_older(policy);
+                break;
+            }
+            tokio::time::sleep(OLDER_LAUNCH_POLL).await;
+            let still = self.director.older_waiting(policy);
+            if still < older {
+                limit = tokio::time::Instant::now() + OLDER_LAUNCH_TURN;
+            }
+            older = still;
+        }
+        began.elapsed()
+    }
+
     /// Bring up what this pass reserved, together and outside the allocation
     /// lock, so one slow package holds up neither another runner nor another
     /// target. How many prepare at once is the launcher's to bound.
@@ -3220,29 +3410,36 @@ impl Reconciler {
     /// these attempts half made: one target's attempts are only ever supervised
     /// by its own loop, which is here.
     async fn finish_reserved(&self, reserved: Vec<Reserved>, report: &mut ReconcileReport) {
-        let finished = futures::future::join_all(reserved.into_iter().map(|reserved| async move {
-            let id = reserved.attempt.id;
-            let waited = reserved.lock_wait + reserved.reserved_at.elapsed();
-            let result = self
-                .launcher
-                .finish_launch(&reserved.policy, reserved.attempt, waited)
+        let finished =
+            futures::future::join_all(reserved.into_iter().map(|reserved| self.bring_up(reserved)))
                 .await;
-            // Told here and not after the others are up: the journal already
-            // says this one failed, and the attempt reports read it.
-            match &result {
-                Ok(_) => self.events.emit(LifecycleEvent::RunnerStarted {
-                    policy: reserved.policy.id,
-                    attempt: id,
-                }),
-                Err(failure) => self.note_start_failed(&reserved.policy, Some(id), failure),
-            }
-            result.is_ok()
-        }))
-        .await;
         let started = finished.into_iter().filter(|started| *started).count();
         report.started = report
             .started
             .saturating_add(u16::try_from(started).unwrap_or(u16::MAX));
+    }
+
+    /// One reserved runner, up or failed: whether it is up.
+    async fn bring_up(&self, reserved: Reserved) -> bool {
+        let id = reserved.attempt.id;
+        let waits = ReservationWaits {
+            order: reserved.order_wait,
+            lock: reserved.lock_wait + reserved.reserved_at.elapsed(),
+        };
+        let result = self
+            .launcher
+            .finish_launch(&reserved.policy, reserved.attempt, waits)
+            .await;
+        // Told here and not after the others are up: the journal already
+        // says this one failed, and the attempt reports read it.
+        match &result {
+            Ok(_) => self.events.emit(LifecycleEvent::RunnerStarted {
+                policy: reserved.policy.id,
+                attempt: id,
+            }),
+            Err(failure) => self.note_start_failed(&reserved.policy, Some(id), failure),
+        }
+        result.is_ok()
     }
 
     fn note_start_failed(
@@ -7442,8 +7639,11 @@ mod tests {
         directed: Mutex<BTreeMap<PolicyId, u32>>,
         started: Mutex<Vec<(PolicyId, AttemptId)>>,
         failed: Mutex<Vec<(PolicyId, Option<AttemptId>)>>,
-        /// How many more times an older launch is said to be waiting.
-        older: AtomicUsize,
+        /// What each look at the older launches answers; the last one repeats.
+        older: Mutex<std::collections::VecDeque<usize>>,
+        passed_over: AtomicUsize,
+        /// Each policy's place among the launches.
+        orders: Mutex<BTreeMap<PolicyId, u64>>,
     }
 
     impl DemandDirector for FixedDirector {
@@ -7459,12 +7659,22 @@ mod tests {
             self.failed.lock().unwrap().push((policy.id, attempt));
         }
 
-        fn older_waiting(&self, _policy: &ScalePolicy) -> bool {
-            self.older
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                    left.checked_sub(1)
-                })
-                .is_ok()
+        fn next_waiting(&self, policy: &ScalePolicy) -> Option<u64> {
+            self.orders.lock().unwrap().get(&policy.id).copied()
+        }
+
+        fn older_waiting(&self, _policy: &ScalePolicy) -> usize {
+            let mut older = self.older.lock().unwrap();
+            if older.len() > 1 {
+                older.pop_front().unwrap_or(0)
+            } else {
+                older.front().copied().unwrap_or(0)
+            }
+        }
+
+        fn pass_over_older(&self, _policy: &ScalePolicy) {
+            self.passed_over.fetch_add(1, Ordering::SeqCst);
+            self.older.lock().unwrap().clear();
         }
     }
 
@@ -7475,6 +7685,7 @@ mod tests {
         inner: Arc<FakeLauncher>,
         barrier: Arc<tokio::sync::Barrier>,
         fail: Option<FailureReason>,
+        waits: Mutex<Vec<ReservationWaits>>,
     }
 
     #[async_trait::async_trait]
@@ -7502,8 +7713,9 @@ mod tests {
             &self,
             _policy: &ScalePolicy,
             attempt: RunnerAttempt,
-            _lock_wait: Duration,
+            waits: ReservationWaits,
         ) -> Result<RunnerAttempt, LaunchFailure> {
+            self.waits.lock().unwrap().push(waits);
             self.barrier.wait().await;
             match &self.fail {
                 Some(reason) => Err(LaunchFailure::new(reason.clone())),
@@ -7548,18 +7760,19 @@ mod tests {
             inner: Arc::clone(&fake),
             barrier,
             fail: None,
+            waits: Mutex::default(),
         });
         let director = Arc::new(FixedDirector::default());
         let (one, two) = (policy(1, "acme/app", 2), policy(2, "acme/other", 2));
         director.directed.lock().unwrap().insert(one.id, 1);
         director.directed.lock().unwrap().insert(two.id, 1);
-        let mut first = directed_reconciler(
+        let first = directed_reconciler(
             2,
             Arc::clone(&held) as _,
             Arc::clone(&lock),
             Arc::clone(&director),
         );
-        let mut second = directed_reconciler(2, held as _, lock, director);
+        let second = directed_reconciler(2, held as _, lock, director);
 
         let (a, b) = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::join!(
@@ -7583,18 +7796,19 @@ mod tests {
             inner: Arc::clone(&fake),
             barrier: Arc::clone(&barrier),
             fail: None,
+            waits: Mutex::default(),
         });
         let director = Arc::new(FixedDirector::default());
         let (one, two) = (policy(1, "acme/app", 2), policy(2, "acme/other", 2));
         director.directed.lock().unwrap().insert(one.id, 1);
         director.directed.lock().unwrap().insert(two.id, 1);
-        let mut first = directed_reconciler(
+        let first = directed_reconciler(
             1,
             Arc::clone(&held) as _,
             Arc::clone(&lock),
             Arc::clone(&director),
         );
-        let mut second = directed_reconciler(1, held as _, lock, director);
+        let second = directed_reconciler(1, held as _, lock, director);
 
         let (a, b) = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::join!(first.start_directed(std::slice::from_ref(&one)), async {
@@ -7621,11 +7835,12 @@ mod tests {
             inner: fake,
             barrier: Arc::new(tokio::sync::Barrier::new(1)),
             fail: Some(FailureReason::JitRequestFailed),
+            waits: Mutex::default(),
         });
         let director = Arc::new(FixedDirector::default());
         let pool = policy(1, "acme/app", 2);
         director.directed.lock().unwrap().insert(pool.id, 1);
-        let mut reconciler = directed_reconciler(
+        let reconciler = directed_reconciler(
             2,
             held as _,
             Arc::new(InProcessAllocationLock::new()),
@@ -7642,36 +7857,292 @@ mod tests {
         );
     }
 
-    /// Oldest first across targets: a younger launch waits for an older one to
-    /// get its runner, and not indefinitely when that one's loop is occupied.
+    fn scripted_older(director: &FixedDirector, looks: &[(usize, usize)]) {
+        *director.older.lock().unwrap() = looks
+            .iter()
+            .flat_map(|(value, count)| std::iter::repeat_n(*value, *count))
+            .collect();
+    }
+
+    /// Oldest first across targets: a younger launch reserves after the older
+    /// ones, however long that takes while they are reserving, and says so in its
+    /// timings.
     #[tokio::test(start_paused = true)]
-    async fn a_younger_launch_lets_an_older_one_reserve_first_for_a_bounded_time() {
+    async fn a_younger_launch_reserves_after_older_ones_while_they_make_progress() {
+        let held = Arc::new(HeldBringUp {
+            inner: Arc::new(FakeLauncher::new()),
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+            fail: None,
+            waits: Mutex::default(),
+        });
+        let director = Arc::new(FixedDirector::default());
+        let pool = policy(1, "acme/app", 3);
+        director.directed.lock().unwrap().insert(pool.id, 1);
+        let reconciler = directed_reconciler(
+            5,
+            Arc::clone(&held) as _,
+            Arc::new(InProcessAllocationLock::new()),
+            Arc::clone(&director),
+        );
+
+        // Three older launches, each reserving just within the turn: four and a
+        // half seconds in all, well over one turn, and nothing is passed over.
+        let looks =
+            (OLDER_LAUNCH_TURN.as_millis() * 3 / 4 / OLDER_LAUNCH_POLL.as_millis()) as usize;
+        scripted_older(&director, &[(3, looks), (2, looks), (1, looks), (0, 1)]);
+        let began = tokio::time::Instant::now();
+        let report = reconciler.start_directed(std::slice::from_ref(&pool)).await;
+        assert_eq!(report.started, 1);
+        assert_eq!(
+            began.elapsed(),
+            OLDER_LAUNCH_POLL * u32::try_from(looks * 3).unwrap()
+        );
+        assert_eq!(director.passed_over.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            held.waits.lock().unwrap()[0].order,
+            OLDER_LAUNCH_POLL * u32::try_from(looks * 3).unwrap(),
+            "the wait is in the launch's timings"
+        );
+    }
+
+    /// A pass concludes runners, so it is not held by a launch's bring-up: with a
+    /// launch side, it reports on the launch and hands it over.
+    #[tokio::test]
+    async fn a_pass_hands_a_directed_launch_to_the_launch_side() {
         let fake = Arc::new(FakeLauncher::new());
         let director = Arc::new(FixedDirector::default());
         let pool = policy(1, "acme/app", 3);
         director.directed.lock().unwrap().insert(pool.id, 1);
+        let signal = Arc::new(tokio::sync::Notify::new());
         let mut reconciler = directed_reconciler(
+            5,
+            Arc::clone(&fake) as _,
+            Arc::new(InProcessAllocationLock::new()),
+            Arc::clone(&director),
+        )
+        .with_launch_side(Arc::clone(&signal));
+
+        let report = reconciler.reconcile(std::slice::from_ref(&pool)).await;
+
+        assert_eq!(report.started, 0);
+        assert_eq!(fake.live_count(), 0);
+        assert_eq!(report.allocations[0].to_start, 1);
+        tokio::time::timeout(Duration::from_secs(1), signal.notified())
+            .await
+            .expect("the launch side is told");
+
+        // Nothing to start: nothing to tell it.
+        director.directed.lock().unwrap().insert(pool.id, 0);
+        reconciler.reconcile(std::slice::from_ref(&pool)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), signal.notified())
+                .await
+                .is_err()
+        );
+    }
+
+    /// One that never reserves costs one wait, then nothing: a loop that cannot
+    /// reserve holds no launch up for long, and not every later one again.
+    #[tokio::test(start_paused = true)]
+    async fn an_older_launch_that_cannot_reserve_is_passed_over_once() {
+        let fake = Arc::new(FakeLauncher::new());
+        let director = Arc::new(FixedDirector::default());
+        let pool = policy(1, "acme/app", 3);
+        director.directed.lock().unwrap().insert(pool.id, 1);
+        let reconciler = directed_reconciler(
             5,
             Arc::clone(&fake) as _,
             Arc::new(InProcessAllocationLock::new()),
             Arc::clone(&director),
         );
 
-        // The older launch gets its runner after three looks.
-        director.older.store(3, Ordering::SeqCst);
-        let began = tokio::time::Instant::now();
-        let report = reconciler.start_directed(std::slice::from_ref(&pool)).await;
-        assert_eq!(report.started, 1);
-        assert_eq!(began.elapsed(), OLDER_LAUNCH_POLL * 3);
-
-        // It never does.
-        director.directed.lock().unwrap().insert(pool.id, 2);
-        director.older.store(usize::MAX, Ordering::SeqCst);
+        scripted_older(&director, &[(1, 1)]);
         let began = tokio::time::Instant::now();
         let report = reconciler.start_directed(std::slice::from_ref(&pool)).await;
         assert_eq!(report.started, 1, "started anyway");
         assert!(began.elapsed() >= OLDER_LAUNCH_TURN);
         assert!(began.elapsed() < OLDER_LAUNCH_TURN + Duration::from_secs(1));
+        assert_eq!(director.passed_over.load(Ordering::SeqCst), 1);
+
+        director.directed.lock().unwrap().insert(pool.id, 2);
+        let began = tokio::time::Instant::now();
+        let report = reconciler.start_directed(std::slice::from_ref(&pool)).await;
+        assert_eq!(report.started, 1);
+        assert_eq!(began.elapsed(), Duration::ZERO);
+    }
+
+    /// A target's own profiles keep the order too: the oldest launch reserves
+    /// first, one runner at a time.
+    #[tokio::test]
+    async fn a_targets_profiles_reserve_oldest_launch_first() {
+        let director = Arc::new(FixedDirector::default());
+        let (younger, older) = (policy(1, "acme/app", 3), policy(2, "acme/app", 3));
+        director.directed.lock().unwrap().insert(younger.id, 1);
+        director.directed.lock().unwrap().insert(older.id, 1);
+        director.orders.lock().unwrap().insert(younger.id, 9);
+        director.orders.lock().unwrap().insert(older.id, 4);
+        let reconciler = directed_reconciler(
+            5,
+            Arc::new(FakeLauncher::new()) as _,
+            Arc::new(InProcessAllocationLock::new()),
+            Arc::clone(&director),
+        );
+
+        let report = reconciler
+            .start_directed(&[younger.clone(), older.clone()])
+            .await;
+
+        assert_eq!(report.started, 2);
+        let order: Vec<PolicyId> = director
+            .started
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(policy, _)| *policy)
+            .collect();
+        assert_eq!(order, vec![older.id, younger.id]);
+    }
+
+    /// Serves `pool` until told to stop, with `signal` and `stop` for the test.
+    fn serving<'a>(
+        reconciler: &'a Reconciler,
+        pool: &ScalePolicy,
+        signal: &'a tokio::sync::Notify,
+        stop: tokio::sync::watch::Receiver<bool>,
+    ) -> impl std::future::Future<Output = ()> + 'a {
+        let pool = pool.clone();
+        async move {
+            let policies = move || vec![pool.clone()];
+            reconciler.serve_launches(&policies, signal, stop).await;
+        }
+    }
+
+    /// The batch does not hold a launch back. Each bring-up waits at the barrier
+    /// for the other, so the second must reach it while the first is coming up, or
+    /// neither ever gets past.
+    #[tokio::test]
+    async fn a_launch_accepted_during_a_batch_starts_without_waiting_for_it() {
+        let fake = Arc::new(FakeLauncher::new());
+        let held = Arc::new(HeldBringUp {
+            inner: Arc::clone(&fake),
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            fail: None,
+            waits: Mutex::default(),
+        });
+        let director = Arc::new(FixedDirector::default());
+        let pool = policy(1, "acme/app", 3);
+        director.directed.lock().unwrap().insert(pool.id, 1);
+        let reconciler = directed_reconciler(
+            5,
+            held as _,
+            Arc::new(InProcessAllocationLock::new()),
+            Arc::clone(&director),
+        );
+        let signal = tokio::sync::Notify::new();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(serving(&reconciler, &pool, &signal, stopped), async {
+                signal.notify_one();
+                while director.started.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+                director.directed.lock().unwrap().insert(pool.id, 2);
+                signal.notify_one();
+                while director.started.lock().unwrap().len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+                stop.send_replace(true);
+            })
+        })
+        .await
+        .expect("the second came up beside the first, and stopping ends it");
+        assert_eq!(fake.live_count(), 2);
+    }
+
+    /// Serving launches beside a batch changes no ceiling: the runner still
+    /// coming up holds its slot.
+    #[tokio::test]
+    async fn a_launch_during_a_batch_takes_no_slot_that_batch_holds() {
+        let fake = Arc::new(FakeLauncher::new());
+        let held = Arc::new(HeldBringUp {
+            inner: Arc::clone(&fake),
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            fail: None,
+            waits: Mutex::default(),
+        });
+        let barrier = Arc::clone(&held.barrier);
+        let director = Arc::new(FixedDirector::default());
+        let pool = policy(1, "acme/app", 3);
+        director.directed.lock().unwrap().insert(pool.id, 1);
+        let reconciler = directed_reconciler(
+            1,
+            held as _,
+            Arc::new(InProcessAllocationLock::new()),
+            Arc::clone(&director),
+        );
+        let signal = tokio::sync::Notify::new();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+
+        tokio::join!(serving(&reconciler, &pool, &signal, stopped), async {
+            signal.notify_one();
+            while director.started.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            director.directed.lock().unwrap().insert(pool.id, 2);
+            signal.notify_one();
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                director.started.lock().unwrap().len(),
+                1,
+                "the host is full"
+            );
+            assert_eq!(fake.live_count(), 1);
+            stop.send_replace(true);
+            barrier.wait().await;
+        });
+    }
+
+    /// A launch whose runner failed coming up is tried again, without a signal
+    /// and without a pass. One signalled after the stop starts nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_that_did_not_start_is_retried_and_a_stop_ends_it() {
+        let held = Arc::new(HeldBringUp {
+            inner: Arc::new(FakeLauncher::new()),
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+            fail: Some(FailureReason::JitRequestFailed),
+            waits: Mutex::default(),
+        });
+        let director = Arc::new(FixedDirector::default());
+        let pool = policy(1, "acme/app", 3);
+        director.directed.lock().unwrap().insert(pool.id, 1);
+        director.orders.lock().unwrap().insert(pool.id, 1);
+        let reconciler = directed_reconciler(
+            5,
+            held as _,
+            Arc::new(InProcessAllocationLock::new()),
+            Arc::clone(&director),
+        );
+        let signal = tokio::sync::Notify::new();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+
+        tokio::join!(serving(&reconciler, &pool, &signal, stopped), async {
+            signal.notify_one();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert_eq!(director.failed.lock().unwrap().len(), 1);
+            // The fake keeps the failed runner: one more launch needs one more.
+            director.directed.lock().unwrap().insert(pool.id, 2);
+            tokio::time::sleep(LAUNCH_RETRY - Duration::from_secs(1)).await;
+            assert_eq!(director.failed.lock().unwrap().len(), 1, "not yet");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(director.failed.lock().unwrap().len(), 2, "retried");
+
+            stop.send_replace(true);
+            signal.notify_one();
+        });
+        assert_eq!(director.failed.lock().unwrap().len(), 2);
     }
 
     /// Coordinated placement: a directed policy starts runners for the
@@ -7724,7 +8195,7 @@ mod tests {
         let report = reconciler.start_directed(std::slice::from_ref(&pool)).await;
         assert_eq!(report.started, 0);
         let fresh = Arc::new(FakeLauncher::new());
-        let mut starter = Reconciler::new(
+        let starter = Reconciler::new(
             host_with(10),
             ReconcilerPorts {
                 demand: Arc::clone(&demand) as Arc<dyn DemandSource>,

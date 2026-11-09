@@ -391,6 +391,8 @@ pub struct QueuedDemand {
     unavailable: Vec<UnavailableRepository>,
     /// Repositories whose count is a floor rather than a total.
     truncated: BTreeSet<OwnerRepo>,
+    /// The workflow file of each run the reading listed, by repository.
+    run_workflows: BTreeMap<OwnerRepo, BTreeMap<u64, String>>,
     /// Repositories with runs under way whose listings **changed** since the
     /// previous poll. See [`QueuedDemand::is_quiet`].
     busy: BTreeSet<OwnerRepo>,
@@ -406,9 +408,17 @@ impl QueuedDemand {
             identities: BTreeMap::new(),
             unavailable: Vec::new(),
             truncated: BTreeSet::new(),
+            run_workflows: BTreeMap::new(),
             busy: BTreeSet::new(),
             rate_limit: None,
         }
+    }
+
+    /// The workflow file of each of `repository`'s active runs the reading saw,
+    /// by run id.
+    #[must_use]
+    pub fn run_workflows_for(&self, repository: &OwnerRepo) -> Option<&BTreeMap<u64, String>> {
+        self.run_workflows.get(repository)
     }
 
     /// `repository`'s queued jobs with their identities, where the reading
@@ -677,6 +687,21 @@ pub trait DemandGateway: fmt::Debug + Send + Sync {
         cancel: &CancelToken,
     ) -> Result<QueuedDemand, InventoryError>;
 
+    /// The workflow file (`.github/workflows/ci.yml`) of one run. Nothing else
+    /// on a run names its workflow stably: its `name` and a job's `workflow_name`
+    /// can be a title that changes at every dispatch.
+    ///
+    /// # Errors
+    /// Every variant of [`InventoryError`].
+    async fn run_workflow(
+        &self,
+        _repository: &OwnerRepo,
+        _run_id: u64,
+        _cancel: &CancelToken,
+    ) -> Result<Option<String>, InventoryError> {
+        Ok(None)
+    }
+
     /// The instant a reading is stamped with.
     fn now(&self) -> Timestamp;
 }
@@ -692,6 +717,15 @@ impl<T: DemandGateway + ?Sized> DemandGateway for Arc<T> {
         cancel: &CancelToken,
     ) -> Result<QueuedDemand, InventoryError> {
         (**self).queued_demand(scope, cancel).await
+    }
+
+    async fn run_workflow(
+        &self,
+        repository: &OwnerRepo,
+        run_id: u64,
+        cancel: &CancelToken,
+    ) -> Result<Option<String>, InventoryError> {
+        (**self).run_workflow(repository, run_id, cancel).await
     }
 
     fn now(&self) -> Timestamp {
@@ -1118,6 +1152,7 @@ impl RestDemand {
         let mut exact = true;
         let mut changed = false;
         let mut resolved: BTreeSet<u64> = BTreeSet::new();
+        let mut run_workflows = BTreeMap::new();
 
         for (status, cap) in [
             (QUEUED_RUN_STATUS, MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL),
@@ -1129,6 +1164,7 @@ impl RestDemand {
             let listing = self.active_runs(repository, status, cap, cancel).await?;
             exact &= listing.complete;
             changed |= listing.changed;
+            run_workflows.extend(listing.workflows);
 
             for run_id in listing.run_ids {
                 // A run that changed status between the two listings is in both.
@@ -1139,7 +1175,11 @@ impl RestDemand {
                 let run = self.queued_jobs_of_run(repository, run_id, cancel).await?;
                 exact &= run.complete;
                 changed |= run.changed;
-                jobs.extend(run.jobs);
+                let workflow = run_workflows.get(&run_id);
+                jobs.extend(run.jobs.into_iter().map(|(job, mut identity)| {
+                    identity.workflow = workflow.cloned();
+                    (job, identity)
+                }));
             }
         }
 
@@ -1151,6 +1191,7 @@ impl RestDemand {
         Ok(RepositoryDemand {
             jobs,
             identities,
+            run_workflows,
             exact,
             busy: changed && !resolved.is_empty(),
         })
@@ -1287,6 +1328,11 @@ impl RestDemand {
             .take(cap)
             .map(|run| run.id)
             .collect();
+        let workflows = page
+            .workflow_runs
+            .into_iter()
+            .filter_map(|run| Some((run.id, run.path?)))
+            .collect();
 
         Ok(RunListing {
             // More runs exist than this pass will resolve, so the job count it
@@ -1295,6 +1341,7 @@ impl RestDemand {
             // first page was itself short of the whole filtered set.
             complete: listed <= cap && !has_next_page,
             run_ids,
+            workflows,
             changed: !not_modified,
         })
     }
@@ -1363,6 +1410,7 @@ impl RestDemand {
                             QueuedJobIdentity {
                                 id: job.id,
                                 name: job.name,
+                                workflow: None,
                             },
                         )
                     }),
@@ -1426,6 +1474,9 @@ impl DemandGateway for RestDemand {
                     demand
                         .identities
                         .insert(repository.clone(), reading.identities);
+                    demand
+                        .run_workflows
+                        .insert(repository.clone(), reading.run_workflows);
                     if !reading.exact {
                         // A floor travels with the aggregate rather than being
                         // flattened into it: one truncated repository makes the
@@ -1454,6 +1505,22 @@ impl DemandGateway for RestDemand {
         Ok(demand)
     }
 
+    async fn run_workflow(
+        &self,
+        repository: &OwnerRepo,
+        run_id: u64,
+        cancel: &CancelToken,
+    ) -> Result<Option<String>, InventoryError> {
+        let request = ApiRequest::get(format!(
+            "/repos/{}/{}/actions/runs/{run_id}",
+            repository.owner(),
+            repository.repo()
+        ));
+        let Fetched { response, .. } = self.get(&request, cancel).await?;
+        let run: QueuedRun = response.json()?;
+        Ok(run.path)
+    }
+
     fn now(&self) -> Timestamp {
         self.clock.now()
     }
@@ -1471,6 +1538,9 @@ pub struct QueuedJobIdentity {
     pub id: Option<u64>,
     /// The job's name, matrix values expanded.
     pub name: Option<String>,
+    /// Its run's workflow file (`.github/workflows/ci.yml`), which, unlike the
+    /// title, does not change between dispatches.
+    pub workflow: Option<String>,
 }
 
 /// One repository's queued jobs, and whether that set is the whole truth.
@@ -1480,6 +1550,8 @@ struct RepositoryDemand {
     jobs: Vec<RunsOn>,
     /// Which job each of `jobs` is, in the same order.
     identities: Vec<QueuedJobIdentity>,
+    /// The workflow file of each run listed.
+    run_workflows: BTreeMap<u64, String>,
     /// `false` when `jobs` is a **floor**: a run cap or a job page budget
     /// stopped the walk before the whole queue had been seen.
     exact: bool,
@@ -1492,6 +1564,7 @@ struct RepositoryDemand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunListing {
     run_ids: Vec<u64>,
+    workflows: BTreeMap<u64, String>,
     complete: bool,
     /// `false` when GitHub answered `304`.
     changed: bool,
@@ -1519,10 +1592,13 @@ struct QueuedRunsPage {
     workflow_runs: Vec<QueuedRun>,
 }
 
-/// One workflow run, reduced to the identifier its jobs are fetched by.
+/// One workflow run, reduced to the identifier its jobs are fetched by and its
+/// workflow file.
 #[derive(Debug, Deserialize)]
 struct QueuedRun {
     id: u64,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 /// One page of `GET …/actions/runs/{run_id}/jobs`.
@@ -2005,14 +2081,82 @@ mod tests {
                 QueuedJobIdentity {
                     id: Some(8),
                     name: Some("build (linux, 3.12)".into()),
+                    workflow: None,
                 },
                 QueuedJobIdentity {
                     id: Some(9),
                     name: Some("older".into()),
+                    workflow: None,
                 },
             ]
         );
         assert_eq!(demand.total(), 2);
+    }
+
+    /// A job's workflow comes from its run's `path`, which unlike its title does
+    /// not change between dispatches.
+    #[tokio::test]
+    async fn a_queued_job_is_named_with_its_runs_workflow_file() {
+        let server = MockServer::start().await;
+        mount_runs(
+            &server,
+            &repo(),
+            QUEUED_RUN_STATUS,
+            json!({
+                "total_count": 1,
+                "workflow_runs": [{
+                    "id": 100,
+                    "name": "load light [1,2] (a title)",
+                    "path": ".github/workflows/load.yml"
+                }]
+            }),
+        )
+        .await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, no_runs()).await;
+        mount_jobs(&server, &repo(), 100, jobs_body(&["rm-home-win-x64"], 1, 0)).await;
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("read");
+
+        let (_, identity) = demand.identified_jobs_for(&repo()).next().expect("a job");
+        assert_eq!(
+            identity.and_then(|identity| identity.workflow.as_deref()),
+            Some(".github/workflows/load.yml")
+        );
+        assert_eq!(
+            demand
+                .run_workflows_for(&repo())
+                .and_then(|runs| runs.get(&100))
+                .map(String::as_str),
+            Some(".github/workflows/load.yml")
+        );
+    }
+
+    #[tokio::test]
+    async fn one_runs_workflow_file_can_be_asked_for() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/{}/{}/actions/runs/77",
+                repo().owner(),
+                repo().repo()
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 77,
+                "path": ".github/workflows/ci.yml"
+            })))
+            .mount(&server)
+            .await;
+
+        let answer = gateway(&server)
+            .run_workflow(&repo(), 77, &CancelToken::new())
+            .await
+            .expect("read");
+
+        assert_eq!(answer.as_deref(), Some(".github/workflows/ci.yml"));
     }
 
     /// A `needs:`-gated job whose run has already started is still demand.
