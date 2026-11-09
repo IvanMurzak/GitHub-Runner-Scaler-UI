@@ -47,6 +47,15 @@
 //! statistics for the queue, the order is stage 3's: a warm workspace for
 //! the repository, then the most free RAM, then the fewest busy slots.
 //!
+//! 0.4.52: a host whose last heartbeat says its CPU is busy (90 % by
+//! default) or its runner root's disk low (under 10 GiB by default) is a
+//! **last resort** ([`crate::stats::Guards`]): tried after every other host
+//! that can take the job now, never excluded outright. Among the rest, idle
+//! cores add to the score.
+//!
+//! An `rm-pool-any` job has candidates of every operating system: every
+//! host whose profile carries that label.
+//!
 //! The first is sent a `launch`; a refusal or no answer within
 //! [`ACK_TIMEOUT`] moves on to the next. A queue left short is given a reason
 //! ([`Unplaced`]), logged at most once a minute and shown by `stats`.
@@ -69,8 +78,8 @@ use tokio::sync::oneshot;
 
 use crate::registry::{Candidate, Registry, is_pool_job};
 use crate::stats::{
-    Aggregates, Contender, Demand, FitFigures, Statistics, StatsConfig, WORKFLOW_SEPARATOR,
-    roomiest, score,
+    Aggregates, Contender, Demand, FitFigures, Guards, LastResort, Load, Statistics, StatsConfig,
+    WORKFLOW_SEPARATOR, roomiest, score,
 };
 
 /// How long a host has to answer a `launch`.
@@ -571,6 +580,9 @@ pub struct Placement {
     lease_ttl: Duration,
     /// Stage 4: weighs placement by what jobs used; `None` places as stage 3.
     stats: Option<Arc<Statistics>>,
+    /// When a host is a last resort: its statistics' settings, else the
+    /// defaults.
+    guards: Guards,
 }
 
 impl Placement {
@@ -593,12 +605,15 @@ impl Placement {
             ack_timeout,
             lease_ttl,
             stats: None,
+            guards: Guards::default(),
         }
     }
 
-    /// Weighs placement with `stats` (stage 4).
+    /// Weighs placement with `stats` (stage 4), and judges last resorts by
+    /// its settings.
     #[must_use]
     pub fn with_statistics(mut self, stats: Arc<Statistics>) -> Self {
+        self.guards = stats.config().guards;
         self.stats = Some(stats);
         self
     }
@@ -1355,7 +1370,10 @@ impl Placement {
                 };
                 chosen
             }
-            None => rank(eligible).into_iter().next().map(|chosen| (chosen, 0)),
+            None => rank(eligible, self.guards)
+                .into_iter()
+                .next()
+                .map(|chosen| (chosen, 0)),
         };
         let Some((chosen, estimate)) = chosen else {
             state.note_unplaced(key, Unplaced::NoMemoryFit);
@@ -1441,15 +1459,15 @@ impl Placement {
                     busy_slots: candidate.heartbeat.busy_slots,
                     reserved: state.reserved_on(&candidate.host_id),
                     committed: state.committed_on(&candidate.host_id),
+                    load: load(candidate, config.guards),
                 })
                 .collect();
             let scored = score(&contenders, &demand, heavier, config, aggregates);
             *figures = roomiest(&contenders, &demand, config);
             let fit = figures.as_ref();
-            let chosen = scored
-                .first()
-                .filter(|(_, best)| best.fits)
-                .map(|(contender, _)| contender.host_id.clone());
+            let best = scored.first().filter(|(_, best)| best.fits);
+            let chosen = best.map(|(contender, _)| contender.host_id.clone());
+            let chosen_load = best.map(|(contender, _)| contender.load);
             let method = if demand.measured {
                 "weighted"
             } else {
@@ -1481,6 +1499,16 @@ impl Placement {
                 committed_bytes = fit.map(|fit| fit.committed),
                 ram_margin_bytes = config.ram_margin,
                 required_bytes = fit.and_then(|fit| fit.required),
+                chosen_cores = chosen_load.map(|load| load.cores),
+                chosen_cpu_load_percent = chosen_load.and_then(|load| load.cpu_load_percent),
+                chosen_disk_free_bytes = chosen_load.and_then(|load| load.disk_free),
+                chosen_last_resort = chosen_load.and_then(|load| load.last_resort.as_str()),
+                last_resorts = scored
+                    .iter()
+                    .filter(|(contender, _)| contender.load.last_resort != LastResort::No)
+                    .count(),
+                cpu_busy_percent = config.guards.cpu_busy_percent,
+                min_disk_free_bytes = config.guards.min_disk_free,
                 "a pool queue was weighed"
             );
             for (contender, host) in &scored {
@@ -1489,10 +1517,15 @@ impl Placement {
                     free_ram_bytes = contender.free_ram,
                     total_ram_bytes = contender.total_ram,
                     reserved_bytes = contender.reserved,
+                    cores = contender.load.cores,
+                    cpu_load_percent = contender.load.cpu_load_percent,
+                    disk_free_bytes = contender.load.disk_free,
+                    last_resort = contender.load.last_resort.as_str(),
                     fits = host.fits,
                     cache = host.cache,
                     headroom = host.headroom,
                     speed = host.speed,
+                    cpu = host.cpu,
                     bigfit = host.bigfit,
                     total = host.total,
                     "placement score"
@@ -1546,12 +1579,25 @@ fn fit(candidate: &Candidate) -> bool {
     !candidate.heartbeat.unfit && !candidate.heartbeat.draining
 }
 
-/// Best first: a warm workspace, then the most free RAM, then the fewest busy
-/// slots, then the host id so the order is stable.
-fn rank(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+/// `candidate`'s CPU and disk, and whether they make it a last resort.
+fn load(candidate: &Candidate, guards: Guards) -> Load {
+    let cpu_load_percent = candidate.heartbeat.cpu_load_percent;
+    Load {
+        cores: candidate.cores,
+        cpu_load_percent,
+        disk_free: candidate.disk_free_bytes,
+        last_resort: guards.last_resort(cpu_load_percent, candidate.disk_free_bytes),
+    }
+}
+
+/// Best first: not a last resort, then a warm workspace, then the most free
+/// RAM, then the fewest busy slots, then the host id so the order is stable.
+fn rank(mut candidates: Vec<Candidate>, guards: Guards) -> Vec<Candidate> {
     candidates.sort_by(|a, b| {
-        b.warm
-            .cmp(&a.warm)
+        load(a, guards)
+            .last_resort
+            .cmp(&load(b, guards).last_resort)
+            .then_with(|| b.warm.cmp(&a.warm))
             .then_with(|| {
                 b.heartbeat
                     .free_ram_bytes
@@ -2796,7 +2842,7 @@ mod tests {
         let b = connect(&registry, "b", LAUNCH_VERSION, POOL, 2, 3 << 30);
         drop((a, b));
         let candidates = registry.launch_candidates("octo/app", &required(POOL));
-        let stage_three: Vec<String> = rank(candidates)
+        let stage_three: Vec<String> = rank(candidates, Guards::default())
             .into_iter()
             .map(|candidate| candidate.host_id)
             .collect();
@@ -3096,5 +3142,211 @@ mod tests {
         );
         assert_eq!(placement.state().committed_on("h"), 0);
         drop(host);
+    }
+
+    /// Connects `id` with a pool profile of `labels`, 8 free slots, `ram` free
+    /// and in all, and its last heartbeat's CPU load and free disk.
+    fn connect_loaded(
+        registry: &Registry,
+        id: &str,
+        labels: &[&str],
+        ram: u64,
+        cpu: Option<u32>,
+        disk: Option<u64>,
+    ) -> FakeHost {
+        let (tx, rx) = mpsc::channel(64);
+        let connection = registry.register(id, LAUNCH_VERSION, tx);
+        registry.set_hello(
+            id,
+            connection,
+            Hello {
+                protocol_version: LAUNCH_VERSION,
+                host_id: id.into(),
+                os: "linux".into(),
+                arch: "x64".into(),
+                cores: 8,
+                ram_bytes: Some(ram),
+                disk_free_bytes: Some(500 << 30),
+                targets: vec![Target {
+                    scope: TargetScope::Repo,
+                    name: "octo/app".into(),
+                    profiles: vec![Profile {
+                        name: "pool".into(),
+                        labels: labels.iter().map(ToString::to_string).collect(),
+                        enabled: true,
+                        warm: false,
+                    }],
+                }],
+            },
+        );
+        registry.set_heartbeat(
+            id,
+            connection,
+            Heartbeat {
+                free_slots: 8,
+                free_ram_bytes: Some(ram),
+                cpu_load_percent: cpu,
+                disk_free_bytes: disk,
+                ..Heartbeat::default()
+            },
+        );
+        FakeHost { rx }
+    }
+
+    fn host_ids(candidates: Vec<Candidate>) -> Vec<String> {
+        candidates.into_iter().map(|c| c.host_id).collect()
+    }
+
+    /// `rm-pool-any`: every host whose profile carries it is a candidate,
+    /// whatever its OS pool; an OS pool job still reaches only its own hosts,
+    /// and extra labels narrow both alike.
+    #[tokio::test]
+    async fn an_any_pool_job_is_placed_across_operating_systems() {
+        let (registry, placement) = setup();
+        let linux = connect_loaded(
+            &registry,
+            "linux",
+            &["rm-pool-linux", "rm-pool-any"],
+            16 << 30,
+            None,
+            None,
+        );
+        let mac = connect_loaded(
+            &registry,
+            "mac",
+            &["rm-pool-macos", "rm-pool-any", "heavy"],
+            64 << 30,
+            None,
+            None,
+        );
+        let windows = connect_loaded(
+            &registry,
+            "windows",
+            &["rm-pool-windows"],
+            64 << 30,
+            None,
+            None,
+        );
+        let mut any = host_ids(registry.launch_candidates("octo/app", &required(&["rm-pool-any"])));
+        any.sort();
+        assert_eq!(any, ["linux", "mac"]);
+        assert_eq!(
+            host_ids(registry.launch_candidates("octo/app", &required(POOL))),
+            ["linux"]
+        );
+        assert_eq!(
+            host_ids(registry.launch_candidates("octo/app", &required(&["rm-pool-any", "heavy"]))),
+            ["mac"]
+        );
+        // The webhook wakes none of them: placement launches one.
+        assert_eq!(
+            registry.wake_for_job("octo/app", &["rm-pool-any".into()], "d"),
+            0
+        );
+        let hosts = [
+            answer(&placement, "linux", linux, Answer::Accept),
+            answer(&placement, "mac", mac, Answer::Accept),
+            answer(&placement, "windows", windows, Answer::Accept),
+        ];
+        let key = placement
+            .queued("octo/app", &required(&["rm-pool-any"]), 1)
+            .expect("a pool job");
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        let mut seen = Vec::new();
+        for host in hosts {
+            seen.push(launches(&host.await.expect("host")));
+        }
+        // Stage 3's order without statistics: the most free memory.
+        assert_eq!(seen, [0, 1, 0]);
+    }
+
+    /// A host whose CPU is busy or whose disk is low is tried after the rest,
+    /// low disk last, with statistics or without; never excluded outright.
+    #[tokio::test]
+    async fn a_busy_or_nearly_full_host_is_a_last_resort() {
+        let (registry, _placement) = setup();
+        let low_disk = connect_loaded(
+            &registry,
+            "low-disk",
+            POOL,
+            64 << 30,
+            Some(5),
+            Some(2 << 30),
+        );
+        let busy = connect_loaded(&registry, "busy", POOL, 48 << 30, Some(95), None);
+        let calm = connect_loaded(&registry, "calm", POOL, 8 << 30, Some(89), Some(11 << 30));
+        let candidates = || registry.launch_candidates("octo/app", &required(POOL));
+        // The heartbeat's disk, else the hello's.
+        let disks: BTreeMap<String, Option<u64>> = candidates()
+            .into_iter()
+            .map(|c| (c.host_id, c.disk_free_bytes))
+            .collect();
+        assert_eq!(disks["busy"], Some(500 << 30));
+        assert_eq!(disks["low-disk"], Some(2 << 30));
+        assert_eq!(
+            host_ids(rank(candidates(), Guards::default())),
+            ["calm", "busy", "low-disk"]
+        );
+        // Thresholds are settings.
+        let lenient = Guards {
+            cpu_busy_percent: 100,
+            min_disk_free: 1 << 30,
+        };
+        assert_eq!(
+            host_ids(rank(candidates(), lenient)),
+            ["low-disk", "busy", "calm"]
+        );
+
+        // Weighed: the same order, and the decision says why.
+        let (placement, _stats) = measured(
+            Placement::with_timings(
+                Arc::clone(&registry),
+                Duration::from_millis(150),
+                Duration::from_secs(300),
+            ),
+            crate::store::Store::open_in_memory().expect("store"),
+        );
+        let hosts = [
+            answer(&placement, "low-disk", low_disk, Answer::Refuse),
+            answer(&placement, "busy", busy, Answer::Accept),
+            answer(&placement, "calm", calm, Answer::Refuse),
+        ];
+        let key = placement
+            .queued_job("octo/app", &required(POOL), 1, Some("octo/app/j".into()))
+            .expect("pool");
+        let mut decision = None;
+        let offered = placement.offer(
+            &key,
+            &HashMap::new(),
+            None,
+            &mut Rebalanced::default(),
+            &mut decision,
+        );
+        assert_eq!(offered.expect("placed").1, "calm");
+        placement.state().leases.clear();
+        let decision = decision.expect("recorded");
+        let resorts: Vec<(&str, Option<&str>)> = decision
+            .scores
+            .iter()
+            .map(|score| (score.host_id.as_str(), score.last_resort.as_deref()))
+            .collect();
+        assert_eq!(
+            resorts,
+            [
+                ("calm", None),
+                ("busy", Some("cpu_busy")),
+                ("low-disk", Some("low_disk"))
+            ]
+        );
+        assert_eq!(decision.scores[0].cpu_load_percent, Some(89));
+        assert_eq!(decision.scores[2].disk_free_bytes, Some(2 << 30));
+        // The calm host refuses (its slots are taken): the busy one takes it
+        // rather than the job waiting.
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        let mut seen = Vec::new();
+        for host in hosts {
+            seen.push(launches(&host.await.expect("host")));
+        }
+        assert_eq!(seen, [0, 1, 1]);
     }
 }

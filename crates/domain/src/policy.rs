@@ -111,8 +111,9 @@ pub enum PolicyError {
     NamedProfileNeedsDerivedSelector,
 
     #[error(
-        "{label} is a shared pool label for another operating system; this host's pool label \
-         is {expected} (labels starting `rm-pool-` are reserved for the coordinator's pools)"
+        "{label} is a shared pool label for another operating system; this host's pool labels \
+         are {expected} and rm-pool-any (labels starting `rm-pool-` are reserved for the \
+         coordinator's pools)"
     )]
     PoolLabelMismatch { label: Label, expected: Label },
 }
@@ -124,11 +125,30 @@ pub enum PolicyError {
 /// The reserved prefix of the coordinator's shared pool labels.
 ///
 /// A workflow that writes `runs-on: rm-pool-linux` lets the optional
-/// coordinator choose which host starts its runner. Exactly three exist, one
-/// per operating system ([`pool_label`]); the prefix is reserved so a label a
-/// host cannot honour (another OS's pool, or a pool class no build knows) is
-/// refused rather than silently advertised.
+/// coordinator choose which host starts its runner. Four exist: one per
+/// operating system ([`pool_label`]) and one for any operating system
+/// ([`ANY_POOL_LABEL`]); the prefix is reserved so a label a host cannot
+/// honour (another OS's pool, or a pool class no build knows) is refused
+/// rather than silently advertised.
 pub const POOL_LABEL_PREFIX: &str = "rm-pool-";
+
+/// The OS-agnostic pool (0.4.52): `runs-on: rm-pool-any` lets the
+/// coordinator pick a host of any operating system, so a job whose steps run
+/// anywhere goes to whichever host its statistics say is best. Any host may
+/// carry it, beside or instead of its own OS pool label.
+pub const ANY_POOL_LABEL: &str = "rm-pool-any";
+
+/// [`ANY_POOL_LABEL`] as a label.
+#[must_use]
+pub fn any_pool_label() -> Label {
+    Label::new(ANY_POOL_LABEL).expect("`rm-pool-any` is a valid label")
+}
+
+/// Whether `label` is [`ANY_POOL_LABEL`], case-insensitively.
+#[must_use]
+pub fn is_any_pool_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case(ANY_POOL_LABEL)
+}
 
 /// Whether `label` is in the reserved pool namespace, compared the way GitHub
 /// compares labels: case-insensitively. Only for refusing labels; what
@@ -140,14 +160,15 @@ pub fn in_pool_namespace(label: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(POOL_LABEL_PREFIX))
 }
 
-/// Whether `label` is one of the three shared pool labels, case-insensitively.
+/// Whether `label` is one of the four shared pool labels, case-insensitively.
 /// An exact match: a host label derived from `--host-label pool`
 /// (`rm-pool-linux-x64`) is that host's own selector, not a pool.
 #[must_use]
 pub fn is_pool_label(label: &str) -> bool {
-    Os::ALL
-        .iter()
-        .any(|os| pool_label(*os).as_str().eq_ignore_ascii_case(label))
+    is_any_pool_label(label)
+        || Os::ALL
+            .iter()
+            .any(|os| pool_label(*os).as_str().eq_ignore_ascii_case(label))
 }
 
 /// The one pool label a host running `os` may carry: `rm-pool-windows`,
@@ -158,13 +179,15 @@ pub fn pool_label(os: Os) -> Label {
         .expect("the pool prefix and a fixed OS token form a valid label")
 }
 
-/// Refuses a label in the pool namespace that is not `os`'s own pool label.
+/// Refuses a label in the pool namespace that is neither `os`'s own pool label
+/// nor [`ANY_POOL_LABEL`].
 ///
 /// # Errors
 /// [`PolicyError::PoolLabelMismatch`].
 pub fn check_pool_label(label: &Label, os: Os) -> Result<(), PolicyError> {
     let expected = pool_label(os);
-    if in_pool_namespace(label.as_str()) && *label != expected {
+    if in_pool_namespace(label.as_str()) && *label != expected && !is_any_pool_label(label.as_str())
+    {
         return Err(PolicyError::PoolLabelMismatch {
             label: label.clone(),
             expected,
@@ -415,14 +438,13 @@ impl RoutingLabels {
         self.host_label == *label || self.additional.contains(label)
     }
 
-    /// The shared pool label this set carries, if any (see
-    /// [`POOL_LABEL_PREFIX`]). The host label is never one: it is derived
-    /// from the host's identity.
-    #[must_use]
-    pub fn pool_label(&self) -> Option<&Label> {
+    /// The shared pool labels this set carries (see [`POOL_LABEL_PREFIX`]):
+    /// at most its OS pool label and [`ANY_POOL_LABEL`] once checked. The
+    /// host label is never one: it is derived from the host's identity.
+    pub fn pool_labels(&self) -> impl Iterator<Item = &Label> {
         self.additional
             .iter()
-            .find(|label| is_pool_label(label.as_str()))
+            .filter(|label| is_pool_label(label.as_str()))
     }
 
     /// Every label, host label first.
@@ -1392,11 +1414,11 @@ impl ScalePolicy {
         self.mode.routing_labels()
     }
 
-    /// The shared pool label this profile answers, if any (coordinator
-    /// stage 3).
-    #[must_use]
-    pub fn pool_label(&self) -> Option<&Label> {
-        self.routing_labels().and_then(RoutingLabels::pool_label)
+    /// The shared pool labels this profile answers (coordinator stage 3).
+    pub fn pool_labels(&self) -> impl Iterator<Item = &Label> {
+        self.routing_labels()
+            .into_iter()
+            .flat_map(RoutingLabels::pool_labels)
     }
 
     /// D4: this repository's configured workspace behaviour.
@@ -1791,10 +1813,32 @@ mod tests {
         assert!(check_pool_label(&label("rm-pool-linux-heavy"), Os::Linux).is_err());
 
         let mut labels = host_labels("home");
-        assert_eq!(labels.pool_label(), None);
+        assert_eq!(labels.pool_labels().next(), None);
         labels.add(label("linux"));
         labels.add(label("rm-pool-windows"));
-        assert_eq!(labels.pool_label(), Some(&label("rm-pool-windows")));
+        assert_eq!(
+            labels.pool_labels().collect::<Vec<_>>(),
+            [&label("rm-pool-windows")]
+        );
+    }
+
+    #[test]
+    fn the_any_pool_is_a_pool_every_os_may_carry_beside_its_own() {
+        assert_eq!(any_pool_label().as_str(), ANY_POOL_LABEL);
+        assert!(is_pool_label("rm-pool-any") && is_pool_label("RM-Pool-Any"));
+        assert!(is_any_pool_label("RM-POOL-ANY"));
+        assert!(!is_any_pool_label("rm-pool-linux"));
+        assert!(!is_pool_label("rm-pool-any-heavy"));
+        for os in Os::ALL {
+            assert!(check_pool_label(&label("rm-pool-any"), os).is_ok());
+        }
+        assert!(check_pool_label(&label("rm-pool-any-heavy"), Os::Linux).is_err());
+
+        let mut labels = host_labels("home");
+        labels.add(label("rm-pool-linux"));
+        labels.add(label("rm-pool-any"));
+        labels.add(label("heavy"));
+        assert_eq!(labels.pool_labels().count(), 2);
     }
 
     // =======================================================================

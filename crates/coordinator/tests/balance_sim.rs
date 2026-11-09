@@ -14,10 +14,16 @@
 //! empty, under three policies: round-robin (the only code here that decides
 //! anything), placement without statistics, and placement with them.
 //!
-//! What this cannot show, compared with real hosts: CPU contention (a job's speed
-//! does not depend on what else runs), swap and out-of-memory kills (memory above
-//! a host's RAM is measured, and the job carries on), disk and network, GitHub's
-//! actual choice of job, and lost or reordered webhooks beyond a seeded delay.
+//! A host may carry `rm-pool-any` beside its OS pool, have CPU load of its own
+//! (which slows its jobs and which its heartbeats report, with a share per
+//! running job), and little free disk (which its heartbeats report).
+//!
+//! What this cannot show, compared with real hosts: CPU contention between jobs
+//! (a job's speed depends on the host's own background load only), swap and
+//! out-of-memory kills (memory above a host's RAM is measured, and the job
+//! carries on), a disk filling up and network, GitHub's actual choice of job, a
+//! runner with both an OS pool and `rm-pool-any` taking a job of the queue it was
+//! not launched for, and lost or reordered webhooks beyond a seeded delay.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -78,6 +84,11 @@ const OLDEST_PERCENT: u64 = 70;
 const LINUX: &str = "rm-pool-linux";
 const WINDOWS: &str = "rm-pool-windows";
 const MACOS: &str = "rm-pool-macos";
+const ANY: &str = "rm-pool-any";
+
+/// What placement treats as busy and as low disk, by default.
+const BUSY_PERCENT: u32 = 90;
+const LOW_DISK: u64 = 10 * GIB;
 
 /// Xorshift: all this needs is a seeded, stable stream.
 struct Rng(u64);
@@ -119,6 +130,13 @@ struct HostSpec {
     /// 2.0 runs a job in half its time.
     speed: f64,
     pool: &'static str,
+    /// It also answers `rm-pool-any`, on the same profile.
+    any: bool,
+    os: &'static str,
+    cores: u32,
+    /// CPU load of its own, in percent: it slows the host's jobs.
+    background_cpu: u32,
+    disk_free: u64,
     /// Repositories this host keeps a persistent workspace for.
     warm: &'static [&'static str],
 }
@@ -131,7 +149,24 @@ const fn host(id: &'static str, gib: u64, slots: u32, speed: f64, pool: &'static
         slots,
         speed,
         pool,
+        any: false,
+        os: "linux",
+        cores: 16,
+        background_cpu: 0,
+        disk_free: 200 * GIB,
         warm: &[],
+    }
+}
+
+impl HostSpec {
+    /// Whether a runner of this host may take a job of `pool`.
+    fn serves(&self, pool: &str) -> bool {
+        pool == self.pool || (self.any && pool == ANY)
+    }
+
+    /// Its own load slows a job: at 100 % a job takes twice as long.
+    fn effective_speed(&self) -> f64 {
+        self.speed * (1.0 - f64::from(self.background_cpu.min(100)) / 200.0)
     }
 }
 
@@ -258,6 +293,31 @@ fn steady_stream(_round: usize) -> Vec<JobSpec> {
         .collect()
 }
 
+/// One `rm-pool-any` job at a time, so memory never decides, between OS jobs that
+/// only their own host may take.
+fn any_os(_round: usize) -> Vec<JobSpec> {
+    let mut jobs: Vec<JobSpec> = (0..5)
+        .map(|index| JobSpec {
+            pool: ANY,
+            ..job(index * 660, "octo/tool", "package", 360, 3.0)
+        })
+        .collect();
+    for (index, pool) in [LINUX, MACOS].into_iter().enumerate() {
+        jobs.push(JobSpec {
+            pool,
+            ..job(300 + index as u64 * 660, "octo/tool", "native", 120, 1.0)
+        });
+    }
+    jobs
+}
+
+/// A job every 40 s, about six at a time: one host can take them all.
+fn light_stream(_round: usize) -> Vec<JobSpec> {
+    (0..20)
+        .map(|index| job(index * 40, "octo/app", "test", 240, 2.0))
+        .collect()
+}
+
 /// The owner's fleet: Linux and WSL, one Windows host, and two Macs, one of them
 /// small with a single slot.
 fn owner_fleet(_round: usize) -> Vec<JobSpec> {
@@ -364,6 +424,52 @@ fn scenarios() -> Vec<Scenario> {
             vanishes: None,
             history: &[],
         },
+        Scenario {
+            name: "8 any OS, fast and slow",
+            hosts: vec![
+                HostSpec {
+                    any: true,
+                    ..host("linux-fast-23", 23, 4, 1.6, LINUX)
+                },
+                HostSpec {
+                    any: true,
+                    os: "macos",
+                    ..host("mac-slow-64", 64, 4, 0.6, MACOS)
+                },
+            ],
+            rounds: 4,
+            jobs: any_os,
+            vanishes: None,
+            history: &[],
+        },
+        Scenario {
+            name: "9 CPU-busy host",
+            hosts: vec![
+                HostSpec {
+                    background_cpu: 95,
+                    ..host("busy-64", 64, 8, 1.0, LINUX)
+                },
+                host("calm-32", 32, 8, 1.0, LINUX),
+            ],
+            rounds: 3,
+            jobs: light_stream,
+            vanishes: None,
+            history: &[],
+        },
+        Scenario {
+            name: "10 low-disk host",
+            hosts: vec![
+                HostSpec {
+                    disk_free: 4 * GIB,
+                    ..host("full-disk-64", 64, 8, 1.0, LINUX)
+                },
+                host("roomy-32", 32, 8, 1.0, LINUX),
+            ],
+            rounds: 3,
+            jobs: light_stream,
+            vanishes: None,
+            history: &[],
+        },
     ]
 }
 
@@ -394,6 +500,11 @@ struct Metrics {
     spread_pct: u64,
     starved: u32,
     lost: u32,
+    /// Jobs started on a host busy with load of its own, on one low on disk, and
+    /// on one whose pools do not include the job's.
+    busy_starts: u32,
+    low_disk_starts: u32,
+    wrong_pool_starts: u32,
 }
 
 #[derive(Debug)]
@@ -609,11 +720,11 @@ impl Sim {
             Hello {
                 protocol_version: PROTOCOL_VERSION,
                 host_id: spec.id.into(),
-                os: "linux".into(),
+                os: spec.os.into(),
                 arch: "x64".into(),
-                cores: 16,
+                cores: spec.cores,
                 ram_bytes: Some(spec.ram),
-                disk_free_bytes: None,
+                disk_free_bytes: Some(spec.disk_free),
                 targets: self
                     .repos
                     .iter()
@@ -622,7 +733,10 @@ impl Sim {
                         name: (*repo).to_string(),
                         profiles: vec![Profile {
                             name: "pool".into(),
-                            labels: vec![spec.pool.to_string()],
+                            labels: std::iter::once(spec.pool)
+                                .chain(spec.any.then_some(ANY))
+                                .map(ToString::to_string)
+                                .collect(),
                             enabled: true,
                             warm: spec.warm.contains(repo),
                         }],
@@ -668,6 +782,11 @@ impl Sim {
     fn heartbeat_of(&self, host: usize) -> Heartbeat {
         let spec = &self.hosts[host].spec;
         let free = spec.slots.saturating_sub(self.slots_used(host));
+        let running = self
+            .runners
+            .iter()
+            .filter(|runner| runner.host == host && runner.state == RunnerState::Running)
+            .count() as u32;
         Heartbeat {
             free_slots: free,
             busy_slots: self
@@ -681,7 +800,9 @@ impl Sim {
                         )
                 })
                 .count() as u32,
-            cpu_load_percent: None,
+            // A running job keeps one core busy.
+            cpu_load_percent: Some((spec.background_cpu + running * 100 / spec.cores).min(100)),
+            disk_free_bytes: Some(spec.disk_free),
             free_ram_bytes: Some(spec.ram.saturating_sub(self.used_ram(host, self.now()))),
             unfit: false,
             draining: false,
@@ -739,7 +860,17 @@ impl Sim {
                     Outbound::Send(ServerMessage::Launch(launch)) => {
                         let spec = self.hosts[index].spec.clone();
                         let answer = if self.slots_used(index) < spec.slots {
-                            let key = JobKey::new(&launch.target.name, &required_of(spec.pool));
+                            // Its runner serves the queue of the job it was launched
+                            // for: `repository#job id`.
+                            let key = launch
+                                .job_key
+                                .rsplit_once('#')
+                                .and_then(|(_, id)| id.parse::<u64>().ok())
+                                .and_then(|id| self.jobs.iter().find(|job| job.id == id))
+                                .map_or_else(
+                                    || JobKey::new(&launch.target.name, &required_of(spec.pool)),
+                                    |job| job.key.clone(),
+                                );
                             self.start_runner(index, Some(launch.lease_id.clone()), key);
                             LaunchAck::accepted(launch.lease_id)
                         } else {
@@ -831,7 +962,8 @@ impl Sim {
                         host.connected
                             && key
                                 .labels
-                                .contains(&Label::new(host.spec.pool).expect("a pool label"))
+                                .iter()
+                                .any(|label| host.spec.serves(label.as_str()))
                             && self.slots_used(index) < host.spec.slots
                     });
                 let Some(index) = free else { break };
@@ -869,7 +1001,7 @@ impl Sim {
         } else {
             1.0
         };
-        job.run_ms = (job.spec.secs * 1000.0 * warm / spec.speed) as u64;
+        job.run_ms = (job.spec.secs * 1000.0 * warm / spec.effective_speed()) as u64;
         job.started_at = Some(now);
         job.host = host_index;
         job.runner = runner_index;
@@ -1202,6 +1334,14 @@ impl Sim {
         self.finish_round(start)
     }
 
+    /// How many jobs that started did so on a host for which `on` holds.
+    fn started_on(&self, on: impl Fn(&HostSpec, &Job) -> bool) -> u32 {
+        self.jobs
+            .iter()
+            .filter(|job| job.started_at.is_some() && on(&self.hosts[job.host].spec, job))
+            .count() as u32
+    }
+
     fn finish_round(&mut self, start: u64) -> Metrics {
         let now = self.now();
         // Whatever never ran is forgotten, so it does not haunt the next round.
@@ -1273,6 +1413,9 @@ impl Sim {
             spread_pct: shares.iter().max().unwrap_or(&0) - shares.iter().min().unwrap_or(&0),
             starved,
             lost: self.jobs.iter().filter(|job| job.lost).count() as u32,
+            busy_starts: self.started_on(|host, _| host.background_cpu >= BUSY_PERCENT),
+            low_disk_starts: self.started_on(|host, _| host.disk_free < LOW_DISK),
+            wrong_pool_starts: self.started_on(|host, job| !host.serves(job.spec.pool)),
         }
     }
 }
@@ -1320,12 +1463,15 @@ fn merged(rounds: &[Metrics]) -> Metrics {
         spread_pct: mean(|m| m.spread_pct),
         starved: total(|m| m.starved),
         lost: total(|m| m.lost),
+        busy_starts: total(|m| m.busy_starts),
+        low_disk_starts: total(|m| m.low_disk_starts),
+        wrong_pool_starts: total(|m| m.wrong_pool_starts),
     }
 }
 
 fn row(scenario: &str, policy: &str, round: &str, m: &Metrics) -> String {
     format!(
-        "| {scenario} | {policy} | {round} | {} | {} | {} | {} | {} | {}s / {} / {} | {} ({}) | {} | {} | {} |",
+        "| {scenario} | {policy} | {round} | {} | {} | {} | {} | {} | {}s / {} / {} | {} ({}) | {} | {} | {} | {} / {} / {} |",
         m.makespan_s,
         m.wait_p50_s,
         m.wait_p95_s,
@@ -1339,6 +1485,9 @@ fn row(scenario: &str, policy: &str, round: &str, m: &Metrics) -> String {
         m.spread_pct,
         m.starved,
         m.lost,
+        m.busy_starts,
+        m.low_disk_starts,
+        m.wrong_pool_starts,
     )
 }
 
@@ -1361,8 +1510,9 @@ impl ScenarioResult {
 fn table(results: &[ScenarioResult]) -> String {
     let mut table = String::from(
         "| Scenario | Policy | Round | Makespan s | Wait p50 s | p95 s | max s | Mean run s | \
-         Over RAM (time / GiB·s / peak GiB) | Misfits (measured) | Spread pts | Starved | Lost |\n\
-         |---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|\n",
+         Over RAM (time / GiB·s / peak GiB) | Misfits (measured) | Spread pts | Starved | Lost | \
+         Starts busy / low disk / wrong pool |\n\
+         |---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---|\n",
     );
     let mut add = |name: &str, policy: &str, round: &str, metrics: &Metrics| {
         writeln!(table, "{}", row(name, policy, round, metrics)).expect("a string");
@@ -1620,6 +1770,76 @@ fn check(results: &[ScenarioResult]) -> Vec<String> {
         format!(
             "7: statistics should overcommit a tenth of round-robin: {} vs {} GiB·s",
             learned.over_gib_s, fleet.round_robin.over_gib_s
+        ),
+    );
+
+    // No job, whatever the policy, starts on a host whose pools do not include its.
+    for result in results {
+        for (policy, metrics) in [
+            ("round-robin", &result.round_robin),
+            ("no statistics", &result.no_statistics),
+            ("statistics", &result.weighted_from(1)),
+        ] {
+            expect(
+                metrics.wrong_pool_starts == 0,
+                format!(
+                    "{}: {policy} started {} jobs outside their pool",
+                    result.name, metrics.wrong_pool_starts
+                ),
+            );
+        }
+    }
+
+    // Scenario 8: across operating systems, it finds the faster host, though the
+    // other has more memory.
+    let any = of("8");
+    let learned = any.weighted_from(2);
+    expect(
+        learned.mean_run_s * 100 <= any.no_statistics.mean_run_s * 60,
+        format!(
+            "8: learning should cut run time by 40% against no statistics: {} vs {} s",
+            learned.mean_run_s, any.no_statistics.mean_run_s
+        ),
+    );
+    expect(
+        learned.mean_run_s < any.round_robin.mean_run_s,
+        format!(
+            "8: statistics should beat round-robin: {} vs {} s",
+            learned.mean_run_s, any.round_robin.mean_run_s
+        ),
+    );
+
+    // Scenarios 9 and 10: a busy or nearly full host is a last resort, and with
+    // room elsewhere never needed.
+    for (name, starts) in [
+        ("9", (|m: &Metrics| m.busy_starts) as fn(&Metrics) -> u32),
+        ("10", |m: &Metrics| m.low_disk_starts),
+    ] {
+        let result = of(name);
+        expect(
+            starts(&result.round_robin) > 0,
+            format!("{name}: round-robin should use the last-resort host"),
+        );
+        for (policy, metrics) in [
+            ("no statistics", &result.no_statistics),
+            ("statistics", &result.weighted_from(1)),
+        ] {
+            expect(
+                starts(metrics) == 0,
+                format!(
+                    "{name}: {policy} started {} jobs on the last-resort host",
+                    starts(metrics)
+                ),
+            );
+        }
+    }
+    let busy = of("9");
+    expect(
+        busy.weighted_from(1).mean_run_s < busy.round_robin.mean_run_s,
+        format!(
+            "9: avoiding the busy host should run jobs faster: {} vs {} s",
+            busy.weighted_from(1).mean_run_s,
+            busy.round_robin.mean_run_s
         ),
     );
     failures

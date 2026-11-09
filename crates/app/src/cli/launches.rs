@@ -8,8 +8,9 @@
 //! # When a profile is directed
 //!
 //! A profile is **directed** while it carries this host's shared pool label
-//! (`rm-pool-linux`, ...) and its target is in `coordinated` mode on a link
-//! that speaks protocol version 3. Its demand is then the number of open
+//! (`rm-pool-linux`, ...) or `rm-pool-any` and its target is in `coordinated`
+//! mode on a link that speaks protocol version 3 (for `rm-pool-any`, to a
+//! coordinator that says it places that pool: `hello_ack.any_pool`). Its demand is then the number of open
 //! launches ([`Launches::directed_demand`]), never its own reading of the
 //! queue, which every host in the pool sees the same way. In `fallback` and
 //! `standalone`, or on a version-2 link, it is an ordinary profile: its own
@@ -56,7 +57,7 @@ use runner_manager_domain::coordinator_protocol::{
     RefusalReason,
 };
 use runner_manager_domain::model::{AttemptId, Host, PolicyId, ScaleTarget};
-use runner_manager_domain::policy::{ScalePolicy, pool_label};
+use runner_manager_domain::policy::{ScalePolicy, is_any_pool_label, pool_label};
 use runner_manager_domain::store::Store;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -345,21 +346,29 @@ impl Launches {
     }
 
     /// Whether `policy` is directed right now: a pool profile of this host
-    /// whose target is coordinated on a version-3 link.
+    /// whose target is coordinated on a version-3 link. One carrying
+    /// `rm-pool-any` only when the coordinator places that pool: an older
+    /// one wakes hosts for such a job, and the profile counts its own demand.
     #[must_use]
     pub fn is_directed(&self, policy: &ScalePolicy) -> bool {
+        let view = self.view.borrow();
         self.is_own_pool_profile(policy)
-            && self
-                .view
-                .borrow()
-                .launch_mode(&policy.target, Instant::now())
+            && (!policy
+                .pool_labels()
+                .any(|label| is_any_pool_label(label.as_str()))
+                || view.ack.as_ref().is_some_and(|ack| ack.any_pool))
+            && view.launch_mode(&policy.target, Instant::now())
     }
 
-    /// A profile of this host answering this host's own pool label. A
-    /// stored label for another OS's pool (written before it was refused)
-    /// never makes a profile a pool profile here.
+    /// A profile of this host answering this host's own pool label or
+    /// `rm-pool-any`. A stored label for another OS's pool (written before
+    /// it was refused) never makes a profile a pool profile here.
     fn is_own_pool_profile(&self, policy: &ScalePolicy) -> bool {
-        policy.is_owned_by(self.host.id) && policy.pool_label() == Some(&pool_label(self.host.os))
+        let own = pool_label(self.host.os);
+        policy.is_owned_by(self.host.id)
+            && policy
+                .pool_labels()
+                .any(|label| *label == own || is_any_pool_label(label.as_str()))
     }
 
     /// Drops every open launch: the link ended, and the coordinator forgets
@@ -847,7 +856,11 @@ mod tests {
 
     use super::*;
 
-    fn directed_view(policy: &ScalePolicy, version: u32) -> watch::Receiver<LinkView> {
+    fn directed_view(
+        policy: &ScalePolicy,
+        version: u32,
+        any_pool: bool,
+    ) -> watch::Receiver<LinkView> {
         let (_sender, receiver) = watch::channel(LinkView {
             configured: true,
             connected: true,
@@ -855,6 +868,7 @@ mod tests {
             ack: Some(HelloAck {
                 reconcile_interval_secs: Some(120),
                 covered: vec![target_ref(&policy.target)],
+                any_pool,
             }),
             version: Some(version),
         });
@@ -879,7 +893,7 @@ mod tests {
         let launches = Launches::new(
             Arc::clone(&store) as Arc<dyn Store>,
             host,
-            directed_view(&policy, version),
+            directed_view(&policy, version, true),
         );
         (store, policy, launches)
     }
@@ -906,7 +920,7 @@ mod tests {
         );
 
         let (store, mut policy, launches) = setup(LAUNCH_VERSION);
-        let pool = policy.pool_label().cloned().expect("pool");
+        let pool = policy.pool_labels().next().cloned().expect("pool");
         policy.remove_routing_label(&pool).expect("removed");
         store
             .update_policy(&policy, policy.revision() - 1)
@@ -920,6 +934,53 @@ mod tests {
             launches.decide(&launch(&policy, "l3"), true, false).reason,
             Some(RefusalReason::Unfit)
         );
+    }
+
+    #[test]
+    fn an_any_pool_profile_is_directed_only_by_a_coordinator_that_places_that_pool() {
+        let host = fixtures::host().build();
+        let mut policy = fixtures::policy()
+            .repository("octo/app")
+            .host(host.id)
+            .autoscale("home", 2)
+            .active()
+            .build();
+        policy
+            .add_routing_label(runner_manager_domain::policy::any_pool_label())
+            .expect("any pool label");
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        store.put_host(&host).expect("host");
+        store.insert_policy(&policy).expect("policy");
+        let view = |any_pool| directed_view(&policy, LAUNCH_VERSION, any_pool);
+        let (with_any, without_any) = (view(true), view(false));
+        let launches = |view: &watch::Receiver<LinkView>| {
+            Launches::new(
+                Arc::clone(&store) as Arc<dyn Store>,
+                host.clone(),
+                view.clone(),
+            )
+        };
+        let current = launches(&with_any);
+        assert!(current.is_directed(&policy));
+        assert!(
+            current
+                .decide(&launch(&policy, "a1"), false, false)
+                .accepted
+        );
+
+        // An older coordinator wakes hosts for an `rm-pool-any` job: the
+        // profile counts its own demand, with its OS pool label too.
+        let older = launches(&without_any);
+        assert!(!older.is_directed(&policy));
+        assert_eq!(
+            older.decide(&launch(&policy, "a2"), false, false).reason,
+            Some(RefusalReason::NotCoordinated)
+        );
+        policy
+            .add_routing_label(pool_label(host.os))
+            .expect("os pool label");
+        assert!(!older.is_directed(&policy));
+        assert!(launches(&with_any).is_directed(&policy));
     }
 
     /// A second profile on one host, recorded, sharing the first's slots.
@@ -955,6 +1016,7 @@ mod tests {
             ack: Some(HelloAck {
                 reconcile_interval_secs: Some(120),
                 covered: vec![target_ref(&policy.target), target_ref(&other.target)],
+                any_pool: true,
             }),
             version: Some(LAUNCH_VERSION),
         });

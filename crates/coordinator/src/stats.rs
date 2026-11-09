@@ -51,9 +51,9 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use runner_manager_domain::coordinator_protocol::{
-    AttemptFinished, AttemptOutcomeKind, HostJobStats, HostScore, HostStats, JobStats,
-    MAX_MESSAGE_BYTES, OpenLease, PendingQueue, PlacementDecision, ServerMessage, StatsReport,
-    is_managed_runner_name, printable,
+    AttemptFinished, AttemptOutcomeKind, ConnectedHostStats, HostJobStats, HostScore, HostStats,
+    JobStats, MAX_MESSAGE_BYTES, OpenLease, PendingQueue, PlacementDecision, ServerMessage,
+    StatsReport, is_managed_runner_name, printable,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
@@ -115,6 +115,9 @@ pub struct Weights {
     pub speed: f64,
     /// Subtracted when this host is the only one a heavier queued job fits.
     pub bigfit: f64,
+    /// The host's idle cores (its cores less its CPU load, by its last
+    /// heartbeat), as a share of the most any contender has idle.
+    pub cpu: f64,
 }
 
 impl Default for Weights {
@@ -124,6 +127,62 @@ impl Default for Weights {
             headroom: 2.0,
             speed: 1.0,
             bigfit: 1.5,
+            cpu: 1.0,
+        }
+    }
+}
+
+/// When a host is tried only after every other host that fits: placed on
+/// only when nothing better can take the job now, never excluded outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Guards {
+    /// A last heartbeat's CPU load at or above this, in percent, is busy.
+    pub cpu_busy_percent: u32,
+    /// Less free disk on the runner root's volume than this is low.
+    pub min_disk_free: u64,
+}
+
+impl Default for Guards {
+    fn default() -> Self {
+        Self {
+            cpu_busy_percent: 90,
+            min_disk_free: 10 << 30,
+        }
+    }
+}
+
+impl Guards {
+    /// Whether, and why, a host with this load and disk is a last resort.
+    /// Low disk is the worse: a job may fail for it, where on a busy CPU it is
+    /// only slow.
+    #[must_use]
+    pub fn last_resort(&self, cpu_load_percent: Option<u32>, disk_free: Option<u64>) -> LastResort {
+        if disk_free.is_some_and(|free| free < self.min_disk_free) {
+            LastResort::LowDisk
+        } else if cpu_load_percent.is_some_and(|load| load >= self.cpu_busy_percent) {
+            LastResort::CpuBusy
+        } else {
+            LastResort::No
+        }
+    }
+}
+
+/// Why a host is tried after the others, in the order tried: `No` first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LastResort {
+    #[default]
+    No,
+    CpuBusy,
+    LowDisk,
+}
+
+impl LastResort {
+    #[must_use]
+    pub const fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::No => None,
+            Self::CpuBusy => Some("cpu_busy"),
+            Self::LowDisk => Some("low_disk"),
         }
     }
 }
@@ -138,6 +197,7 @@ pub struct StatsConfig {
     /// Free memory a host must keep beyond the estimate to be placed on.
     pub ram_margin: u64,
     pub weights: Weights,
+    pub guards: Guards,
 }
 
 impl Default for StatsConfig {
@@ -148,6 +208,7 @@ impl Default for StatsConfig {
             default_job_ram: 2 << 30,
             ram_margin: 512 << 20,
             weights: Weights::default(),
+            guards: Guards::default(),
         }
     }
 }
@@ -1006,6 +1067,26 @@ pub struct Contender {
     /// The estimates of every launch on it whose job has not ended: what its
     /// total memory is spoken for by, whatever its jobs have grown to so far.
     pub committed: u64,
+    /// Its CPU and disk by its last heartbeat, and its cores by its `hello`.
+    pub load: Load,
+}
+
+/// A contender's CPU and disk, and whether they make it a last resort.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Load {
+    pub cores: u32,
+    pub cpu_load_percent: Option<u32>,
+    pub disk_free: Option<u64>,
+    pub last_resort: LastResort,
+}
+
+impl Load {
+    /// Thousandths of a core idle; none known without a CPU load.
+    fn idle_millicores(&self) -> u64 {
+        self.cpu_load_percent.map_or(0, |load| {
+            u64::from(self.cores) * 10 * u64::from(100u32.saturating_sub(load.min(100)))
+        })
+    }
 }
 
 impl Contender {
@@ -1087,10 +1168,14 @@ fn share(part: u64, whole: u64) -> f64 {
 /// * **Score** = `cache`·warm (unless measured slower than usual) +
 ///   `headroom`·(memory free after this job, as a share of the host's memory) +
 ///   `speed`·([`speed_to_try`]: how much faster than usual it
-///   ran these job keys) − `bigfit`·(1 when a heavier queued job,
-///   `heavier`, fits this host and no other, and this queue fits another).
-/// * **Order**: by score, then stage 3's order. With no statistics for this
-///   queue, stage 3's order alone.
+///   ran these job keys) + `cpu`·(its idle cores, as a share of the most any
+///   contender has idle; 0 without a CPU load) − `bigfit`·(1 when a heavier
+///   queued job, `heavier`, fits this host and no other, and this queue fits
+///   another).
+/// * **Order**: the hosts that fit first; among them, a [last resort](Guards)
+///   (busy CPU, then low disk) after the rest; then by score, then stage 3's
+///   order. With no statistics for this queue, stage 3's order alone after the
+///   last-resort rule.
 #[must_use]
 pub fn score(
     contenders: &[Contender],
@@ -1113,6 +1198,11 @@ pub fn score(
     let fits = |contender: &Contender| {
         required.is_none_or(|bytes| contender.fits(bytes, config.ram_margin))
     };
+    let most_idle = contenders
+        .iter()
+        .map(|contender| contender.load.idle_millicores())
+        .max()
+        .unwrap_or(0);
     let mut scored: Vec<(Contender, HostScore)> = contenders
         .iter()
         .map(|contender| {
@@ -1142,7 +1232,11 @@ pub fn score(
                     })
             });
             let bigfit = if bigfit { 1.0 } else { 0.0 };
-            let total = weights.cache * cache + weights.headroom * headroom + weights.speed * speed
+            let cpu = share(contender.load.idle_millicores(), most_idle);
+            let total = weights.cache * cache
+                + weights.headroom * headroom
+                + weights.speed * speed
+                + weights.cpu * cpu
                 - weights.bigfit * bigfit;
             let score = HostScore {
                 host_id: contender.host_id.clone(),
@@ -1152,6 +1246,10 @@ pub fn score(
                 headroom: thousandths(weights.headroom * headroom),
                 speed: thousandths(weights.speed * speed),
                 bigfit: thousandths(weights.bigfit * bigfit),
+                cpu: thousandths(weights.cpu * cpu),
+                cpu_load_percent: contender.load.cpu_load_percent,
+                disk_free_bytes: contender.load.disk_free,
+                last_resort: contender.load.last_resort.as_str().map(str::to_string),
                 total: thousandths(total),
             };
             (contender.clone(), score)
@@ -1162,6 +1260,7 @@ pub fn score(
         b_score
             .fits
             .cmp(&a_score.fits)
+            .then_with(|| a.load.last_resort.cmp(&b.load.last_resort))
             .then_with(|| {
                 if weighted {
                     b_score.total.cmp(&a_score.total)
@@ -1395,6 +1494,7 @@ impl Statistics {
         if let Some(live) = live {
             report.pending = live.pending;
             report.leases = live.leases;
+            report.connected = live.connected;
             report.live_at = Some(now.timestamp());
         }
         Ok(fit_report(report))
@@ -1501,12 +1601,12 @@ pub fn report(
         .iter()
         .filter_map(|json| serde_json::from_str(json).ok())
         .collect();
-    let (pending, leases, live_at) = store
+    let (live, live_at) = store
         .live_state()?
         .and_then(|(json, at)| {
             serde_json::from_str::<LiveState>(&json)
                 .ok()
-                .map(|live| (live.pending, live.leases, Some(at.timestamp())))
+                .map(|live| (live, Some(at.timestamp())))
         })
         .unwrap_or_default();
     Ok(StatsReport {
@@ -1521,18 +1621,22 @@ pub fn report(
         jobs,
         hosts,
         decisions,
-        pending,
-        leases,
+        connected: live.connected,
+        pending: live.pending,
+        leases: live.leases,
         live_at,
     })
 }
 
-/// Placement's pending queues and open leases, as the server saves them for
-/// the admin CLI.
+/// Placement's pending queues and open leases, and the connected hosts, as
+/// the server saves them for the admin CLI.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct LiveState {
     pub pending: Vec<PendingQueue>,
     pub leases: Vec<OpenLease>,
+    /// Absent from a copy saved before 0.4.52.
+    #[serde(default)]
+    pub connected: Vec<ConnectedHostStats>,
 }
 
 /// Trims a report until its message fits one WebSocket frame: decisions
@@ -1542,6 +1646,7 @@ pub fn fit_report(mut report: StatsReport) -> StatsReport {
     let budget = MAX_MESSAGE_BYTES - 1024;
     while ServerMessage::Stats(report.clone()).encode().len() > budget {
         if report.decisions.pop().is_some()
+            || report.connected.pop().is_some()
             || report.leases.pop().is_some()
             || report.pending.pop().is_some()
             || report.jobs.pop().is_some()
@@ -1655,6 +1760,7 @@ mod tests {
             busy_slots: 1,
             reserved,
             committed: 0,
+            load: Load::default(),
         };
         let config = StatsConfig::default();
         let demand = Demand {
@@ -1956,6 +2062,7 @@ mod tests {
             busy_slots: 1,
             reserved: 0,
             committed: 0,
+            load: Load::default(),
         };
         let config = StatsConfig::default();
         let fits = |job_keys: &[String]| {
@@ -2078,6 +2185,7 @@ mod tests {
             busy_slots: 0,
             reserved: 0,
             committed: 0,
+            load: Load::default(),
         }
     }
 
@@ -2117,6 +2225,106 @@ mod tests {
             vec![("big", true), ("leased", false), ("small", false)]
         );
         assert_eq!(scored[0].1.free_after_bytes, Some(36 * GIB));
+    }
+
+    #[test]
+    fn busy_cpu_and_low_disk_make_a_last_resort_by_their_settings() {
+        let guards = Guards::default();
+        assert_eq!(guards.last_resort(None, None), LastResort::No);
+        assert_eq!(guards.last_resort(Some(89), Some(10 * GIB)), LastResort::No);
+        assert_eq!(guards.last_resort(Some(90), None), LastResort::CpuBusy);
+        assert_eq!(
+            guards.last_resort(Some(100), Some(10 * GIB - 1)),
+            LastResort::LowDisk,
+            "low disk is the worse"
+        );
+        assert!(LastResort::No < LastResort::CpuBusy && LastResort::CpuBusy < LastResort::LowDisk);
+        assert_eq!(LastResort::CpuBusy.as_str(), Some("cpu_busy"));
+        assert_eq!(LastResort::No.as_str(), None);
+    }
+
+    fn loaded(id: &str, cores: u32, cpu: Option<u32>, disk: Option<u64>) -> Contender {
+        let mut host = contender(id, 30 * GIB, 32 * GIB);
+        host.load = Load {
+            cores,
+            cpu_load_percent: cpu,
+            disk_free: disk,
+            last_resort: Guards::default().last_resort(cpu, disk),
+        };
+        host
+    }
+
+    #[test]
+    fn idle_cores_add_to_the_score_and_a_last_resort_goes_after_every_host_that_fits() {
+        let config = StatsConfig::default();
+        let demand = Demand {
+            estimate: GIB,
+            source: EstimateSource::Job,
+            measured_job: Some(GIB),
+            job_keys: vec![],
+            measured: true,
+            fleet_ram: None,
+        };
+        let scored = score(
+            &[
+                loaded("half-busy", 16, Some(50), None),
+                loaded("idle", 16, Some(0), None),
+                loaded("unknown", 16, None, None),
+            ],
+            &demand,
+            None,
+            &config,
+            &Aggregates::default(),
+        );
+        let cpu: Vec<(&str, i64)> = scored
+            .iter()
+            .map(|(contender, score)| (contender.host_id.as_str(), score.cpu))
+            .collect();
+        // The most idle cores score the weight; half of them half; no reading, 0.
+        assert_eq!(cpu, [("idle", 1000), ("half-busy", 500), ("unknown", 0)]);
+        // Cores count: 32 at half load have as many idle as 16 at none.
+        let scored = score(
+            &[
+                loaded("big", 32, Some(50), None),
+                loaded("small", 16, Some(0), None),
+            ],
+            &demand,
+            None,
+            &config,
+            &Aggregates::default(),
+        );
+        assert_eq!(scored[0].1.cpu, scored[1].1.cpu);
+
+        // A last resort scores best yet comes after every host that fits, but
+        // before one that does not.
+        let mut too_full = loaded("too-full", 16, Some(0), None);
+        too_full.free_ram = Some(0);
+        let mut roomy_low_disk = loaded("low-disk", 64, Some(0), Some(GIB));
+        roomy_low_disk.total_ram = Some(256 * GIB);
+        roomy_low_disk.free_ram = Some(250 * GIB);
+        let scored = score(
+            &[
+                too_full,
+                roomy_low_disk,
+                loaded("busy", 16, Some(95), None),
+                loaded("plain", 16, Some(60), None),
+            ],
+            &demand,
+            None,
+            &config,
+            &Aggregates::default(),
+        );
+        assert_eq!(
+            order(&scored),
+            [
+                ("plain", true),
+                ("busy", true),
+                ("low-disk", true),
+                ("too-full", false)
+            ]
+        );
+        assert!(scored[2].1.total > scored[0].1.total);
+        assert_eq!(scored[2].1.last_resort.as_deref(), Some("low_disk"));
     }
 
     #[test]
@@ -2350,12 +2558,17 @@ mod tests {
                 ..PendingQueue::default()
             }],
             leases: Vec::new(),
+            connected: vec![ConnectedHostStats {
+                host_id: "h".into(),
+                disk_free_bytes: Some(5 << 30),
+                ..ConnectedHostStats::default()
+            }],
         };
         let now = Utc::now();
         let report = again.report_with(now, Some(live())).expect("report");
         assert_eq!(
-            (report.pending.len(), report.live_at),
-            (1, Some(now.timestamp()))
+            (report.pending.len(), report.connected.len(), report.live_at),
+            (1, 1, Some(now.timestamp()))
         );
         assert!(
             again.report(now).expect("report").pending.is_empty(),
@@ -2364,6 +2577,7 @@ mod tests {
         again.save_live(&live());
         let saved = again.report(now).expect("report");
         assert_eq!(saved.pending[0].queued, 2);
+        assert_eq!(saved.connected[0].disk_free_bytes, Some(5 << 30));
         assert!(saved.live_at.is_some());
     }
 

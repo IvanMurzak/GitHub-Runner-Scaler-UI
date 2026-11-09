@@ -16,8 +16,8 @@ use runner_manager_domain::model::{
     TargetScope,
 };
 use runner_manager_domain::policy::{
-    NamedProfileSpec, PolicyMode, PolicyState, RoutingLabels, ScalePolicy, check_pool_label,
-    in_pool_namespace, pool_label,
+    NamedProfileSpec, PolicyMode, PolicyState, RoutingLabels, ScalePolicy, any_pool_label,
+    check_pool_label, in_pool_namespace, is_any_pool_label, pool_label,
 };
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::WorkspaceKind;
@@ -147,6 +147,7 @@ pub fn dispatch_org(
             &ScaleTarget::organization(&a.organization).map_err(invalid)?,
             None,
             a.pool.is_on(),
+            a.any,
             out,
         ),
         OrgCommand::Remove(a) => remove(
@@ -489,12 +490,18 @@ fn record_named_policy(
 /// Shared pool labels (coordinator stage 3, D10).
 ///
 /// A label in the reserved `rm-pool-` namespace must be this host's own pool
-/// label: `rm-pool-linux` on Linux, and so on. And at most one profile of a
-/// target on this host may carry it: a job `runs-on: rm-pool-linux` would
-/// match both, and the local ambiguity rule (overlapping profiles start no
-/// runner) would leave it unserved — so the second is refused here instead.
-/// The pool label is an ordinary label to that rule: a pool job selects its
-/// profile by the pool label alone, which is why it must be unique.
+/// label (`rm-pool-linux` on Linux, and so on) or the OS-agnostic
+/// `rm-pool-any`. And at most one profile of a target on this host may carry
+/// each: a job `runs-on: rm-pool-linux` would match both, and the local
+/// ambiguity rule (overlapping profiles start no runner) would leave it
+/// unserved — so the second is refused here instead. The pool label is an
+/// ordinary label to that rule: a pool job selects its profile by the pool
+/// label alone, which is why it must be unique.
+///
+/// One profile may carry both pool labels: a job asking for either then
+/// matches that profile alone. Two profiles may split them (one answering
+/// `rm-pool-linux`, another `rm-pool-any`): each pool job still matches
+/// exactly one, since neither carries the other's pool label.
 ///
 /// # Errors
 /// A mismatched pool label, or another profile of the target carrying it.
@@ -514,14 +521,13 @@ pub fn check_pool_labels(store: &dyn Store, policy: &ScalePolicy) -> Result<(), 
     for label in labels.additional() {
         check_pool_label(label, os).map_err(invalid)?;
     }
-    let Some(pool) = labels.pool_label() else {
+    let pools: Vec<&Label> = labels.pool_labels().collect();
+    if pools.is_empty() {
         return Ok(());
-    };
-    let sibling = store
-        .policies()
-        .map_err(store_failure)?
-        .into_iter()
-        .find(|other| {
+    }
+    let siblings = store.policies().map_err(store_failure)?;
+    for pool in pools {
+        let sibling = siblings.iter().find(|other| {
             other.id != policy.id
                 && other.target == policy.target
                 && other.host_id == policy.host_id
@@ -529,17 +535,22 @@ pub fn check_pool_labels(store: &dyn Store, policy: &ScalePolicy) -> Result<(), 
                     .routing_labels()
                     .is_some_and(|labels| labels.contains(pool))
         });
-    if let Some(sibling) = sibling {
-        return Err(CliError::with_remedy(
-            Failure::Conflict,
-            format!(
-                "profile {} of {} already answers {pool}; a pool job would match both profiles \
-                 and start no runner. Nothing was changed.",
-                sibling.profile_name(),
-                policy.target
-            ),
-            pool_remedy(&policy.target, sibling.profile_name().as_str()),
-        ));
+        if let Some(sibling) = sibling {
+            return Err(CliError::with_remedy(
+                Failure::Conflict,
+                format!(
+                    "profile {} of {} already answers {pool}; a pool job would match both \
+                     profiles and start no runner. Nothing was changed.",
+                    sibling.profile_name(),
+                    policy.target
+                ),
+                pool_remedy(
+                    &policy.target,
+                    sibling.profile_name().as_str(),
+                    is_any_pool_label(pool.as_str()),
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -558,16 +569,20 @@ fn host_os(store: &dyn Store, policy: &ScalePolicy) -> Result<Os, CliError> {
         .os)
 }
 
-fn pool_remedy(target: &ScaleTarget, profile: &str) -> String {
+fn pool_remedy(target: &ScaleTarget, profile: &str, any: bool) -> String {
+    let any = if any { " --any" } else { "" };
     match target.scope() {
-        TargetScope::Repository => {
-            format!("runner-manager repo profile set-pool {target} --profile {profile} --pool off")
+        TargetScope::Repository => format!(
+            "runner-manager repo profile set-pool {target} --profile {profile} --pool off{any}"
+        ),
+        TargetScope::Organization => {
+            format!("runner-manager org set-pool {target} --pool off{any}")
         }
-        TargetScope::Organization => format!("runner-manager org set-pool {target} --pool off"),
     }
 }
 
-/// `set-pool --pool on|off`: adds or removes this host's own pool label.
+/// `set-pool --pool on|off [--any]`: adds or removes this host's own pool
+/// label, or with `any` the OS-agnostic `rm-pool-any`.
 ///
 /// # Errors
 /// As [`mutate_labels_selected`], plus [`check_pool_labels`]'s refusals.
@@ -576,13 +591,20 @@ pub fn set_pool_selected(
     target: &ScaleTarget,
     profile: Option<&str>,
     on: bool,
+    any: bool,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let store = context.store()?;
     let policy = find_policy_selected(&store, target, profile)?;
     let os = host_os(&store, &policy)?;
     drop(store);
-    let label = pool_label(os).as_str().to_string();
+    let label = if any {
+        any_pool_label()
+    } else {
+        pool_label(os)
+    }
+    .as_str()
+    .to_string();
     mutate_labels_selected(
         context,
         target,
@@ -603,6 +625,14 @@ pub fn set_pool_selected(
              start a runner and the surplus exits idle."
         )
         .map_err(write_failed("this pool result"))?;
+        if any {
+            writeln!(
+                out,
+                "rm-pool-any is served by hosts of every operating system: use it only for jobs \
+                 whose steps run on any of them."
+            )
+            .map_err(write_failed("this pool result"))?;
+        }
     }
     Ok(())
 }

@@ -4356,6 +4356,7 @@ mod tests {
                     scope: TargetScope::Repo,
                     name: "acme/repo".into(),
                 }],
+                any_pool: true,
             }),
             version: Some(4),
         });
@@ -4448,6 +4449,7 @@ mod tests {
                     scope: TargetScope::Repo,
                     name: "acme/repo".into(),
                 }],
+                any_pool: true,
             }),
             version: Some(4),
         };
@@ -4691,6 +4693,7 @@ mod tests {
                 scope: TargetScope::Repo,
                 name: "acme/repo".into(),
             }],
+            any_pool: true,
         };
         link.send_replace(LinkView {
             configured: true,
@@ -4775,6 +4778,7 @@ mod tests {
                     scope: TargetScope::Repo,
                     name: "acme/repo".into(),
                 }],
+                any_pool: true,
             }),
         });
         target.coordination = Some(view);

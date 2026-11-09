@@ -7,6 +7,37 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.52
+
+### Added
+
+- **`runs-on: rm-pool-any`: a shared pool across operating systems.** A host of any OS may opt a
+  profile in with `repo profile set-pool OWNER/REPO [--profile NAME] --pool on --any` (or
+  `org set-pool ORG --pool on --any`; `--pool off --any` removes it), beside its own OS pool label on the
+  same profile or on another. The coordinator's candidates for such a job are every connected host whose
+  profile carries the label, whatever its OS, and its usual scores and statistics choose: in the
+  simulation a fast Linux host and a slow Mac with more memory, mean run 466 s without statistics to
+  197 s once learned. Extra labels (`[rm-pool-any, heavy]`) narrow it as they do an OS pool. Only one
+  profile of a target on a host may carry it. A host directs an `rm-pool-any` profile only when its
+  coordinator says it places that pool; with an older coordinator the profile counts its own demand, so
+  upgrade the coordinator first. See [Shared pools](docs/coordinator.md#shared-pools).
+- **A host's CPU load counts in placement.** Idle cores (cores less the last heartbeat's CPU load) add up
+  to `cpu` points (weight 1, `COORDINATOR_PLACEMENT_WEIGHTS` `cpu=`), and a host at or above
+  `COORDINATOR_CPU_BUSY_PERCENT` (90 %) is a last resort: tried after every other host that can take the
+  job, never excluded. Simulated against a host 95 % busy with work of its own: round-robin started 30
+  jobs there over 3 seeds, placement none; mean run 348 s to 238 s.
+- **Free disk in every heartbeat, and a low-disk guard.** A host now measures free space on its runner
+  root's volume at every heartbeat, not only at connect. A host under `COORDINATOR_MIN_DISK_FREE`
+  (10 GiB) is a last resort, after a busy one. Simulated with a 4 GiB host: round-robin started 30 jobs
+  there, placement none.
+- `stats` shows the **connected hosts** with their cores, CPU load, free memory, free disk and slots, and
+  each placement score its `cpu` points, CPU load, free disk and last-resort reason; `--json` adds
+  `connected` and those score fields. `runner-manager-coordinator hosts list` shows a connected host's CPU
+  load and free disk, and its `--json` adds `connected`. `a pool queue was weighed` adds the chosen host's
+  cores, CPU load, free disk and last-resort reason.
+
+All protocol changes are additive: an older host or coordinator ignores them and works as before.
+
 ## 0.4.51
 
 ### Fixed

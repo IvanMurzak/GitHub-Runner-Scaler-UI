@@ -359,7 +359,7 @@ runner-manager repo profile set-workspace OWNER/REPO [--profile NAME] \
 runner-manager repo profile set-execution OWNER/REPO [--profile NAME] --mode native
 runner-manager repo profile set-execution OWNER/REPO [--profile NAME] --mode isolated \
   --backend auto --image PINNED-REFERENCE [--cpu N --memory N --disk N]
-runner-manager repo profile set-pool OWNER/REPO [--profile NAME] --pool on|off  # Answer this host's rm-pool-<os> label
+runner-manager repo profile set-pool OWNER/REPO [--profile NAME] --pool on|off [--any]  # Answer this host's rm-pool-<os> label, or rm-pool-any
 runner-manager repo profile remove OWNER/REPO [--profile NAME] [--purge]
 runner-manager repo cache show OWNER/REPO                      # Show the caches this repository's runners get
 runner-manager repo cache set-enabled OWNER/REPO --enabled BOOL
@@ -375,7 +375,7 @@ runner-manager org set-capacity ORG --max-capacity N           # Change organiza
 runner-manager org set-scale ORG --enabled BOOL                # Enable scaling or drain runners
 runner-manager org add-label ORG --label LABEL                 # Add a runs-on label
 runner-manager org remove-label ORG --label LABEL              # Remove a runs-on label
-runner-manager org set-pool ORG --pool on|off                  # Answer this host's rm-pool-<os> label
+runner-manager org set-pool ORG --pool on|off [--any]          # Answer this host's rm-pool-<os> label, or rm-pool-any
 runner-manager org remove ORG [--purge]                        # Remove a policy and optional retained data
 runner-manager org cache show ORG                              # Show the caches this organization's runners get
 runner-manager org cache set-enabled ORG --enabled BOOL        # Organizations have no cache until you turn it on
@@ -680,10 +680,12 @@ that frees up is reused promptly.
 
 **Shared pools.** A workflow that writes `runs-on: rm-pool-linux` (or `rm-pool-windows`,
 `rm-pool-macos`) lets the coordinator start its runner on exactly one host of that OS instead of
-on every host carrying the label. Give each host's serving profile its pool label with
-`repo profile set-pool OWNER/REPO [--profile NAME] --pool on` or `org set-pool ORG --pool on`
-(`profile list`/`show` print `pool=`); another OS's pool label is refused, and so is a second
-profile of the same target. While the target is `coordinated`, that profile starts runners only
+on every host carrying the label; `runs-on: rm-pool-any` lets it pick a host of any OS that opted in.
+Give each host's serving profile its pool label with
+`repo profile set-pool OWNER/REPO [--profile NAME] --pool on [--any]` or
+`org set-pool ORG --pool on [--any]` (`profile list`/`show` print `pool=`); another OS's pool label is
+refused, and so is a second profile of the same target carrying the same pool label. One profile may
+carry both its OS pool label and `rm-pool-any`. While the target is `coordinated`, that profile starts runners only
 when the coordinator places one on it, and only within its own `max_capacity`, host capacity and
 `host doctor` fitness; in `fallback` or `standalone` it serves its own demand as before.
 

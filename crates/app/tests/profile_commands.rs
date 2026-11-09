@@ -772,7 +772,94 @@ fn pool_labels_follow_the_host_os_and_belong_to_one_profile_per_target() {
             policy.target.slug() == "octo/one" && policy.profile_name().as_str() == "default"
         })
         .unwrap();
-    assert_eq!(default.pool_label(), None, "nothing was changed");
+    assert_eq!(default.pool_labels().next(), None, "nothing was changed");
+
+    // The OS-agnostic pool: any OS may carry it, beside its own pool label on
+    // the same profile, and again only one profile of a target answers it.
+    let any_on = run_command(&[
+        "repo",
+        "profile",
+        "set-pool",
+        "octo/one",
+        "--profile",
+        "build",
+        "--pool",
+        "on",
+        "--any",
+    ]);
+    assert_eq!(any_on.code, 0, "{}", any_on.both());
+    assert!(
+        any_on.stdout.contains("runs-on: rm-pool-any"),
+        "{}",
+        any_on.both()
+    );
+    let shown = run_command(&["repo", "profile", "show", "octo/one", "--profile", "build"]);
+    assert!(
+        shown.stdout.contains(&format!("pool={pool},rm-pool-any"))
+            || shown.stdout.contains(&format!("pool=rm-pool-any,{pool}")),
+        "{}",
+        shown.both()
+    );
+    let second_any = run_command(&[
+        "repo",
+        "profile",
+        "set-pool",
+        "octo/one",
+        "--profile",
+        "default",
+        "--pool",
+        "on",
+        "--any",
+    ]);
+    assert_ne!(second_any.code, 0, "{}", second_any.both());
+    assert!(
+        second_any.both().contains("already answers rm-pool-any")
+            && second_any.both().contains("--pool off --any"),
+        "{}",
+        second_any.both()
+    );
+    let any_off = run_command(&[
+        "repo",
+        "profile",
+        "set-pool",
+        "octo/one",
+        "--profile",
+        "build",
+        "--pool",
+        "off",
+        "--any",
+    ]);
+    assert_eq!(any_off.code, 0, "{}", any_off.both());
+    let shown = run_command(&["repo", "profile", "show", "octo/one", "--profile", "build"]);
+    assert!(
+        shown.stdout.contains(&format!("pool={pool} ")),
+        "only the OS pool is left: {}",
+        shown.both()
+    );
+    // Now free, another profile of the target may answer it alone.
+    let split = run_command(&[
+        "repo",
+        "profile",
+        "add-label",
+        "octo/one",
+        "--profile",
+        "default",
+        "--label",
+        "rm-pool-any",
+    ]);
+    assert_eq!(split.code, 0, "{}", split.both());
+    let split_off = run_command(&[
+        "repo",
+        "profile",
+        "set-pool",
+        "octo/one",
+        "--profile",
+        "default",
+        "--pool",
+        "off",
+        "--any",
+    ]);
+    assert_eq!(split_off.code, 0, "{}", split_off.both());
 
     // An organization target has its own pool profile.
     let org = run_command(&["org", "set-pool", "octo", "--pool", "on"]);
