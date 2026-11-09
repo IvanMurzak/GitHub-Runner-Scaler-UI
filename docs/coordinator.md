@@ -650,7 +650,7 @@ counts it. On Linux and macOS, a change to the shared tree's `ctime` also discar
 
 A copy that differs, by contents, size, a missing entry or an added one, is removed and not used, and
 `package_copy_differs` in the host log gives `reason` (`modified`, `missing`, `unexpected`, `unreadable`). The
-shared package is then read too. If it differs as well, or a copy of it could not be made, it is no longer
+shared package is then read too, as it is when a copy fails outright. If it differs, it is no longer
 trusted (`package_verify_failed`), and the next attempt, the launch's own retry or a later launch, downloads
 it afresh. If it is clean, nothing is downloaded: the copy's disk or another job was at fault. Each daemon start
 has no record, so the first launch after one downloads the package, on Windows as on Linux and macOS (Windows

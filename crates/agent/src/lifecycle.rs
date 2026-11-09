@@ -652,16 +652,11 @@ impl SharedPackages {
         &self,
         root: &Path,
         origin: &Path,
-        contents: Option<&Arc<PackageContents>>,
+        contents: &Arc<PackageContents>,
         reason: &'static str,
     ) {
         let current = self.trusted.contents_of(root);
-        let same = match (contents, current.as_ref()) {
-            (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
-            (None, None) => true,
-            _ => false,
-        };
-        if same {
+        if current.is_some_and(|current| Arc::ptr_eq(&current, contents)) {
             tracing::warn!(
                 event = "package_verify_failed",
                 reason,
@@ -759,6 +754,42 @@ impl CachedRuntimePackages {
     #[must_use]
     pub const fn new(cache: Arc<PackageCache>, shared: SharedPackages) -> Self {
         Self { cache, shared }
+    }
+
+    /// A copy that cannot be used: removed, and the trees it came from read to see
+    /// whose fault it is. A runtime can be touched by a job, or sit on a disk with a
+    /// fault, and that is no reason to download anything. A tree that differs is
+    /// discarded, and prepared again by the next launch that needs it.
+    async fn reject_copy(
+        &self,
+        attempt: &RunnerAttempt,
+        root: &Path,
+        origin: &Path,
+        contents: &Arc<PackageContents>,
+        timings: &mut PackageTimings,
+    ) -> Result<(), FailureReason> {
+        let (attempt_copy, checking, from) =
+            (attempt.clone(), Arc::clone(contents), origin.to_path_buf());
+        let differs = timed(
+            &mut timings.verify,
+            self.blocking(root, move |_, source| {
+                let _ = remove_materialized_package(&attempt_copy);
+                let shared = checking.verify(source, |_| false);
+                shared.and_then(|()| {
+                    if from == source {
+                        Ok(())
+                    } else {
+                        checking.verify(&from, |_| false)
+                    }
+                })
+            }),
+        )
+        .await?;
+        if let Err(mismatch) = differs {
+            self.shared
+                .discard(root, origin, contents, mismatch.as_str());
+        }
+        Ok(())
     }
 
     /// The tree a runtime can be copied from right now, under nothing more than
@@ -870,8 +901,12 @@ impl RuntimePackages for CachedRuntimePackages {
                 break (exclusive.downgrade(), ready);
             }
         };
-        // Taken under the hold, so it is the record of the tree this copies.
-        let contents = self.shared.trusted.contents_of(installed.root());
+        // Taken under the hold, so it is the record of the tree this copies. None
+        // vouches for a tree with no record: before it is copied, not after.
+        let Some(contents) = self.shared.trusted.contents_of(installed.root()) else {
+            self.shared.trusted.forget(installed.root());
+            return Err(FailureReason::ProcessStartFailed);
+        };
         let copied_from = origin.clone();
         // Off the async thread: the daemon runs a current-thread runtime, and a
         // copy can take minutes on a busy disk.
@@ -894,33 +929,21 @@ impl RuntimePackages for CachedRuntimePackages {
             }),
         )
         .await?;
-        if let Err(error) = copied {
+        if copied.is_err() {
             // Nothing a failed or tainted copy left may reach a retry's copy,
             // which lays out over the same runtime.
-            let _ = remove_materialized_package(attempt);
-            // A tree that cannot be copied may be one a job broke, on Windows with
-            // nothing else to tell. A full disk says nothing about the tree.
-            if error.kind() != std::io::ErrorKind::StorageFull {
-                self.shared.discard(
-                    installed.root(),
-                    &copied_from,
-                    contents.as_ref(),
-                    "copy_failed",
-                );
-            }
+            drop(hold);
+            self.reject_copy(attempt, installed.root(), &copied_from, &contents, timings)
+                .await?;
             return Err(FailureReason::ProcessStartFailed);
         }
         if let Err(error) = self.cache.lease(attempt, installed.version()) {
             // Undoing the copy must not undo the *job* workspace: a persistent
             // slot's `_work` is retained across attempts, and this rollback
             // runs before the attempt that would have owned it ever started.
-            let _ = remove_materialized_package(attempt);
-            self.shared.discard(
-                installed.root(),
-                &copied_from,
-                contents.as_ref(),
-                "lease_failed",
-            );
+            drop(hold);
+            self.reject_copy(attempt, installed.root(), &copied_from, &contents, timings)
+                .await?;
             return Err(package_failure(error));
         }
         // Leased while still holding the trees, so a prune that gets the
@@ -928,33 +951,18 @@ impl RuntimePackages for CachedRuntimePackages {
         drop(hold);
         // What runs is this copy, so this copy is what is checked, whatever
         // happened to the shared trees meanwhile: read in full against the
-        // archive, under neither the host lock nor the trees' hold. A tree with no
-        // record has nothing vouching for it, and fails like one that differs.
-        let Some(contents) = contents else {
-            let _ = self.cache.release(attempt.id);
-            let _ = remove_materialized_package(attempt);
-            return Err(FailureReason::ProcessStartFailed);
-        };
+        // archive, under neither the host lock nor the trees' hold.
         let persistent = matches!(attempt.workspace(), AttemptWorkspace::PersistentSlot { .. });
-        let source = installed.root().to_path_buf();
         let checking = Arc::clone(&contents);
-        let copy = timed(
+        let verified = timed(
             &mut timings.verify,
             self.blocking(installed.root(), move |_, _| {
-                let verified =
-                    checking.verify(&destination, |name| persistent && is_work_folder(name));
-                // Who is to blame: a runtime can be touched by a job, or sit on a
-                // disk with a fault, and that is no reason to download anything.
-                let shared = verified
-                    .is_err()
-                    .then(|| checking.verify(&source, |_| false));
-                (verified, shared)
+                checking.verify(&destination, |name| persistent && is_work_folder(name))
             }),
         )
         .await?;
-        if let (Err(mismatch), shared) = copy {
+        if let Err(mismatch) = verified {
             let _ = self.cache.release(attempt.id);
-            let _ = remove_materialized_package(attempt);
             tracing::warn!(
                 event = "package_copy_differs",
                 attempt_id = %attempt.id,
@@ -962,14 +970,8 @@ impl RuntimePackages for CachedRuntimePackages {
                 "a runner's package copy does not match the package's verified archive; it was \
                  removed and not used"
             );
-            if let Some(Err(mismatch)) = shared {
-                self.shared.discard(
-                    installed.root(),
-                    &copied_from,
-                    Some(&contents),
-                    mismatch.as_str(),
-                );
-            }
+            self.reject_copy(attempt, installed.root(), &copied_from, &contents, timings)
+                .await?;
             return Err(FailureReason::ProcessStartFailed);
         }
         Ok(installed.version().clone())
