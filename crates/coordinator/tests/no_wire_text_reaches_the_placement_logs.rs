@@ -206,6 +206,10 @@ fn no_wire_text_reaches_the_placement_logs() {
         "a job sample was recorded",
         "a pool queue was weighed",
         "placement score",
+        "free_ram_bytes",
+        "reserved_bytes",
+        "ram_margin_bytes",
+        "required_bytes",
     ] {
         assert!(logs.contains(expected), "missing `{expected}`:\n{logs}");
     }

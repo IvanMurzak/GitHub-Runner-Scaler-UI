@@ -850,6 +850,54 @@ impl Aggregates {
     }
 }
 
+/// The memory a host must have free for a queue. Only a job's own samples filter:
+/// its repository's p90 is a guess at a job never measured, and heavy samples of
+/// another job must not keep it waiting. Nor when no host could ever hold it:
+/// waiting would be forever, and the job is better run somewhere.
+fn required_memory(contenders: &[Contender], demand: &Demand, config: &StatsConfig) -> Option<u64> {
+    demand.measured_job.filter(|bytes| {
+        let needed = bytes.saturating_add(config.ram_margin);
+        contenders
+            .iter()
+            .any(|contender| contender.total_ram.is_none_or(|total| total >= needed))
+    })
+}
+
+/// The figures behind a fit, for the log: a host fits when `free_ram` less
+/// `reserved` holds `required` and `ram_margin`. So a reading can tell a stale or
+/// low `free_ram` from memory spoken for by open launches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FitFigures {
+    pub host_id: String,
+    pub free_ram: Option<u64>,
+    pub total_ram: Option<u64>,
+    pub reserved: u64,
+    pub ram_margin: u64,
+    pub required: Option<u64>,
+}
+
+/// The figures of the candidate with the most memory available: the one nearest
+/// to fitting, if none does. One that reports no free memory is never filtered.
+#[must_use]
+pub fn roomiest(
+    contenders: &[Contender],
+    demand: &Demand,
+    config: &StatsConfig,
+) -> Option<FitFigures> {
+    let required = required_memory(contenders, demand, config);
+    contenders
+        .iter()
+        .max_by_key(|contender| contender.available().unwrap_or(u64::MAX))
+        .map(|contender| FitFigures {
+            host_id: contender.host_id.clone(),
+            free_ram: contender.free_ram,
+            total_ram: contender.total_ram,
+            reserved: contender.reserved,
+            ram_margin: config.ram_margin,
+            required,
+        })
+}
+
 /// One host that could take the queue, as placement sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contender {
@@ -932,12 +980,7 @@ pub fn score(
     // job never measured, and heavy samples of another job must not keep it
     // waiting. Nor when no host could ever hold it: waiting would be forever,
     // and the job is better run somewhere.
-    let required = demand.measured_job.filter(|bytes| {
-        let needed = bytes.saturating_add(config.ram_margin);
-        contenders
-            .iter()
-            .any(|contender| contender.total_ram.is_none_or(|total| total >= needed))
-    });
+    let required = required_memory(contenders, demand, config);
     let ratios: Vec<BTreeMap<String, HostRatio>> = demand
         .job_keys
         .iter()
@@ -1464,6 +1507,43 @@ mod tests {
         let other = identity("build2").key();
         aggregates.add(sample(&other, "h1", 60, GIB), 30);
         assert_eq!(aggregates.job(&alone).unwrap().samples, everything);
+    }
+
+    /// The candidate nearest to fitting, with what decides it. Reading these, a
+    /// host short of free memory is told from one whose memory is spoken for.
+    #[test]
+    fn the_roomiest_candidate_says_why_it_does_not_fit() {
+        let contender = |host: &str, free, reserved| Contender {
+            host_id: host.into(),
+            warm: false,
+            free_ram: free,
+            total_ram: Some(32 * GIB),
+            busy_slots: 0,
+            reserved,
+        };
+        let config = StatsConfig::default();
+        let demand = Demand {
+            estimate: 4 * GIB,
+            source: EstimateSource::Job,
+            measured_job: Some(4 * GIB),
+            job_keys: vec![],
+            measured: true,
+        };
+        let figures = roomiest(
+            &[
+                contender("low", Some(2 * GIB), 0),
+                contender("spoken-for", Some(23 * GIB), 20 * GIB),
+            ],
+            &demand,
+            &config,
+        )
+        .expect("a candidate");
+        assert_eq!(figures.host_id, "spoken-for");
+        assert_eq!(figures.free_ram, Some(23 * GIB));
+        assert_eq!(figures.reserved, 20 * GIB);
+        assert_eq!(figures.required, Some(4 * GIB));
+        assert_eq!(figures.ram_margin, config.ram_margin);
+        assert_eq!(roomiest(&[], &demand, &config), None);
     }
 
     /// `stats` lists each key once, as it was kept, and readably.

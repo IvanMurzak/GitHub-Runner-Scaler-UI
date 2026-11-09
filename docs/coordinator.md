@@ -471,7 +471,11 @@ services:
 
 Every decision is logged with host ids, the estimate in bytes, where it came from and the scores
 (per host at `debug`), never a repository, workflow, job or runner name, and the last 50 are kept
-in the database.
+in the database. `a pool queue was weighed`, and `a pool queue is not placed` with `no_memory_fit`, say
+what decided the fit for the candidate nearest to fitting: `free_ram_bytes` (its last heartbeat),
+`reserved_bytes` (its open launches), `ram_margin_bytes`, `required_bytes` (absent when no job is measured,
+or no host could ever hold it, so nothing is filtered) and `total_ram_bytes`. A host fits when free less
+reserved holds required plus margin, so a low or stale free figure can be told from memory spoken for.
 
 ### Reading `stats`
 

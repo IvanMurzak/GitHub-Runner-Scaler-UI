@@ -41,6 +41,10 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 ### Added
 
+- **The coordinator's log says why a host does not fit a job.** `a pool queue was
+  weighed` and `no_memory_fit` carry `free_ram_bytes`, `reserved_bytes`,
+  `ram_margin_bytes`, `required_bytes` and `total_ram_bytes` for the candidate nearest
+  to fitting. The fit rule itself is unchanged.
 - **A daily backup of the coordinator's database.** The compose file gains a `backup`
   service keeping the last 7 consistent copies; `docker compose up -d --build` starts
   it. To keep them on another disk, and to restore, see
