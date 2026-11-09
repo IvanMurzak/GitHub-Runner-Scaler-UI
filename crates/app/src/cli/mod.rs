@@ -1294,8 +1294,7 @@ pub enum RepoProfileCommand {
     RemoveLabel(RepoProfileLabelArgs),
     SetWorkspace(RepoProfileWorkspaceArgs),
     SetExecution(RepoProfileExecutionArgs),
-    /// Answer this host's coordinator pool label (rm-pool-<os>), or with
-    /// --any the OS-agnostic rm-pool-any.
+    /// Answer this host's rm-pool-<os> label, or rm-pool-any with --any.
     SetPool(RepoProfilePoolArgs),
     Remove(RepoProfileRemoveArgs),
 }
@@ -1581,8 +1580,7 @@ pub enum OrgCommand {
     AddLabel(OrgLabelArgs),
     /// Stop answering a label. The derived host label cannot be removed.
     RemoveLabel(OrgLabelArgs),
-    /// Answer this host's coordinator pool label (rm-pool-<os>), or with
-    /// --any the OS-agnostic rm-pool-any.
+    /// Answer this host's rm-pool-<os> label, or rm-pool-any with --any.
     SetPool(OrgPoolArgs),
     /// Remove a policy, optionally with its cache and diagnostics.
     Remove(OrgRemoveArgs),
