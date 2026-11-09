@@ -23,12 +23,13 @@ fixed and asserted there.
 - **A long build's memory stays counted on its host until it ends.** The reservation lapsed 2 minutes
   after a job started, and a build whose peak comes later left its host reading free, so more builds
   landed there: up to 18 GiB past a 64 GiB host. It now counts against the host's total memory, through a
-  broken link too, until the attempt's report, a heartbeat saying the host runs nothing, or 6 hours.
+  broken link too, until the attempt's report, a heartbeat saying the host runs fewer jobs than are held
+  for it, or 6 hours.
 - **A launch reserves the job its runner took**, once a webhook names it, rather than the queue's next
   heaviest when it was placed. A job taken by a runner whose launch was already gone now counts too.
 - **A job that turned heavy is seen at its next run**, not after four. What it is expected to need is
-  its p90, or more if one of its 3 newest samples needed more. A job heavy from then on: 3 of 4 runs on a
-  host too small to none after the first.
+  its p90, or more if one of its 3 newest samples needed more. A job heavy from then on: on a host too small
+  for its first four runs to its first only.
 - **Placement now finds out which host is faster.** A host that never ran a job other hosts have run
   scores as fastest for it until its first run finishes. The host with the most memory otherwise kept
   every job for good: a job twice as fast on a smaller host ran on the bigger one for ever. Mean run 595 s
@@ -39,7 +40,7 @@ fixed and asserted there.
 - **A failed job no longer reads as a fast one.** How long a job that did not succeed took is not kept
   as its duration: one failing at once made its host look the fastest there is. Its memory still counts.
 - **The biggest host idle and still too short for a job's estimate no longer holds that job for ever.**
-  It runs there. With its estimate following its newest samples, one spike could otherwise stall it for good.
+  It runs on that host. With its estimate following its newest samples, one spike could otherwise stall it for good.
 
 ### Changed
 

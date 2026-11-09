@@ -560,6 +560,8 @@ pub struct HostRatio {
     /// Its median duration over the usual one, in thousandths.
     pub ratio: Option<u32>,
     pub samples: usize,
+    /// Those with a duration: a failed job has none.
+    pub timed: usize,
     pub median_secs: Option<u64>,
 }
 
@@ -785,6 +787,7 @@ fn ratios_of(samples: &[&JobSample]) -> BTreeMap<String, HostRatio> {
                 HostRatio {
                     ratio,
                     samples: count,
+                    timed: by_host.get(host).map_or(0, Vec::len),
                     median_secs: median,
                 },
             )
@@ -919,25 +922,32 @@ impl Aggregates {
 /// with every slot taken still holds it, soon: its job waits for that host rather
 /// than start on one too small.
 fn required_memory(contenders: &[Contender], demand: &Demand, config: &StatsConfig) -> Option<u64> {
-    demand.measured_job.filter(|bytes| {
-        let needed = bytes.saturating_add(config.ram_margin);
-        let largest = demand.fleet_ram.into_iter().chain(
-            contenders
-                .iter()
-                .map(|contender| contender.total_ram.unwrap_or(u64::MAX)),
-        );
-        let held = largest.clone().any(|ram| ram >= needed);
-        // The biggest host doing nothing and still too short: its memory is taken
-        // by something placement cannot wait out, and the job never starts to say
-        // it has grown lighter.
-        let biggest = largest.max().unwrap_or(0);
-        let hopeless = contenders.iter().any(|contender| {
-            contender.total_ram == Some(biggest)
-                && contender.idle()
-                && !contender.fits(*bytes, config.ram_margin)
-        });
-        held && !hopeless
-    })
+    let bytes = demand.measured_job?;
+    let needed = bytes.saturating_add(config.ram_margin);
+    let totals = contenders
+        .iter()
+        .map(|contender| contender.total_ram.unwrap_or(u64::MAX));
+    let biggest = demand.fleet_ram.into_iter().chain(totals).max()?;
+    if biggest < needed {
+        return None;
+    }
+    // Every biggest host doing nothing and still too short: what holds their memory
+    // is nothing placement can wait out, and a job that never starts never says it
+    // has grown lighter. It asks for what they have, so it runs on one of them.
+    let biggest_hosts = || {
+        contenders
+            .iter()
+            .filter(move |contender| contender.total_ram == Some(biggest))
+    };
+    if biggest_hosts().next().is_some()
+        && biggest_hosts().all(|host| host.idle() && !host.fits(bytes, config.ram_margin))
+    {
+        return biggest_hosts()
+            .filter_map(Contender::available)
+            .max()
+            .map(|available| available.saturating_sub(config.ram_margin));
+    }
+    Some(bytes)
 }
 
 /// The figures behind a fit, for the log: a host fits when `free_ram` less
@@ -1028,7 +1038,7 @@ fn warm_not_worth_it(ratios: &[BTreeMap<String, HostRatio>], host: &str) -> bool
         .filter(|by_host| {
             by_host
                 .get(host)
-                .is_some_and(|figures| figures.samples >= WARM_JUDGED_AFTER)
+                .is_some_and(|figures| figures.timed >= WARM_JUDGED_AFTER)
         })
         .cloned()
         .collect();
@@ -2538,6 +2548,40 @@ mod tests {
         };
         assert!(!fits(2), "it has jobs to wait out");
         assert!(fits(0));
+        // It runs on that host, not on whatever else scores best with no filter.
+        let scored = |big: Contender| {
+            score(
+                &[big, contender("small", 14 * GIB, 16 * GIB)],
+                &Demand {
+                    estimate: 61 * GIB,
+                    measured_job: Some(61 * GIB),
+                    ..heavy_demand(None)
+                },
+                None,
+                &config,
+                &Aggregates::default(),
+            )
+        };
+        let hosts = scored(contender("big", 58 * GIB, 64 * GIB));
+        assert_eq!(hosts[0].0.host_id, "big");
+        assert!(hosts[0].1.fits);
+        assert!(!hosts[1].1.fits);
+        // Another as big as it that would hold the job: nothing is relaxed.
+        let required = required_memory(
+            &[
+                contender("idle", 50 * GIB, 64 * GIB),
+                Contender {
+                    busy_slots: 2,
+                    ..contender("busy", 62 * GIB, 64 * GIB)
+                },
+            ],
+            &Demand {
+                measured_job: Some(58 * GIB),
+                ..heavy_demand(None)
+            },
+            &config,
+        );
+        assert_eq!(required, Some(58 * GIB));
     }
 
     /// A job that fails at once says nothing of how fast its host is, or that host

@@ -353,20 +353,29 @@ impl State {
             .fold(leased, |sum, ramping| sum.saturating_add(ramping.estimate))
     }
 
-    /// A host that says it runs nothing has no job still growing, from before it
-    /// said so, whether or not that job's end was heard of: a machine that died
-    /// with them, say, and came back.
+    /// A host running `n` attempts has at most `n` jobs left from before it said
+    /// so, whether or not the ends of the others were heard of: reported during a
+    /// broken link, say, or never, by a machine that died with them. The newest are
+    /// kept.
     fn forget_ended(&mut self, candidates: &[Candidate]) {
-        let ended: Vec<(&str, Instant)> = candidates
-            .iter()
-            .filter(|candidate| candidate.heartbeat.busy_slots == 0)
-            .map(|candidate| (candidate.host_id.as_str(), candidate.heartbeat_at))
-            .collect();
-        self.ramping.retain(|ramping| {
-            !ended
+        for candidate in candidates {
+            let mut claims: Vec<Instant> = self
+                .ramping
                 .iter()
-                .any(|(host, at)| *host == ramping.host_id && ramping.claimed_at <= *at)
-        });
+                .filter(|ramping| {
+                    ramping.host_id == candidate.host_id
+                        && ramping.claimed_at <= candidate.heartbeat_at
+                })
+                .map(|ramping| ramping.claimed_at)
+                .collect();
+            claims.sort_unstable_by(|a, b| b.cmp(a));
+            let Some(&newest_gone) = claims.get(candidate.heartbeat.busy_slots as usize) else {
+                continue;
+            };
+            self.ramping.retain(|ramping| {
+                ramping.host_id != candidate.host_id || ramping.claimed_at > newest_gone
+            });
+        }
     }
 
     /// The job `runner` took is known: its lease reserves what that job is
@@ -946,7 +955,10 @@ impl Placement {
     pub fn attempt_finished(&self, host_id: &str, finished: &AttemptFinished) {
         self.close(host_id, finished.lease_id.as_deref());
         let runner = finished.runner_name.to_ascii_lowercase();
-        self.state().ramping.retain(|ramping| {
+        let mut state = self.state();
+        // A late webhook for it must not read as a runner still at work.
+        state.runners.remove(&runner);
+        state.ramping.retain(|ramping| {
             ramping.host_id != host_id
                 || (Some(ramping.lease_id.as_str()) != finished.lease_id.as_deref()
                     && ramping.lease_id != runner)
@@ -1013,7 +1025,19 @@ impl Placement {
     /// launch it was answering is refused at once.
     pub fn host_gone(&self, host_id: &str) {
         let mut state = self.state();
-        // Its running jobs are not: a runner outlives a broken link.
+        // Its running jobs' memory stays: a runner outlives a broken link.
+        let claimed: Vec<(String, Instant)> = state
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.host_id == host_id)
+            .filter_map(|(id, lease)| match lease.state {
+                LeaseState::Claimed(at) => Some((id.clone(), at)),
+                _ => None,
+            })
+            .collect();
+        for (lease_id, at) in claimed {
+            state.release_claimed(&lease_id, at);
+        }
         state.leases.retain(|_, lease| lease.host_id != host_id);
         drop(state);
         self.waiting().retain(|_, (host, _)| host != host_id);
@@ -1180,7 +1204,8 @@ impl Placement {
     /// missing lease, host by host, and cancels the newest surplus leases.
     pub async fn rebalance(&self, key: &JobKey) -> Rebalanced {
         let mut report = Rebalanced::default();
-        let mut tried: HashSet<String> = HashSet::new();
+        // Each host tried, and whether it may yet take the queue's job.
+        let mut tried: HashMap<String, bool> = HashMap::new();
         let mut last_failure = None;
         loop {
             let mut decision = None;
@@ -1198,7 +1223,7 @@ impl Placement {
             // the launch is not sent to its new link untracked.
             if !self.state().leases.contains_key(&lease_id) {
                 self.waiting().remove(&lease_id);
-                tried.insert(host_id);
+                tried.insert(host_id, false);
                 continue;
             }
             // `Ok(Err)`: undeliverable, or the host went away meanwhile.
@@ -1210,6 +1235,7 @@ impl Placement {
                 Ok(Err(()))
             };
             self.waiting().remove(&lease_id);
+            let mut still_able = false;
             match answer {
                 Ok(Ok(ack)) if ack.accepted => {
                     if let Some(lease) = self.state().leases.get_mut(&lease_id) {
@@ -1228,6 +1254,11 @@ impl Placement {
                         %host_id,
                         reason = ack.reason.map_or("unspecified", |reason| reason.as_str()),
                         "a host refused a launch; trying the next"
+                    );
+                    // Its slots are taken: a job too big for the rest waits for it.
+                    still_able = matches!(
+                        ack.reason,
+                        Some(RefusalReason::MaxCapacity | RefusalReason::HostCapacity)
                     );
                     last_failure = Some(Unplaced::Refused(
                         ack.reason.unwrap_or(RefusalReason::Other),
@@ -1251,7 +1282,7 @@ impl Placement {
             }
             self.state().leases.remove(&lease_id);
             report.refused += 1;
-            tried.insert(host_id);
+            tried.insert(host_id, still_able);
         }
     }
 
@@ -1260,7 +1291,7 @@ impl Placement {
     fn offer(
         &self,
         key: &JobKey,
-        tried: &HashSet<String>,
+        tried: &HashMap<String, bool>,
         last_failure: Option<Unplaced>,
         report: &mut Rebalanced,
         decision: &mut Option<PlacementDecision>,
@@ -1281,7 +1312,7 @@ impl Placement {
             state.fit.remove(key);
             return None;
         }
-        let untried = |candidate: &Candidate| !tried.contains(&candidate.host_id);
+        let untried = |candidate: &Candidate| !tried.contains_key(&candidate.host_id);
         let free = |candidate: &Candidate| {
             candidate.heartbeat.free_slots
                 > state.unreported_on(&candidate.host_id, candidate.heartbeat_at)
@@ -1301,11 +1332,12 @@ impl Placement {
             state.note_unplaced(key, reason);
             return None;
         }
-        // Not a host that just refused: the job goes elsewhere, as it does for any
-        // other refusal, rather than wait for as long as that lasts.
+        // Not a host that cannot take it, for as long as that lasts: the job goes
+        // elsewhere.
         let fleet_ram = candidates
             .iter()
-            .filter(|candidate| untried(candidate) && fit(candidate))
+            .filter(|candidate| fit(candidate))
+            .filter(|candidate| tried.get(&candidate.host_id).copied().unwrap_or(true))
             .map(|candidate| candidate.ram_bytes.unwrap_or(u64::MAX))
             .max();
         let eligible: Vec<Candidate> = candidates
@@ -1565,6 +1597,8 @@ mod tests {
     enum Answer {
         Accept,
         Refuse,
+        /// Refuse for a reason other than its slots.
+        Disabled,
         Silent,
     }
 
@@ -1654,6 +1688,10 @@ mod tests {
                         Answer::Refuse => placement.acknowledged(
                             id,
                             LaunchAck::refused(&launch.lease_id, RefusalReason::HostCapacity),
+                        ),
+                        Answer::Disabled => placement.acknowledged(
+                            id,
+                            LaunchAck::refused(&launch.lease_id, RefusalReason::Disabled),
                         ),
                         Answer::Silent => {}
                     }
@@ -2379,7 +2417,7 @@ mod tests {
             let mut decision = None;
             placement.offer(
                 key,
-                &HashSet::new(),
+                &HashMap::new(),
                 None,
                 &mut Rebalanced::default(),
                 &mut decision,
@@ -2777,7 +2815,7 @@ mod tests {
         let mut decision = None;
         let offered = placement.offer(
             &key,
-            &HashSet::new(),
+            &HashMap::new(),
             None,
             &mut Rebalanced::default(),
             &mut decision,
@@ -2903,37 +2941,94 @@ mod tests {
         drop((host, back));
     }
 
-    /// A big host that refuses, for as long as that lasts, does not keep a job from
-    /// the smaller host that would take it.
+    /// A big host that cannot take a job does not keep it from a smaller host that
+    /// would; one whose slots are taken does, as with a heartbeat that says so.
     #[tokio::test]
-    async fn a_heavy_job_goes_elsewhere_when_the_big_host_refuses_it() {
-        let (registry, placement) = light_and_mem();
-        let big = connect_sized(
-            &registry,
-            "big",
-            LAUNCH_VERSION,
-            POOL,
-            2,
-            20 << 30,
-            Some(20 << 30),
+    async fn a_heavy_job_goes_elsewhere_only_when_the_big_host_cannot_take_it() {
+        for (how, accepted) in [(Answer::Disabled, 1), (Answer::Refuse, 0)] {
+            let (registry, placement) = light_and_mem();
+            let big = connect_sized(
+                &registry,
+                "big",
+                LAUNCH_VERSION,
+                POOL,
+                2,
+                20 << 30,
+                Some(20 << 30),
+            );
+            let small = connect_sized(
+                &registry,
+                "small",
+                LAUNCH_VERSION,
+                POOL,
+                2,
+                2 << 30,
+                Some(2 << 30),
+            );
+            let big = answer(&placement, "big", big, how);
+            let small = answer(&placement, "small", small, Answer::Accept);
+            let key = placement
+                .queued_job("octo/app", &required(POOL), 1, Some("octo/app/mem".into()))
+                .expect("pool");
+            let report = placement.rebalance(&key).await;
+            assert_eq!((report.accepted, report.refused), (accepted, 1));
+            drop((big, small));
+        }
+    }
+
+    /// Past what its host says it runs, a job's end was missed, and the oldest are
+    /// the likeliest to have ended.
+    #[tokio::test]
+    async fn a_host_holds_no_more_jobs_memory_than_it_says_it_runs() {
+        let (placement, key, lease, host) = one_lease().await;
+        let pool = required(POOL);
+        placement.attempt_started("h", &started_by("runner-manager-a", Some(&lease)));
+        placement.dequeued_by("octo/app", &pool, 1, Some("runner-manager-a"));
+        for (id, runner) in [(2, "runner-manager-b"), (3, "runner-manager-c")] {
+            placement.attempt_started("h", &started_by(runner, None));
+            placement.queued_job("octo/app", &pool, id, Some("octo/app/light".into()));
+            placement.dequeued_by("octo/app", &pool, id, Some(runner));
+        }
+        assert_eq!(placement.state().committed_on("h"), (7 << 29) + (2 << 29));
+        let registry = Arc::clone(placement.registry());
+        let (tx, rx) = mpsc::channel(8);
+        let connection = registry.register("h", LAUNCH_VERSION, tx);
+        registry.set_hello(
+            "h",
+            connection,
+            Hello {
+                protocol_version: LAUNCH_VERSION,
+                host_id: "h".into(),
+                os: "linux".into(),
+                arch: "x64".into(),
+                cores: 8,
+                ram_bytes: Some(20 << 30),
+                disk_free_bytes: None,
+                targets: vec![Target {
+                    scope: TargetScope::Repo,
+                    name: "octo/app".into(),
+                    profiles: vec![Profile {
+                        name: "pool".into(),
+                        labels: POOL.iter().map(ToString::to_string).collect(),
+                        enabled: true,
+                        warm: false,
+                    }],
+                }],
+            },
         );
-        let small = connect_sized(
-            &registry,
-            "small",
-            LAUNCH_VERSION,
-            POOL,
-            2,
-            2 << 30,
-            Some(2 << 30),
+        registry.set_heartbeat(
+            "h",
+            connection,
+            Heartbeat {
+                free_slots: 4,
+                busy_slots: 2,
+                free_ram_bytes: Some(20 << 30),
+                ..Heartbeat::default()
+            },
         );
-        let big = answer(&placement, "big", big, Answer::Refuse);
-        let small = answer(&placement, "small", small, Answer::Accept);
-        let key = placement
-            .queued_job("octo/app", &required(POOL), 1, Some("octo/app/mem".into()))
-            .expect("pool");
-        let report = placement.rebalance(&key).await;
-        assert_eq!((report.accepted, report.refused), (1, 1));
-        drop((big, small));
+        placement.rebalance(&key).await;
+        assert_eq!(placement.state().committed_on("h"), 2 << 29);
+        drop((host, rx));
     }
 
     /// The webhook usually beats the host. A runner of one queue's lease taking
