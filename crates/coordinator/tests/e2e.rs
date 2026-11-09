@@ -254,10 +254,14 @@ async fn a_version_two_host_is_told_its_coverage_and_woken() {
         ))
         .await
         .expect("hello");
-    // No GitHub App here: no sweep, so nothing is covered.
+    // No GitHub App here: no sweep, so nothing is covered; `rm-pool-any` is
+    // placed all the same.
     assert_eq!(
         next(&mut socket).await,
-        ServerMessage::HelloAck(HelloAck::default())
+        ServerMessage::HelloAck(HelloAck {
+            any_pool: true,
+            ..HelloAck::default()
+        })
     );
     let body = queued("octo/app", &["self-hosted", "linux"]);
     assert_eq!(
