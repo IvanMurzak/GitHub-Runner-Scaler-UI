@@ -8165,6 +8165,8 @@ mod tests {
         let signal = tokio::sync::Notify::new();
         let (stop, stopped) = tokio::sync::watch::channel(false);
 
+        // Nothing older at the first look, and one that never reserves at the next.
+        scripted_older(&director, &[(0, 1), (1, 1)]);
         tokio::join!(serving(&reconciler, &pool, &signal, stopped), async {
             signal.notify_one();
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -8173,7 +8175,6 @@ mod tests {
                 1,
                 "the first is coming up"
             );
-            scripted_older(&director, &[(1, 1)]);
             tokio::time::sleep(OLDER_LAUNCH_TURN + Duration::from_secs(1)).await;
             assert_eq!(held.waits.lock().unwrap().len(), 2);
             stop.send_replace(true);
