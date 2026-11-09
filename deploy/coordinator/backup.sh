@@ -13,16 +13,20 @@ set -eu
 
 DATABASE="${COORDINATOR_DB:-/data/coordinator.db}"
 BACKUP_DIR="${COORDINATOR_BACKUP_DIR:-/backups}"
-KEEP="${COORDINATOR_BACKUP_KEEP:-7}"
+KEEP="${COORDINATOR_BACKUP_KEEP-7}"
 INTERVAL_SECS="${COORDINATOR_BACKUP_INTERVAL_SECS:-86400}"
 RETRY_SECS="${COORDINATOR_BACKUP_RETRY_SECS:-3600}"
 
-case "$KEEP" in
-    '' | 0 | *[!0-9]*)
-        echo "backup: COORDINATOR_BACKUP_KEEP must be a whole number above 0" >&2
-        exit 2
-        ;;
-esac
+# Nothing with a leading zero: 00 would remove every copy, and 08 is not a number
+# to the shell's arithmetic.
+for setting in "$KEEP" "$INTERVAL_SECS" "$RETRY_SECS"; do
+    case "$setting" in
+        '' | 0* | *[!0-9]*)
+            echo "backup: the keep, interval and retry settings must be whole numbers above 0" >&2
+            exit 2
+            ;;
+    esac
+done
 
 backup_once() {
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"

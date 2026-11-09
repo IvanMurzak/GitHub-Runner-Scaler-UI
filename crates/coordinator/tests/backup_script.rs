@@ -94,15 +94,39 @@ fn the_daily_loop_keeps_no_copy_of_a_database_it_could_not_read() {
         .env("COORDINATOR_DB", dir.path().join("missing.db"))
         .env("COORDINATOR_BACKUP_DIR", &backups)
         .env("COORDINATOR_BACKUP_RETRY_SECS", "1")
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("sh runs");
 
     std::thread::sleep(std::time::Duration::from_millis(2500));
     let _ = running.kill();
-    let _ = running.wait();
+    let said = running.wait_with_output().expect("collected").stderr;
 
+    assert!(
+        String::from_utf8_lossy(&said).contains("failed; trying again"),
+        "the loop ran: {}",
+        String::from_utf8_lossy(&said)
+    );
     assert_eq!(copies(&backups), Vec::<String>::new());
+}
+
+/// A setting that would remove every copy is refused before anything happens.
+#[test]
+fn a_keep_count_of_zero_in_any_spelling_is_refused() {
+    let dir = tempfile::tempdir().expect("a directory");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/coordinator/backup.sh");
+    for keep in ["0", "00", "08", "x", ""] {
+        let output = Command::new("sh")
+            .arg(&script)
+            .arg("once")
+            .env("COORDINATOR_DB", dir.path().join("missing.db"))
+            .env("COORDINATOR_BACKUP_DIR", dir.path())
+            .env("COORDINATOR_BACKUP_KEEP", keep)
+            .output()
+            .expect("sh runs");
+        assert_eq!(output.status.code(), Some(2), "{keep:?}");
+    }
 }
 
 #[test]

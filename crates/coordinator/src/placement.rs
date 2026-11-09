@@ -68,7 +68,8 @@ use tokio::sync::oneshot;
 
 use crate::registry::{Candidate, Registry, is_pool_job};
 use crate::stats::{
-    Aggregates, Contender, Demand, FitFigures, Statistics, StatsConfig, roomiest, score,
+    Aggregates, Contender, Demand, FitFigures, Statistics, StatsConfig, WORKFLOW_SEPARATOR,
+    roomiest, score,
 };
 
 /// How long a host has to answer a `launch`.
@@ -698,7 +699,12 @@ impl Placement {
                     .jobs
                     .entry(*id)
                     .or_insert_with(|| (Instant::now(), None));
-                if job_key.is_some() {
+                // Not back to the job alone from a key that names its workflow.
+                if job_key.as_ref().is_some_and(|new| {
+                    known.1.as_ref().is_none_or(|old| {
+                        new.contains(WORKFLOW_SEPARATOR) || !old.contains(WORKFLOW_SEPARATOR)
+                    })
+                }) {
                     known.1.clone_from(job_key);
                 }
             }

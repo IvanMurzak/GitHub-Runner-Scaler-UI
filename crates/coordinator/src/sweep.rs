@@ -298,8 +298,8 @@ impl Sweeper {
         let installations = self.reach.installations();
         let wanted = self.workflows.take_wanted();
         let asked = wanted.len();
-        let answers = tokio::time::timeout(WANTED_RUNS_BUDGET, async {
-            let mut answered = 0_usize;
+        let mut answered = 0_usize;
+        let _ = tokio::time::timeout(WANTED_RUNS_BUDGET, async {
             for (repository, run_id) in wanted {
                 let installation = installations.iter().find(|installation| {
                     installation
@@ -321,14 +321,9 @@ impl Sweeper {
                     answered += 1;
                 }
             }
-            answered
         })
         .await;
-        tracing::debug!(
-            asked,
-            answered = answers.unwrap_or_default(),
-            "asked GitHub for runs' workflows"
-        );
+        tracing::debug!(asked, answered, "asked GitHub for runs' workflows");
     }
 
     async fn read(

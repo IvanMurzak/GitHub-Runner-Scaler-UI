@@ -172,7 +172,7 @@ pub struct JobIdentity {
 
 /// Between a job and its workflow in a sample's key. A control character, so no
 /// name can hold one: [`clean`] takes them out of what comes off the wire.
-const WORKFLOW_SEPARATOR: char = '\u{1f}';
+pub(crate) const WORKFLOW_SEPARATOR: char = '\u{1f}';
 
 /// The part of `key` that names the job alone: what a sample of an older version
 /// is keyed by, and one whose workflow was not known.

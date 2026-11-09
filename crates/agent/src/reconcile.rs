@@ -2414,7 +2414,9 @@ pub struct ReservationWaits {
 /// What one round of serving launches has reserved so far.
 #[derive(Default)]
 struct ReservationRound {
-    reserved: BTreeMap<PolicyId, u32>,
+    /// Per policy, how many it reserved and the most launches seen open: a lease
+    /// closing during the round must not cut short the launches after it.
+    reserved: BTreeMap<PolicyId, (u32, u32)>,
     exhausted: BTreeSet<PolicyId>,
 }
 
@@ -2875,8 +2877,9 @@ impl Reconciler {
                     match reserved {
                         Some(reserved) => {
                             bringing_up.push(self.bring_up(reserved));
+                            known = read;
                             if !stopping {
-                                reserving = Some(self.reserve_step(read, round));
+                                reserving = Some(self.reserve_step(policies(), round));
                             }
                         }
                         None => known = read,
@@ -2935,11 +2938,12 @@ impl Reconciler {
                         && !round.exhausted.contains(&policy.id)
                 })
                 .min_by_key(|policy| self.director.next_waiting(policy).unwrap_or(u64::MAX))?;
-            let served = round.reserved.entry(policy.id).or_default();
+            let (served, most) = round.reserved.entry(policy.id).or_default();
             // Bounded by the launches open, however late the journal shows these.
             if let Some(directed) = self.director.directed_demand(policy)
-                && *served < directed
+                && *served < directed.max(*most)
             {
+                *most = directed.max(*most);
                 let mut reserved = Vec::new();
                 self.start_runners(policy, directed, 1, report, &mut reserved)
                     .await;
