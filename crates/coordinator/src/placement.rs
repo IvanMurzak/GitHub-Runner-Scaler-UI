@@ -355,25 +355,25 @@ impl State {
 
     /// A host running `n` attempts has at most `n` jobs left from before it said
     /// so, whether or not the ends of the others were heard of: reported during a
-    /// broken link, say, or never, by a machine that died with them. The newest are
-    /// kept.
+    /// broken link, say, or never, by a machine that died with them. Which ended is
+    /// not known, so the `n` largest are kept: better too much spoken for than a
+    /// long build forgotten.
     fn forget_ended(&mut self, candidates: &[Candidate]) {
         for candidate in candidates {
-            let mut claims: Vec<Instant> = self
-                .ramping
-                .iter()
-                .filter(|ramping| {
+            let mut before: Vec<usize> = (0..self.ramping.len())
+                .filter(|&index| {
+                    let ramping = &self.ramping[index];
                     ramping.host_id == candidate.host_id
                         && ramping.claimed_at <= candidate.heartbeat_at
                 })
-                .map(|ramping| ramping.claimed_at)
                 .collect();
-            claims.sort_unstable_by(|a, b| b.cmp(a));
-            let Some(&newest_gone) = claims.get(candidate.heartbeat.busy_slots as usize) else {
-                continue;
-            };
-            self.ramping.retain(|ramping| {
-                ramping.host_id != candidate.host_id || ramping.claimed_at > newest_gone
+            before.sort_unstable_by_key(|&index| std::cmp::Reverse(self.ramping[index].estimate));
+            let keep = (candidate.heartbeat.busy_slots as usize).min(before.len());
+            let gone: HashSet<usize> = before.split_off(keep).into_iter().collect();
+            let mut index = 0;
+            self.ramping.retain(|_| {
+                index += 1;
+                !gone.contains(&(index - 1))
             });
         }
     }
@@ -1332,13 +1332,13 @@ impl Placement {
             state.note_unplaced(key, reason);
             return None;
         }
-        // Not a host that cannot take it, for as long as that lasts: the job goes
-        // elsewhere.
+        // The hosts this queue waits for: their slots are taken. Not one that cannot
+        // take it, for as long as that lasts: the job goes elsewhere.
         let fleet_ram = candidates
             .iter()
-            .filter(|candidate| fit(candidate))
-            .filter(|candidate| tried.get(&candidate.host_id).copied().unwrap_or(true))
-            .map(|candidate| candidate.ram_bytes.unwrap_or(u64::MAX))
+            .filter(|c| fit(c) && !(untried(c) && free(c)))
+            .filter(|c| tried.get(&c.host_id).copied().unwrap_or(true))
+            .map(|c| c.ram_bytes.unwrap_or(u64::MAX))
             .max();
         let eligible: Vec<Candidate> = candidates
             .into_iter()
@@ -2976,8 +2976,8 @@ mod tests {
         }
     }
 
-    /// Past what its host says it runs, a job's end was missed, and the oldest are
-    /// the likeliest to have ended.
+    /// Past what its host says it runs, a job's end was missed. Which is not known,
+    /// so the largest are kept.
     #[tokio::test]
     async fn a_host_holds_no_more_jobs_memory_than_it_says_it_runs() {
         let (placement, key, lease, host) = one_lease().await;
@@ -3027,7 +3027,7 @@ mod tests {
             },
         );
         placement.rebalance(&key).await;
-        assert_eq!(placement.state().committed_on("h"), 2 << 29);
+        assert_eq!(placement.state().committed_on("h"), (7 << 29) + (1 << 29));
         drop((host, rx));
     }
 

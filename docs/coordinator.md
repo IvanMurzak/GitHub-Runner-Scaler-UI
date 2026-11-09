@@ -452,7 +452,7 @@ and labels), not a single job:
    too small for what it turns out to need. It reserves at most `COORDINATOR_DEFAULT_JOB_RAM`. Nor is anything filtered when the
    demand plus the margin is more than the total memory of every host that serves the queue, a host
    with no slot free just now or whose refusal says only that its slots are taken included: no host could
-   ever hold it, so the job runs where the score says. When the biggest hosts are all idle and still too
+   ever hold it, so the job runs where the score says. When the biggest hosts are all free to take it, idle and still too
    short, what holds their memory is nothing placement can wait out, and the job runs on one of them.
    Otherwise the job waits for a host big enough, and does not start on one too small because that
    host's slots are taken. The estimates of a host's launches stay reserved
@@ -460,7 +460,7 @@ and labels), not a single job:
    that job ends, whichever is first; and until that job ends they count against the host's total
    memory, since a build's peak can come after those 2 minutes with its host's heartbeat showing that
    memory free until then. That survives a broken link, and ends at the attempt's report, when the host's
-   heartbeat says it runs fewer jobs than are held for it (the oldest go first), or after 6 hours. Once a webhook names the job a launch's runner took,
+   heartbeat says it runs fewer jobs than are held for it (the largest are kept), or after 6 hours. Once a webhook names the job a launch's runner took,
    the launch reserves that job's expected peak rather than the queue's next heaviest, and a runner with
    no lease left counts for the job it took.
 3. **Score** = `cache` x warm workspace (0 or 1; 0 when, after at least 3 runs of a job, this host is measured more than 10% slower

@@ -833,8 +833,8 @@ pub struct Demand {
     pub job_keys: Vec<String>,
     /// Any statistics at all for this queue: its keys or its repository.
     pub measured: bool,
-    /// The most memory of any host that could serve this queue, including one
-    /// with no slot free just now (`u64::MAX` when one's memory is unknown).
+    /// The most memory of any host that could serve this queue but is no contender
+    /// now, its slots taken (`u64::MAX` when one's memory is unknown).
     pub fleet_ram: Option<u64>,
 }
 
@@ -931,21 +931,23 @@ fn required_memory(contenders: &[Contender], demand: &Demand, config: &StatsConf
     if biggest < needed {
         return None;
     }
-    // Every biggest host doing nothing and still too short: what holds their memory
-    // is nothing placement can wait out, and a job that never starts never says it
-    // has grown lighter. It asks for what they have, so it runs on one of them.
+    // The biggest hosts all here, doing nothing and still too short: what holds their
+    // memory is nothing placement can wait out, and a job that never starts never
+    // says it has grown lighter. It asks for what they have, so it runs on one of
+    // them; if that is less than the margin, on whichever the score says.
     let biggest_hosts = || {
         contenders
             .iter()
             .filter(move |contender| contender.total_ram == Some(biggest))
     };
-    if biggest_hosts().next().is_some()
+    if demand.fleet_ram.is_none_or(|ram| ram < biggest)
+        && biggest_hosts().next().is_some()
         && biggest_hosts().all(|host| host.idle() && !host.fits(bytes, config.ram_margin))
     {
         return biggest_hosts()
             .filter_map(Contender::available)
             .max()
-            .map(|available| available.saturating_sub(config.ram_margin));
+            .and_then(|available| available.checked_sub(config.ram_margin));
     }
     Some(bytes)
 }
@@ -2537,7 +2539,7 @@ mod tests {
                 &Demand {
                     estimate: 61 * GIB,
                     measured_job: Some(61 * GIB),
-                    ..heavy_demand(Some(64 * GIB))
+                    ..heavy_demand(None)
                 },
                 None,
                 &config,
@@ -2566,6 +2568,17 @@ mod tests {
         assert_eq!(hosts[0].0.host_id, "big");
         assert!(hosts[0].1.fits);
         assert!(!hosts[1].1.fits);
+        // Another as big, its slots taken: the job waits for it.
+        assert!(
+            required_memory(
+                &[contender("idle", 58 * GIB, 64 * GIB)],
+                &Demand {
+                    measured_job: Some(61 * GIB),
+                    ..heavy_demand(Some(64 * GIB))
+                },
+                &config,
+            ) == Some(61 * GIB)
+        );
         // Another as big as it that would hold the job: nothing is relaxed.
         let required = required_memory(
             &[
