@@ -96,11 +96,11 @@ enum Command {
         lease_ttl: Duration,
         /// A host whose last heartbeat reports this CPU load or more, in
         /// percent, is placed on only when no other host can take the job.
-        #[arg(long, env = "COORDINATOR_CPU_BUSY_PERCENT", default_value_t = 90, value_parser = clap::value_parser!(u32).range(1..=100))]
+        #[arg(long, env = "COORDINATOR_CPU_BUSY_PERCENT", default_value_t = stats::DEFAULT_CPU_BUSY_PERCENT, value_parser = clap::value_parser!(u32).range(1..=100))]
         cpu_busy_percent: u32,
         /// A host with less free disk than this on its runner root's volume
         /// is placed on only when no other host can take the job: 10GiB.
-        #[arg(long, env = "COORDINATOR_MIN_DISK_FREE", default_value = "10GiB", value_parser = parse_bytes)]
+        #[arg(long, env = "COORDINATOR_MIN_DISK_FREE", default_value_t = stats::DEFAULT_MIN_DISK_FREE, value_parser = parse_bytes)]
         min_disk_free: u64,
     },
     /// The job weight statistics: heaviest jobs, hosts, recent placements.
@@ -302,24 +302,9 @@ struct HostsDocument<'a> {
 
 /// The connected hosts as the running server last saved them.
 fn saved_connected(store: &Store) -> anyhow::Result<Vec<ConnectedHostStats>> {
-    Ok(store
-        .live_state()?
-        .and_then(|(json, _)| serde_json::from_str::<stats::LiveState>(&json).ok())
-        .map(|live| live.connected)
+    Ok(stats::saved_live(store)?
+        .map(|(live, _)| live.connected)
         .unwrap_or_default())
-}
-
-/// `cpu 40%, disk free 12.3 GiB` for a host the server last saw connected.
-fn load_text(host: &ConnectedHostStats) -> String {
-    const GIB: u64 = 1 << 30;
-    let cpu = host
-        .cpu_load_percent
-        .map_or_else(|| "-".to_string(), |load| format!("{load}%"));
-    let disk = host.disk_free_bytes.map_or_else(
-        || "-".to_string(),
-        |free| format!("{}.{} GiB", free / GIB, free % GIB * 10 / GIB),
-    );
-    format!("cpu {cpu}, disk free {disk}")
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
@@ -462,7 +447,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                                 .iter()
                                 .find(|live| live.host_id == host.id)
                                 .map_or_else(String::new, |live| {
-                                    format!("  connected: {}", load_text(live))
+                                    format!("  connected: {}", live.load_text())
                                 });
                             writeln!(
                                 out,
@@ -559,20 +544,6 @@ mod tests {
         assert!(parse_weights("gpu=1").is_err());
         assert!(parse_weights("cache=-1").is_err());
         assert!(parse_weights("cache").is_err());
-    }
-
-    #[test]
-    fn a_connected_hosts_load_reads_in_percent_and_gib() {
-        let host = ConnectedHostStats {
-            cpu_load_percent: Some(40),
-            disk_free_bytes: Some((12 << 30) + (3 << 30) / 10 + 1),
-            ..ConnectedHostStats::default()
-        };
-        assert_eq!(load_text(&host), "cpu 40%, disk free 12.3 GiB");
-        assert_eq!(
-            load_text(&ConnectedHostStats::default()),
-            "cpu -, disk free -"
-        );
     }
 
     #[test]

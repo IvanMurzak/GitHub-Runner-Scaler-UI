@@ -43,7 +43,8 @@ use chrono::{DateTime, TimeDelta, Utc};
 use runner_manager_coordinator::placement::{CLAIM_GRACE, JobKey, Placement, TICK};
 use runner_manager_coordinator::registry::{Coverage, OUTBOUND_QUEUE, Outbound, Registry};
 use runner_manager_coordinator::stats::{
-    JobIdentity, JobTimes, Statistics, StatsConfig, percentile,
+    DEFAULT_CPU_BUSY_PERCENT, DEFAULT_MIN_DISK_FREE, JobIdentity, JobTimes, Statistics,
+    StatsConfig, percentile,
 };
 use runner_manager_coordinator::store::{JobSample, Store};
 use runner_manager_coordinator::webhook::required_labels;
@@ -87,8 +88,8 @@ const MACOS: &str = "rm-pool-macos";
 const ANY: &str = "rm-pool-any";
 
 /// What placement treats as busy and as low disk, by default.
-const BUSY_PERCENT: u32 = 90;
-const LOW_DISK: u64 = 10 * GIB;
+const BUSY_PERCENT: u32 = DEFAULT_CPU_BUSY_PERCENT;
+const LOW_DISK: u64 = DEFAULT_MIN_DISK_FREE;
 
 /// Xorshift: all this needs is a seeded, stable stream.
 struct Rng(u64);

@@ -142,11 +142,15 @@ pub struct Guards {
     pub min_disk_free: u64,
 }
 
+/// [`Guards::default`]'s figures, for the server's options too.
+pub const DEFAULT_CPU_BUSY_PERCENT: u32 = 90;
+pub const DEFAULT_MIN_DISK_FREE: u64 = 10 << 30;
+
 impl Default for Guards {
     fn default() -> Self {
         Self {
-            cpu_busy_percent: 90,
-            min_disk_free: 10 << 30,
+            cpu_busy_percent: DEFAULT_CPU_BUSY_PERCENT,
+            min_disk_free: DEFAULT_MIN_DISK_FREE,
         }
     }
 }
@@ -1601,13 +1605,8 @@ pub fn report(
         .iter()
         .filter_map(|json| serde_json::from_str(json).ok())
         .collect();
-    let (live, live_at) = store
-        .live_state()?
-        .and_then(|(json, at)| {
-            serde_json::from_str::<LiveState>(&json)
-                .ok()
-                .map(|live| (live, Some(at.timestamp())))
-        })
+    let (live, live_at) = saved_live(store)?
+        .map(|(live, at)| (live, Some(at.timestamp())))
         .unwrap_or_default();
     Ok(StatsReport {
         generated_at: now.timestamp(),
@@ -1626,6 +1625,19 @@ pub fn report(
         leases: live.leases,
         live_at,
     })
+}
+
+/// The live state the server last saved, and when; `None` when it saved none
+/// or it cannot be read.
+///
+/// # Errors
+/// SQLite's.
+pub fn saved_live(store: &Store) -> Result<Option<(LiveState, DateTime<Utc>)>, StoreError> {
+    Ok(store.live_state()?.and_then(|(json, at)| {
+        serde_json::from_str::<LiveState>(&json)
+            .ok()
+            .map(|live| (live, at))
+    }))
 }
 
 /// Placement's pending queues and open leases, and the connected hosts, as

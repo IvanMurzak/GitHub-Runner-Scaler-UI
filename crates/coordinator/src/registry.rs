@@ -50,6 +50,15 @@ struct Connected {
 }
 
 impl Connected {
+    /// Free disk on its runner root's volume: its last heartbeat's figure,
+    /// else its `hello`'s (an older host measures only at connect).
+    fn disk_free_bytes(&self) -> Option<u64> {
+        self.heartbeat
+            .as_ref()
+            .and_then(|heartbeat| heartbeat.disk_free_bytes)
+            .or_else(|| self.hello.as_ref()?.disk_free_bytes)
+    }
+
     /// Whether this host's pool profiles on `target` are in launch mode: the
     /// one rule that decides between a `launch` and a wake.
     fn launch_mode(&self, coverage: &Coverage, target: &TargetRef) -> bool {
@@ -332,7 +341,7 @@ impl Registry {
                         warm: profile.warm,
                         ram_bytes: hello.ram_bytes,
                         cores: hello.cores,
-                        disk_free_bytes: heartbeat.disk_free_bytes.or(hello.disk_free_bytes),
+                        disk_free_bytes: connected.disk_free_bytes(),
                         heartbeat: heartbeat.clone(),
                         heartbeat_at: connected.heartbeat_at,
                     });
@@ -492,28 +501,29 @@ impl Registry {
     /// Every connected host's last load report, for `stats` and `hosts list`.
     #[must_use]
     pub fn connected_stats(&self) -> Vec<ConnectedHostStats> {
-        self.connected()
-            .into_iter()
-            .map(|host| {
-                let hello = host.hello.as_ref();
-                let heartbeat = host.heartbeat.unwrap_or_default();
+        let mut hosts: Vec<ConnectedHostStats> = self
+            .lock()
+            .iter()
+            .map(|(host_id, connected)| {
+                let hello = connected.hello.as_ref();
+                let heartbeat = connected.heartbeat.as_ref();
                 ConnectedHostStats {
+                    host_id: host_id.clone(),
                     os: hello.map(|hello| hello.os.clone()).unwrap_or_default(),
                     cores: hello.map_or(0, |hello| hello.cores),
                     ram_bytes: hello.and_then(|hello| hello.ram_bytes),
-                    free_slots: heartbeat.free_slots,
-                    busy_slots: heartbeat.busy_slots,
-                    cpu_load_percent: heartbeat.cpu_load_percent,
-                    free_ram_bytes: heartbeat.free_ram_bytes,
-                    disk_free_bytes: heartbeat
-                        .disk_free_bytes
-                        .or_else(|| hello.and_then(|hello| hello.disk_free_bytes)),
-                    unfit: heartbeat.unfit,
-                    draining: heartbeat.draining,
-                    host_id: host.host_id,
+                    free_slots: heartbeat.map_or(0, |heartbeat| heartbeat.free_slots),
+                    busy_slots: heartbeat.map_or(0, |heartbeat| heartbeat.busy_slots),
+                    cpu_load_percent: heartbeat.and_then(|heartbeat| heartbeat.cpu_load_percent),
+                    free_ram_bytes: heartbeat.and_then(|heartbeat| heartbeat.free_ram_bytes),
+                    disk_free_bytes: connected.disk_free_bytes(),
+                    unfit: heartbeat.is_some_and(|heartbeat| heartbeat.unfit),
+                    draining: heartbeat.is_some_and(|heartbeat| heartbeat.draining),
                 }
             })
-            .collect()
+            .collect();
+        hosts.sort_by(|a, b| a.host_id.cmp(&b.host_id));
+        hosts
     }
 
     /// Wakes every connected host that advertised a target covering

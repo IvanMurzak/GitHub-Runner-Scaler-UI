@@ -580,9 +580,6 @@ pub struct Placement {
     lease_ttl: Duration,
     /// Stage 4: weighs placement by what jobs used; `None` places as stage 3.
     stats: Option<Arc<Statistics>>,
-    /// When a host is a last resort: its statistics' settings, else the
-    /// defaults.
-    guards: Guards,
 }
 
 impl Placement {
@@ -605,7 +602,6 @@ impl Placement {
             ack_timeout,
             lease_ttl,
             stats: None,
-            guards: Guards::default(),
         }
     }
 
@@ -613,7 +609,6 @@ impl Placement {
     /// its settings.
     #[must_use]
     pub fn with_statistics(mut self, stats: Arc<Statistics>) -> Self {
-        self.guards = stats.config().guards;
         self.stats = Some(stats);
         self
     }
@@ -1370,7 +1365,7 @@ impl Placement {
                 };
                 chosen
             }
-            None => rank(eligible, self.guards)
+            None => rank(eligible, Guards::default())
                 .into_iter()
                 .next()
                 .map(|chosen| (chosen, 0)),
@@ -1592,11 +1587,14 @@ fn load(candidate: &Candidate, guards: Guards) -> Load {
 
 /// Best first: not a last resort, then a warm workspace, then the most free
 /// RAM, then the fewest busy slots, then the host id so the order is stable.
-fn rank(mut candidates: Vec<Candidate>, guards: Guards) -> Vec<Candidate> {
-    candidates.sort_by(|a, b| {
-        load(a, guards)
-            .last_resort
-            .cmp(&load(b, guards).last_resort)
+fn rank(candidates: Vec<Candidate>, guards: Guards) -> Vec<Candidate> {
+    let mut ranked: Vec<(LastResort, Candidate)> = candidates
+        .into_iter()
+        .map(|candidate| (load(&candidate, guards).last_resort, candidate))
+        .collect();
+    ranked.sort_by(|(a_resort, a), (b_resort, b)| {
+        a_resort
+            .cmp(b_resort)
             .then_with(|| b.warm.cmp(&a.warm))
             .then_with(|| {
                 b.heartbeat
@@ -1607,7 +1605,7 @@ fn rank(mut candidates: Vec<Candidate>, guards: Guards) -> Vec<Candidate> {
             .then_with(|| a.heartbeat.busy_slots.cmp(&b.heartbeat.busy_slots))
             .then_with(|| a.host_id.cmp(&b.host_id))
     });
-    candidates
+    ranked.into_iter().map(|(_, candidate)| candidate).collect()
 }
 
 #[cfg(test)]

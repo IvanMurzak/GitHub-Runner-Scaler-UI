@@ -179,6 +179,13 @@ pub fn pool_label(os: Os) -> Label {
         .expect("the pool prefix and a fixed OS token form a valid label")
 }
 
+/// Whether a host running `os` may carry pool label `label`: its own OS
+/// pool label or [`ANY_POOL_LABEL`].
+#[must_use]
+pub fn may_carry_pool(label: &Label, os: Os) -> bool {
+    *label == pool_label(os) || is_any_pool_label(label.as_str())
+}
+
 /// Refuses a label in the pool namespace that is neither `os`'s own pool label
 /// nor [`ANY_POOL_LABEL`].
 ///
@@ -186,8 +193,7 @@ pub fn pool_label(os: Os) -> Label {
 /// [`PolicyError::PoolLabelMismatch`].
 pub fn check_pool_label(label: &Label, os: Os) -> Result<(), PolicyError> {
     let expected = pool_label(os);
-    if in_pool_namespace(label.as_str()) && *label != expected && !is_any_pool_label(label.as_str())
-    {
+    if in_pool_namespace(label.as_str()) && !may_carry_pool(label, os) {
         return Err(PolicyError::PoolLabelMismatch {
             label: label.clone(),
             expected,

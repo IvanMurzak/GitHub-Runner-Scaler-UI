@@ -855,6 +855,18 @@ pub struct ConnectedHostStats {
     pub draining: bool,
 }
 
+impl ConnectedHostStats {
+    /// `cpu 40%, disk free 12.3 GiB`, as `hosts list` prints it.
+    #[must_use]
+    pub fn load_text(&self) -> String {
+        format!(
+            "cpu {}, disk free {}",
+            percent(self.cpu_load_percent),
+            bytes(self.disk_free_bytes)
+        )
+    }
+}
+
 /// A pool queue (repository and labels) short of runners.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1521,6 +1533,20 @@ mod tests {
         assert!(
             listed.ends_with(r#""draining":false,"open_leases":["l1"]}"#),
             "{listed}"
+        );
+    }
+
+    #[test]
+    fn a_connected_hosts_load_reads_in_percent_and_bytes() {
+        let host = ConnectedHostStats {
+            cpu_load_percent: Some(40),
+            disk_free_bytes: Some((12 << 30) + (3 << 30) / 10 + 1),
+            ..ConnectedHostStats::default()
+        };
+        assert_eq!(host.load_text(), "cpu 40%, disk free 12.3 GiB");
+        assert_eq!(
+            ConnectedHostStats::default().load_text(),
+            "cpu -, disk free -"
         );
     }
 

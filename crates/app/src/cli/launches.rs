@@ -57,7 +57,7 @@ use runner_manager_domain::coordinator_protocol::{
     RefusalReason,
 };
 use runner_manager_domain::model::{AttemptId, Host, PolicyId, ScaleTarget};
-use runner_manager_domain::policy::{ScalePolicy, is_any_pool_label, pool_label};
+use runner_manager_domain::policy::{ScalePolicy, is_any_pool_label, may_carry_pool};
 use runner_manager_domain::store::Store;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -364,11 +364,10 @@ impl Launches {
     /// `rm-pool-any`. A stored label for another OS's pool (written before
     /// it was refused) never makes a profile a pool profile here.
     fn is_own_pool_profile(&self, policy: &ScalePolicy) -> bool {
-        let own = pool_label(self.host.os);
         policy.is_owned_by(self.host.id)
             && policy
                 .pool_labels()
-                .any(|label| *label == own || is_any_pool_label(label.as_str()))
+                .any(|label| may_carry_pool(label, self.host.os))
     }
 
     /// Drops every open launch: the link ended, and the coordinator forgets
@@ -851,6 +850,7 @@ fn finished(attempt: &RunnerAttempt, launches: &Launches, meters: &AttemptMeters
 #[cfg(test)]
 mod tests {
     use runner_manager_domain::coordinator_protocol::{HelloAck, LAUNCH_VERSION};
+    use runner_manager_domain::policy::pool_label;
     use runner_manager_domain::store::SqliteStore;
     use runner_manager_testkit::fixtures;
 
