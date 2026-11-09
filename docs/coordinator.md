@@ -334,7 +334,9 @@ A slow launch is a warning in the host's log, `attempt_launch_slow`, saying wher
 `order_wait_ms` (older launches reserving first), `lock_wait_ms`, `turn_wait_ms`, `materialize_ms` (of which `package_wait_ms`, `package_install_ms`,
 `package_verify_ms`, `package_copy_ms`, and `package_downloaded`), `prepare_ms`, `register_ms`,
 `spawn_ms`. The first launch after a daemon starts downloads the package again: a tree this process
-did not install may hold a job's edits. After that, it is shared by every target.
+did not install may hold a job's edits. After that, it is shared by every target, and each launch's copy
+is read against the package's archive (see [Shared runner packages](#shared-runner-packages)), which
+`package_verify_ms` counts.
 
 A download that sends nothing for 60 seconds, or cannot connect in 30, fails and is tried again; a slow one
 that keeps sending takes as long as it takes. Its partial file is removed and was never going to be used: an
@@ -629,3 +631,39 @@ A copy from an older version is upgraded when the coordinator opens it. One from
   remote admin endpoint. An enrolled host may only read `stats` over its signed link.
 - Logs carry identifiers, counts and fixed words: never the secret, a code, a key, a signature,
   or text from a webhook body.
+
+### Shared runner packages
+
+A host prepares a runner package once and copies it for each runner, so a package is shared between
+attempts, and between targets. A native runner's job runs under the account that owns that package, with or
+without a coordinator, so it can write to it: it cannot be made unwritable to that account, which could
+change the permissions back. So the package is not trusted because it was left alone. It is checked.
+
+When the daemon downloads a package, it verifies the archive against GitHub's published SHA-256 before
+unpacking it, and reads from that archive what every entry must be: file contents (SHA-256), sizes,
+symlink targets and, on Linux and macOS, modes. That record is kept in the daemon's memory only, since a
+file could be rewritten by the same account. Then, for every native or isolated launch, after the package is
+copied into the runner's own directory and before anything is registered, the daemon reads the whole copy
+against the record, on up to 4 threads, outside the host allocation lock and the package's locks.
+`package_verify_ms` counts it. On Linux and macOS, a change to the shared tree's metadata
+(`ctime`) also discards it before the copy, cheaply.
+
+If the copy differs in any way, including a file added or removed, `package_verify_failed` in the host log
+says so with `reason` (`modified`, `missing`, `unexpected`, `unreadable`). The copy is removed, the shared
+package is discarded, and the launch retries with a fresh download. The next daemon start also downloads
+afresh, since it has no record, on Windows as on Linux and macOS (from 0.4.50).
+
+**What this guarantees:** a runner starts only from a copy that matched the verified archive at the moment
+it was read. An edit a job made to the shared package does not reach a later job's runner.
+
+**What it does not guarantee:**
+
+- A job running under the same account at that moment can edit a runner's copy *after* it was read and
+  before or while it runs, and can edit the job workspaces, tool caches and dependency caches other jobs use,
+  or read their files. Nothing here isolates jobs on one account from each other. Use an isolated execution
+  policy (containers or VMs) for jobs you do not trust, or do not run them on a shared host.
+- A job running as root or an administrator (a boot-mode service on Linux and macOS runs as root and so do
+  its native runners, unless you configured otherwise; `sudo` in a step is the same) can change the daemon
+  itself, its memory, or GitHub's answer on the way in. No check by the daemon holds against that.
+- The check starts from GitHub's published digest, so it trusts GitHub, or an operator-pinned digest.
+- A persistent slot's retained `_work` is the job's own and is not checked.

