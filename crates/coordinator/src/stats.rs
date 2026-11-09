@@ -292,7 +292,13 @@ impl RunWorkflows {
 
     /// The runs to ask GitHub about, by repository and run id.
     pub fn take_wanted(&self) -> Vec<(String, u64)> {
-        lock(&self.known).wanted.drain(..).collect()
+        let mut known = lock(&self.known);
+        let wanted = std::mem::take(&mut known.wanted);
+        // A sweep may have listed one since it was asked about.
+        wanted
+            .into_iter()
+            .filter(|(_, run_id)| matches!(known.runs.get(run_id), Some(None)))
+            .collect()
     }
 }
 
@@ -677,44 +683,42 @@ fn figures_of(samples: &[&JobSample]) -> Option<JobFigures> {
 
 /// Per host in `samples`, its median duration over the usual one.
 fn ratios_of(samples: &[&JobSample]) -> BTreeMap<String, HostRatio> {
-    {
-        let mut by_host: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
-        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-        for sample in samples.iter().copied() {
-            *counts.entry(&sample.host_id).or_default() += 1;
-            by_host
-                .entry(&sample.host_id)
-                .or_default()
-                .extend(sample.duration_secs);
-        }
-        let medians: BTreeMap<&str, Option<u64>> = by_host
-            .iter()
-            .map(|(host, durations)| (*host, percentile(durations, 50)))
-            .collect();
-        let known: Vec<u64> = medians.values().flatten().copied().collect();
-        let usual = (!known.is_empty())
-            .then(|| known.iter().sum::<u64>() / u64::try_from(known.len()).unwrap_or(1));
-        counts
-            .into_iter()
-            .map(|(host, count)| {
-                let median = medians.get(host).copied().flatten();
-                let ratio = match (median, usual) {
-                    (Some(median), Some(usual)) if usual > 0 => {
-                        u32::try_from(median.saturating_mul(1000) / usual).ok()
-                    }
-                    _ => None,
-                };
-                (
-                    host.to_string(),
-                    HostRatio {
-                        ratio,
-                        samples: count,
-                        median_secs: median,
-                    },
-                )
-            })
-            .collect()
+    let mut by_host: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for sample in samples {
+        *counts.entry(&sample.host_id).or_default() += 1;
+        by_host
+            .entry(&sample.host_id)
+            .or_default()
+            .extend(sample.duration_secs);
     }
+    let medians: BTreeMap<&str, Option<u64>> = by_host
+        .iter()
+        .map(|(host, durations)| (*host, percentile(durations, 50)))
+        .collect();
+    let known: Vec<u64> = medians.values().flatten().copied().collect();
+    let usual = (!known.is_empty())
+        .then(|| known.iter().sum::<u64>() / u64::try_from(known.len()).unwrap_or(1));
+    counts
+        .into_iter()
+        .map(|(host, count)| {
+            let median = medians.get(host).copied().flatten();
+            let ratio = match (median, usual) {
+                (Some(median), Some(usual)) if usual > 0 => {
+                    u32::try_from(median.saturating_mul(1000) / usual).ok()
+                }
+                _ => None,
+            };
+            (
+                host.to_string(),
+                HostRatio {
+                    ratio,
+                    samples: count,
+                    median_secs: median,
+                },
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

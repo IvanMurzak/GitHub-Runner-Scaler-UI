@@ -386,15 +386,10 @@ impl Scenario {
                 // completed sign-in would have left.
                 let document = format!(r#"{{"access_token":"{}"}}"#, support::fixture_token());
                 let store = self.secret_store()?;
-                // One seed at a time in this process, and a transient refusal
-                // tried again: every scenario creates its own keychain, and
-                // once a full run under load failed here with macOS's `-676`,
-                // which a replay did not repeat. Sign-in is not what these
-                // scenarios test, and a store that keeps refusing still fails.
-                static SEEDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-                let _one_at_a_time = SEEDING
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A transient refusal is tried again: once a full run under load
+                // failed here with macOS's `-676`, which no replay repeated.
+                // Sign-in is not what these scenarios test, and a store that keeps
+                // refusing still fails.
                 let mut tries = 0;
                 loop {
                     tries += 1;

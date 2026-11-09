@@ -860,44 +860,19 @@ where
 /// A connection that stops sending fails the download: every copy of the
 /// package on this host waits for it. There is no limit on the whole transfer,
 /// because a large package on a slow line is legitimately slow; only silence
-/// fails it. What was written is removed by the caller, on every path out of the
-/// fetch, and it was never going to be taken for a package: an archive is only
-/// extracted once its digest matches.
+/// fails it, `reqwest`'s read timeout starting over with every read. What was
+/// written is removed by the caller, on every path out of the fetch, and it was
+/// never going to be taken for a package: an archive is only extracted once its
+/// digest matches.
 #[derive(Debug, Clone)]
 pub struct HttpFetcher {
     client: reqwest::Client,
-    stall_timeout: std::time::Duration,
 }
 
 impl HttpFetcher {
     #[must_use]
     pub fn new(client: reqwest::Client) -> Self {
-        Self {
-            client,
-            stall_timeout: DOWNLOAD_STALL_TIMEOUT,
-        }
-    }
-
-    /// How long the connection may go without sending anything.
-    #[must_use]
-    pub const fn with_stall_timeout(mut self, stall_timeout: std::time::Duration) -> Self {
-        self.stall_timeout = stall_timeout;
-        self
-    }
-
-    /// Fails with [`PackageError::Download`] if `step` is silent for too long.
-    async fn before_stall<T>(
-        &self,
-        step: impl std::future::Future<Output = T>,
-    ) -> Result<T, PackageError> {
-        tokio::time::timeout(self.stall_timeout, step)
-            .await
-            .map_err(|_| PackageError::Download {
-                detail: format!(
-                    "the connection sent nothing for {} seconds",
-                    self.stall_timeout.as_secs_f32()
-                ),
-            })
+        Self { client }
     }
 }
 
@@ -905,6 +880,7 @@ impl Default for HttpFetcher {
     fn default() -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+            .read_timeout(DOWNLOAD_STALL_TIMEOUT)
             .build()
             .unwrap_or_default();
         Self::new(client)
@@ -918,8 +894,10 @@ impl PackageFetcher for HttpFetcher {
         use tokio::io::AsyncWriteExt as _;
 
         let response = self
-            .before_stall(self.client.get(url).send())
-            .await?
+            .client
+            .get(url)
+            .send()
+            .await
             .and_then(reqwest::Response::error_for_status)
             .map_err(|error| PackageError::Download {
                 detail: error.to_string(),
@@ -935,7 +913,7 @@ impl PackageFetcher for HttpFetcher {
 
         let mut stream = response.bytes_stream();
         let mut written = 0_u64;
-        while let Some(chunk) = self.before_stall(stream.next()).await? {
+        while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| PackageError::Download {
                 detail: error.to_string(),
             })?;
@@ -4369,6 +4347,15 @@ mod tests {
 
     const STALL: std::time::Duration = std::time::Duration::from_millis(300);
 
+    fn impatient_fetcher() -> HttpFetcher {
+        HttpFetcher::new(
+            reqwest::Client::builder()
+                .read_timeout(STALL)
+                .build()
+                .expect("a client"),
+        )
+    }
+
     #[tokio::test]
     async fn a_download_that_goes_silent_fails_rather_than_waits() {
         use tokio::io::AsyncWriteExt as _;
@@ -4384,8 +4371,7 @@ mod tests {
         )
         .await;
 
-        let error = HttpFetcher::default()
-            .with_stall_timeout(STALL)
+        let error = impatient_fetcher()
             .fetch(&url, &dir.path().join("archive"))
             .await
             .unwrap_err();
@@ -4400,8 +4386,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/package.tar.gz", listener.local_addr().unwrap());
 
-        let error = HttpFetcher::default()
-            .with_stall_timeout(STALL)
+        let error = impatient_fetcher()
             .fetch(&url, &dir.path().join("archive"))
             .await
             .unwrap_err();
@@ -4430,8 +4415,7 @@ mod tests {
         .await;
         let destination = dir.path().join("archive");
 
-        let written = HttpFetcher::default()
-            .with_stall_timeout(STALL)
+        let written = impatient_fetcher()
             .fetch(&url, &destination)
             .await
             .expect("slow is not stalled");

@@ -3427,22 +3427,20 @@ impl LifecycleLauncher {
         // every attempt read here that a bring-up may write to is known to be
         // one: it has no process yet and no registration, which this pass would
         // read as a runner gone, and what was read of it is out of date at once.
-        let (attempts, bringing_up) = {
+        let attempts = {
             let bringing_up = self
                 .bringing_up
                 .lock()
                 .map_err(|_| LifecycleError::Journal)?;
-            let attempts = self
+            let mut attempts = self
                 .ports
                 .store
                 .attempts_for_policy(policy.id)
                 .map_err(|_| LifecycleError::Journal)?;
-            (attempts, bringing_up.clone())
+            attempts.retain(|attempt| !bringing_up.contains(&attempt.id));
+            attempts
         };
         for attempt in attempts {
-            if bringing_up.contains(&attempt.id) {
-                continue;
-            }
             authorize(self.host_id, policy, &attempt).map_err(|_| LifecycleError::Journal)?;
             if let ReconcileProgress::Replacement { attempt, operation } =
                 self.reconcile_one(policy, attempt).await?

@@ -2415,8 +2415,7 @@ pub struct ReservationWaits {
 struct Reserved {
     policy: ScalePolicy,
     attempt: RunnerAttempt,
-    order_wait: Duration,
-    lock_wait: Duration,
+    waits: ReservationWaits,
     reserved_at: std::time::Instant,
     /// Let go when this runner is up or has failed.
     _hold: LaunchHold,
@@ -2790,6 +2789,7 @@ impl Reconciler {
     /// Starts the runners of `policies`' coordinator launches, and nothing
     /// else: no GitHub poll, no supervision. Every launch open at that moment is
     /// served by one call. See [`Self::serve_launches`].
+    #[cfg(test)]
     pub async fn start_directed(&self, policies: &[ScalePolicy]) -> ReconcileReport {
         let mut report = ReconcileReport::default();
         let reserved = self.reserve_open_launches(policies, &mut report).await;
@@ -2903,11 +2903,10 @@ impl Reconciler {
             })
             .collect();
         loop {
-            let Some(&policy) = candidates.iter().min_by_key(|policy| {
-                self.director
-                    .next_waiting(policy)
-                    .map_or(u64::MAX, |next| next)
-            }) else {
+            let Some(&policy) = candidates
+                .iter()
+                .min_by_key(|policy| self.director.next_waiting(policy).unwrap_or(u64::MAX))
+            else {
                 return reserved;
             };
             let before = reserved.len();
@@ -3355,8 +3354,10 @@ impl Reconciler {
                     reserved.push(Reserved {
                         policy: policy.clone(),
                         attempt,
-                        order_wait,
-                        lock_wait,
+                        waits: ReservationWaits {
+                            order: order_wait,
+                            lock: lock_wait,
+                        },
                         reserved_at: std::time::Instant::now(),
                         _hold: hold,
                     });
@@ -3422,10 +3423,8 @@ impl Reconciler {
     /// One reserved runner, up or failed: whether it is up.
     async fn bring_up(&self, reserved: Reserved) -> bool {
         let id = reserved.attempt.id;
-        let waits = ReservationWaits {
-            order: reserved.order_wait,
-            lock: reserved.lock_wait + reserved.reserved_at.elapsed(),
-        };
+        let mut waits = reserved.waits;
+        waits.lock += reserved.reserved_at.elapsed();
         let result = self
             .launcher
             .finish_launch(&reserved.policy, reserved.attempt, waits)

@@ -195,7 +195,6 @@ impl Book {
         now: Instant,
     ) {
         let mut released = Vec::new();
-        let mut orders = self.orders;
         for open in self.open.values_mut() {
             let Some(attempt) = open.attempt else {
                 continue;
@@ -214,8 +213,8 @@ impl Book {
                 {
                     open.attempt = None;
                     open.accepted_at = now;
-                    orders += 1;
-                    open.order = orders;
+                    self.orders += 1;
+                    open.order = self.orders;
                     open.blocked_since = None;
                     open.passed_over = false;
                     released.push(attempt);
@@ -225,7 +224,6 @@ impl Book {
                 _ => open.expires = now,
             }
         }
-        self.orders = orders;
         self.open.retain(|_, open| open.expires > now);
         for attempt in released {
             self.leased.remove(&attempt);

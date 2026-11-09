@@ -52,6 +52,9 @@ struct Meter {
     peak_rss: u64,
     peak_millicores: u32,
     samples: u32,
+    /// When its runner process was first seen gone, for the log line that says
+    /// how long its slot took to free.
+    gone_at: Option<Instant>,
 }
 
 /// CPU time over wall time, in thousandths of a CPU.
@@ -86,9 +89,6 @@ pub struct AttemptMeters {
     /// pass cannot conclude yet (GitHub unreachable) does not pull every poll
     /// forward, and one misread process table does not silence it for good.
     exited: Mutex<HashMap<AttemptId, Instant>>,
-    /// When each attempt's runner process was first seen gone, for the log line
-    /// that says how long its slot took to free.
-    first_seen_gone: Mutex<HashMap<AttemptId, Instant>>,
 }
 
 impl AttemptMeters {
@@ -109,6 +109,7 @@ impl AttemptMeters {
             peak_rss: 0,
             peak_millicores: 0,
             samples: 0,
+            gone_at: None,
         });
         // A descendant that exited took its CPU time out of the total: only
         // increases count, from wherever the total now stands.
@@ -121,16 +122,14 @@ impl AttemptMeters {
         meter.last_cpu = usage.cpu_time;
         meter.peak_rss = meter.peak_rss.max(usage.rss_bytes);
         meter.samples = meter.samples.saturating_add(1);
+        meter.gone_at = None;
     }
 
-    /// How long ago `attempt`'s runner was first seen gone, once. Up to
+    /// How long ago `attempt`'s runner was first seen gone. Up to
     /// [`SAMPLE_EVERY`] less than since it exited.
     pub fn since_seen_gone(&self, attempt: AttemptId, now: Instant) -> Option<Duration> {
-        self.first_seen_gone
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&attempt)
-            .map(|at| now.saturating_duration_since(at))
+        let gone_at = self.lock().get(&attempt)?.gone_at?;
+        Some(now.saturating_duration_since(gone_at))
     }
 
     /// What `attempt` used, once: the meter is gone afterwards.
@@ -179,11 +178,9 @@ impl AttemptMeters {
         seen.retain(|attempt, _| live.contains(attempt));
         for (attempt, pid, target) in roots {
             let Some(usage) = trees.get(&pid) else {
-                self.first_seen_gone
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .entry(attempt)
-                    .or_insert(now);
+                if let Some(meter) = self.lock().get_mut(&attempt) {
+                    meter.gone_at.get_or_insert(now);
+                }
                 let due = seen
                     .get(&attempt)
                     .is_none_or(|at| now.saturating_duration_since(*at) >= ANNOUNCE_AGAIN);
@@ -195,20 +192,9 @@ impl AttemptMeters {
                 continue;
             };
             seen.remove(&attempt);
-            self.first_seen_gone
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&attempt);
             self.record(attempt, now, *usage);
         }
         drop(seen);
-        self.first_seen_gone
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|attempt, at| {
-                live.contains(attempt)
-                    || now.saturating_duration_since(*at) < KEEP_AFTER_LAST_SAMPLE
-            });
         self.forget_stale(&live, now);
         exited
     }
@@ -295,7 +281,6 @@ mod tests {
 
         assert_eq!(announced, vec![policy.target.clone()]);
         assert!(meters.since_seen_gone(attempt.id, Instant::now()).is_some());
-        assert_eq!(meters.since_seen_gone(attempt.id, Instant::now()), None);
     }
 
     fn tree(rss: u64, cpu_ms: u64) -> TreeUsage {

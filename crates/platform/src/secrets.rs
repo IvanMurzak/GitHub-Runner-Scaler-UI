@@ -2333,15 +2333,25 @@ mod sys {
         }
     }
 
-    /// Suppresses keychain UI for as long as the returned guard lives.
+    /// Suppresses keychain UI for as long as the returned guards live, and keeps
+    /// this process's other keychain operations out meanwhile.
+    ///
+    /// The setting is process-wide, so without that one thread's guard would
+    /// turn the interaction back on under another thread's operation.
     ///
     /// Best effort: a platform that refuses the call is not a reason to fail
     /// the operation, only a reason not to have the guarantee. The guard
     /// re-enables interaction on drop, so this never leaks process-wide state
     /// past the call that took it.
-    fn without_user_interaction()
-    -> Option<security_framework::os::macos::keychain::KeychainUserInteractionLock> {
-        SecKeychain::disable_user_interaction().ok()
+    fn without_user_interaction() -> (
+        std::sync::MutexGuard<'static, ()>,
+        Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
+    ) {
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let turn = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (turn, SecKeychain::disable_user_interaction().ok())
     }
 
     /// Opens the keychain, creating a rooted one if asked and if it is missing.
