@@ -828,8 +828,8 @@ where
 /// Streams the package with `reqwest`, one chunk at a time.
 ///
 /// The `stream` feature exists in this workspace for exactly this: the package
-/// is 150-300 MB, and buffering it in memory on a home host is not an option —
-/// nor would it leave a partial file on disk for the mismatch path to remove.
+/// is 150-300 MB, and nothing else should sit in memory while a connection may
+/// take minutes. Verifying it reads it in once, for seconds.
 ///
 /// A connection that stops sending fails the download: every copy of the
 /// package on this host waits for it. There is no limit on the whole transfer,
@@ -1875,14 +1875,8 @@ impl PackageCache {
             installed_at: now,
             filename: download.filename.clone(),
         };
-        let manifest_path = extracted.join(MANIFEST_FILE);
-        write_json(&manifest_path, &manifest)?;
-        // Read back rather than trusted: a copy of this tree holds this file too.
-        let written = fs::read(&manifest_path).map_err(|source| PackageError::Io {
-            what: "read back the runner package manifest",
-            path: manifest_path.clone(),
-            source,
-        })?;
+        // A copy of this tree holds this file too.
+        let written = write_json(&extracted.join(MANIFEST_FILE), &manifest)?;
         contents.add_file(Path::new(MANIFEST_FILE), &written);
 
         let target = self.version_dir(version);
@@ -1894,7 +1888,7 @@ impl PackageCache {
         // commit over.
         let displace =
             fs::symlink_metadata(&target).is_ok() && (force || self.entry(version)?.is_none());
-        let _displaced = if displace {
+        let displaced = if displace {
             Some(self.set_aside(&target)?)
         } else {
             None
@@ -1904,7 +1898,11 @@ impl PackageCache {
         // Windows and replaces nothing on Unix, and either way the answer is the
         // same: someone already installed this version, and an installed entry
         // is never overwritten. A forced install adopts nothing and fails.
-        match fs::rename(&extracted, &target) {
+        let committed = fs::rename(&extracted, &target);
+        // Removing a tree is blocking work, kept off the daemon's current-thread
+        // runtime, and what a job left in this one is not to be waited for.
+        tokio::task::spawn_blocking(move || drop(displaced));
+        match committed {
             Ok(()) => {}
             Err(source) => {
                 if !force && let Some(entry) = self.entry(version)? {
@@ -2013,7 +2011,10 @@ impl PackageCache {
         if !root.is_dir() {
             return Ok(None);
         }
-        let Some(manifest) = read_json::<Manifest>(&root.join(MANIFEST_FILE))? else {
+        // Whatever keeps it from being read, a directory in its place included: a
+        // job can do that, and an error here would stop every launch on this host,
+        // through every restart, before any install could replace it.
+        let Ok(Some(manifest)) = read_json::<Manifest>(&root.join(MANIFEST_FILE)) else {
             return Ok(None);
         };
         if manifest.version != *version {
@@ -2131,7 +2132,8 @@ impl PackageCache {
             &Lease {
                 version: version.clone(),
             },
-        )
+        )?;
+        Ok(())
     }
 
     /// Drop `attempt`'s hold, whatever it was holding.
@@ -2296,7 +2298,7 @@ impl PackageCache {
         }
 
         let dir = self.version_dir(version);
-        remove_dir_all::remove_dir_all(&dir).map_err(|source| PackageError::Io {
+        remove_tree(&dir).map_err(|source| PackageError::Io {
             what: "remove a cached runner package",
             path: dir,
             source,
@@ -2341,7 +2343,7 @@ impl PackageCache {
             // Both shapes live here: `download-<uuid>.archive` files and
             // `<uuid>/` extraction directories.
             let removed = if path.is_dir() {
-                remove_dir_all::remove_dir_all(&path).is_ok()
+                remove_tree(&path).is_ok()
             } else {
                 fs::remove_file(&path).is_ok()
             };
@@ -2373,7 +2375,7 @@ impl StagingGuard {
     /// ordinary litter and is removed on the spot rather than on unwind.
     fn disarm_into_sweep(mut self) {
         if let Some(dir) = self.dir.take() {
-            let _ = remove_dir_all::remove_dir_all(dir);
+            let _ = remove_tree(dir);
         }
     }
 }
@@ -2381,8 +2383,22 @@ impl StagingGuard {
 impl Drop for StagingGuard {
     fn drop(&mut self) {
         if let Some(dir) = self.dir.take() {
-            let _ = remove_dir_all::remove_dir_all(dir);
+            let _ = remove_tree(dir);
         }
+    }
+}
+
+/// Removes a tree a job may have written to. On Unix the standard library's
+/// remover unlinks what is not a directory without opening it; opening a FIFO, as
+/// the `remove_dir_all` crate does there, would wait for ever.
+fn remove_tree(path: impl AsRef<Path>) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::remove_dir_all(path)
+    }
+    #[cfg(not(unix))]
+    {
+        remove_dir_all::remove_dir_all(path)
     }
 }
 
@@ -2797,15 +2813,16 @@ fn create_dir_all(path: &Path) -> Result<(), PackageError> {
     })
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PackageError> {
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<Vec<u8>, PackageError> {
     let encoded = serde_json::to_vec_pretty(value).map_err(|error| PackageError::Extract {
         detail: format!("the package manifest could not be encoded: {error}"),
     })?;
-    fs::write(path, encoded).map_err(|source| PackageError::Io {
+    fs::write(path, &encoded).map_err(|source| PackageError::Io {
         what: "write a runner package cache file",
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    Ok(encoded)
 }
 
 /// Which attempt one lease file records as holding `version`, if any.
@@ -2859,7 +2876,12 @@ fn holder_of(path: &Path, version: &RunnerVersion) -> Result<Option<AttemptId>, 
 /// [`PackageError::UnreadableLease`] when the file exists and does not parse,
 /// [`PackageError::Io`] when it cannot be read at all.
 fn read_lease(path: &Path) -> Result<Option<Lease>, PackageError> {
-    let bytes = match fs::read(path) {
+    // Not a plain read: a job could leave a FIFO here, which would wait for ever.
+    let read = open_regular(path).and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let bytes = match read {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
@@ -2884,7 +2906,12 @@ fn read_lease(path: &Path) -> Result<Option<Lease>, PackageError> {
 /// installed — and a cache that refuses to answer at all because one directory
 /// is damaged is worse than one that ignores it.
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, PackageError> {
-    let bytes = match fs::read(path) {
+    // Not a plain read: a job could leave a FIFO here, which would wait for ever.
+    let read = open_regular(path).and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let bytes = match read {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
@@ -4942,6 +4969,23 @@ mod tests {
                 let held = fs::read_to_string(&manifest).unwrap();
                 fs::write(manifest, held.replace("2.330.0", "2.331.0")).unwrap();
             },
+            |root: &Path| {
+                let manifest = root.join(MANIFEST_FILE);
+                fs::remove_file(&manifest).unwrap();
+                fs::create_dir(manifest).unwrap();
+            },
+            #[cfg(unix)]
+            |root: &Path| {
+                let manifest = root.join(MANIFEST_FILE);
+                fs::remove_file(&manifest).unwrap();
+                assert!(
+                    std::process::Command::new("mkfifo")
+                        .arg(&manifest)
+                        .status()
+                        .expect("mkfifo runs")
+                        .success()
+                );
+            },
         ] {
             let (harness, _, _) = linux_fixture();
             let (one, _two, _shared) = two_targets(&harness);
@@ -4958,6 +5002,48 @@ mod tests {
             assert_eq!(harness.fetcher.count(), 2);
             assert!(second.runtime_path().join("run.sh").exists());
         }
+    }
+
+    /// A FIFO left in a broken entry must not stop the daemon: removing the tree
+    /// must not open it, and must not run on the async thread.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_in_a_broken_entry_holds_nothing_up() {
+        use crate::lifecycle::{PackageTimings, RuntimePackages as _};
+
+        let (harness, _, _) = linux_fixture();
+        let (one, _two, _shared) = two_targets(&harness);
+        one.materialize(&reserved(&harness, 1), &mut PackageTimings::default())
+            .await
+            .expect("clean");
+        let root = harness.cache().installed().unwrap().remove(0);
+        fs::remove_file(root.root().join(MANIFEST_FILE)).unwrap();
+        let fifo = root.root().join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo runs")
+                .success()
+        );
+
+        let second = reserved(&harness, 2);
+        let mut timings = PackageTimings::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            one.materialize(&second, &mut timings),
+        )
+        .await
+        .expect("it does not wait on the FIFO")
+        .expect("prepared again");
+        let staging = harness.cache().staging_root();
+        for _ in 0..500 {
+            if fs::read_dir(&staging).map_or(0, Iterator::count) == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the broken tree was not removed");
     }
 
     /// A package as GitHub really shapes it: `./` entries, explicit directories,

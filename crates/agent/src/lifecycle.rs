@@ -655,15 +655,13 @@ impl SharedPackages {
         contents: &Arc<PackageContents>,
         reason: &'static str,
     ) {
-        let current = self.trusted.contents_of(root);
-        if current.is_some_and(|current| Arc::ptr_eq(&current, contents)) {
+        if self.trusted.forget_if_holding(root, contents) {
             tracing::warn!(
                 event = "package_verify_failed",
                 reason,
                 "a shared runner package does not match its verified archive; it is discarded \
                  and prepared again"
             );
-            self.trusted.forget(root);
             self.trusted.forget(origin);
         }
     }
@@ -840,6 +838,15 @@ impl CachedRuntimePackages {
             )
             .await?;
         if fresh && !downloaded {
+            // After a restart there is simply no record. With one, this is an edit.
+            if self.shared.trusted.contents_of(installed.root()).is_some() {
+                tracing::warn!(
+                    event = "package_verify_failed",
+                    reason = "changed",
+                    "a shared runner package changed since it was prepared; it is discarded and \
+                     prepared again"
+                );
+            }
             installed = timed(&mut timings.install, self.cache.reinstall())
                 .await
                 .map_err(package_failure)?;
@@ -967,8 +974,8 @@ impl RuntimePackages for CachedRuntimePackages {
                 event = "package_copy_differs",
                 attempt_id = %attempt.id,
                 reason = mismatch.as_str(),
-                "a runner's package copy does not match the package's verified archive; it was \
-                 removed and not used"
+                "a runner's package copy does not match the package's verified archive; it is \
+                 being removed and will not be used"
             );
             self.reject_copy(attempt, installed.root(), &copied_from, &contents, timings)
                 .await?;
@@ -1963,6 +1970,20 @@ impl TrustedTrees {
         };
         self.trees().insert(root.to_path_buf(), tree);
         Ok(())
+    }
+
+    /// Stops trusting `root` if `contents` is still what is recorded for it, and
+    /// answers whether it did.
+    fn forget_if_holding(&self, root: &Path, contents: &Arc<PackageContents>) -> bool {
+        let mut trees = self.trees();
+        let holding = trees
+            .get(root)
+            .and_then(|tree| tree.contents.as_ref())
+            .is_some_and(|current| Arc::ptr_eq(current, contents));
+        if holding {
+            trees.remove(root);
+        }
+        holding
     }
 
     /// Stop trusting `root`: its next use rebuilds it.

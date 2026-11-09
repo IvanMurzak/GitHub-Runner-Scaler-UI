@@ -652,16 +652,24 @@ A copy that differs, by contents, size, a missing entry or an added one, is remo
 `package_copy_differs` in the host log gives `reason` (`modified`, `missing`, `unexpected`, `unreadable`). The
 shared package is then read too, as it is when a copy fails outright. If it differs, it is no longer
 trusted (`package_verify_failed`), and the next attempt, the launch's own retry or a later launch, downloads
-it afresh. If it is clean, nothing is downloaded: the copy's disk or another job was at fault. Each daemon start
-has no record, so the first launch after one downloads the package, on Windows as on Linux and macOS (Windows
-from 0.4.50).
+it afresh. If it reads clean, it is kept: the copy's disk or another job was at fault. A change that only moved
+the shared tree's `ctime` still costs a download on Linux and macOS (`reason=changed`). Each daemon start has no
+record, so the first launch after one downloads the package, on Windows as on Linux and macOS (Windows from
+0.4.50). There, a process with a handle or its working directory inside the old tree can fail that launch until
+it exits, since the tree is replaced by renaming it.
 
-**What this guarantees:** a runner starts only from a copy that matched the digest-verified archive at the
-moment it was read, by the entries' contents, sizes, kinds and names. An edit a job made to the shared
-package does not reach a later job's runner.
+**What this guarantees:** against a job that can edit the shared package but not the daemon, a runner starts
+only from a copy that matched the digest-verified archive at the moment it was read, by the entries' contents,
+sizes, kinds and names, and an edit to the shared package does not reach a later job's runner. It catches
+what a job did by mistake, or left behind for later, where nothing else would.
 
 **What it does not guarantee:**
 
+- A native job runs under the daemon's own account, so it can usually reach the daemon too: replace its binary,
+  or its configuration, or read its memory where the OS allows. Then no check by the daemon holds. On a
+  boot-mode host that account is root on Linux and macOS and LocalSystem on Windows, so this is certain there.
+  Use an isolated execution policy (containers or VMs) for jobs you do not trust, or do not run them on a shared
+  host. The same goes for `sudo` in a step.
 - A job running under the same account at that moment can edit a runner's copy *after* it was read and
   before or while it runs, and can edit the workspaces, tool caches and dependency caches other jobs use,
   or read their files. Nothing here isolates jobs on one account from each other. Use an isolated execution
@@ -670,7 +678,8 @@ package does not reach a later job's runner.
   with it, so a job on such a host can change the daemon itself, its memory, or what it downloads. No check by
   the daemon holds against that: this protects a host in practice only when jobs run under an account that
   cannot reach the daemon's process, which means an isolated execution policy. The same goes for `sudo` in a step.
-- Extended attributes, NTFS alternate streams, ACLs and times are not compared.
-- The check starts from GitHub's published digest, so it trusts GitHub, or an operator-pinned digest.
+- Extended attributes, NTFS alternate streams, ACLs, owners, times and mode bits other than a file being
+  executable are not compared.
+- The check starts from GitHub's published digest, so it trusts GitHub.
 - A persistent slot's retained `_work` is the job's own and is not checked.
 
