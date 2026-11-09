@@ -1242,6 +1242,7 @@ fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
         unfit: ports.unfit.load(Ordering::Relaxed),
         draining: ports.draining.load(Ordering::Relaxed),
         open_leases,
+        disk_free_bytes: runner_manager_platform::host_fitness::free_disk_bytes(&ports.runner_root),
     }
 }
 

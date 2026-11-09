@@ -1294,7 +1294,7 @@ pub enum RepoProfileCommand {
     RemoveLabel(RepoProfileLabelArgs),
     SetWorkspace(RepoProfileWorkspaceArgs),
     SetExecution(RepoProfileExecutionArgs),
-    /// Answer this host's coordinator pool label (rm-pool-<os>).
+    /// Answer this host's rm-pool-<os> label, or rm-pool-any with --any.
     SetPool(RepoProfilePoolArgs),
     Remove(RepoProfileRemoveArgs),
 }
@@ -1408,6 +1408,10 @@ pub struct RepoProfilePoolArgs {
     pub selection: RepoProfileSelectArgs,
     #[arg(long, value_enum)]
     pub pool: PoolSwitch,
+    /// The OS-agnostic pool rm-pool-any instead of this host's OS pool: a job
+    /// `runs-on: rm-pool-any` may run on a host of any operating system.
+    #[arg(long)]
+    pub any: bool,
 }
 
 /// `--pool on|off`.
@@ -1576,7 +1580,7 @@ pub enum OrgCommand {
     AddLabel(OrgLabelArgs),
     /// Stop answering a label. The derived host label cannot be removed.
     RemoveLabel(OrgLabelArgs),
-    /// Answer this host's coordinator pool label (rm-pool-<os>).
+    /// Answer this host's rm-pool-<os> label, or rm-pool-any with --any.
     SetPool(OrgPoolArgs),
     /// Remove a policy, optionally with its cache and diagnostics.
     Remove(OrgRemoveArgs),
@@ -1616,6 +1620,9 @@ pub struct OrgPoolArgs {
     pub organization: String,
     #[arg(long, value_enum)]
     pub pool: PoolSwitch,
+    /// The OS-agnostic pool rm-pool-any instead of this host's OS pool.
+    #[arg(long)]
+    pub any: bool,
 }
 
 #[derive(Debug, Args)]

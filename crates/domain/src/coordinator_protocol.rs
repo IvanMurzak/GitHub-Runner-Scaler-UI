@@ -249,6 +249,11 @@ pub struct Heartbeat {
     /// `None` from an older host, which is then trusted as before.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_leases: Option<Vec<String>>,
+    /// From 0.4.52: free space on the runner root's volume, measured at every
+    /// heartbeat (the `hello` one is measured once, at connect). `None` from
+    /// an older host, or when it cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_free_bytes: Option<u64>,
 }
 
 /// The most lease ids a heartbeat names.
@@ -302,6 +307,12 @@ pub struct HelloAck {
     pub reconcile_interval_secs: Option<u32>,
     /// The host's targets the sweep reads, as the host named them.
     pub covered: Vec<TargetRef>,
+    /// From 0.4.52: this coordinator places `rm-pool-any` jobs. A host
+    /// directs a profile carrying that label by launches only when it is
+    /// set; an older coordinator wakes hosts for such a job instead, and the
+    /// profile then counts its own demand.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub any_pool: bool,
 }
 
 impl HelloAck {
@@ -561,6 +572,28 @@ impl StatsReport {
         let live = self
             .live_at
             .map(|at| u64::try_from(self.generated_at.saturating_sub(at)).unwrap_or(0));
+        if !self.connected.is_empty() {
+            writeln!(out, "\nConnected hosts{}:", as_of(live))?;
+            for host in &self.connected {
+                writeln!(
+                    out,
+                    "  {:<24} {:<8} {:>3} cores  cpu {:>4}  ram free {:<10} disk free {:<10} slots {} free {} busy{}",
+                    printable(&host.host_id),
+                    printable(&host.os),
+                    host.cores,
+                    percent(host.cpu_load_percent),
+                    bytes(host.free_ram_bytes),
+                    bytes(host.disk_free_bytes),
+                    host.free_slots,
+                    host.busy_slots,
+                    match (host.unfit, host.draining) {
+                        (true, _) => "  unfit",
+                        (false, true) => "  draining",
+                        (false, false) => "",
+                    }
+                )?;
+            }
+        }
         if !self.pending.is_empty() {
             writeln!(out, "\nPool queues waiting for a runner{}:", as_of(live))?;
             for queue in &self.pending {
@@ -617,15 +650,25 @@ impl StatsReport {
                 for score in &decision.scores {
                     writeln!(
                         out,
-                        "      {:<24} {:<8} free after {:<10} cache {} headroom {} speed {} bigfit -{} = {}",
+                        "      {:<24} {:<8} free after {:<10} cache {} headroom {} speed {} cpu {} bigfit -{} = {}  (cpu {}, disk free {}){}",
                         printable(&score.host_id),
                         if score.fits { "fits" } else { "too full" },
                         bytes(score.free_after_bytes),
                         points(score.cache),
                         points(score.headroom),
                         points(score.speed),
+                        points(score.cpu),
                         points(score.bigfit),
-                        points(score.total)
+                        points(score.total),
+                        percent(score.cpu_load_percent),
+                        bytes(score.disk_free_bytes),
+                        score
+                            .last_resort
+                            .as_deref()
+                            .map_or_else(String::new, |why| format!(
+                                "  last resort: {}",
+                                printable(why).replace('_', " ")
+                            ))
                     )?;
                 }
             }
@@ -677,6 +720,10 @@ fn duration(secs: Option<u64>) -> String {
             }
         },
     )
+}
+
+fn percent(value: Option<u32>) -> String {
+    value.map_or_else(|| "-".into(), |value| format!("{value}%"))
 }
 
 fn points(thousandths: i64) -> String {
@@ -743,8 +790,9 @@ pub enum SessionPurpose {
 /// Version of the `stats --json` document, on a host and on the coordinator.
 /// 2 (0.4.47): `p50_duration_secs` is the job's own run time by GitHub's
 /// webhooks, and the queue wait percentiles are added. 3: `pending` pool
-/// queues and open `leases`.
-pub const STATS_JSON_SCHEMA_VERSION: u32 = 3;
+/// queues and open `leases`. 4 (0.4.52): `connected` hosts, and the scores'
+/// `cpu`, `cpu_load_percent`, `disk_free_bytes` and `last_resort`.
+pub const STATS_JSON_SCHEMA_VERSION: u32 = 4;
 
 /// The coordinator's job weight statistics, as `stats` prints them.
 ///
@@ -776,6 +824,9 @@ pub struct StatsReport {
     pub hosts: Vec<HostStats>,
     /// The last placement decisions, newest first.
     pub decisions: Vec<PlacementDecision>,
+    /// The hosts connected now and their last heartbeat. Absent from a
+    /// coordinator older than 0.4.52.
+    pub connected: Vec<ConnectedHostStats>,
     /// Pool queues with fewer runners on their way than jobs queued, and why
     /// the rest are not placed. Absent from a coordinator older than 0.4.47.
     pub pending: Vec<PendingQueue>,
@@ -785,6 +836,36 @@ pub struct StatsReport {
     /// live state, or for the admin CLI the copy the server last saved
     /// (within a minute).
     pub live_at: Option<i64>,
+}
+
+/// One connected host and its last load report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectedHostStats {
+    pub host_id: String,
+    pub os: String,
+    pub cores: u32,
+    pub ram_bytes: Option<u64>,
+    pub free_slots: u32,
+    pub busy_slots: u32,
+    pub cpu_load_percent: Option<u32>,
+    pub free_ram_bytes: Option<u64>,
+    /// The heartbeat's figure, else the `hello`'s.
+    pub disk_free_bytes: Option<u64>,
+    pub unfit: bool,
+    pub draining: bool,
+}
+
+impl ConnectedHostStats {
+    /// `cpu 40%, disk free 12.3 GiB`, as `hosts list` prints it.
+    #[must_use]
+    pub fn load_text(&self) -> String {
+        format!(
+            "cpu {}, disk free {}",
+            percent(self.cpu_load_percent),
+            bytes(self.disk_free_bytes)
+        )
+    }
 }
 
 /// A pool queue (repository and labels) short of runners.
@@ -894,6 +975,13 @@ pub struct HostScore {
     pub headroom: i64,
     pub speed: i64,
     pub bigfit: i64,
+    /// From 0.4.52: the share of the contenders' most idle cores this host has
+    /// idle, weighted.
+    pub cpu: i64,
+    pub cpu_load_percent: Option<u32>,
+    pub disk_free_bytes: Option<u64>,
+    /// `cpu_busy` or `low_disk`: tried only after every other host that fits.
+    pub last_resort: Option<String>,
     pub total: i64,
 }
 
@@ -1254,6 +1342,7 @@ mod tests {
                 unfit: false,
                 draining: true,
                 open_leases: Some(vec!["l1".into()]),
+                disk_free_bytes: Some(20 << 30),
             }),
         ];
         let attempts = [
@@ -1305,6 +1394,7 @@ mod tests {
                     scope: TargetScope::Repo,
                     name: "octo/app".into(),
                 }],
+                any_pool: true,
             }),
             ServerMessage::Welcome {
                 protocol_version: PROTOCOL_VERSION,
@@ -1381,8 +1471,25 @@ mod tests {
                         headroom: 1750,
                         speed: 0,
                         bigfit: 0,
-                        total: 1750,
+                        cpu: 500,
+                        cpu_load_percent: Some(50),
+                        disk_free_bytes: Some(8 << 30),
+                        last_resort: Some("low_disk".into()),
+                        total: 2250,
                     }],
+                }],
+                connected: vec![ConnectedHostStats {
+                    host_id: "h1".into(),
+                    os: "linux".into(),
+                    cores: 16,
+                    ram_bytes: Some(64 << 30),
+                    free_slots: 1,
+                    busy_slots: 1,
+                    cpu_load_percent: Some(50),
+                    free_ram_bytes: Some(32 << 30),
+                    disk_free_bytes: Some(8 << 30),
+                    unfit: false,
+                    draining: false,
                 }],
                 pending: vec![PendingQueue {
                     repository: "octo/app".into(),
@@ -1428,6 +1535,68 @@ mod tests {
             listed.ends_with(r#""draining":false,"open_leases":["l1"]}"#),
             "{listed}"
         );
+    }
+
+    #[test]
+    fn a_connected_hosts_load_reads_in_percent_and_bytes() {
+        let host = ConnectedHostStats {
+            cpu_load_percent: Some(40),
+            disk_free_bytes: Some((12 << 30) + (3 << 30) / 10 + 1),
+            ..ConnectedHostStats::default()
+        };
+        assert_eq!(host.load_text(), "cpu 40%, disk free 12.3 GiB");
+        assert_eq!(
+            ConnectedHostStats::default().load_text(),
+            "cpu -, disk free -"
+        );
+    }
+
+    #[test]
+    fn an_older_peer_without_disk_or_the_any_pool_still_decodes() {
+        // A heartbeat from a host older than 0.4.52: no disk figure.
+        let older = r#"{"type":"heartbeat","free_slots":2,"busy_slots":0,"cpu_load_percent":10,"free_ram_bytes":null,"unfit":false,"draining":false}"#;
+        assert!(matches!(
+            HostMessage::decode(older),
+            Ok(HostMessage::Heartbeat(Heartbeat {
+                free_slots: 2,
+                disk_free_bytes: None,
+                ..
+            }))
+        ));
+        let measured = HostMessage::Heartbeat(Heartbeat {
+            disk_free_bytes: Some(7),
+            ..Heartbeat::default()
+        })
+        .encode();
+        assert!(measured.ends_with(r#","disk_free_bytes":7}"#), "{measured}");
+        // A `hello_ack` from a coordinator older than 0.4.52: it does not
+        // place `rm-pool-any`, and this build's says so only when it does.
+        let older = r#"{"type":"hello_ack","reconcile_interval_secs":120,"covered":[]}"#;
+        assert!(matches!(
+            ServerMessage::decode(older),
+            Ok(ServerMessage::HelloAck(HelloAck {
+                any_pool: false,
+                ..
+            }))
+        ));
+        assert!(
+            !ServerMessage::HelloAck(HelloAck::default())
+                .encode()
+                .contains("any_pool")
+        );
+        assert!(
+            ServerMessage::HelloAck(HelloAck {
+                any_pool: true,
+                ..HelloAck::default()
+            })
+            .encode()
+            .contains(r#""any_pool":true"#)
+        );
+        // A report from an older coordinator: no connected hosts.
+        assert!(matches!(
+            ServerMessage::decode(r#"{"type":"stats","launches":1}"#),
+            Ok(ServerMessage::Stats(StatsReport { launches: 1, ref connected, .. })) if connected.is_empty()
+        ));
     }
 
     #[test]
@@ -1597,10 +1766,26 @@ mod tests {
                 scores: vec![HostScore {
                     host_id: "h1".into(),
                     fits: true,
+                    cpu: 750,
+                    cpu_load_percent: Some(95),
+                    disk_free_bytes: Some(40 << 30),
+                    last_resort: Some("cpu_busy".into()),
                     total: -1250,
                     ..HostScore::default()
                 }],
                 ..PlacementDecision::default()
+            }],
+            connected: vec![ConnectedHostStats {
+                host_id: "h1".into(),
+                os: "macos".into(),
+                cores: 8,
+                cpu_load_percent: Some(12),
+                free_ram_bytes: Some(4 << 30),
+                disk_free_bytes: Some(9 << 30),
+                free_slots: 1,
+                busy_slots: 1,
+                draining: true,
+                ..ConnectedHostStats::default()
             }],
             ..StatsReport::default()
         };
@@ -1614,7 +1799,9 @@ mod tests {
             "linux (h1)",
             "0.91x the usual time",
             "needs 3.0 GiB (job), weighted: h1",
-            "= -1.25",
+            "cpu 0.75 bigfit -0.00 = -1.25  (cpu 95%, disk free 40.0 GiB)  last resort: cpu busy",
+            "Connected hosts:",
+            "macos      8 cores  cpu  12%  ram free 4.0 GiB    disk free 9.0 GiB    slots 1 free 1 busy  draining",
         ] {
             assert!(text.contains(expected), "missing `{expected}`:\n{text}");
         }

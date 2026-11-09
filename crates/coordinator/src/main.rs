@@ -13,11 +13,11 @@ use clap::{Parser, Subcommand};
 use runner_manager_coordinator::github_app::{AppKey, GithubApp};
 use runner_manager_coordinator::placement;
 use runner_manager_coordinator::server::{AppState, Config, serve};
-use runner_manager_coordinator::stats::{self, StatsConfig, Weights};
+use runner_manager_coordinator::stats::{self, Guards, StatsConfig, Weights};
 use runner_manager_coordinator::store::{HostRecord, Store};
 use runner_manager_coordinator::sweep::{self, Sweeper};
 use runner_manager_domain::coordinator_protocol::{
-    CoordinatorUrl, STATS_JSON_SCHEMA_VERSION, StatsReport,
+    ConnectedHostStats, CoordinatorUrl, STATS_JSON_SCHEMA_VERSION, StatsReport,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
@@ -87,13 +87,21 @@ enum Command {
         #[arg(long, env = "COORDINATOR_RAM_MARGIN", default_value = "512MiB", value_parser = parse_bytes)]
         ram_margin: u64,
         /// The placement score's weights:
-        /// cache=4,headroom=2,speed=1,bigfit=1.5 (any subset).
+        /// cache=4,headroom=2,speed=1,bigfit=1.5,cpu=1 (any subset).
         #[arg(long, env = "COORDINATOR_PLACEMENT_WEIGHTS", default_value = "", value_parser = parse_weights)]
         placement_weights: Weights,
         /// How long an accepted launch counts while its runner has taken no
         /// job: 30s at least, 2m by default.
         #[arg(long, env = "COORDINATOR_LEASE_TTL", default_value = "2m", value_parser = parse_lease_ttl)]
         lease_ttl: Duration,
+        /// A host whose last heartbeat reports this CPU load or more, in
+        /// percent, is placed on only when no other host can take the job.
+        #[arg(long, env = "COORDINATOR_CPU_BUSY_PERCENT", default_value_t = stats::DEFAULT_CPU_BUSY_PERCENT, value_parser = clap::value_parser!(u32).range(1..=100))]
+        cpu_busy_percent: u32,
+        /// A host with less free disk than this on its runner root's volume
+        /// is placed on only when no other host can take the job: 10GiB.
+        #[arg(long, env = "COORDINATOR_MIN_DISK_FREE", default_value_t = stats::DEFAULT_MIN_DISK_FREE, value_parser = parse_bytes)]
+        min_disk_free: u64,
     },
     /// The job weight statistics: heaviest jobs, hosts, recent placements.
     Stats {
@@ -199,7 +207,8 @@ fn parse_bytes(text: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("`{text}` is too large"))
 }
 
-/// `cache=4,headroom=2,speed=1,bigfit=1.5`: any subset, the rest default.
+/// `cache=4,headroom=2,speed=1,bigfit=1.5,cpu=1`: any subset, the rest
+/// default.
 fn parse_weights(text: &str) -> Result<Weights, String> {
     let mut weights = Weights::default();
     for part in text
@@ -221,9 +230,10 @@ fn parse_weights(text: &str) -> Result<Weights, String> {
             "headroom" => weights.headroom = value,
             "speed" => weights.speed = value,
             "bigfit" => weights.bigfit = value,
+            "cpu" => weights.cpu = value,
             other => {
                 return Err(format!(
-                    "`{other}` is not a weight; use cache, headroom, speed or bigfit"
+                    "`{other}` is not a weight; use cache, headroom, speed, bigfit or cpu"
                 ));
             }
         }
@@ -285,6 +295,20 @@ fn webhook_secret() -> anyhow::Result<SecretString> {
 struct HostsDocument<'a> {
     schema_version: u32,
     hosts: &'a [HostRecord],
+    /// The connected hosts' last load reports, as the server last saved them
+    /// (every minute while it runs); from 0.4.52.
+    connected: &'a [ConnectedHostStats],
+    /// Unix seconds: when that copy was saved. A server that stopped leaves
+    /// its last copy, so an old one says the list is not live.
+    connected_at: Option<i64>,
+}
+
+/// The connected hosts as the server last saved them, and when.
+fn saved_connected(
+    store: &Store,
+) -> anyhow::Result<(Vec<ConnectedHostStats>, Option<chrono::DateTime<Utc>>)> {
+    Ok(stats::saved_live(store)?
+        .map_or_else(Default::default, |(live, at)| (live.connected, Some(at))))
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
@@ -301,6 +325,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ram_margin,
             placement_weights,
             lease_ttl,
+            cpu_busy_percent,
+            min_disk_free,
         } => {
             let origin = CoordinatorUrl::parse(&public_url)
                 .context("COORDINATOR_PUBLIC_URL is not a usable https URL")?
@@ -313,6 +339,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 default_job_ram,
                 ram_margin,
                 weights: placement_weights,
+                guards: Guards {
+                    cpu_busy_percent,
+                    min_disk_free,
+                },
                 ..StatsConfig::default()
             };
             let app = github_app(github_app_id, github_api_url)?;
@@ -394,12 +424,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             match command {
                 HostsCommand::List { json } => {
                     let hosts = store.hosts()?;
+                    let (connected, connected_at) = saved_connected(&store)?;
+                    let age = connected_at.map_or(0, |at| (Utc::now() - at).num_seconds().max(0));
                     if json {
                         serde_json::to_writer_pretty(
                             &mut out,
                             &HostsDocument {
                                 schema_version: JSON_SCHEMA_VERSION,
                                 hosts: &hosts,
+                                connected: &connected,
+                                connected_at: connected_at.map(|at| at.timestamp()),
                             },
                         )?;
                         writeln!(out)?;
@@ -415,9 +449,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                             let seen = host
                                 .last_seen_at
                                 .map_or_else(|| "never".to_string(), |at| at.to_rfc3339());
+                            let load = connected
+                                .iter()
+                                .find(|live| live.host_id == host.id)
+                                .map_or_else(String::new, |live| {
+                                    format!("  connected as of {age}s ago: {}", live.load_text())
+                                });
                             writeln!(
                                 out,
-                                "{}  {:<20} {:<8} host {:<24} last seen {seen}",
+                                "{}  {:<20} {:<8} host {:<24} last seen {seen}{load}",
                                 host.id, host.name, state, host.hostname
                             )?;
                         }
@@ -501,8 +541,11 @@ mod tests {
         assert_eq!(parse_bytes("4096"), Ok(4096));
         assert!(parse_bytes("lots").is_err() && parse_bytes("2TiB").is_err());
         assert_eq!(parse_weights(""), Ok(Weights::default()));
-        let weights = parse_weights("cache=0, bigfit=3").expect("parses");
-        assert_eq!((weights.cache, weights.bigfit), (0.0, 3.0));
+        let weights = parse_weights("cache=0, bigfit=3, cpu=2").expect("parses");
+        assert_eq!(
+            (weights.cache, weights.bigfit, weights.cpu),
+            (0.0, 3.0, 2.0)
+        );
         assert_eq!(weights.headroom, Weights::default().headroom);
         assert!(parse_weights("gpu=1").is_err());
         assert!(parse_weights("cache=-1").is_err());

@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use runner_manager_domain::coordinator_protocol::{
-    CLOSE_REPLACED, HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, LAUNCH_VERSION, ServerMessage,
-    Target, TargetRef, TargetScope, Wake, WakeReason,
+    CLOSE_REPLACED, ConnectedHostStats, HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck,
+    LAUNCH_VERSION, ServerMessage, Target, TargetRef, TargetScope, Wake, WakeReason,
 };
 use runner_manager_domain::model::Label;
 use runner_manager_domain::policy::is_pool_label;
@@ -26,6 +26,10 @@ pub const OUTBOUND_QUEUE: usize = 64;
 
 /// What the server task of one connection is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a message is queued briefly and sent; boxing every one buys nothing"
+)]
 pub enum Outbound {
     Send(ServerMessage),
     Close(u16, &'static str),
@@ -46,6 +50,15 @@ struct Connected {
 }
 
 impl Connected {
+    /// Free disk on its runner root's volume: its last heartbeat's figure,
+    /// else its `hello`'s (an older host measures only at connect).
+    fn disk_free_bytes(&self) -> Option<u64> {
+        self.heartbeat
+            .as_ref()
+            .and_then(|heartbeat| heartbeat.disk_free_bytes)
+            .or_else(|| self.hello.as_ref()?.disk_free_bytes)
+    }
+
     /// Whether this host's pool profiles on `target` are in launch mode: the
     /// one rule that decides between a `launch` and a wake.
     fn launch_mode(&self, coverage: &Coverage, target: &TargetRef) -> bool {
@@ -89,6 +102,7 @@ impl Coverage {
                 .map(Target::reference)
                 .filter(|target| self.covers(target))
                 .collect(),
+            any_pool: true,
         }
     }
 }
@@ -197,14 +211,19 @@ pub struct Candidate {
     pub profile: String,
     /// The profile keeps a persistent workspace there.
     pub warm: bool,
-    /// The host's memory, as its `hello` reported it.
+    /// The host's memory and cores, as its `hello` reported them.
     pub ram_bytes: Option<u64>,
+    pub cores: u32,
+    /// Free space on its runner root's volume: its last heartbeat's figure,
+    /// else its `hello`'s (an older host measures only at connect).
+    pub disk_free_bytes: Option<u64>,
     pub heartbeat: Heartbeat,
     /// When that heartbeat arrived: launches sent later are not in it.
     pub heartbeat_at: Instant,
 }
 
-/// Whether a job requiring `required` asks for a shared pool.
+/// Whether a job requiring `required` asks for a shared pool: an OS pool or
+/// `rm-pool-any`.
 #[must_use]
 pub fn is_pool_job(required: &[Label]) -> bool {
     required.iter().any(|label| is_pool_label(label.as_str()))
@@ -291,6 +310,11 @@ impl Registry {
     /// Every connected host in launch mode for `repository` with an enabled
     /// pool profile whose labels cover `required`, and its last heartbeat. A
     /// host that has not sent a heartbeat yet is not a candidate.
+    ///
+    /// The operating system is not looked at: a job asking for `rm-pool-any`
+    /// is covered by every profile carrying that label, on any OS, and one
+    /// asking for `rm-pool-linux` only by profiles carrying that one, which
+    /// only a Linux host may.
     #[must_use]
     pub fn launch_candidates(&self, repository: &str, required: &[Label]) -> Vec<Candidate> {
         let coverage = self.coverage();
@@ -316,6 +340,8 @@ impl Registry {
                         profile: profile.name.clone(),
                         warm: profile.warm,
                         ram_bytes: hello.ram_bytes,
+                        cores: hello.cores,
+                        disk_free_bytes: connected.disk_free_bytes(),
                         heartbeat: heartbeat.clone(),
                         heartbeat_at: connected.heartbeat_at,
                     });
@@ -466,6 +492,34 @@ impl Registry {
                 host_id: host_id.clone(),
                 hello: connected.hello.clone(),
                 heartbeat: connected.heartbeat.clone(),
+            })
+            .collect();
+        hosts.sort_by(|a, b| a.host_id.cmp(&b.host_id));
+        hosts
+    }
+
+    /// Every connected host's last load report, for `stats` and `hosts list`.
+    #[must_use]
+    pub fn connected_stats(&self) -> Vec<ConnectedHostStats> {
+        let mut hosts: Vec<ConnectedHostStats> = self
+            .lock()
+            .iter()
+            .map(|(host_id, connected)| {
+                let hello = connected.hello.as_ref();
+                let heartbeat = connected.heartbeat.as_ref();
+                ConnectedHostStats {
+                    host_id: host_id.clone(),
+                    os: hello.map(|hello| hello.os.clone()).unwrap_or_default(),
+                    cores: hello.map_or(0, |hello| hello.cores),
+                    ram_bytes: hello.and_then(|hello| hello.ram_bytes),
+                    free_slots: heartbeat.map_or(0, |heartbeat| heartbeat.free_slots),
+                    busy_slots: heartbeat.map_or(0, |heartbeat| heartbeat.busy_slots),
+                    cpu_load_percent: heartbeat.and_then(|heartbeat| heartbeat.cpu_load_percent),
+                    free_ram_bytes: heartbeat.and_then(|heartbeat| heartbeat.free_ram_bytes),
+                    disk_free_bytes: connected.disk_free_bytes(),
+                    unfit: heartbeat.is_some_and(|heartbeat| heartbeat.unfit),
+                    draining: heartbeat.is_some_and(|heartbeat| heartbeat.draining),
+                }
             })
             .collect();
         hosts.sort_by(|a, b| a.host_id.cmp(&b.host_id));
@@ -711,7 +765,10 @@ mod tests {
         // No sweep yet: the answer says so, and covers nothing.
         assert_eq!(
             new_rx.try_recv(),
-            Ok(Outbound::Send(ServerMessage::HelloAck(HelloAck::default())))
+            Ok(Outbound::Send(ServerMessage::HelloAck(HelloAck {
+                any_pool: true,
+                ..HelloAck::default()
+            })))
         );
         assert!(old_rx.try_recv().is_err(), "a version-1 host gets none");
 
@@ -760,6 +817,50 @@ mod tests {
         ));
         assert!(old_rx.try_recv().is_err());
         assert_eq!(registry.advertised().len(), 1, "the same target once");
+    }
+
+    #[tokio::test]
+    async fn the_connected_hosts_report_their_load_and_disk() {
+        let registry = Registry::default();
+        registry.set_coverage(Coverage {
+            interval: Some(Duration::from_secs(120)),
+            repositories: BTreeSet::from(["octo/app".to_string()]),
+            accounts: BTreeSet::new(),
+        });
+        let (tx, _rx) = mpsc::channel(8);
+        let connection = registry.register("h", PROTOCOL_VERSION, tx);
+        registry.set_hello(
+            "h",
+            connection,
+            Hello {
+                disk_free_bytes: Some(100),
+                cores: 12,
+                ..hello(TargetScope::Repo, "octo/app", &["rm-pool-any"], true)
+            },
+        );
+        // Before a heartbeat: the hello's disk.
+        assert_eq!(registry.connected_stats()[0].disk_free_bytes, Some(100));
+        registry.set_heartbeat(
+            "h",
+            connection,
+            Heartbeat {
+                cpu_load_percent: Some(30),
+                disk_free_bytes: Some(40),
+                ..Heartbeat::default()
+            },
+        );
+        let host = &registry.connected_stats()[0];
+        assert_eq!(
+            (
+                host.host_id.as_str(),
+                host.cores,
+                host.cpu_load_percent,
+                host.disk_free_bytes
+            ),
+            ("h", 12, Some(30), Some(40))
+        );
+        let candidate = &registry.launch_candidates("octo/app", &required(&["rm-pool-any"]))[0];
+        assert_eq!((candidate.cores, candidate.disk_free_bytes), (12, Some(40)));
     }
 
     #[tokio::test]

@@ -235,7 +235,11 @@ async fn flush_counters(state: Arc<AppState>) {
 
 fn live_state(state: &AppState) -> LiveState {
     let (pending, leases) = state.placement.snapshot();
-    LiveState { pending, leases }
+    LiveState {
+        pending,
+        leases,
+        connected: state.registry.connected_stats(),
+    }
 }
 
 /// Closes a revoked host's connection as soon as `hosts revoke` commits.

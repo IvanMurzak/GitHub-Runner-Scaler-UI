@@ -2178,18 +2178,21 @@ Select another profile in Repositories or create one with the CLI.",
                 .copyable(Some(STATIC_SELECTOR_WARNING.to_owned())),
             FormLine::keep(FORK_TRUST_WARNING).copyable(Some(FORK_TRUST_WARNING.to_owned())),
         ];
-        // Coordinator stage 3: a profile answering this host's pool label
-        // says so, with the line a workflow copies.
-        if let Some(pool) = form
+        // Coordinator stage 3: a profile answering a pool label says so,
+        // with the line a workflow copies; one line per pool it answers.
+        for pool in form
             .extra_labels
             .iter()
-            .find(|label| runner_manager_domain::policy::is_pool_label(label))
+            .filter(|label| runner_manager_domain::policy::is_pool_label(label))
         {
+            let scope = if runner_manager_domain::policy::is_any_pool_label(pool) {
+                "any OS; a joined coordinator picks one host per job"
+            } else {
+                "a joined coordinator picks one host per job"
+            };
             lines.push(
-                FormLine::text(format!(
-                    "Shared pool: runs-on: {pool}  (a joined coordinator picks one host per job)"
-                ))
-                .copyable(Some(format!("runs-on: {pool}"))),
+                FormLine::text(format!("Shared pool: runs-on: {pool}  ({scope})"))
+                    .copyable(Some(format!("runs-on: {pool}"))),
             );
         }
         let mut next = 0;

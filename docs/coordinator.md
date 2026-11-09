@@ -206,22 +206,41 @@ coordinator choose instead (design decisions D4 and D10):
 | `rm-pool-linux` | Linux hosts (and a managed WSL distribution joined as its own host) |
 | `rm-pool-windows` | Windows hosts |
 | `rm-pool-macos` | macOS hosts |
+| `rm-pool-any` | hosts of any OS that opted in (0.4.52) |
 
-On each host, give the profile that should serve the pool its OS's pool label:
+On each host, give the profile that should serve the pool its OS's pool label, or `rm-pool-any`
+with `--any`:
 
 ```bash
 runner-manager repo profile set-pool octo/app [--profile NAME] --pool on    # repository target
 runner-manager org set-pool octo --pool on                                   # organization target
-runner-manager repo profile show octo/app --profile NAME                     # pool=rm-pool-linux
+runner-manager repo profile set-pool octo/app [--profile NAME] --pool on --any   # rm-pool-any
+runner-manager repo profile show octo/app --profile NAME                     # pool=rm-pool-linux,rm-pool-any
 ```
 
-`set-pool` adds this host's own pool label; `add-label` with a pool label works the same way. A
-label in the reserved `rm-pool-` namespace that is not this host's (`rm-pool-windows` on Linux, or
-an unknown class such as `rm-pool-linux-heavy`) is refused. At most one profile of a target on a
-host may carry the pool label: a pool job selects its profile by that label alone, and two
-profiles matching one job fall under the existing rule that overlapping profiles start no
-runner, so `set-pool` refuses the second one and names the first. The TUI's profile settings
-show the pool line ready to copy.
+`set-pool` adds this host's own pool label, or with `--any` the OS-agnostic `rm-pool-any`;
+`--pool off [--any]` removes it, and `add-label` with a pool label works the same way. A label in
+the reserved `rm-pool-` namespace that is neither this host's OS pool nor `rm-pool-any`
+(`rm-pool-windows` on Linux, or an unknown class such as `rm-pool-linux-heavy`) is refused. At
+most one profile of a target on a host may carry each pool label: a pool job selects its profile
+by that label alone, and two profiles matching one job fall under the existing rule that
+overlapping profiles start no runner, so `set-pool` refuses the second one and names the first.
+One profile may carry both its OS pool label and `rm-pool-any`, or two profiles may split them;
+either way each pool job matches exactly one profile. The TUI's profile settings show a pool line
+per pool label, ready to copy.
+
+**`rm-pool-any`** is for jobs whose steps run on any OS the opted-in hosts have (a script in a
+portable language, a container-free tool run): its candidates are every host whose profile for the
+repository carries `rm-pool-any`, whatever its OS, and placement then chooses by its usual scores, so
+as statistics accumulate the host measured fastest at that job wins. Only opt in a profile on hosts
+where those jobs really work. A host directs an `rm-pool-any` profile by launches only when its
+coordinator says it places that pool (`hello_ack.any_pool`, 0.4.52); with an older coordinator such a
+profile counts its own demand, as in `fallback` (every host carrying the label may start a runner and
+the surplus exits idle), so upgrade the coordinator before opting hosts in. A profile carrying both its
+OS pool label and `rm-pool-any` stops being directed for its OS pool too under an older coordinator:
+that coordinator keeps offering it launches it refuses, and its OS pool jobs start from its own reading
+of the queue, at the coordinated poll interval (5 minutes) rather than at once. Keep the two labels on
+separate profiles while an older coordinator may be in use.
 
 Then switch the workflows that may run on any machine of that OS:
 
@@ -233,8 +252,8 @@ jobs:
     runs-on: rm-home-linux-x64      # still pinned to one machine by its own selector
 ```
 
-Labels can be combined (`runs-on: [rm-pool-linux, gpu]`): only pool profiles carrying every label
-are candidates.
+Labels can be combined (`runs-on: [rm-pool-linux, gpu]`, `runs-on: [rm-pool-any, heavy]`): only
+pool profiles carrying every label are candidates.
 
 ### How a host is chosen
 
@@ -244,7 +263,12 @@ sweep, with an enabled pool profile whose labels cover the job, not unfit, not d
 a free slot by its last heartbeat once the launches already sent to it are counted. With job
 statistics it weighs the candidates (see [Weighted placement](#weighted-placement)); without
 any for that queue it prefers a profile with a persistent workspace for that repository (a warm
-checkout), then the most free RAM, then the fewest busy slots. It sends that host a `launch` and waits up to 10 seconds for the
+checkout), then the most free RAM, then the fewest busy slots. Either way a **last resort** goes after
+every other candidate (0.4.52): a host whose last heartbeat reports its CPU load at or above
+`COORDINATOR_CPU_BUSY_PERCENT` (90 %), or less free disk on its runner root's volume than
+`COORDINATOR_MIN_DISK_FREE` (10 GiB; low disk is the worse). It is not excluded: when no other host can
+take the job now, it gets it. A host older than 0.4.52 reports its disk only at connect; that figure
+is used until a heartbeat carries one. It sends that host a `launch` and waits up to 10 seconds for the
 answer; a refusal (`max_capacity`, `host_capacity`, `unfit`, `draining`, `disabled`,
 `not_coordinated`, ...) or no answer moves on to the next candidate. A job no candidate can take
 waits and is retried every 5 seconds, and at once whenever a host reports a runner ended or a
@@ -469,11 +493,14 @@ and labels), not a single job:
    faster than usual this host ran these jobs, -1 to 1; a host that never ran a job other hosts have
    run counts as 1 for it until its first run finishes, or the host with the most headroom would keep
    every job and the others would never be compared; a warm host, or much more headroom, still outscores
-   this, and a host whose samples have aged out of the 30 kept counts as not having run it) - `bigfit` x (1 when the
+   this, and a host whose samples have aged out of the 30 kept counts as not having run it) + `cpu` x
+   (its idle cores, cores x (1 - CPU load) by its last heartbeat, as a share of the most any candidate has
+   idle; 0 for a host that reports no CPU load) - `bigfit` x (1 when the
    heaviest measured queue waiting elsewhere needs at least twice this one's memory and fits only
    this host of this queue's candidates, and this queue fits another).
-4. **Order**: the best score first, ties in stage 3's order. With no statistics at all for the
-   queue, stage 3's order alone: warm workspace, most free memory, fewest busy slots.
+4. **Order**: hosts that fit first; among them, last resorts (busy CPU, then low disk) after the rest;
+   then the best score, ties in stage 3's order. With no statistics at all for the queue, stage 3's
+   order alone after the last-resort rule: warm workspace, most free memory, fewest busy slots.
 
 A runner takes any job of its queue, so a runner started for a light job can take a heavy one queued
 after it, and a host starts a launch's runner at once, so cancelling the launch does not stop it. For the
@@ -486,7 +513,9 @@ are much heavier than their neighbours do best with **a label of their own**
 seconds a runner takes to come up, and no heavy job lands on a host too small once measured.
 
 Weights are set with `COORDINATOR_PLACEMENT_WEIGHTS` (`--placement-weights`), any subset of
-`cache=4,headroom=2,speed=1,bigfit=1.5`, each 0 to 100. For example, a fleet where checkouts are
+`cache=4,headroom=2,speed=1,bigfit=1.5,cpu=1`, each 0 to 100. What makes a host a last resort is set
+with `COORDINATOR_CPU_BUSY_PERCENT` (`--cpu-busy-percent`, 1 to 100, default 90) and
+`COORDINATOR_MIN_DISK_FREE` (`--min-disk-free`, default `10GiB`). For example, a fleet where checkouts are
 cheap but one host is much bigger than the rest:
 
 ```yaml
@@ -504,7 +533,11 @@ what decided the fit for the candidate nearest to fitting: `free_ram_bytes` (its
 `reserved_bytes` (its open launches), `committed_bytes`, `ram_margin_bytes`, `required_bytes` (absent when no job is measured,
 or no host could ever hold it, so nothing is filtered) and `total_ram_bytes`. A host fits when free less
 reserved, and total less `committed_bytes` (every launch and job on it not yet ended), both hold required plus
-margin, so a low or stale free figure can be told from memory spoken for.
+margin, so a low or stale free figure can be told from memory spoken for. From 0.4.52 it also carries the
+chosen host's `chosen_cores`, `chosen_cpu_load_percent`, `chosen_disk_free_bytes` and `chosen_last_resort`
+(`cpu_busy`, `low_disk`, absent when none), how many candidates were `last_resorts`, and the
+`cpu_busy_percent` and `min_disk_free_bytes` in force; the per-host `placement score` lines carry
+`cores`, `cpu_load_percent`, `disk_free_bytes`, `last_resort` and the `cpu` points.
 
 ### Reading `stats`
 
@@ -530,8 +563,11 @@ Samples per host:
 
 Last placements, newest first (scores in points):
   2m 10s ago  octo/app [rm-pool-linux] needs 6.2 GiB (job), weighted: 4f1c...
-      4f1c...   fits     free after 38.0 GiB   cache 0.00 headroom 1.18 speed 0.15 bigfit -0.00 = 1.33
-      9b20...   too full free after 0 MiB      cache 4.00 headroom 0.00 speed 0.00 bigfit -0.00 = 4.00
+      4f1c...   fits     free after 38.0 GiB   cache 0.00 headroom 1.18 speed 0.15 cpu 0.80 bigfit -0.00 = 2.13  (cpu 12%, disk free 210.4 GiB)
+      9b20...   too full free after 0 MiB      cache 4.00 headroom 0.00 speed 0.00 cpu 0.10 bigfit -0.00 = 4.10  (cpu 93%, disk free 6.1 GiB)  last resort: low disk
+
+Connected hosts:
+  4f1c...                  linux     32 cores  cpu  12%  ram free 40.2 GiB   disk free 210.4 GiB  slots 6 free 2 busy
 ```
 
 - **Queue wait**: queued to started over every kept sample, then per job. A p90 that grows
@@ -541,12 +577,17 @@ Last placements, newest first (scores in points):
 - **Pool queues waiting for a runner**: each queue (repository and labels) with fewer runners
   on their way than jobs queued, the oldest job's wait (since the coordinator first saw it), and why
   no more is placed (see above).
+- **Connected hosts** (0.4.52): each connected host's OS, cores, and by its last heartbeat its CPU
+  load, free memory, free disk on its runner root's volume and slots, as live or as saved as the
+  open leases below. `--json` adds `connected`; `decisions[].scores[]` add `cpu`, `cpu_load_percent`,
+  `disk_free_bytes` and `last_resort`.
 - **Open leases**: per host, each launch not yet closed, its state (`offered`, `accepted`,
   `claimed`) and age. On a host's `stats` these are live; the admin CLI on the coordinator's
   machine reads the copy the server saves every minute (`as of ... ago`).
 - `--json` is schema version 3 since 0.4.47: `p50_duration_secs` is the job's run time,
   `p50_queue_wait_secs` / `p90_queue_wait_secs` are added (overall and per job), and `pending`,
-  `leases` and `live_at`.
+  `leases` and `live_at`. Schema version 4 since 0.4.52 adds `connected` and the scores'
+  `cpu`, `cpu_load_percent`, `disk_free_bytes` and `last_resort`.
 - Names are printed with control, bidirectional and zero-width characters removed: a workflow
   or job name is whatever a pull request wrote.
 - **Last placements**: what the queue was estimated to need and why (`job`, `repository` or

@@ -318,7 +318,7 @@ fn stats_are_read_over_the_hosts_signed_link_and_need_a_join() {
     let json = command(data, &["coordinator", "stats", "--json"]);
     assert_eq!(json.code, 0, "{}", json.stderr);
     let document: Value = serde_json::from_str(&json.stdout).expect("json");
-    assert_eq!(document["schema_version"], 3);
+    assert_eq!(document["schema_version"], 4);
     assert_eq!(document["samples_per_job"], 30);
     assert_eq!(document["p90_queue_wait_secs"], Value::Null);
     assert_eq!(document["jobs"], Value::Array(Vec::new()));
