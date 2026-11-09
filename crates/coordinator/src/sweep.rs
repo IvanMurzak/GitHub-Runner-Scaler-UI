@@ -44,6 +44,9 @@ pub const INVENTORY_EVERY: Duration = Duration::from_secs(10 * 60);
 /// advertising a target not covered, a webhook for a repository not known).
 pub const INVENTORY_DEBOUNCE: Duration = Duration::from_secs(30);
 
+/// The longest the sweep is held up asking which workflow runs belong to.
+const WANTED_RUNS_BUDGET: Duration = Duration::from_secs(30);
+
 /// The delivery id a sweep's wakes carry.
 pub const SWEEP_DELIVERY: &str = "reconcile";
 
@@ -288,30 +291,44 @@ impl Sweeper {
 
     /// Asks GitHub which workflow the runs webhooks named belong to, one request
     /// each. A short job comes and goes between two sweeps, and its sample would
-    /// otherwise be kept under its job alone. Best effort, and asked once: a run
-    /// not answered keeps that.
+    /// otherwise be kept under its job alone. Best effort, asked once, and for at
+    /// most [`WANTED_RUNS_BUDGET`] at a time, so a slow GitHub does not hold the
+    /// sweep up: a run not answered keeps that, unless a sweep lists it.
     pub async fn answer_wanted_runs(&mut self) {
         let installations = self.reach.installations();
-        for (repository, run_id) in self.workflows.take_wanted() {
-            let installation = installations.iter().find(|installation| {
-                installation
-                    .repositories
-                    .iter()
-                    .any(|known| known.to_string().eq_ignore_ascii_case(&repository))
-            });
-            let (Some(installation), Ok(owner_repo)) =
-                (installation, OwnerRepo::parse(&repository))
-            else {
-                continue;
-            };
-            let answer = installation
-                .demand
-                .run_workflow(&owner_repo, run_id, &CancelToken::new())
-                .await;
-            if let Ok(Some(workflow)) = answer {
-                self.workflows.learn(run_id, workflow);
+        let wanted = self.workflows.take_wanted();
+        let asked = wanted.len();
+        let answers = tokio::time::timeout(WANTED_RUNS_BUDGET, async {
+            let mut answered = 0_usize;
+            for (repository, run_id) in wanted {
+                let installation = installations.iter().find(|installation| {
+                    installation
+                        .repositories
+                        .iter()
+                        .any(|known| known.to_string().eq_ignore_ascii_case(&repository))
+                });
+                let (Some(installation), Ok(owner_repo)) =
+                    (installation, OwnerRepo::parse(&repository))
+                else {
+                    continue;
+                };
+                let answer = installation
+                    .demand
+                    .run_workflow(&owner_repo, run_id, &CancelToken::new())
+                    .await;
+                if let Ok(Some(workflow)) = answer {
+                    self.workflows.learn(run_id, workflow);
+                    answered += 1;
+                }
             }
-        }
+            answered
+        })
+        .await;
+        tracing::debug!(
+            asked,
+            answered = answers.unwrap_or_default(),
+            "asked GitHub for runs' workflows"
+        );
     }
 
     async fn read(
@@ -703,11 +720,11 @@ mod tests {
         .with_placement(Arc::clone(&placement))
         .with_workflows(Arc::clone(&workflows));
 
+        // A webhook got there first, with the job alone.
+        let pool = [Label::new("rm-pool-linux").expect("label")];
+        placement.queued_job("octo/app", &pool, 11, Some("octo/app/build".to_string()));
         sweeper.sweep_once().await;
-        let key = crate::placement::JobKey::new(
-            "octo/app",
-            &[Label::new("rm-pool-linux").expect("label")],
-        );
+        let key = crate::placement::JobKey::new("octo/app", &pool);
         assert_eq!(
             placement.queued_job_keys(&key).0,
             vec![

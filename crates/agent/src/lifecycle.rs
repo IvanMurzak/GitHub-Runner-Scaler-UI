@@ -643,12 +643,17 @@ pub struct SharedPackages {
 }
 
 impl SharedPackages {
-    fn note_failed_install(&self, reason: &FailureReason) {
+    /// What an install ended in, for the launches queued behind it. A terminal
+    /// failure is not shared: it would close each of them, with no retry of its
+    /// own, and one that succeeded clears the last failure.
+    fn note_install(&self, result: Result<(), &FailureReason>) {
         *self
             .failed_install
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((std::time::Instant::now(), reason.clone()));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = result
+            .err()
+            .filter(|reason| !package_failure_is_terminal(reason))
+            .map(|reason| (std::time::Instant::now(), reason.clone()));
     }
 
     /// What an install that failed while a launch queued since `queued` for it
@@ -815,13 +820,9 @@ impl RuntimePackages for CachedRuntimePackages {
             if let Some(reason) = self.shared.install_failed_since(queued) {
                 return Err(reason);
             }
-            let ready = match self.install_trusted(&destination, timings).await {
-                Ok(ready) => ready,
-                Err(reason) => {
-                    self.shared.note_failed_install(&reason);
-                    return Err(reason);
-                }
-            };
+            let installed = self.install_trusted(&destination, timings).await;
+            self.shared.note_install(installed.as_ref().map(|_| ()));
+            let ready = installed?;
             installs += 1;
             if installs == 2 {
                 break (exclusive.downgrade(), ready);

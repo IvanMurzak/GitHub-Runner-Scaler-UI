@@ -65,6 +65,10 @@ const MAX_NAME_CHARS: usize = 120;
 /// Runs whose workflow is remembered, and asked about at once.
 const RUN_MEMORY: usize = 20_000;
 
+/// How many samples with memory figures a workflow's job needs before they alone
+/// stand for it.
+const ENOUGH_OF_ITS_OWN: usize = 3;
+
 /// How long a webhook's runner-to-job mapping waits for its attempt report,
 /// and the other way round.
 const CORRELATION_MEMORY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -603,33 +607,38 @@ impl Aggregates {
 
     /// The samples that speak for `key`.
     ///
-    /// A key with a workflow: its own samples, or, while it has none, those of
-    /// its job alone: kept by an older version, or taken when the run's workflow
-    /// was not known. Two workflows' jobs of one name were kept together there.
+    /// A key with a workflow: its own samples once [`ENOUGH_OF_ITS_OWN`] of them
+    /// measured memory. Until then those of its job alone count too, kept by an
+    /// older version or taken when the run's workflow was not known, so one quick
+    /// failure does not stand for a job with a long history. Two workflows' jobs
+    /// of one name were kept together there.
     ///
     /// A key without one: every sample of that job. A queued job's workflow is
     /// often not known yet, so this is what keeps it from reading as never
     /// measured. Its estimate may be another workflow's job of the same name, as
     /// it always was.
     fn speaking_for(&self, key: &str) -> Vec<&JobSample> {
-        let own = self.by_key.get(key);
+        let own = self.by_key.get(key).into_iter().flatten();
         if key.contains(WORKFLOW_SEPARATOR) {
+            let measured = own
+                .clone()
+                .filter(|sample| sample.peak_rss_bytes.is_some())
+                .count();
+            if measured >= ENOUGH_OF_ITS_OWN {
+                return own.collect();
+            }
             return own
-                .or_else(|| self.by_key.get(job_alone(key)))
-                .into_iter()
-                .flatten()
+                .chain(self.by_key.get(job_alone(key)).into_iter().flatten())
                 .collect();
         }
         let variants = format!("{key}{WORKFLOW_SEPARATOR}");
-        own.into_iter()
-            .chain(
-                self.by_key
-                    .range(variants.clone()..)
-                    .take_while(|(candidate, _)| candidate.starts_with(&variants))
-                    .map(|(_, samples)| samples),
-            )
-            .flatten()
-            .collect()
+        own.chain(
+            self.by_key
+                .range(variants.clone()..)
+                .take_while(|(candidate, _)| candidate.starts_with(&variants))
+                .flat_map(|(_, samples)| samples),
+        )
+        .collect()
     }
 
     /// What placement weighs `key` by. See [`Self::speaking_for`].
@@ -1420,11 +1429,23 @@ mod tests {
             );
         }
 
-        // Its own samples speak for a workflow as soon as it has any.
+        // One quick sample does not stand for its history.
         aggregates.add(sample(&ci, "h1", 60, GIB), 30);
-        aggregates.add(sample(&nightly, "h1", 60, 8 * GIB), 30);
+        assert_eq!(aggregates.job(&ci).unwrap().samples, 2);
+        assert_eq!(
+            aggregates.job(&ci).unwrap().p90_peak_rss_bytes,
+            Some(3 * GIB)
+        );
+
+        // Enough of its own, and they alone speak for a workflow.
+        for _ in 1..ENOUGH_OF_ITS_OWN {
+            aggregates.add(sample(&ci, "h1", 60, GIB), 30);
+        }
+        for _ in 0..ENOUGH_OF_ITS_OWN {
+            aggregates.add(sample(&nightly, "h1", 60, 8 * GIB), 30);
+        }
         assert_eq!(aggregates.job(&ci).unwrap().p90_peak_rss_bytes, Some(GIB));
-        assert_eq!(aggregates.job(&ci).unwrap().samples, 1);
+        assert_eq!(aggregates.job(&ci).unwrap().samples, ENOUGH_OF_ITS_OWN);
         assert_eq!(
             aggregates.job(&nightly).unwrap().p90_peak_rss_bytes,
             Some(8 * GIB)
@@ -1432,16 +1453,17 @@ mod tests {
 
         // A job whose workflow is not known yet counts all of them, so it does
         // not read as never measured.
+        let everything = 1 + 2 * ENOUGH_OF_ITS_OWN;
         let any = aggregates.job(&alone).unwrap();
-        assert_eq!(any.samples, 3);
+        assert_eq!(any.samples, everything);
         assert_eq!(any.p90_peak_rss_bytes, Some(8 * GIB));
-        assert_eq!(aggregates.host_ratios(&alone)["h1"].samples, 3);
-        assert_eq!(aggregates.host_ratios(&ci)["h1"].samples, 1);
+        assert_eq!(aggregates.host_ratios(&alone)["h1"].samples, everything);
+        assert_eq!(aggregates.host_ratios(&ci)["h1"].samples, ENOUGH_OF_ITS_OWN);
 
         // A job whose name starts the same is another job.
         let other = identity("build2").key();
         aggregates.add(sample(&other, "h1", 60, GIB), 30);
-        assert_eq!(aggregates.job(&alone).unwrap().samples, 3);
+        assert_eq!(aggregates.job(&alone).unwrap().samples, everything);
     }
 
     /// `stats` lists each key once, as it was kept, and readably.

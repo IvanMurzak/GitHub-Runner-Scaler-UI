@@ -77,6 +77,34 @@ fn a_database_in_use_is_copied_whole_and_the_last_seven_are_kept() {
         .expect("still writable");
 }
 
+/// The daily loop, which is what runs: a failure there must stop the copy just
+/// as it does for `once`, or an empty file replaces a good one.
+#[test]
+fn the_daily_loop_keeps_no_copy_of_a_database_it_could_not_read() {
+    if Command::new("sqlite3").arg("-version").output().is_err() {
+        eprintln!("skipped: no sqlite3 command");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a directory");
+    let backups = dir.path().join("backups");
+    std::fs::create_dir(&backups).expect("created");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/coordinator/backup.sh");
+    let mut running = Command::new("sh")
+        .arg(script)
+        .env("COORDINATOR_DB", dir.path().join("missing.db"))
+        .env("COORDINATOR_BACKUP_DIR", &backups)
+        .env("COORDINATOR_BACKUP_RETRY_SECS", "1")
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("sh runs");
+
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let _ = running.kill();
+    let _ = running.wait();
+
+    assert_eq!(copies(&backups), Vec::<String>::new());
+}
+
 #[test]
 fn a_failed_backup_removes_nothing_and_leaves_nothing_that_looks_like_one() {
     if Command::new("sqlite3").arg("-version").output().is_err() {

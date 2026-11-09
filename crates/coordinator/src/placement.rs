@@ -677,13 +677,14 @@ impl Placement {
             let queue = state.queues.entry(key.clone()).or_default();
             let before = queue.len();
             // The listing's ids are the webhooks' ids: a job known already
-            // gains its name, one not known yet is named from the start.
+            // gains its name, and its workflow, which a webhook may not have
+            // known; one not known yet is named from the start.
             for (id, job_key) in &swept.jobs {
                 let known = queue
                     .jobs
                     .entry(*id)
                     .or_insert_with(|| (Instant::now(), None));
-                if known.1.is_none() {
+                if job_key.is_some() {
                     known.1.clone_from(job_key);
                 }
             }

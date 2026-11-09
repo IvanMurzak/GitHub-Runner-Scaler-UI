@@ -110,9 +110,6 @@ fn parse_proc_stat(line: &str) -> Option<(u32, u64, u64)> {
     // After the name: state(3) ppid(4) ... utime(14) stime(15) cutime(16)
     // cstime(17) ... rss(24); index 0 here is field 3.
     let field = |number: usize| fields.get(number - 3).copied();
-    if matches!(field(3)?, "Z" | "X" | "x") {
-        return None;
-    }
     let parent = field(4)?.parse().ok()?;
     let ticks = [14, 15, 16, 17]
         .into_iter()
@@ -124,12 +121,22 @@ fn parse_proc_stat(line: &str) -> Option<(u32, u64, u64)> {
     Some((parent, ticks, pages))
 }
 
+/// Whether one `/proc/<pid>/stat` line is of a process that has exited. A zombie
+/// stays in `/proc` until its parent reaps it, and a runner's parent is the daemon,
+/// which reaps it in the pass this look exists to bring forward.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_stat_exited(line: &str) -> bool {
+    crate::process::proc_stat_after_comm(line)
+        .and_then(|fields| fields.split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
+}
+
 #[cfg(target_os = "linux")]
 mod sys {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use super::{Facts, TreeUsage, parse_proc_stat, trees};
+    use super::{Facts, TreeUsage, parse_proc_stat, proc_stat_exited, trees};
 
     pub(super) fn sample_trees(roots: &[u32]) -> HashMap<u32, TreeUsage> {
         // SAFETY: `sysconf` reads a constant and cannot fail in a way that
@@ -160,6 +167,12 @@ mod sys {
             let Ok(line) = std::fs::read_to_string(entry.path().join("stat")) else {
                 continue;
             };
+            // A root that exited is gone, or its slot waits for the next scheduled
+            // poll. Not a descendant: it would drop out of the tree's CPU total, and
+            // return to it through its parent's once reaped, counted twice.
+            if roots.contains(&pid) && proc_stat_exited(&line) {
+                continue;
+            }
             if let Some((parent, ticks, pages)) = parse_proc_stat(&line) {
                 parents.push((pid, parent));
                 facts.insert(
@@ -450,13 +463,15 @@ mod tests {
     }
 
     #[test]
-    fn a_stat_line_of_a_process_that_exited_is_not_a_process() {
+    fn a_stat_line_says_whether_the_process_exited() {
         let line = |state: &str| {
             format!("7 (run.sh) {state} 1 7 7 0 -1 0 0 0 0 0 5 6 7 8 20 0 1 0 100 4096 42 0")
         };
-        assert!(parse_proc_stat(&line("S")).is_some());
-        assert_eq!(parse_proc_stat(&line("Z")), None);
-        assert_eq!(parse_proc_stat(&line("X")), None);
+        assert!(!proc_stat_exited(&line("S")));
+        assert!(!proc_stat_exited(&line("R")));
+        assert!(proc_stat_exited(&line("Z")));
+        assert!(proc_stat_exited(&line("X")));
+        assert!(!proc_stat_exited("garbage"));
     }
 
     /// A runner that exited stays in the process table until its parent reaps

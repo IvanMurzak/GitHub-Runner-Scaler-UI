@@ -2411,6 +2411,22 @@ pub struct ReservationWaits {
     pub lock: Duration,
 }
 
+/// What one round of serving launches has reserved so far.
+#[derive(Default)]
+struct ReservationRound {
+    reserved: BTreeMap<PolicyId, u32>,
+    exhausted: BTreeSet<PolicyId>,
+}
+
+/// One step of a round: what it reserved, the round, and the policies it read.
+type Reserving<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = (Option<Reserved>, ReservationRound, Vec<ScalePolicy>)>
+            + Send
+            + 'a,
+    >,
+>;
+
 /// A runner reserved under the allocation lock, to bring up outside it.
 struct Reserved {
     policy: ScalePolicy,
@@ -2792,17 +2808,24 @@ impl Reconciler {
     #[cfg(test)]
     pub async fn start_directed(&self, policies: &[ScalePolicy]) -> ReconcileReport {
         let mut report = ReconcileReport::default();
-        let reserved = self.reserve_open_launches(policies, &mut report).await;
+        let mut round = ReservationRound::default();
+        let mut reserved = Vec::new();
+        while let Some(next) = self
+            .reserve_next_launch(policies, &mut round, &mut report)
+            .await
+        {
+            reserved.push(next);
+        }
         self.finish_reserved(reserved, &mut report).await;
         report
     }
 
     /// Serves a target's coordinator launches until `stop`: on `signal`, and
     /// [`LAUNCH_RETRY`] after one that did not start, it reserves a runner for
-    /// every launch open at that moment and brings them up. A launch the
-    /// coordinator placed here needs no reading of the queue, so this runs
-    /// beside the target's passes: a launch accepted while one is polling GitHub,
-    /// or while runners already reserved are coming up (here or in that pass), is
+    /// every launch open at that moment, one at a time, and brings each up as soon
+    /// as it is reserved. A launch the coordinator placed here needs no reading of
+    /// the queue, so this runs beside the target's passes: a launch accepted while
+    /// one is polling GitHub, or while runners already reserved are coming up, is
     /// reserved and brought up at once rather than after them.
     ///
     /// It goes through the same allocator, ceilings and host-wide lock as
@@ -2819,26 +2842,11 @@ impl Reconciler {
         mut stop: tokio::sync::watch::Receiver<bool>,
     ) {
         use futures::StreamExt as _;
-        type Reserving<'a> =
-            std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Reserved>> + Send + 'a>>;
 
-        let reserve = || -> Reserving<'_> {
-            let policies = policies();
-            Box::pin(async move {
-                let mut report = ReconcileReport::default();
-                let reserved = self.reserve_open_launches(&policies, &mut report).await;
-                if !reserved.is_empty() {
-                    tracing::info!(
-                        event = "coordinator_launches_reserved",
-                        count = reserved.len(),
-                    );
-                }
-                reserved
-            })
-        };
         let mut bringing_up = futures::stream::FuturesUnordered::new();
         let mut reserving: Option<Reserving<'_>> = None;
         let mut retry_at: Option<tokio::time::Instant> = None;
+        let mut known: Vec<ScalePolicy> = Vec::new();
         let mut stopping = *stop.borrow();
         loop {
             if stopping && reserving.is_none() && bringing_up.is_empty() {
@@ -2846,7 +2854,7 @@ impl Reconciler {
             }
             tokio::select! {
                 () = signal.notified(), if !stopping && reserving.is_none() => {
-                    reserving = Some(reserve());
+                    reserving = Some(self.reserve_step(policies(), ReservationRound::default()));
                 }
                 () = async {
                     match retry_at {
@@ -2855,16 +2863,24 @@ impl Reconciler {
                     }
                 }, if !stopping && reserving.is_none() => {
                     retry_at = None;
-                    reserving = Some(reserve());
+                    reserving = Some(self.reserve_step(policies(), ReservationRound::default()));
                 }
-                reserved = async {
+                (reserved, round, read) = async {
                     match reserving.as_mut() {
                         Some(reserving) => reserving.await,
                         None => std::future::pending().await,
                     }
                 } => {
                     reserving = None;
-                    bringing_up.extend(reserved.into_iter().map(|reserved| self.bring_up(reserved)));
+                    match reserved {
+                        Some(reserved) => {
+                            bringing_up.push(self.bring_up(reserved));
+                            if !stopping {
+                                reserving = Some(self.reserve_step(read, round));
+                            }
+                        }
+                        None => known = read,
+                    }
                 }
                 Some(_) = bringing_up.next(), if !bringing_up.is_empty() => {}
                 changed = stop.changed(), if !stopping => {
@@ -2873,50 +2889,66 @@ impl Reconciler {
             }
             // One that did not start, a registration that failed, is tried again
             // well inside its lease's lifetime.
-            if reserving.is_none() && retry_at.is_none() {
-                let waiting = policies()
+            if reserving.is_none()
+                && retry_at.is_none()
+                && known
                     .iter()
-                    .any(|policy| self.director.next_waiting(policy).is_some());
-                if waiting {
-                    retry_at = Some(tokio::time::Instant::now() + LAUNCH_RETRY);
-                }
+                    .any(|policy| self.director.next_waiting(policy).is_some())
+            {
+                retry_at = Some(tokio::time::Instant::now() + LAUNCH_RETRY);
             }
         }
     }
 
-    /// Reserves one runner at a time for `policies`' open launches, whichever is
-    /// oldest next: a target's own profiles keep the order too. Slow work comes
-    /// after this, in [`Self::bring_up`], so no launch's package holds up another
-    /// launch's reservation.
-    async fn reserve_open_launches(
+    /// [`Self::reserve_next_launch`], as a future that owns what it needs.
+    fn reserve_step(
+        &self,
+        policies: Vec<ScalePolicy>,
+        mut round: ReservationRound,
+    ) -> Reserving<'_> {
+        Box::pin(async move {
+            let mut report = ReconcileReport::default();
+            let reserved = self
+                .reserve_next_launch(&policies, &mut round, &mut report)
+                .await;
+            (reserved, round, policies)
+        })
+    }
+
+    /// Reserves one runner for the oldest of `policies`' open launches: a target's
+    /// own profiles keep the order too. Slow work comes after this, in
+    /// [`Self::bring_up`], so no launch's package holds up another's reservation.
+    /// `None` when `round` has served all it can.
+    async fn reserve_next_launch(
         &self,
         policies: &[ScalePolicy],
+        round: &mut ReservationRound,
         report: &mut ReconcileReport,
-    ) -> Vec<Reserved> {
-        let mut reserved: Vec<Reserved> = Vec::new();
-        let mut candidates: Vec<&ScalePolicy> = policies
-            .iter()
-            .filter(|policy| {
-                policy.owns_runners()
-                    && policy.is_owned_by(self.host.id)
-                    && policy.may_start_runners()
-            })
-            .collect();
+    ) -> Option<Reserved> {
         loop {
-            let Some(&policy) = candidates
+            let policy = policies
                 .iter()
-                .min_by_key(|policy| self.director.next_waiting(policy).unwrap_or(u64::MAX))
-            else {
-                return reserved;
-            };
-            let before = reserved.len();
-            if let Some(directed) = self.director.directed_demand(policy) {
+                .filter(|policy| {
+                    policy.owns_runners()
+                        && policy.is_owned_by(self.host.id)
+                        && policy.may_start_runners()
+                        && !round.exhausted.contains(&policy.id)
+                })
+                .min_by_key(|policy| self.director.next_waiting(policy).unwrap_or(u64::MAX))?;
+            let served = round.reserved.entry(policy.id).or_default();
+            // Bounded by the launches open, however late the journal shows these.
+            if let Some(directed) = self.director.directed_demand(policy)
+                && *served < directed
+            {
+                let mut reserved = Vec::new();
                 self.start_runners(policy, directed, 1, report, &mut reserved)
                     .await;
+                if let Some(next) = reserved.pop() {
+                    *served += 1;
+                    return Some(next);
+                }
             }
-            if reserved.len() == before {
-                candidates.retain(|candidate| candidate.id != policy.id);
-            }
+            round.exhausted.insert(policy.id);
         }
     }
 
@@ -3281,6 +3313,12 @@ impl Reconciler {
 
         while budget > 0 {
             let order_wait = self.let_older_launches_reserve(policy).await;
+            // A launch may have been cancelled while this one waited.
+            let demand = if order_wait.is_zero() {
+                demand
+            } else {
+                self.director.directed_demand(policy).unwrap_or(demand)
+            };
             let waiting_since = std::time::Instant::now();
             let guard = match self.lock.acquire().await {
                 Ok(guard) => guard,
@@ -8101,6 +8139,44 @@ mod tests {
             assert_eq!(fake.live_count(), 1);
             stop.send_replace(true);
             barrier.wait().await;
+        });
+    }
+
+    /// Nothing reserved waits for the rest of the round: here the next reservation
+    /// cannot start until the first runner's bring-up has run, because an older
+    /// launch elsewhere holds it for a whole turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_reserved_runner_comes_up_before_the_next_reservation_ends() {
+        let held = Arc::new(HeldBringUp {
+            inner: Arc::new(FakeLauncher::new()),
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+            fail: None,
+            waits: Mutex::default(),
+        });
+        let director = Arc::new(FixedDirector::default());
+        let pool = policy(1, "acme/app", 3);
+        director.directed.lock().unwrap().insert(pool.id, 2);
+        let reconciler = directed_reconciler(
+            5,
+            Arc::clone(&held) as _,
+            Arc::new(InProcessAllocationLock::new()),
+            Arc::clone(&director),
+        );
+        let signal = tokio::sync::Notify::new();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+
+        tokio::join!(serving(&reconciler, &pool, &signal, stopped), async {
+            signal.notify_one();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert_eq!(
+                held.waits.lock().unwrap().len(),
+                1,
+                "the first is coming up"
+            );
+            scripted_older(&director, &[(1, 1)]);
+            tokio::time::sleep(OLDER_LAUNCH_TURN + Duration::from_secs(1)).await;
+            assert_eq!(held.waits.lock().unwrap().len(), 2);
+            stop.send_replace(true);
         });
     }
 

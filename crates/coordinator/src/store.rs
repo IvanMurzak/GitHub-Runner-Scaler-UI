@@ -391,6 +391,10 @@ fn rekey_samples(connection: &Connection) -> Result<(), StoreError> {
         .collect::<Result<_, _>>()?;
     let transaction = connection.unchecked_transaction()?;
     for (id, key, repository) in rows {
+        // A key with a workflow is newer than this, seen again after a rollback.
+        if key.contains('\u{1f}') {
+            continue;
+        }
         let Some(rest) = key
             .strip_prefix(&repository)
             .and_then(|rest| rest.strip_prefix('/'))

@@ -405,10 +405,10 @@ the workflow, so the file comes from the run: from the sweep's listing, or from 
 is the job alone, as it was. A request that fails is not repeated, and that run's samples are kept
 under the job alone, which is also where samples from before 0.4.50 stay, with no migration.
 
-What weighs a job: its workflow's samples, or while it has none, those kept under the job alone. A
+What weighs a job: its workflow's samples, and until it has enough, those kept under the job alone too. A
 queued job whose workflow is not known yet counts every sample of its name, in any workflow, so it
 does not read as never measured; it can then be estimated from the other workflow's job, until a sweep
-names it. `stats` lists each key as it was kept: `octo/app/build [.github/workflows/ci.yml]`. To roll
+names it. A workflow's own samples stand alone once 3 of them measured memory. `stats` lists each key as it was kept: `octo/app/build [.github/workflows/ci.yml]`. To roll
 back, nothing needs doing: an older coordinator reads a key with a workflow as a job it never sees
 queued, and goes on from the samples under the job alone.
 
@@ -568,11 +568,12 @@ To move a host to a new key, revoke it, issue a new invite, then on the host run
 
 ## Back up and restore
 
-The compose file runs a `backup` service: at its start and then once a day it copies the database with
-`VACUUM INTO`, which is safe while the coordinator is writing, checks the copy with `PRAGMA
-integrity_check`, and keeps the last 7 as `coordinator-<UTC time>.db`, mode `0600`, in the
-`coordinator-backups` volume. A failed run says so in `docker compose logs backup`, removes no earlier
-copy, and tries again the next day; the time of the newest file is the way to check it is working.
+The compose file runs a `backup` service: once a day (at its first start, then whenever the newest copy is
+a day old) it copies the database with `VACUUM INTO`, which is safe while the coordinator is writing, checks
+the copy with `PRAGMA integrity_check` and that it holds tables, and keeps the last 7 as
+`coordinator-<UTC time>.db`, mode `0600`, in the `coordinator-backups` volume. A failed run says so in
+`docker compose logs backup`, keeps nothing, removes no earlier copy, and tries again in an hour; the time of
+the newest file is the way to check it is working.
 
 That volume is on the same disk as the database, which protects against a bad upgrade or a damaged
 database and not against losing the disk. To keep the copies elsewhere, replace the volume with a path on
@@ -587,12 +588,18 @@ services:
       - /mnt/backups/coordinator:/backups
 ```
 
-The copies hold what the database holds: enrolled hosts' names and public keys, hashes of invites, job
-names and statistics. No GitHub credential is in there. Treat them as private all the same.
+The copies hold what the database holds: enrolled hosts' names, hostnames and public keys, when each was
+last seen, hashes of invites, repository and job names, statistics and placement decisions. No GitHub
+credential is in there, nor the webhook secret. Treat them as private all the same.
 
 To restore, stop the writers, put the copy in place, remove the old database's WAL files, and start again.
 Hosts reconnect on their own; a host enrolled after that copy was made must `coordinator leave` and join
 again with a new invite. Samples and counters since the copy are lost.
+
+**A restore undoes what happened since the copy, revocations included.** A host revoked since then is
+accepted again, and an invite used since then, if it has not expired, can be used again. After restoring,
+run `hosts list` and revoke again whatever you revoked since that copy was made, before you expose the
+coordinator again if you can.
 
 ```bash
 docker compose stop coordinator backup
