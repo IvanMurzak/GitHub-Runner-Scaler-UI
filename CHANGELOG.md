@@ -7,6 +7,49 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.50
+
+### Fixed
+
+- **A stalled package download no longer holds a host's launches for good.** A
+  download had no time limit, and every copy of the package waits for it. It now
+  fails after 30 seconds without a connection or 60 seconds without a byte, however
+  long a download that keeps sending takes. Its partial file is removed, the launches
+  queued behind it get its failure and retry on their own back-off.
+- **A native runner's slot on Linux frees within about 10 seconds of its process
+  exiting, not at the next scheduled poll (about 60 seconds).** The 2-second check
+  read a runner that had exited as still running, because an exited process stays in
+  the process table until the daemon collects it, and only a pass did that. Launches
+  were refused with `max_capacity` for that long (live: 35 refusals in 90 seconds). A
+  pass also no longer waits for a coordinator launch's bring-up. The host log says
+  how long each took: `attempt_slot_released`, `exit_to_report_ms`.
+- **A coordinator launch starts at once, whatever its target is doing.** One accepted
+  while its target's pass polled GitHub or brought up a batch of runners waited for
+  that. Each target now serves its launches beside its passes, under the same host
+  lock, journal and ceilings; a pass does not supervise a runner still coming up.
+- **Launches now reserve strictly oldest first across a host's targets and
+  profiles**, in the order the host accepted them, rather than a younger one waiting
+  for at most 2 seconds. Only the reservation is ordered, a lock hold and a journal
+  write, so one slow package holds nothing up. An older launch that cannot reserve at
+  all is passed over after 2 seconds without progress, once, and the log says so
+  (`older_launch_passed_over`). `attempt_launch_slow` gains `order_wait_ms`.
+- **Jobs of the same name in two workflows no longer share statistics, when the
+  workflow is known.** With the GitHub App, a job's key gains its run's workflow file,
+  from the sweep or one request per run. Existing samples keep working under the job
+  alone, with no migration, and hosts of any version are unaffected. See
+  [Job statistics](docs/coordinator.md#job-statistics).
+
+### Added
+
+- **The coordinator's log says why a host does not fit a job.** `a pool queue was
+  weighed` and `no_memory_fit` carry `free_ram_bytes`, `reserved_bytes`,
+  `ram_margin_bytes`, `required_bytes` and `total_ram_bytes` for the candidate nearest
+  to fitting. The fit rule itself is unchanged.
+- **A daily backup of the coordinator's database.** The compose file gains a `backup`
+  service keeping the last 7 consistent copies; `docker compose up -d --build` starts
+  it. To keep them on another disk, and to restore, see
+  [Back up and restore](docs/coordinator.md#back-up-and-restore).
+
 ## 0.4.49
 
 ### Fixed

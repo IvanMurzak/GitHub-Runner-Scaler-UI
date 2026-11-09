@@ -385,9 +385,24 @@ impl Scenario {
                 // a bare token, so the next process reads exactly what a
                 // completed sign-in would have left.
                 let document = format!(r#"{{"access_token":"{}"}}"#, support::fixture_token());
-                self.secret_store()?
-                    .store(&SecretString::from(document))
-                    .map_err(|error| format!("cannot seed the credential: {error}"))
+                let store = self.secret_store()?;
+                // A transient refusal is tried again: once a full run under load
+                // failed here with macOS's `-676`, which no replay repeated.
+                // Sign-in is not what these scenarios test, and a store that keeps
+                // refusing still fails.
+                let mut tries = 0;
+                loop {
+                    tries += 1;
+                    match store.store(&SecretString::from(document.clone())) {
+                        Ok(()) => return Ok(()),
+                        Err(_) if tries < 5 => {
+                            std::thread::sleep(std::time::Duration::from_millis(100 * tries));
+                        }
+                        Err(error) => {
+                            return Err(format!("cannot seed the credential: {error}"));
+                        }
+                    }
+                }
             }
             Seed::Attempt { target, kind } => {
                 let store = self.require_store()?;

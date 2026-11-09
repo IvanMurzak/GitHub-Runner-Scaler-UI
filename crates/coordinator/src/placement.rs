@@ -67,7 +67,10 @@ use runner_manager_domain::model::Label;
 use tokio::sync::oneshot;
 
 use crate::registry::{Candidate, Registry, is_pool_job};
-use crate::stats::{Aggregates, Contender, Demand, Statistics, StatsConfig, score};
+use crate::stats::{
+    Aggregates, Contender, Demand, FitFigures, Statistics, StatsConfig, WORKFLOW_SEPARATOR,
+    roomiest, score,
+};
 
 /// How long a host has to answer a `launch`.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -276,6 +279,8 @@ struct State {
     /// Why each queue short of leases was not placed, and when it was last
     /// logged.
     unplaced: HashMap<JobKey, (Unplaced, Option<Instant>)>,
+    /// What decided each queue's last weighing, for that log line.
+    fit: HashMap<JobKey, FitFigures>,
     /// Runners whose `attempt_started` came in, by lower-cased name.
     runners: HashMap<String, Runner>,
     /// Jobs a webhook said a runner took before its host reported that
@@ -397,12 +402,22 @@ impl State {
                 .and_then(|queue| queue.jobs.iter().min_by_key(|(_, (at, _))| *at))
                 .map(|(id, _)| *id);
             let leases = self.leases_for(key);
+            let fit = self
+                .fit
+                .get(key)
+                .filter(|_| matches!(reason, Unplaced::NoMemoryFit));
             tracing::info!(
                 reason = reason.as_str(),
                 refusal = reason.refusal().map_or("", RefusalReason::as_str),
                 queued,
                 leases,
                 oldest_job = oldest_job.unwrap_or_default(),
+                host_id = fit.map(|fit| fit.host_id.as_str()),
+                free_ram_bytes = fit.and_then(|fit| fit.free_ram),
+                total_ram_bytes = fit.and_then(|fit| fit.total_ram),
+                reserved_bytes = fit.map(|fit| fit.reserved),
+                ram_margin_bytes = fit.map(|fit| fit.ram_margin),
+                required_bytes = fit.and_then(|fit| fit.required),
                 "a pool queue is not placed"
             );
         }
@@ -677,13 +692,19 @@ impl Placement {
             let queue = state.queues.entry(key.clone()).or_default();
             let before = queue.len();
             // The listing's ids are the webhooks' ids: a job known already
-            // gains its name, one not known yet is named from the start.
+            // gains its name, and its workflow, which a webhook may not have
+            // known; one not known yet is named from the start.
             for (id, job_key) in &swept.jobs {
                 let known = queue
                     .jobs
                     .entry(*id)
                     .or_insert_with(|| (Instant::now(), None));
-                if known.1.is_none() {
+                // Not back to the job alone from a key that names its workflow.
+                if job_key.as_ref().is_some_and(|new| {
+                    known.1.as_ref().is_none_or(|old| {
+                        new.contains(WORKFLOW_SEPARATOR) || !old.contains(WORKFLOW_SEPARATOR)
+                    })
+                }) {
                     known.1.clone_from(job_key);
                 }
             }
@@ -938,6 +959,7 @@ impl Placement {
             .map(|(key, _)| key.clone())
             .collect();
         state.unplaced.retain(|key, _| short.contains(key));
+        state.fit.retain(|key, _| short.contains(key));
         short
     }
 
@@ -1141,6 +1163,7 @@ impl Placement {
         }
         if open == queued {
             state.unplaced.remove(key);
+            state.fit.remove(key);
             return None;
         }
         let untried = |candidate: &Candidate| !tried.contains(&candidate.host_id);
@@ -1170,7 +1193,15 @@ impl Placement {
             .filter(|c| untried(c) && fit(c) && free(c))
             .collect();
         let chosen = match &self.stats {
-            Some(stats) => Self::weigh(stats, &state, key, eligible, decision),
+            Some(stats) => {
+                let mut fit = None;
+                let chosen = Self::weigh(stats, &state, key, eligible, decision, &mut fit);
+                match fit {
+                    Some(fit) => state.fit.insert(key.clone(), fit),
+                    None => state.fit.remove(key),
+                };
+                chosen
+            }
             None => rank(eligible).into_iter().next().map(|chosen| (chosen, 0)),
         };
         let Some((chosen, estimate)) = chosen else {
@@ -1221,6 +1252,7 @@ impl Placement {
         key: &JobKey,
         eligible: Vec<Candidate>,
         decision: &mut Option<PlacementDecision>,
+        figures: &mut Option<FitFigures>,
     ) -> Option<(Candidate, u64)> {
         if eligible.is_empty() {
             return None;
@@ -1254,6 +1286,8 @@ impl Placement {
                 })
                 .collect();
             let scored = score(&contenders, &demand, heavier, config, aggregates);
+            *figures = roomiest(&contenders, &demand, config);
+            let fit = figures.as_ref();
             let chosen = scored
                 .first()
                 .filter(|(_, best)| best.fits)
@@ -1282,11 +1316,20 @@ impl Placement {
                     })
                     .count(),
                 jobs_unnamed = state.unnamed_jobs(key),
+                roomiest_host_id = fit.map(|fit| fit.host_id.as_str()),
+                free_ram_bytes = fit.and_then(|fit| fit.free_ram),
+                total_ram_bytes = fit.and_then(|fit| fit.total_ram),
+                reserved_bytes = fit.map(|fit| fit.reserved),
+                ram_margin_bytes = config.ram_margin,
+                required_bytes = fit.and_then(|fit| fit.required),
                 "a pool queue was weighed"
             );
-            for (_, host) in &scored {
+            for (contender, host) in &scored {
                 tracing::debug!(
                     host_id = %host.host_id,
+                    free_ram_bytes = contender.free_ram,
+                    total_ram_bytes = contender.total_ram,
+                    reserved_bytes = contender.reserved,
                     fits = host.fits,
                     cache = host.cache,
                     headroom = host.headroom,
@@ -2320,6 +2363,14 @@ mod tests {
             placement.snapshot().0[0].reason.as_deref(),
             Some("no_memory_fit")
         );
+        // What the log says about it: free memory, what is spoken for, and need.
+        let state = placement.state();
+        let fit = &state.fit[&key];
+        assert_eq!(fit.host_id, "h");
+        assert_eq!(fit.free_ram, Some(8 << 30));
+        assert_eq!(fit.reserved, (7 << 29) + (2 << 29));
+        assert_eq!(fit.required, Some(7 << 29));
+        drop(state);
         drop(host);
     }
 

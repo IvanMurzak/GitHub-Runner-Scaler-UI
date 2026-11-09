@@ -52,6 +52,9 @@ struct Meter {
     peak_rss: u64,
     peak_millicores: u32,
     samples: u32,
+    /// When its runner process was first seen gone, for the log line that says
+    /// how long its slot took to free.
+    gone_at: Option<Instant>,
 }
 
 /// CPU time over wall time, in thousandths of a CPU.
@@ -106,6 +109,7 @@ impl AttemptMeters {
             peak_rss: 0,
             peak_millicores: 0,
             samples: 0,
+            gone_at: None,
         });
         // A descendant that exited took its CPU time out of the total: only
         // increases count, from wherever the total now stands.
@@ -118,6 +122,14 @@ impl AttemptMeters {
         meter.last_cpu = usage.cpu_time;
         meter.peak_rss = meter.peak_rss.max(usage.rss_bytes);
         meter.samples = meter.samples.saturating_add(1);
+        meter.gone_at = None;
+    }
+
+    /// How long ago `attempt`'s runner was first seen gone. Up to
+    /// [`SAMPLE_EVERY`] less than since it exited.
+    pub fn since_seen_gone(&self, attempt: AttemptId, now: Instant) -> Option<Duration> {
+        let gone_at = self.lock().get(&attempt)?.gone_at?;
+        Some(now.saturating_duration_since(gone_at))
     }
 
     /// What `attempt` used, once: the meter is gone afterwards.
@@ -166,6 +178,9 @@ impl AttemptMeters {
         seen.retain(|attempt, _| live.contains(attempt));
         for (attempt, pid, target) in roots {
             let Some(usage) = trees.get(&pid) else {
+                if let Some(meter) = self.lock().get_mut(&attempt) {
+                    meter.gone_at.get_or_insert(now);
+                }
                 let due = seen
                     .get(&attempt)
                     .is_none_or(|at| now.saturating_duration_since(*at) >= ANNOUNCE_AGAIN);
@@ -216,6 +231,57 @@ pub async fn sample_attempts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole of what a slot's prompt release rests on, on this OS: a runner
+    /// that exited and that nothing has reaped yet is announced, so a pass runs
+    /// and reaps it. A sampler that read it as live waited for the scheduled poll.
+    #[cfg(unix)]
+    #[test]
+    fn a_runner_that_exited_unreaped_is_announced_and_timed() {
+        use runner_manager_domain::attempt::AttemptState;
+        use runner_manager_domain::store::SqliteStore;
+        use runner_manager_testkit::fixtures;
+
+        let dir = tempfile::tempdir().expect("a directory");
+        let store = SqliteStore::open(dir.path().join("journal.db")).expect("store");
+        let host = fixtures::host().build();
+        store.put_host(&host).expect("host");
+        let host = host.id;
+        let policy = fixtures::policy()
+            .repository("acme/repo")
+            .host(host)
+            .autoscale("home", 1)
+            .active()
+            .build();
+        store.insert_policy(&policy).expect("policy");
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.3"])
+            .spawn()
+            .expect("sh starts");
+        let attempt = fixtures::attempt()
+            .id(AttemptId::new_random())
+            .policy_id(policy.id)
+            .state(AttemptState::Busy)
+            .github_runner_id(1)
+            .process_id(child.id())
+            .build();
+        store.record_attempt(&attempt).expect("recorded");
+
+        let meters = AttemptMeters::default();
+        assert!(meters.sample_once(&store, host).is_empty(), "still running");
+        let mut announced = Vec::new();
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            announced = meters.sample_once(&store, host);
+            if !announced.is_empty() {
+                break;
+            }
+        }
+        let _ = child.wait();
+
+        assert_eq!(announced, vec![policy.target.clone()]);
+        assert!(meters.since_seen_gone(attempt.id, Instant::now()).is_some());
+    }
 
     fn tree(rss: u64, cpu_ms: u64) -> TreeUsage {
         TreeUsage {

@@ -43,7 +43,7 @@
 //! and runner names came off the wire: they are stored and shown to the
 //! owner by `stats`, never logged.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,11 +55,19 @@ use runner_manager_domain::coordinator_protocol::{
     is_managed_runner_name, printable,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::store::{JobSample, Store, StoreError};
 
 /// The longest repository or job name kept.
 const MAX_NAME_CHARS: usize = 120;
+
+/// Runs whose workflow is remembered, and asked about at once.
+const RUN_MEMORY: usize = 20_000;
+
+/// How many samples with memory figures a workflow's job needs before they alone
+/// stand for it.
+const ENOUGH_OF_ITS_OWN: usize = 3;
 
 /// How long a webhook's runner-to-job mapping waits for its attempt report,
 /// and the other way round.
@@ -144,12 +152,13 @@ impl StatsConfig {
 
 /// Which job a runner took, as GitHub names it.
 ///
-/// Deliberately not by workflow. GitHub's `workflow_name` on a job is the
-/// **run's title**, so a workflow with a `run-name` (`load light [1,2] (tag)`)
-/// has a different one at every dispatch: a key holding it never meets its own
-/// samples, and every queue falls back to its repository's p90. Nothing on a
-/// `workflow_job` webhook names the workflow stably. The price: jobs of the same
-/// name in two workflows of one repository share their statistics.
+/// GitHub's `workflow_name` on a job is the **run's title**, so a workflow with a
+/// `run-name` (`load light [1,2] (tag)`) has a different one at every dispatch: a
+/// key holding it never meets its own samples, and every queue falls back to its
+/// repository's p90. Nothing on a `workflow_job` webhook names the workflow
+/// stably. Its run does (`path`), and the run comes from the sweep or a request of
+/// its own, so a job's workflow is known only sometimes: see [`Aggregates::job`]
+/// for what a sample without one counts as.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JobIdentity {
     /// `owner/name`, lower-cased.
@@ -157,6 +166,27 @@ pub struct JobIdentity {
     /// The job's name, matrix values included as GitHub expands them:
     /// `build (ubuntu, 3.12)`.
     pub job: String,
+    /// Its run's workflow file, when that is known: `.github/workflows/ci.yml`.
+    pub workflow: Option<String>,
+}
+
+/// Between a job and its workflow in a sample's key. A control character, so no
+/// name can hold one: [`clean`] takes them out of what comes off the wire.
+pub(crate) const WORKFLOW_SEPARATOR: char = '\u{1f}';
+
+/// The part of `key` that names the job alone: what a sample of an older version
+/// is keyed by, and one whose workflow was not known.
+fn job_alone(key: &str) -> &str {
+    key.split_once(WORKFLOW_SEPARATOR)
+        .map_or(key, |(job, _)| job)
+}
+
+/// `key`, for people.
+fn display_key(key: &str) -> String {
+    match key.split_once(WORKFLOW_SEPARATOR) {
+        Some((job, workflow)) => format!("{job} [{workflow}]"),
+        None => key.to_string(),
+    }
 }
 
 /// A name off the wire, reduced to something safe to store and print: no
@@ -177,14 +207,102 @@ impl JobIdentity {
         let identity = Self {
             repository: clean(repository).to_ascii_lowercase(),
             job: clean(job?),
+            workflow: None,
         };
         (!identity.repository.is_empty() && !identity.job.is_empty()).then_some(identity)
     }
 
-    /// `owner/repo/job`: what samples are kept and aggregated by.
+    /// With its run's workflow file, when known.
+    #[must_use]
+    pub fn in_workflow(mut self, workflow: Option<&str>) -> Self {
+        self.workflow = workflow.map(clean).filter(|path| !path.is_empty());
+        self
+    }
+
+    /// `owner/repo/job`, and its workflow when known: what samples are kept and
+    /// aggregated by.
     #[must_use]
     pub fn key(&self) -> String {
-        format!("{}/{}", self.repository, self.job)
+        match &self.workflow {
+            Some(workflow) => format!(
+                "{}/{}{WORKFLOW_SEPARATOR}{workflow}",
+                self.repository, self.job
+            ),
+            None => format!("{}/{}", self.repository, self.job),
+        }
+    }
+}
+
+/// Which workflow each run belongs to, as far as anyone has said: a webhook names
+/// only the run, and the job's key wants its workflow.
+#[derive(Debug, Default)]
+pub struct RunWorkflows {
+    known: Mutex<KnownRuns>,
+    asked: Notify,
+}
+
+/// A run with `None` was asked about, and no answer has come.
+#[derive(Debug, Default)]
+struct KnownRuns {
+    runs: HashMap<u64, Option<String>>,
+    order: VecDeque<u64>,
+    wanted: VecDeque<(String, u64)>,
+}
+
+impl KnownRuns {
+    fn remember(&mut self, run_id: u64, workflow: Option<String>) {
+        if self.runs.insert(run_id, workflow).is_none() {
+            self.order.push_back(run_id);
+        }
+        if self.order.len() > RUN_MEMORY
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.runs.remove(&oldest);
+        }
+    }
+}
+
+impl RunWorkflows {
+    /// A sweep's run listing, or a request's answer.
+    pub fn learn(&self, run_id: u64, workflow: String) {
+        lock(&self.known).remember(run_id, Some(workflow));
+    }
+
+    /// `run_id`'s workflow file, if known.
+    #[must_use]
+    pub fn of(&self, run_id: u64) -> Option<String> {
+        lock(&self.known).runs.get(&run_id).cloned().flatten()
+    }
+
+    /// Asks for `run_id`'s workflow once. The sweeper answers.
+    pub fn want(&self, repository: &str, run_id: u64) {
+        let mut known = lock(&self.known);
+        if known.runs.contains_key(&run_id) {
+            return;
+        }
+        known.remember(run_id, None);
+        known.wanted.push_back((repository.to_string(), run_id));
+        if known.wanted.len() > RUN_MEMORY {
+            known.wanted.pop_front();
+        }
+        drop(known);
+        self.asked.notify_one();
+    }
+
+    /// Waits until a run is asked about.
+    pub async fn asked(&self) {
+        self.asked.notified().await;
+    }
+
+    /// The runs to ask GitHub about, by repository and run id.
+    pub fn take_wanted(&self) -> Vec<(String, u64)> {
+        let mut known = lock(&self.known);
+        let wanted = std::mem::take(&mut known.wanted);
+        // A sweep may have listed one since it was asked about.
+        wanted
+            .into_iter()
+            .filter(|(_, run_id)| matches!(known.runs.get(run_id), Some(None)))
+            .collect()
     }
 }
 
@@ -409,11 +527,14 @@ pub fn percentile<T: Copy + Ord>(values: &[T], p: u32) -> Option<T> {
 
 /// The percentile `p` of one optional field over `samples`.
 fn field_percentile<T: Copy + Ord>(
-    samples: &[JobSample],
+    samples: &[&JobSample],
     field: impl Fn(&JobSample) -> Option<T>,
     p: u32,
 ) -> Option<T> {
-    percentile(&samples.iter().filter_map(field).collect::<Vec<_>>(), p)
+    percentile(
+        &samples.iter().filter_map(|s| field(s)).collect::<Vec<_>>(),
+        p,
+    )
 }
 
 /// One host's figures for one job key.
@@ -484,17 +605,51 @@ impl Aggregates {
         self.by_key.retain(|_, samples| !samples.is_empty());
     }
 
+    /// The samples that speak for `key`.
+    ///
+    /// A key with a workflow: its own samples once [`ENOUGH_OF_ITS_OWN`] of them
+    /// measured memory. Until then those of its job alone count too, kept by an
+    /// older version or taken when the run's workflow was not known, so one quick
+    /// failure does not stand for a job with a long history. Two workflows' jobs
+    /// of one name were kept together there.
+    ///
+    /// A key without one: every sample of that job. A queued job's workflow is
+    /// often not known yet, so this is what keeps it from reading as never
+    /// measured. Its estimate may be another workflow's job of the same name, as
+    /// it always was.
+    fn speaking_for(&self, key: &str) -> Vec<&JobSample> {
+        let own = self.by_key.get(key).into_iter().flatten();
+        if key.contains(WORKFLOW_SEPARATOR) {
+            let measured = own
+                .clone()
+                .filter(|sample| sample.peak_rss_bytes.is_some())
+                .count();
+            if measured >= ENOUGH_OF_ITS_OWN {
+                return own.collect();
+            }
+            return own
+                .chain(self.by_key.get(job_alone(key)).into_iter().flatten())
+                .collect();
+        }
+        let variants = format!("{key}{WORKFLOW_SEPARATOR}");
+        own.chain(
+            self.by_key
+                .range(variants.clone()..)
+                .take_while(|(candidate, _)| candidate.starts_with(&variants))
+                .flat_map(|(_, samples)| samples),
+        )
+        .collect()
+    }
+
+    /// What placement weighs `key` by. See [`Self::speaking_for`].
     #[must_use]
     pub fn job(&self, key: &str) -> Option<JobFigures> {
-        let samples = self.by_key.get(key)?;
-        Some(JobFigures {
-            samples: samples.len(),
-            p50_duration_secs: field_percentile(samples, |s| s.duration_secs, 50),
-            p50_queue_wait_secs: field_percentile(samples, |s| s.queue_wait_secs, 50),
-            p90_queue_wait_secs: field_percentile(samples, |s| s.queue_wait_secs, 90),
-            p90_peak_rss_bytes: field_percentile(samples, |s| s.peak_rss_bytes, 90),
-            p90_cpu_millicores: field_percentile(samples, |s| s.cpu_avg_millicores, 90),
-        })
+        figures_of(&self.speaking_for(key))
+    }
+
+    /// What was kept under exactly `key`, for `stats`, which lists every key.
+    fn kept_under(&self, key: &str) -> Vec<&JobSample> {
+        self.by_key.get(key).into_iter().flatten().collect()
     }
 
     /// The p90 peak memory over every sample of `repository`.
@@ -516,43 +671,63 @@ impl Aggregates {
     /// it the norm).
     #[must_use]
     pub fn host_ratios(&self, key: &str) -> BTreeMap<String, HostRatio> {
-        let mut by_host: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
-        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-        for sample in self.by_key.get(key).into_iter().flatten() {
-            *counts.entry(&sample.host_id).or_default() += 1;
-            by_host
-                .entry(&sample.host_id)
-                .or_default()
-                .extend(sample.duration_secs);
-        }
-        let medians: BTreeMap<&str, Option<u64>> = by_host
-            .iter()
-            .map(|(host, durations)| (*host, percentile(durations, 50)))
-            .collect();
-        let known: Vec<u64> = medians.values().flatten().copied().collect();
-        let usual = (!known.is_empty())
-            .then(|| known.iter().sum::<u64>() / u64::try_from(known.len()).unwrap_or(1));
-        counts
-            .into_iter()
-            .map(|(host, count)| {
-                let median = medians.get(host).copied().flatten();
-                let ratio = match (median, usual) {
-                    (Some(median), Some(usual)) if usual > 0 => {
-                        u32::try_from(median.saturating_mul(1000) / usual).ok()
-                    }
-                    _ => None,
-                };
-                (
-                    host.to_string(),
-                    HostRatio {
-                        ratio,
-                        samples: count,
-                        median_secs: median,
-                    },
-                )
-            })
-            .collect()
+        ratios_of(&self.speaking_for(key))
     }
+}
+
+/// A job's figures from `samples`; `None` without any.
+fn figures_of(samples: &[&JobSample]) -> Option<JobFigures> {
+    if samples.is_empty() {
+        return None;
+    }
+    Some(JobFigures {
+        samples: samples.len(),
+        p50_duration_secs: field_percentile(samples, |s| s.duration_secs, 50),
+        p50_queue_wait_secs: field_percentile(samples, |s| s.queue_wait_secs, 50),
+        p90_queue_wait_secs: field_percentile(samples, |s| s.queue_wait_secs, 90),
+        p90_peak_rss_bytes: field_percentile(samples, |s| s.peak_rss_bytes, 90),
+        p90_cpu_millicores: field_percentile(samples, |s| s.cpu_avg_millicores, 90),
+    })
+}
+
+/// Per host in `samples`, its median duration over the usual one.
+fn ratios_of(samples: &[&JobSample]) -> BTreeMap<String, HostRatio> {
+    let mut by_host: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for sample in samples {
+        *counts.entry(&sample.host_id).or_default() += 1;
+        by_host
+            .entry(&sample.host_id)
+            .or_default()
+            .extend(sample.duration_secs);
+    }
+    let medians: BTreeMap<&str, Option<u64>> = by_host
+        .iter()
+        .map(|(host, durations)| (*host, percentile(durations, 50)))
+        .collect();
+    let known: Vec<u64> = medians.values().flatten().copied().collect();
+    let usual = (!known.is_empty())
+        .then(|| known.iter().sum::<u64>() / u64::try_from(known.len()).unwrap_or(1));
+    counts
+        .into_iter()
+        .map(|(host, count)| {
+            let median = medians.get(host).copied().flatten();
+            let ratio = match (median, usual) {
+                (Some(median), Some(usual)) if usual > 0 => {
+                    u32::try_from(median.saturating_mul(1000) / usual).ok()
+                }
+                _ => None,
+            };
+            (
+                host.to_string(),
+                HostRatio {
+                    ratio,
+                    samples: count,
+                    median_secs: median,
+                },
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +850,54 @@ impl Aggregates {
     }
 }
 
+/// The memory a host must have free for a queue. Only a job's own samples filter:
+/// its repository's p90 is a guess at a job never measured, and heavy samples of
+/// another job must not keep it waiting. Nor when no host could ever hold it:
+/// waiting would be forever, and the job is better run somewhere.
+fn required_memory(contenders: &[Contender], demand: &Demand, config: &StatsConfig) -> Option<u64> {
+    demand.measured_job.filter(|bytes| {
+        let needed = bytes.saturating_add(config.ram_margin);
+        contenders
+            .iter()
+            .any(|contender| contender.total_ram.is_none_or(|total| total >= needed))
+    })
+}
+
+/// The figures behind a fit, for the log: a host fits when `free_ram` less
+/// `reserved` holds `required` and `ram_margin`. So a reading can tell a stale or
+/// low `free_ram` from memory spoken for by open launches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FitFigures {
+    pub host_id: String,
+    pub free_ram: Option<u64>,
+    pub total_ram: Option<u64>,
+    pub reserved: u64,
+    pub ram_margin: u64,
+    pub required: Option<u64>,
+}
+
+/// The figures of the candidate with the most memory available: the one nearest
+/// to fitting, if none does. One that reports no free memory is never filtered.
+#[must_use]
+pub fn roomiest(
+    contenders: &[Contender],
+    demand: &Demand,
+    config: &StatsConfig,
+) -> Option<FitFigures> {
+    let required = required_memory(contenders, demand, config);
+    contenders
+        .iter()
+        .max_by_key(|contender| contender.available().unwrap_or(u64::MAX))
+        .map(|contender| FitFigures {
+            host_id: contender.host_id.clone(),
+            free_ram: contender.free_ram,
+            total_ram: contender.total_ram,
+            reserved: contender.reserved,
+            ram_margin: config.ram_margin,
+            required,
+        })
+}
+
 /// One host that could take the queue, as placement sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contender {
@@ -757,12 +980,7 @@ pub fn score(
     // job never measured, and heavy samples of another job must not keep it
     // waiting. Nor when no host could ever hold it: waiting would be forever,
     // and the job is better run somewhere.
-    let required = demand.measured_job.filter(|bytes| {
-        let needed = bytes.saturating_add(config.ram_margin);
-        contenders
-            .iter()
-            .any(|contender| contender.total_ram.is_none_or(|total| total >= needed))
-    });
+    let required = required_memory(contenders, demand, config);
     let ratios: Vec<BTreeMap<String, HostRatio>> = demand
         .job_keys
         .iter()
@@ -842,9 +1060,16 @@ pub struct Statistics {
     launches: AtomicU64,
     wakes: AtomicU64,
     unplaced: Mutex<HashMap<String, Instant>>,
+    workflows: Arc<RunWorkflows>,
 }
 
 impl Statistics {
+    /// What is known of runs' workflows, for the webhook and the sweep.
+    #[must_use]
+    pub fn run_workflows(&self) -> Arc<RunWorkflows> {
+        Arc::clone(&self.workflows)
+    }
+
     /// Loads the samples kept in `db`; starts empty (and says so) when they
     /// cannot be read: placement then falls back to stage 3's order.
     #[must_use]
@@ -866,6 +1091,7 @@ impl Statistics {
             launches: AtomicU64::new(0),
             wakes: AtomicU64::new(0),
             unplaced: Mutex::new(HashMap::new()),
+            workflows: Arc::default(),
         }
     }
 
@@ -1079,9 +1305,9 @@ pub fn report(
         .by_key
         .keys()
         .filter_map(|key| {
-            let figures = aggregates.job(key)?;
-            let hosts = aggregates
-                .host_ratios(key)
+            let samples = aggregates.kept_under(key);
+            let figures = figures_of(&samples)?;
+            let hosts = ratios_of(&samples)
                 .into_iter()
                 .map(|(host_id, figures)| HostJobStats {
                     host_name: names.get(&host_id).cloned(),
@@ -1093,7 +1319,7 @@ pub fn report(
                 .take(REPORT_HOSTS_PER_JOB)
                 .collect();
             Some(JobStats {
-                job_key: key.clone(),
+                job_key: display_key(key),
                 samples: u32::try_from(figures.samples).unwrap_or(u32::MAX),
                 p50_duration_secs: figures.p50_duration_secs,
                 p50_queue_wait_secs: figures.p50_queue_wait_secs,
@@ -1220,6 +1446,164 @@ mod tests {
 
     fn identity(job: &str) -> JobIdentity {
         JobIdentity::new("Octo/App", Some(job)).expect("named")
+    }
+
+    /// Jobs of one name in two workflows keep their own figures once their
+    /// workflows are known; samples from before that keep working.
+    #[test]
+    fn a_jobs_workflow_tells_it_from_another_of_the_same_name() {
+        let ci = identity("build")
+            .in_workflow(Some(".github/workflows/ci.yml"))
+            .key();
+        let nightly = identity("build")
+            .in_workflow(Some(".github/workflows/nightly.yml"))
+            .key();
+        let alone = identity("build").key();
+        assert_eq!(alone, "octo/app/build", "as an older version kept it");
+
+        // Only old data: both workflows, and a queued job not yet placed in one,
+        // read what was kept for the job.
+        let mut aggregates = Aggregates::default();
+        aggregates.add(sample(&alone, "h1", 60, 3 * GIB), 30);
+        for key in [&ci, &nightly, &alone] {
+            assert_eq!(
+                aggregates.job(key).unwrap().p90_peak_rss_bytes,
+                Some(3 * GIB)
+            );
+        }
+
+        // One quick sample does not stand for its history.
+        aggregates.add(sample(&ci, "h1", 60, GIB), 30);
+        assert_eq!(aggregates.job(&ci).unwrap().samples, 2);
+        assert_eq!(
+            aggregates.job(&ci).unwrap().p90_peak_rss_bytes,
+            Some(3 * GIB)
+        );
+
+        // Enough of its own, and they alone speak for a workflow.
+        for _ in 1..ENOUGH_OF_ITS_OWN {
+            aggregates.add(sample(&ci, "h1", 60, GIB), 30);
+        }
+        for _ in 0..ENOUGH_OF_ITS_OWN {
+            aggregates.add(sample(&nightly, "h1", 60, 8 * GIB), 30);
+        }
+        assert_eq!(aggregates.job(&ci).unwrap().p90_peak_rss_bytes, Some(GIB));
+        assert_eq!(aggregates.job(&ci).unwrap().samples, ENOUGH_OF_ITS_OWN);
+        assert_eq!(
+            aggregates.job(&nightly).unwrap().p90_peak_rss_bytes,
+            Some(8 * GIB)
+        );
+
+        // A job whose workflow is not known yet counts all of them, so it does
+        // not read as never measured.
+        let everything = 1 + 2 * ENOUGH_OF_ITS_OWN;
+        let any = aggregates.job(&alone).unwrap();
+        assert_eq!(any.samples, everything);
+        assert_eq!(any.p90_peak_rss_bytes, Some(8 * GIB));
+        assert_eq!(aggregates.host_ratios(&alone)["h1"].samples, everything);
+        assert_eq!(aggregates.host_ratios(&ci)["h1"].samples, ENOUGH_OF_ITS_OWN);
+
+        // A job whose name starts the same is another job.
+        let other = identity("build2").key();
+        aggregates.add(sample(&other, "h1", 60, GIB), 30);
+        assert_eq!(aggregates.job(&alone).unwrap().samples, everything);
+    }
+
+    /// The candidate nearest to fitting, with what decides it. Reading these, a
+    /// host short of free memory is told from one whose memory is spoken for.
+    #[test]
+    fn the_roomiest_candidate_says_why_it_does_not_fit() {
+        let contender = |host: &str, free, reserved| Contender {
+            host_id: host.into(),
+            warm: false,
+            free_ram: free,
+            total_ram: Some(32 * GIB),
+            busy_slots: 0,
+            reserved,
+        };
+        let config = StatsConfig::default();
+        let demand = Demand {
+            estimate: 4 * GIB,
+            source: EstimateSource::Job,
+            measured_job: Some(4 * GIB),
+            job_keys: vec![],
+            measured: true,
+        };
+        let figures = roomiest(
+            &[
+                contender("low", Some(2 * GIB), 0),
+                contender("spoken-for", Some(23 * GIB), 20 * GIB),
+            ],
+            &demand,
+            &config,
+        )
+        .expect("a candidate");
+        assert_eq!(figures.host_id, "spoken-for");
+        assert_eq!(figures.free_ram, Some(23 * GIB));
+        assert_eq!(figures.reserved, 20 * GIB);
+        assert_eq!(figures.required, Some(4 * GIB));
+        assert_eq!(figures.ram_margin, config.ram_margin);
+        assert_eq!(roomiest(&[], &demand, &config), None);
+    }
+
+    /// `stats` lists each key once, as it was kept, and readably.
+    #[test]
+    fn stats_lists_a_jobs_workflows_apart() {
+        let mut store = Store::open_in_memory().expect("store");
+        let now = Utc::now();
+        let ci = identity("build")
+            .in_workflow(Some(".github/workflows/ci.yml"))
+            .key();
+        for key in ["octo/app/build", &ci] {
+            let mut kept = sample(key, "h1", 60, GIB);
+            kept.finished_at = now;
+            store
+                .record_sample(&kept, 30, now - chrono::Duration::days(1))
+                .expect("stored");
+        }
+        let report = report(&store, &StatsConfig::default(), now).expect("report");
+        let mut keys: Vec<(&str, u32)> = report
+            .jobs
+            .iter()
+            .map(|job| (job.job_key.as_str(), job.samples))
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                ("octo/app/build", 1),
+                ("octo/app/build [.github/workflows/ci.yml]", 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_runs_workflow_is_asked_for_once_and_remembered() {
+        let workflows = RunWorkflows::default();
+        assert_eq!(workflows.of(9), None);
+        workflows.want("octo/app", 9);
+        workflows.want("octo/app", 9);
+        assert_eq!(workflows.take_wanted(), vec![("octo/app".to_string(), 9)]);
+        assert!(workflows.take_wanted().is_empty());
+        workflows.want("octo/app", 9);
+        assert!(workflows.take_wanted().is_empty(), "already asked");
+        workflows.learn(9, ".github/workflows/ci.yml".into());
+        assert_eq!(workflows.of(9).as_deref(), Some(".github/workflows/ci.yml"));
+        workflows.learn(10, "ci.yml".into());
+        workflows.want("octo/app", 10);
+        assert!(workflows.take_wanted().is_empty(), "already known");
+    }
+
+    #[test]
+    fn a_workflow_name_is_cleaned_like_any_other() {
+        let key = identity("build")
+            .in_workflow(Some("a\u{1f}b\u{202e}.yml"))
+            .key();
+        assert_eq!(key.matches(WORKFLOW_SEPARATOR).count(), 1);
+        assert_eq!(
+            identity("build").in_workflow(Some(" \u{1f} ")).workflow,
+            None
+        );
     }
 
     fn sample(key: &str, host: &str, secs: u64, rss: u64) -> JobSample {

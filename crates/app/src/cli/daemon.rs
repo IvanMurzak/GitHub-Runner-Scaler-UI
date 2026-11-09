@@ -476,25 +476,26 @@ async fn run_generation(
                 cancel.clone(),
             ));
             let signals = routes.add(package_target.clone());
+            let ports = ReconcilerPorts {
+                demand,
+                launcher: Arc::new(FitnessGatedLauncher::new(launcher, Arc::clone(&host_unfit))),
+                lock: Arc::clone(&shared_lock) as Arc<_>,
+                directory: Arc::clone(&directory) as Arc<_>,
+                clock: Arc::clone(&clock),
+                jitter: Arc::new(RandomJitter),
+                events: Arc::clone(&events),
+            };
+            let director = Arc::clone(&launches) as Arc<dyn DemandDirector>;
             Ok(ManagedTarget {
                 policies,
                 store: Arc::clone(&store) as Arc<dyn Store>,
-                reconciler: Reconciler::new(
-                    host.clone(),
-                    ReconcilerPorts {
-                        demand,
-                        launcher: Arc::new(FitnessGatedLauncher::new(
-                            launcher,
-                            Arc::clone(&host_unfit),
-                        )),
-                        lock: Arc::clone(&shared_lock) as Arc<_>,
-                        directory: Arc::clone(&directory) as Arc<_>,
-                        clock: Arc::clone(&clock),
-                        jitter: Arc::new(RandomJitter),
-                        events: Arc::clone(&events),
-                    },
-                )
-                .with_director(Arc::clone(&launches) as Arc<dyn DemandDirector>),
+                launch_side: Some(
+                    Reconciler::new(host.clone(), ports.clone())
+                        .with_director(Arc::clone(&director)),
+                ),
+                reconciler: Reconciler::new(host.clone(), ports)
+                    .with_director(director)
+                    .with_launch_side(Arc::clone(&signals.launch)),
                 cancel,
                 polling: Arc::clone(&polling),
                 wake: signals.wake,
@@ -2304,16 +2305,14 @@ trait TargetReconciler: Send + 'static {
         Duration::ZERO
     }
 
-    /// The link's "start the accepted launches now" signal, when the daemon
-    /// routes one to this loop.
-    fn launch_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+    /// What serves this target's coordinator launches, beside its passes, until
+    /// `stop`. See `Reconciler::serve_launches`. `None` where the daemon has no
+    /// link to bring any, and on a second call.
+    fn launch_driver(
+        &mut self,
+        _stop: tokio::sync::watch::Receiver<bool>,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>> {
         None
-    }
-
-    /// Starts the runners of the coordinator launches accepted for this
-    /// target, without polling GitHub. See `Reconciler::start_directed`.
-    fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async {})
     }
 
     /// The link's view, for this target's poll mode. `None` where no link
@@ -2373,6 +2372,9 @@ trait TargetReconciler: Send + 'static {
 struct ManagedTarget {
     policies: Vec<ScalePolicy>,
     reconciler: Reconciler,
+    /// Over the same ports, for [`Reconciler::serve_launches`]: taken when the
+    /// loop starts, and run beside `reconciler`'s passes.
+    launch_side: Option<Reconciler>,
     cancel: CancelToken,
     store: Arc<dyn Store>,
     polling: Arc<super::polling::PollingMonitor>,
@@ -2392,10 +2394,6 @@ impl TargetReconciler for ManagedTarget {
         Some(Arc::clone(&self.wake))
     }
 
-    fn launch_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
-        Some(Arc::clone(&self.launch))
-    }
-
     fn pacing_floor(&self) -> Duration {
         self.pacing_floor
     }
@@ -2404,16 +2402,30 @@ impl TargetReconciler for ManagedTarget {
         self.launches.holds_unstarted(&self.policies)
     }
 
-    fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async {
-            let report = self.reconciler.start_directed(&self.policies).await;
-            if report.started > 0 {
-                tracing::info!(
-                    started = report.started,
-                    "started the runners of accepted coordinator launches"
-                );
-            }
-        })
+    fn launch_driver(
+        &mut self,
+        stop: tokio::sync::watch::Receiver<bool>,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>> {
+        let launch_side = self.launch_side.take()?;
+        let signal = Arc::clone(&self.launch);
+        let store = Arc::clone(&self.store);
+        let target = self.policies.first()?.target.clone();
+        Some(Box::pin(async move {
+            // Read at each launch, so a profile an operator disabled a moment
+            // ago starts nothing. One that cannot be read starts nothing now;
+            // the launch stays open for the next pass.
+            let policies = move || -> Vec<ScalePolicy> {
+                store.policies().map_or_else(
+                    |_| Vec::new(),
+                    |all| {
+                        all.into_iter()
+                            .filter(|policy| policy.target == target)
+                            .collect()
+                    },
+                )
+            };
+            launch_side.serve_launches(&policies, &signal, stop).await;
+        }))
     }
 
     fn coordination(&self) -> Option<tokio::sync::watch::Receiver<super::coordinator::LinkView>> {
@@ -2615,14 +2627,30 @@ enum DrainKind {
     Upgrade,
 }
 
-/// How soon a pass retries an accepted launch that did not start.
-const LAUNCH_RETRY: Duration = Duration::from_secs(30);
-
+/// A target's passes, and beside them what serves its coordinator launches, so
+/// a launch does not wait for a pass to finish. Launches stop being started when
+/// the target drains, and the loop ends once those coming up are up.
 async fn run_target_loop<T: TargetReconciler>(
+    mut target: T,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    upgrade: tokio::sync::watch::Receiver<bool>,
+    contacts: Arc<dyn ContactRecorder>,
+) -> Result<(), CliError> {
+    let (stop_launches, launches_stopped) = tokio::sync::watch::channel(false);
+    let launch_driver = target.launch_driver(launches_stopped);
+    let passes = run_target_passes(target, shutdown, upgrade, contacts, stop_launches);
+    match launch_driver {
+        Some(driver) => futures::future::join(passes, driver).await.0,
+        None => passes.await,
+    }
+}
+
+async fn run_target_passes<T: TargetReconciler>(
     mut target: T,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut upgrade: tokio::sync::watch::Receiver<bool>,
     contacts: Arc<dyn ContactRecorder>,
+    stop_launches: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), CliError> {
     let mut draining = shutdown_kind(&shutdown, &upgrade);
     let mut drain_deadline = match draining {
@@ -2630,10 +2658,10 @@ async fn run_target_loop<T: TargetReconciler>(
         _ => None,
     };
     if draining.is_some() {
+        stop_launches.send_replace(true);
         target.begin_drain();
     }
     let wake = target.wake();
-    let launch = target.launch_signal();
     let mut coordination = target.coordination();
     let target_name = target
         .policies()
@@ -2650,10 +2678,6 @@ async fn run_target_loop<T: TargetReconciler>(
         // pull the next poll forward for a job already seen.
         if let Some(wake) = &wake {
             let _ = futures::FutureExt::now_or_never(wake.notified());
-        }
-        // This pass starts every accepted launch too.
-        if let Some(launch) = &launch {
-            let _ = futures::FutureExt::now_or_never(launch.notified());
         }
         // Before deciding anything, so a policy an operator changed a moment
         // ago governs this pass rather than the next one.
@@ -2789,29 +2813,12 @@ async fn run_target_loop<T: TargetReconciler>(
                         None => std::future::pending().await,
                     }
                 } => {}
-                // Accepted coordinator launches: their runners start now,
-                // all of them, without a poll and so without its gap; the
-                // next pass stays where it was scheduled.
-                () = async {
-                    match &launch {
-                        Some(launch) => launch.notified().await,
-                        None => std::future::pending().await,
-                    }
-                }, if draining.is_none() => {
-                    target.refresh_policies();
-                    target.start_directed().await;
-                    // One that did not start (a registration that failed) is
-                    // tried again by a pass well inside its lease's lifetime.
-                    if target.holds_unstarted_launches() {
-                        let retry = tokio::time::Instant::now() + LAUNCH_RETRY;
-                        woken = Some(woken.map_or(retry, |woken| woken.min(retry)));
-                    }
-                }
                 changed = shutdown.changed(), if draining != Some(DrainKind::Shutdown) => {
                     if changed.is_err() || *shutdown.borrow() {
                         // A shutdown arriving mid-upgrade supersedes it, deadline
                         // and all: the machine is going down either way, and the
                         // upgrade's patience is no longer anybody's benefit.
+                        stop_launches.send_replace(true);
                         target.begin_drain();
                         draining = Some(DrainKind::Shutdown);
                         drain_deadline = Some(tokio::time::Instant::now() + DRAIN_DEADLINE);
@@ -2820,6 +2827,7 @@ async fn run_target_loop<T: TargetReconciler>(
                 }
                 changed = upgrade.changed(), if draining.is_none() => {
                     if changed.is_err() || *upgrade.borrow() {
+                        stop_launches.send_replace(true);
                         target.begin_drain();
                         draining = Some(DrainKind::Upgrade);
                     }
@@ -3400,6 +3408,8 @@ mod tests {
         /// The link's launch signal, and how often accepted launches were
         /// started, when a test wires one.
         launch: Option<(Arc<tokio::sync::Notify>, Arc<AtomicUsize>)>,
+        /// Each pass takes a permit first, when a test wires this.
+        hold_pass: Option<Arc<tokio::sync::Semaphore>>,
         /// What the budget says about this target's charged polls.
         pacing_floor: Duration,
         /// A launch of this target stays open with no runner.
@@ -3422,6 +3432,7 @@ mod tests {
                     wake: None,
                     coordination: None,
                     launch: None,
+                    hold_pass: None,
                     pacing_floor: Duration::ZERO,
                     unstarted: false,
                 },
@@ -3442,6 +3453,7 @@ mod tests {
                 wake: None,
                 coordination: None,
                 launch: None,
+                hold_pass: None,
                 pacing_floor: Duration::ZERO,
                 unstarted: false,
             }
@@ -3462,6 +3474,7 @@ mod tests {
                 wake: None,
                 coordination: None,
                 launch: None,
+                hold_pass: None,
                 pacing_floor: Duration::ZERO,
                 unstarted: false,
             }
@@ -3493,7 +3506,13 @@ mod tests {
                 report.next_poll.delay = Duration::from_secs(1);
                 report
             });
-            Box::pin(std::future::ready(report))
+            let hold = self.hold_pass.clone();
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    hold.acquire().await.expect("never closed").forget();
+                }
+                report
+            })
         }
 
         fn active_owned(&self, _report: &ReconcileReport) -> Option<u16> {
@@ -3524,10 +3543,6 @@ mod tests {
             self.coordination.clone()
         }
 
-        fn launch_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
-            self.launch.as_ref().map(|(signal, _)| Arc::clone(signal))
-        }
-
         fn pacing_floor(&self) -> Duration {
             self.pacing_floor
         }
@@ -3536,11 +3551,25 @@ mod tests {
             self.unstarted
         }
 
-        fn start_directed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-            if let Some((_, started)) = &self.launch {
-                started.fetch_add(1, Ordering::SeqCst);
-            }
-            Box::pin(async {})
+        fn launch_driver(
+            &mut self,
+            mut stop: tokio::sync::watch::Receiver<bool>,
+        ) -> Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>> {
+            let (signal, started) = self.launch.take()?;
+            Some(Box::pin(async move {
+                loop {
+                    tokio::select! {
+                        () = signal.notified() => {
+                            started.fetch_add(1, Ordering::SeqCst);
+                        }
+                        changed = stop.changed() => {
+                            if changed.is_err() || *stop.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }))
         }
     }
 
@@ -4340,18 +4369,12 @@ mod tests {
         ));
         after(0).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the first pass");
-        // Accepted, and still not started: a pass 30 seconds on.
+        // Accepted, and still not started: the 60 s schedule, not the 300 s one.
         signal.notify_one();
-        after(0).await;
-        after(29).await;
+        after(59).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         after(1).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "retried at 30 s");
-        // With no launch signal, the 60 s schedule, not the 300 s one.
-        after(59).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        after(1).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "at 60 s");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "at 60 s");
         stop.send(true).unwrap();
         after(120).await;
         let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
@@ -4491,6 +4514,51 @@ mod tests {
         stop.send(true).unwrap();
         after(60).await;
         let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+    }
+
+    /// A launch does not wait for its target's pass: one running for as long as
+    /// it likes, polling GitHub or bringing up a batch, does not hold it back.
+    /// Draining stops launches, and the loop ends once they have stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_is_served_while_a_pass_runs_and_a_drain_stops_serving() {
+        let mut report = ReconcileReport::default();
+        report.next_poll.delay = Duration::from_secs(60);
+        let (mut target, calls) = FakeTarget::repeating(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+            report,
+        );
+        target.active = 0;
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        target.launch = Some((Arc::clone(&signal), Arc::clone(&started)));
+        let pass = Arc::new(tokio::sync::Semaphore::new(0));
+        target.hold_pass = Some(Arc::clone(&pass));
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            never_upgraded(),
+            Arc::new(CountingContacts::default()) as Arc<dyn ContactRecorder>,
+        ));
+        after(0).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "in its first pass");
+
+        signal.notify_one();
+        after(600).await;
+        assert_eq!(started.load(Ordering::SeqCst), 1, "served during it");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "still in it");
+
+        pass.add_permits(100);
+        stop.send(true).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(60), daemon)
+            .await
+            .expect("the loop ends, the launch side with it")
+            .expect("joined");
+        assert!(ended.is_ok());
     }
 
     /// A repository added while the daemon runs gets a loop of its own; one

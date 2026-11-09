@@ -31,6 +31,21 @@ services:
     expose:
       - "8080"
 
+  # A copy of the database every day, the last 7 kept; docs/coordinator.md says
+  # how to restore one and how to keep them off this disk. Not read-only: reading
+  # a live WAL database needs its shared-memory file.
+  backup:
+    build:
+      context: ../..
+      dockerfile: deploy/coordinator/Dockerfile.backup
+    image: runner-manager-coordinator-backup:local
+    restart: unless-stopped
+    depends_on:
+      - coordinator
+    volumes:
+      - coordinator-data:/data
+      - coordinator-backups:/backups
+
   caddy:
     image: caddy:2.10
     restart: unless-stopped
@@ -52,5 +67,6 @@ secrets:
 
 volumes:
   coordinator-data:
+  coordinator-backups:
   caddy-data:
   caddy-config:

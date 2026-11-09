@@ -81,6 +81,11 @@ const START_LIMIT: Duration = Duration::from_secs(45);
 const BRING_UP_LIMIT: Duration = Duration::from_secs(15 * 60);
 const TAKE_JOB_GRACE: Duration = Duration::from_secs(30);
 
+/// A runner's exit taking longer than this to be reported as a free slot is a
+/// warning: the 2-second look, the 5-second gap between passes, the pass itself
+/// and the 2-second look at attempts leave plenty of room.
+const SLOW_SLOT_RELEASE: Duration = Duration::from_secs(15);
+
 /// One accepted launch.
 #[derive(Debug, Clone)]
 struct Open {
@@ -88,10 +93,15 @@ struct Open {
     target: ScaleTarget,
     expires: Instant,
     accepted_at: Instant,
+    /// Its place among this host's launches: lower reserves first. A launch
+    /// whose runner exited idle waits afresh, behind those waiting already.
+    order: u64,
     /// The runner reserved for it, once a pass reserved one.
     attempt: Option<AttemptId>,
     /// Since when no runner can be started for it, for a real reason.
     blocked_since: Option<Instant>,
+    /// A younger launch stopped waiting for it: its loop did not reserve.
+    passed_over: bool,
 }
 
 #[derive(Debug, Default)]
@@ -104,9 +114,24 @@ struct Book {
     leased_order: VecDeque<AttemptId>,
     /// A launch was dropped since the link last asked: say so at once.
     dropped: bool,
+    orders: u64,
 }
 
 impl Book {
+    fn next_order(&mut self) -> u64 {
+        self.orders += 1;
+        self.orders
+    }
+
+    /// `policy`'s oldest launch still without a runner.
+    fn next_waiting(&self, policy: PolicyId) -> Option<u64> {
+        self.open
+            .values()
+            .filter(|open| open.policy == policy && open.attempt.is_none())
+            .map(|open| open.order)
+            .min()
+    }
+
     fn remember(&mut self, lease_id: &str) {
         if self.seen_set.insert(lease_id.to_string()) {
             self.seen.push_back(lease_id.to_string());
@@ -188,7 +213,10 @@ impl Book {
                 {
                     open.attempt = None;
                     open.accepted_at = now;
+                    self.orders += 1;
+                    open.order = self.orders;
                     open.blocked_since = None;
+                    open.passed_over = false;
                     released.push(attempt);
                 }
                 // Not read yet (bound since those reads): looked at next time.
@@ -504,15 +532,19 @@ impl Launches {
             }
         }
         let ttl = Duration::from_secs(u64::from(launch.ttl_secs));
-        self.book().open.insert(
+        let mut book = self.book();
+        let order = book.next_order();
+        book.open.insert(
             launch.lease_id.clone(),
             Open {
                 policy: policy.id,
                 target: policy.target.clone(),
                 expires: now + ttl,
                 accepted_at: now,
+                order,
                 attempt: None,
                 blocked_since: None,
+                passed_over: false,
             },
         );
         LaunchAck::accepted(&launch.lease_id)
@@ -597,7 +629,7 @@ impl DemandDirector for Launches {
             .open
             .iter()
             .filter(|(_, open)| open.policy == policy.id && open.attempt.is_none())
-            .min_by_key(|(_, open)| open.accepted_at)
+            .min_by_key(|(_, open)| open.order)
             .map(|(id, _)| id.clone());
         if let Some(lease_id) = lease {
             if let Some(open) = book.open.get_mut(&lease_id) {
@@ -628,23 +660,42 @@ impl DemandDirector for Launches {
         }
     }
 
-    fn older_waiting(&self, policy: &ScalePolicy) -> bool {
-        let book = self.book();
-        let waiting = || book.open.values().filter(|open| open.attempt.is_none());
-        waiting()
-            .filter(|open| open.policy == policy.id)
-            .map(|open| open.accepted_at)
-            .min()
-            .is_some_and(|oldest| {
-                // One that cannot start is no reason to wait for it.
-                // Nor for one of this loop's own: it cannot go during this wait.
-                waiting().any(|open| {
-                    open.target != policy.target
-                        && open.blocked_since.is_none()
-                        && open.accepted_at < oldest
-                })
-            })
+    fn next_waiting(&self, policy: &ScalePolicy) -> Option<u64> {
+        self.book().next_waiting(policy.id)
     }
+
+    fn older_waiting(&self, policy: &ScalePolicy) -> usize {
+        let book = self.book();
+        book.next_waiting(policy.id).map_or(0, |next| {
+            book.open
+                .values()
+                .filter(|open| older_than(open, next, &policy.target))
+                .count()
+        })
+    }
+
+    fn pass_over_older(&self, policy: &ScalePolicy) {
+        let mut book = self.book();
+        if let Some(next) = book.next_waiting(policy.id) {
+            for open in book.open.values_mut() {
+                if older_than(open, next, &policy.target) {
+                    open.passed_over = true;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `open` is a launch of another target that a launch at `next` of
+/// `target` lets reserve first. Not one that cannot start, or one that its loop
+/// did not reserve in time. Nor one of `target` itself: its own loop picks it
+/// first (`Reconciler::serve_launches`), and would be waiting for itself.
+fn older_than(open: &Open, next: u64, target: &ScaleTarget) -> bool {
+    open.order < next
+        && open.attempt.is_none()
+        && open.blocked_since.is_none()
+        && !open.passed_over
+        && open.target != *target
 }
 
 /// What the attempt reports need to remember between two looks.
@@ -757,6 +808,24 @@ fn finished(attempt: &RunnerAttempt, launches: &Launches, meters: &AttemptMeters
     let ended = attempt
         .terminal_at()
         .unwrap_or_else(|| attempt.last_state_change_at());
+    // The host cannot see when a job ended, only when its runner exited. A slot
+    // frees when the attempt concludes, and this report is sent within moments.
+    if let Some(took) = meters.since_seen_gone(attempt.id, Instant::now()) {
+        let exit_to_report_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+        if took >= SLOW_SLOT_RELEASE {
+            tracing::warn!(
+                event = "attempt_slot_release_slow",
+                attempt_id = %attempt.id,
+                exit_to_report_ms,
+            );
+        } else {
+            tracing::info!(
+                event = "attempt_slot_released",
+                attempt_id = %attempt.id,
+                exit_to_report_ms,
+            );
+        }
+    }
     AttemptReport::Finished(AttemptFinished {
         lease_id: launches.lease_of(attempt.id),
         runner_name: runner_manager_agent::lifecycle::runner_name(attempt.id),
@@ -1044,6 +1113,65 @@ mod tests {
         assert_eq!(launches.open_for(policy.id), 0);
     }
 
+    /// A younger launch does not wait again for one its target's loop could not
+    /// reserve, and waits afresh only once that one is given another chance.
+    #[test]
+    fn an_older_launch_passed_over_is_not_waited_for_again() {
+        let (store, policy, launches) = setup(LAUNCH_VERSION);
+        let other = second_profile(&store, &policy, 6);
+        for (lease, owner) in [("old", &other), ("new", &policy)] {
+            let now = Instant::now();
+            let mut book = launches.book();
+            let order = book.next_order();
+            book.open.insert(
+                lease.into(),
+                Open {
+                    policy: owner.id,
+                    target: owner.target.clone(),
+                    expires: now + Duration::from_secs(300),
+                    accepted_at: now,
+                    order,
+                    attempt: None,
+                    blocked_since: None,
+                    passed_over: false,
+                },
+            );
+        }
+        assert_eq!(launches.next_waiting(&policy), Some(2));
+        assert_eq!(launches.older_waiting(&policy), 1);
+        launches.pass_over_older(&policy);
+        assert_eq!(launches.older_waiting(&policy), 0);
+        assert_eq!(launches.older_waiting(&other), 0, "it never waited");
+    }
+
+    /// One whose runner exited idle waits again behind the launches already
+    /// waiting: its order is taken afresh.
+    #[test]
+    fn a_launch_whose_runner_exited_idle_goes_behind_those_waiting() {
+        let (store, policy, launches) = setup(LAUNCH_VERSION);
+        for lease in ["first", "second"] {
+            assert!(
+                launches
+                    .decide(&launch(&policy, lease), false, false)
+                    .accepted
+            );
+        }
+        let runner = AttemptId::new_random();
+        launches.launched(&policy, runner);
+        assert_eq!(launches.next_waiting(&policy), Some(2));
+        let idle = fixtures::attempt()
+            .id(runner)
+            .policy_id(policy.id)
+            .state(AttemptState::Finished)
+            .outcome(AttemptOutcome::ExitedIdleWithoutWork)
+            .build();
+        store.record_attempt(&idle).expect("recorded");
+        launches.settle(Instant::now());
+        assert_eq!(launches.next_waiting(&policy), Some(2));
+        let order = launches.book().open["first"].order;
+        assert!(order > 2, "behind the launch already waiting: {order}");
+    }
+
     #[test]
     fn an_older_launch_of_another_profile_goes_first() {
         let (store, policy, launches) = setup(LAUNCH_VERSION);
@@ -1056,7 +1184,7 @@ mod tests {
             .active()
             .build();
 
-        assert!(!launches.older_waiting(&policy), "nothing open");
+        assert_eq!(launches.older_waiting(&policy), 0, "nothing open");
         {
             let now = Instant::now();
             let mut book = launches.book();
@@ -1072,17 +1200,21 @@ mod tests {
                         target: owner.target.clone(),
                         expires: now + Duration::from_secs(300),
                         accepted_at: now - Duration::from_secs(age),
+                        order: 100 - age,
                         attempt: None,
                         blocked_since: None,
+                        passed_over: false,
                     },
                 );
             }
         }
-        assert!(launches.older_waiting(&policy));
-        assert!(!launches.older_waiting(&other), "it is the oldest");
+        assert_eq!(launches.older_waiting(&policy), 1);
+        assert_eq!(launches.next_waiting(&same_loop), Some(95));
+        assert_eq!(launches.older_waiting(&other), 0, "it is the oldest");
         launches.launched(&other, AttemptId::new_random());
-        assert!(
-            !launches.older_waiting(&policy),
+        assert_eq!(
+            launches.older_waiting(&policy),
+            0,
             "it has its runner, and the one left is in this loop"
         );
     }

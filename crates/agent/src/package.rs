@@ -138,6 +138,13 @@ pub const CHECK_INTERVAL_HOURS: i64 = 6;
 /// abandoned. A terminal failure consumes none of this budget.
 pub const RETRY_BUDGET: u32 = 3;
 
+/// How long a download may take to connect.
+pub const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a download may go without receiving a byte, its response's headers
+/// included. Not a limit on the transfer: see [`HttpFetcher`].
+pub const DOWNLOAD_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 // ---------------------------------------------------------------------------
 // RunnerVersion
 // ---------------------------------------------------------------------------
@@ -849,6 +856,14 @@ where
 /// The `stream` feature exists in this workspace for exactly this: the package
 /// is 150-300 MB, and buffering it in memory on a home host is not an option —
 /// nor would it leave a partial file on disk for the mismatch path to remove.
+///
+/// A connection that stops sending fails the download: every copy of the
+/// package on this host waits for it. There is no limit on the whole transfer,
+/// because a large package on a slow line is legitimately slow; only silence
+/// fails it, `reqwest`'s read timeout starting over with every read. What was
+/// written is removed by the caller, on every path out of the fetch, and it was
+/// never going to be taken for a package: an archive is only extracted once its
+/// digest matches.
 #[derive(Debug, Clone)]
 pub struct HttpFetcher {
     client: reqwest::Client,
@@ -863,7 +878,12 @@ impl HttpFetcher {
 
 impl Default for HttpFetcher {
     fn default() -> Self {
-        Self::new(reqwest::Client::new())
+        let client = reqwest::Client::builder()
+            .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+            .read_timeout(DOWNLOAD_STALL_TIMEOUT)
+            .build()
+            .unwrap_or_default();
+        Self::new(client)
     }
 }
 
@@ -2763,6 +2783,8 @@ mod tests {
         /// assertion from passing over a file that was never created.
         wrote: Mutex<Vec<PathBuf>>,
         fail: Mutex<bool>,
+        /// Each fetch takes a permit first, when a test wires this.
+        gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     }
 
     impl FakeFetcher {
@@ -2772,6 +2794,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 wrote: Mutex::new(Vec::new()),
                 fail: Mutex::new(false),
+                gate: Mutex::new(None),
             })
         }
 
@@ -2799,6 +2822,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((url.to_string(), destination.to_path_buf()));
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.expect("never closed").forget();
+            }
             if *self.fail.lock().unwrap() {
                 return Err(PackageError::Download {
                     detail: "connection reset".to_string(),
@@ -4296,6 +4323,187 @@ mod tests {
             ),
             shared,
         )
+    }
+
+    /// An address that answers with `head`, then whatever `then` sends.
+    async fn serving_once<F, T>(head: &'static str, then: F) -> String
+    where
+        F: FnOnce(tokio::net::TcpStream) -> T + Send + 'static,
+        T: std::future::Future<Output = ()> + Send,
+    {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream.write_all(head.as_bytes()).await.unwrap();
+            then(stream).await;
+        });
+        format!("http://{address}/package.tar.gz")
+    }
+
+    const STALL: std::time::Duration = std::time::Duration::from_millis(300);
+
+    fn impatient_fetcher() -> HttpFetcher {
+        HttpFetcher::new(
+            reqwest::Client::builder()
+                .read_timeout(STALL)
+                .build()
+                .expect("a client"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_download_that_goes_silent_fails_rather_than_waits() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = serving_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n",
+            |mut stream| async move {
+                stream.write_all(b"the first bytes").await.unwrap();
+                std::future::pending::<()>().await;
+                drop(stream);
+            },
+        )
+        .await;
+
+        let error = impatient_fetcher()
+            .fetch(&url, &dir.path().join("archive"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, PackageError::Download { .. }), "{error}");
+        assert!(!error.is_terminal(), "a later attempt may try again");
+    }
+
+    #[tokio::test]
+    async fn a_response_that_never_comes_fails_rather_than_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/package.tar.gz", listener.local_addr().unwrap());
+
+        let error = impatient_fetcher()
+            .fetch(&url, &dir.path().join("archive"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, PackageError::Download { .. }), "{error}");
+        drop(listener);
+    }
+
+    /// A large package on a slow line takes as long as it takes: silence is what
+    /// fails it, not time.
+    #[tokio::test]
+    async fn a_slow_download_that_keeps_coming_completes() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = serving_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n",
+            |mut stream| async move {
+                for _ in 0..8 {
+                    tokio::time::sleep(STALL / 3).await;
+                    stream.write_all(b"x").await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+            },
+        )
+        .await;
+        let destination = dir.path().join("archive");
+
+        let written = impatient_fetcher()
+            .fetch(&url, &destination)
+            .await
+            .expect("slow is not stalled");
+
+        assert_eq!(written, 8);
+        assert_eq!(fs::read(&destination).unwrap(), b"xxxxxxxx");
+    }
+
+    /// What a stalled download wrote is not left behind, and is not an entry;
+    /// the next attempt downloads from the start.
+    #[tokio::test]
+    async fn a_failed_download_leaves_nothing_and_the_next_attempt_retries() {
+        #[derive(Debug)]
+        struct Partial;
+        #[async_trait::async_trait]
+        impl PackageFetcher for Partial {
+            async fn fetch(&self, _url: &str, destination: &Path) -> Result<u64, PackageError> {
+                fs::write(destination, b"half an archive").unwrap();
+                Err(PackageError::Download {
+                    detail: "the connection sent nothing".into(),
+                })
+            }
+        }
+
+        let (harness, _, _) = linux_fixture();
+        let stalled = PackageCache::new(
+            &harness.paths,
+            Os::Linux,
+            Arch::X64,
+            CachePorts {
+                catalog: Arc::clone(&harness.catalog) as Arc<dyn DownloadCatalog>,
+                fetcher: Arc::new(Partial),
+                backoff: Arc::new(NoBackoff),
+                clock: Arc::clone(&harness.clock) as Arc<dyn Clock>,
+            },
+        )
+        .with_retry_budget(1);
+
+        stalled.ensure_installed().await.unwrap_err();
+
+        assert!(stalled.installed().unwrap().is_empty());
+        let left = fs::read_dir(stalled.staging_root())
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(left, 0, "the partial download is gone");
+        harness.cache().ensure_installed().await.expect("retried");
+    }
+
+    /// The launches queued behind an install that failed get its answer rather
+    /// than each spending a stall of its own, and a later attempt tries again.
+    #[tokio::test]
+    async fn launches_queued_behind_a_failed_install_share_its_failure() {
+        use crate::lifecycle::{PackageTimings, RuntimePackages as _};
+
+        let (harness, _, _) = linux_fixture();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *harness.fetcher.gate.lock().unwrap() = Some(Arc::clone(&gate));
+        *harness.fetcher.fail.lock().unwrap() = true;
+        let (one, two, _shared) = two_targets(&harness);
+        let (first, second) = (reserved(&harness, 1), reserved(&harness, 2));
+
+        let (mut one_timings, mut two_timings) =
+            (PackageTimings::default(), PackageTimings::default());
+        let (a, b, ()) = tokio::join!(
+            one.materialize(&first, &mut one_timings),
+            two.materialize(&second, &mut two_timings),
+            async {
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                gate.add_permits(100);
+            }
+        );
+
+        assert!(a.is_err());
+        assert!(b.is_err());
+        assert_eq!(
+            harness.fetcher.count(),
+            RETRY_BUDGET as usize,
+            "one launch's retries"
+        );
+
+        *harness.fetcher.fail.lock().unwrap() = false;
+        let third = reserved(&harness, 3);
+        one.materialize(&third, &mut PackageTimings::default())
+            .await
+            .expect("the next attempt downloads it");
+        assert_eq!(harness.fetcher.count(), RETRY_BUDGET as usize + 1);
     }
 
     /// The 142 s launch: each target distrusted the tree the other installed,

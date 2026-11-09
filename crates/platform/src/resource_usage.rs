@@ -121,12 +121,22 @@ fn parse_proc_stat(line: &str) -> Option<(u32, u64, u64)> {
     Some((parent, ticks, pages))
 }
 
+/// Whether one `/proc/<pid>/stat` line is of a process that has exited. A zombie
+/// stays in `/proc` until its parent reaps it, and a runner's parent is the daemon,
+/// which reaps it in the pass this look exists to bring forward.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_stat_exited(line: &str) -> bool {
+    crate::process::proc_stat_after_comm(line)
+        .and_then(|fields| fields.split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
+}
+
 #[cfg(target_os = "linux")]
 mod sys {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use super::{Facts, TreeUsage, parse_proc_stat, trees};
+    use super::{Facts, TreeUsage, parse_proc_stat, proc_stat_exited, trees};
 
     pub(super) fn sample_trees(roots: &[u32]) -> HashMap<u32, TreeUsage> {
         // SAFETY: `sysconf` reads a constant and cannot fail in a way that
@@ -157,6 +167,12 @@ mod sys {
             let Ok(line) = std::fs::read_to_string(entry.path().join("stat")) else {
                 continue;
             };
+            // A root that exited is gone, or its slot waits for the next scheduled
+            // poll. Not a descendant: it would drop out of the tree's CPU total, and
+            // return to it through its parent's once reaped, counted twice.
+            if roots.contains(&pid) && proc_stat_exited(&line) {
+                continue;
+            }
             if let Some((parent, ticks, pages)) = parse_proc_stat(&line) {
                 parents.push((pid, parent));
                 facts.insert(
@@ -444,6 +460,47 @@ mod tests {
             |child, _| child != 11,
         );
         assert_eq!(cut[&10].processes, 1);
+    }
+
+    #[test]
+    fn a_stat_line_says_whether_the_process_exited() {
+        let line = |state: &str| {
+            format!("7 (run.sh) {state} 1 7 7 0 -1 0 0 0 0 0 5 6 7 8 20 0 1 0 100 4096 42 0")
+        };
+        assert!(!proc_stat_exited(&line("S")));
+        assert!(!proc_stat_exited(&line("R")));
+        assert!(proc_stat_exited(&line("Z")));
+        assert!(proc_stat_exited(&line("X")));
+        assert!(!proc_stat_exited("garbage"));
+    }
+
+    /// A runner that exited stays in the process table until its parent reaps
+    /// it, and nothing reaps it but the pass this look exists to bring forward. So
+    /// it has to read as gone, or a slot waits for the next scheduled poll.
+    #[test]
+    fn a_process_that_exited_and_was_not_reaped_is_gone() {
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("sh starts");
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("cmd starts");
+        let root = child.id();
+        let mut gone = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if sample_tree(root).is_none() {
+                gone = true;
+                break;
+            }
+        }
+        let reaped = child.wait();
+        assert!(reaped.is_ok(), "it was still ours to reap: {reaped:?}");
+        assert!(gone, "an exited process still reads as running");
     }
 
     /// A real child tree of this process: the measurement on the current OS.
