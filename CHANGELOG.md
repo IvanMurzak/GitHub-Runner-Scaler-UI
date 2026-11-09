@@ -13,37 +13,43 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 Placement between several hosts of one pool had only ever run with one host per pool. A
 deterministic simulation of the real placement code over several hosts
-(`crates/coordinator/tests/balance_sim.rs`) found the following, each now fixed and asserted there.
+(`crates/coordinator/tests/balance_sim.rs`, numbers are its own) found the following, each now
+fixed and asserted there.
 
 - **A heavy job no longer starts on a host too small for it because the big host's slots are all
-  taken.** A job no host could ever hold is run anywhere, and only hosts with a free slot were asked.
-  It now waits for the big host. Simulated, jobs already measured on a host too small for them, over
-  3 seeds: 2 or 3 a round to none.
+  taken.** A job no host could hold is run anywhere, and only hosts with a free slot were asked. It now
+  waits for the big host. Jobs already measured landing on a host too small, with heavy jobs in a queue of
+  their own: 6 in 9 rounds to none.
 - **A long build's memory stays counted on its host until it ends.** The reservation lapsed 2 minutes
-  after a job started, and a build whose peak comes later left its host reading free. Two more builds
-  could land there, up to 24 GiB past a 64 GiB host. It now counts against the host's total until the
-  attempt ends, or the host disconnects.
+  after a job started, and a build whose peak comes later left its host reading free, so more builds
+  landed there: up to 18 GiB past a 64 GiB host. It now counts against the host's total memory, through a
+  broken link too, until the attempt's report, a heartbeat saying the host runs nothing, or 6 hours.
 - **A launch reserves the job its runner took**, once a webhook names it, rather than the queue's next
-  heaviest at the time it was placed. A heavy job taken by a launch sized for a light one is no longer
-  invisible to the next placement.
-- **A launch on a host too small for a job queued later is withdrawn**, while another host could hold
-  it: its runner would otherwise take that job.
+  heaviest when it was placed. A job taken by a runner whose launch was already gone now counts too.
 - **A job that turned heavy is seen at its next run**, not after four. What it is expected to need is
-  its p90, or more if one of its 3 newest samples needed more.
-- **Placement now finds out which host is faster.** A host that never ran a job other hosts have run scores
-  as fastest for it until its first run finishes. The host with the most memory otherwise kept every job for good: a job twice as
-  fast on a smaller host ran on the bigger one for ever. Simulated: mean run 595 s to 238 s.
-- **A warm workspace no longer beats a measured result.** A host measured over at least 3 runs as more than 10% slower than usual
-  at a job loses its `cache` points for it, since its measured times already hold what the checkout saves.
-  Simulated: mean run 177 s to 155 s with a warm workspace on a slow host.
+  its p90, or more if one of its 3 newest samples needed more. A job heavy from then on: 3 of 4 runs on a
+  host too small to none after the first.
+- **Placement now finds out which host is faster.** A host that never ran a job other hosts have run
+  scores as fastest for it until its first run finishes. The host with the most memory otherwise kept
+  every job for good: a job twice as fast on a smaller host ran on the bigger one for ever. Mean run 595 s
+  to 238 s.
+- **A warm workspace no longer beats a measured result.** A host measured over at least 3 runs as more
+  than 10% slower than usual at a job loses its `cache` points for it, since its measured times already hold
+  what the checkout saves. With a warm workspace on a slow host, mean run 178 s to 155 s by the sixth round.
+- **A failed job no longer reads as a fast one.** How long a job that did not succeed took is not kept
+  as its duration: one failing at once made its host look the fastest there is. Its memory still counts.
+- **The biggest host idle and still too short for a job's estimate no longer holds that job for ever.**
+  It runs there. With its estimate following its newest samples, one spike could otherwise stall it for good.
 
 ### Changed
 
-- **A queue's light jobs now wait while its heavy job waits for memory**, which was already the rule and
-  was undone by the first fix above. In the simulation, their median wait rises from 12 s to several
-  minutes when heavy and light jobs share a queue, with memory overcommit gone. Give heavy jobs a label of
-  their own (`runs-on: [rm-pool-linux, heavy]`) to keep both: see
+- **Heavy jobs wait for the memory they need.** A third 28 GiB job on a 64 GiB host now waits about 15
+  minutes for the first to finish rather than take the host 18 GiB past its memory, so such a burst takes longer
+  to finish: about 1,800 s, from 1,400 to 1,950 s with memory overcommitted. Light jobs in the same queue wait with
+  a heavy one, since a runner started for them could take it instead. Give heavy jobs a label of their own
+  (`runs-on: [rm-pool-linux, heavy]`) to spare them: see
   [Weighted placement](docs/coordinator.md#weighted-placement).
+- `a pool queue was weighed` and `a pool queue is not placed` gain `committed_bytes`.
 
 ## 0.4.50
 

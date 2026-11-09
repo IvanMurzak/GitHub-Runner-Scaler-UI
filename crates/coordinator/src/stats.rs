@@ -343,6 +343,9 @@ pub struct JobTimes {
     pub created_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// GitHub says the job did not succeed: how long it took says nothing of how
+    /// fast its host is.
+    pub failed: bool,
 }
 
 /// Whole seconds from `from` to `to`; `None` unless both are known and in
@@ -365,6 +368,7 @@ impl JobTimes {
             created_at: at(created),
             started_at: at(started),
             completed_at: at(completed),
+            failed: false,
         }
     }
 
@@ -385,6 +389,7 @@ impl JobTimes {
         self.created_at = newer.created_at.or(self.created_at);
         self.started_at = newer.started_at.or(self.started_at);
         self.completed_at = newer.completed_at.or(self.completed_at);
+        self.failed |= newer.failed;
     }
 }
 
@@ -583,7 +588,13 @@ pub fn speed_to_try(ratios: &[BTreeMap<String, HostRatio>], host: &str) -> f64 {
     let terms: Vec<f64> = ratios
         .iter()
         .filter(|by_host| by_host.values().any(|figures| figures.ratio.is_some()))
-        .map(|by_host| speed(std::slice::from_ref(by_host), host).unwrap_or(1.0))
+        .map(|by_host| {
+            if by_host.contains_key(host) {
+                speed(std::slice::from_ref(by_host), host).unwrap_or(0.0)
+            } else {
+                1.0
+            }
+        })
         .collect();
     #[allow(clippy::cast_precision_loss, reason = "a handful of terms")]
     let count = terms.len() as f64;
@@ -677,7 +688,7 @@ impl Aggregates {
     /// The memory `key` is expected to need: its p90 peak, or more if one of its
     /// newest [`RECENT_SAMPLES`] needed more. A p90 over a long history answers
     /// slowly: with 30 samples kept, a job that turned heavy goes on being placed
-    /// as light for four more runs, and each of those is what the host's
+    /// as light for three more runs, and each of those is what the host's
     /// out-of-memory killer finds.
     #[must_use]
     pub fn expected_peak(&self, key: &str) -> Option<u64> {
@@ -876,7 +887,7 @@ impl Aggregates {
 }
 
 impl Aggregates {
-    /// What a lease of each queued job reserves, heaviest first: its own p90,
+    /// What a lease of each queued job reserves, heaviest first: its expected peak,
     /// else the lesser of its repository's and `default_job_ram`, a guess that
     /// must not hold memory a measured job needs. `unnamed` jobs have no key.
     /// A lease reserves one of these: five jobs hold one heaviest job, not five.
@@ -910,22 +921,36 @@ impl Aggregates {
 fn required_memory(contenders: &[Contender], demand: &Demand, config: &StatsConfig) -> Option<u64> {
     demand.measured_job.filter(|bytes| {
         let needed = bytes.saturating_add(config.ram_margin);
-        demand.fleet_ram.is_some_and(|ram| ram >= needed)
-            || contenders
+        let largest = demand.fleet_ram.into_iter().chain(
+            contenders
                 .iter()
-                .any(|contender| contender.total_ram.is_none_or(|total| total >= needed))
+                .map(|contender| contender.total_ram.unwrap_or(u64::MAX)),
+        );
+        let held = largest.clone().any(|ram| ram >= needed);
+        // The biggest host doing nothing and still too short: its memory is taken
+        // by something placement cannot wait out, and the job never starts to say
+        // it has grown lighter.
+        let biggest = largest.max().unwrap_or(0);
+        let hopeless = contenders.iter().any(|contender| {
+            contender.total_ram == Some(biggest)
+                && contender.idle()
+                && !contender.fits(*bytes, config.ram_margin)
+        });
+        held && !hopeless
     })
 }
 
 /// The figures behind a fit, for the log: a host fits when `free_ram` less
-/// `reserved` holds `required` and `ram_margin`. So a reading can tell a stale or
-/// low `free_ram` from memory spoken for by open launches.
+/// `reserved`, and `total_ram` less `committed`, both hold `required` and
+/// `ram_margin`. So a reading can tell a stale or low `free_ram` from memory spoken
+/// for by open launches and running jobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FitFigures {
     pub host_id: String,
     pub free_ram: Option<u64>,
     pub total_ram: Option<u64>,
     pub reserved: u64,
+    pub committed: u64,
     pub ram_margin: u64,
     pub required: Option<u64>,
 }
@@ -947,6 +972,7 @@ pub fn roomiest(
             free_ram: contender.free_ram,
             total_ram: contender.total_ram,
             reserved: contender.reserved,
+            committed: contender.committed,
             ram_margin: config.ram_margin,
             required,
         })
@@ -982,6 +1008,10 @@ impl Contender {
                 unclaimed.min(total.saturating_sub(self.committed))
             })
         })
+    }
+
+    const fn idle(&self) -> bool {
+        self.busy_slots == 0 && self.reserved == 0 && self.committed == 0
     }
 
     fn fits(&self, bytes: u64, margin: u64) -> bool {
@@ -1265,6 +1295,9 @@ impl Statistics {
         // The job's own run time; the host's attempt (start, wait for a job,
         // cleanup) only when GitHub's times are missing.
         let (duration_secs, duration_source) = match times.run_secs() {
+            // Its memory still counts, and a failure may be why it ended. Its time
+            // does not: one that fails at once would read as the fastest host there is.
+            _ if times.failed || finished.outcome == AttemptOutcomeKind::Failed => (None, "failed"),
             Some(secs) => (Some(secs), "webhook"),
             None => (finished.duration_secs, "host"),
         };
@@ -1607,7 +1640,7 @@ mod tests {
             warm: false,
             free_ram: free,
             total_ram: Some(32 * GIB),
-            busy_slots: 0,
+            busy_slots: 1,
             reserved,
             committed: 0,
         };
@@ -1908,7 +1941,7 @@ mod tests {
             warm: false,
             free_ram: Some(free),
             total_ram: Some(64 * GIB),
-            busy_slots: 0,
+            busy_slots: 1,
             reserved: 0,
             committed: 0,
         };
@@ -2175,7 +2208,10 @@ mod tests {
         let scored = score(
             &[
                 contender("a", 10 * GIB, 16 * GIB),
-                contender("big", 12 * GIB, 64 * GIB),
+                Contender {
+                    busy_slots: 1,
+                    ..contender("big", 12 * GIB, 64 * GIB)
+                },
             ],
             &demand,
             None,
@@ -2476,7 +2512,93 @@ mod tests {
         assert_eq!(best(360, 240, 2), "warm");
     }
 
-    /// Thirty samples: a p90 would not see this for four runs.
+    /// One spike among a job's newest samples, above what its host has free even
+    /// with nothing running: waiting would never end, and without a run the spike
+    /// would never leave the newest samples.
+    #[test]
+    fn a_job_runs_on_the_biggest_host_idle_and_still_short_rather_than_wait_for_ever() {
+        let config = StatsConfig::default();
+        let fits = |busy_slots| {
+            score(
+                &[Contender {
+                    busy_slots,
+                    ..contender("h", 58 * GIB, 64 * GIB)
+                }],
+                &Demand {
+                    estimate: 61 * GIB,
+                    measured_job: Some(61 * GIB),
+                    ..heavy_demand(Some(64 * GIB))
+                },
+                None,
+                &config,
+                &Aggregates::default(),
+            )[0]
+            .1
+            .fits
+        };
+        assert!(!fits(2), "it has jobs to wait out");
+        assert!(fits(0));
+    }
+
+    /// A job that fails at once says nothing of how fast its host is, or that host
+    /// would take every job. Its memory still counts.
+    #[test]
+    fn a_failed_job_keeps_its_memory_figure_and_gives_no_speed() {
+        let db = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let stats = Statistics::load(db, StatsConfig::default());
+        let times = JobTimes {
+            failed: true,
+            ..JobTimes::parse(
+                Some("2026-11-07T10:00:00Z"),
+                Some("2026-11-07T10:00:00Z"),
+                Some("2026-11-07T10:00:05Z"),
+            )
+        };
+        stats.job_identified(
+            "runner-manager-1",
+            JobIdentity::new("octo/app", Some("build")).expect("named"),
+            times,
+        );
+        stats.attempt_finished(
+            "broken",
+            &AttemptFinished {
+                lease_id: None,
+                runner_name: "runner-manager-1".into(),
+                outcome: AttemptOutcomeKind::CompletedJob,
+                duration_secs: Some(9),
+                usage: Some(AttemptUsage {
+                    peak_rss_bytes: GIB,
+                    samples: 3,
+                    ..AttemptUsage::default()
+                }),
+            },
+            None,
+        );
+        stats.with_aggregates(|aggregates| {
+            let key = "octo/app/build";
+            let figures = aggregates.job(key).expect("a sample");
+            assert_eq!(figures.p50_duration_secs, None);
+            assert_eq!(figures.p90_peak_rss_bytes, Some(GIB));
+            // No other host's time to weigh it against, and it has been tried.
+            let ratios = [aggregates.host_ratios(key)];
+            assert!((speed_to_try(&ratios, "broken") - 0.0).abs() < 1e-9);
+        });
+        let ratios = [Aggregates::from_samples(
+            vec![
+                JobSample {
+                    duration_secs: None,
+                    ..sample("octo/app/build", "broken", 5, GIB)
+                },
+                sample("octo/app/build", "good", 60, GIB),
+            ],
+            30,
+        )
+        .host_ratios("octo/app/build")];
+        assert!((speed_to_try(&ratios, "broken") - 0.0).abs() < 1e-9);
+        assert!((speed_to_try(&ratios, "unknown") - 1.0).abs() < 1e-9);
+    }
+
+    /// Thirty samples: a p90 would not see this for three more runs.
     #[test]
     fn a_job_that_turned_heavy_is_expected_heavy_from_its_next_run() {
         let at = |seconds| Utc::now() + chrono::TimeDelta::seconds(seconds);

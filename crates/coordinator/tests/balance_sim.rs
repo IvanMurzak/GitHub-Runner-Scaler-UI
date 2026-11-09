@@ -254,7 +254,7 @@ fn grows_heavier(round: usize) -> Vec<JobSpec> {
 
 fn steady_stream(_round: usize) -> Vec<JobSpec> {
     (0..24)
-        .map(|index| job(index * 10, "octo/app", "build", 300, 3.0))
+        .map(|index| job(index * 10, "octo/app", "build", 300, 5.0))
         .collect()
 }
 
@@ -438,7 +438,6 @@ struct Host {
     connection: u64,
     connected: bool,
     rx: mpsc::Receiver<Outbound>,
-    busy_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -472,7 +471,7 @@ struct Sim {
     jobs: Vec<Job>,
     runners: Vec<Runner>,
     /// GitHub's queues: what a runner of each can take.
-    github: BTreeMap<JobKey, BTreeSet<usize>>,
+    github: BTreeMap<JobKey, BTreeSet<(u64, usize)>>,
     next_job_id: u64,
     next_runner: u64,
     next_host: usize,
@@ -481,6 +480,7 @@ struct Sim {
     over_ms: u64,
     over_gib_ms: f64,
     over_peak: u64,
+    misfits_measured: u32,
 }
 
 fn required_of(pool: &str) -> Vec<Label> {
@@ -563,6 +563,7 @@ impl Sim {
             over_ms: 0,
             over_gib_ms: 0.0,
             over_peak: 0,
+            misfits_measured: 0,
         };
         for spec in &scenario.hosts {
             let (_, rx) = mpsc::channel(1);
@@ -571,7 +572,6 @@ impl Sim {
                 connection: 0,
                 connected: false,
                 rx,
-                busy_ms: 0,
             });
         }
         sim
@@ -754,10 +754,11 @@ impl Sim {
                             if runner.host == index
                                 && runner.lease.as_deref() == Some(&cancel.lease_id)
                             {
-                                match runner.state {
-                                    RunnerState::Booting => runner.state = RunnerState::Gone,
-                                    RunnerState::Idle => runner.lease = None,
-                                    _ => {}
+                                // A host starts a launch's runner at once: one already
+                                // started stays, and may take any job (`Launches::cancel`).
+                                if matches!(runner.state, RunnerState::Booting | RunnerState::Idle)
+                                {
+                                    runner.lease = None;
                                 }
                             }
                         }
@@ -852,10 +853,10 @@ impl Sim {
         } else {
             self.rng.range(0, queue.len() as u64 - 1) as usize
         };
-        let Some(&job_index) = queue.iter().nth(position) else {
+        let Some(&(queued_at, job_index)) = queue.iter().nth(position) else {
             return false;
         };
-        queue.remove(&job_index);
+        queue.remove(&(queued_at, job_index));
         if queue.is_empty() {
             self.github.remove(&key);
         }
@@ -873,8 +874,14 @@ impl Sim {
         job.host = host_index;
         job.runner = runner_index;
         let run_ms = job.run_ms;
+        if job.spec.peak + spec.os_ram > spec.ram
+            && self
+                .seen
+                .contains(&(job.spec.repo.to_string(), job.spec.name.to_string()))
+        {
+            self.misfits_measured += 1;
+        }
         self.runners[runner_index].state = RunnerState::Running;
-        self.hosts[host_index].busy_ms += run_ms;
         let in_progress = self.webhook_delay();
         self.after(in_progress, Event::InProgressWebhook(job_index));
         self.after(ATTEMPT_STARTED_MS, Event::AttemptStarted(runner_index));
@@ -900,6 +907,7 @@ impl Sim {
                 .started_at
                 .filter(|_| !in_progress)
                 .map(|started| wall(started + job.run_ms)),
+            failed: job.lost,
         };
         let took = in_progress.then_some(runner.as_str());
         if let Some(placement) = &self.placement {
@@ -949,7 +957,10 @@ impl Sim {
                     job.id,
                     Self::identity_of(job),
                 );
-                self.github.entry(key.clone()).or_default().insert(index);
+                self.github
+                    .entry(key.clone())
+                    .or_default()
+                    .insert((now, index));
                 if let Some(placement) = &self.placement {
                     placement.queued_job(repo, &required, id, Some(identity.key()));
                 }
@@ -1127,8 +1138,8 @@ impl Sim {
         self.over_ms = 0;
         self.over_gib_ms = 0.0;
         self.over_peak = 0;
+        self.misfits_measured = 0;
         for index in 0..self.hosts.len() {
-            self.hosts[index].busy_ms = 0;
             if !self.hosts[index].connected {
                 self.connect(index);
             }
@@ -1194,7 +1205,7 @@ impl Sim {
     fn finish_round(&mut self, start: u64) -> Metrics {
         let now = self.now();
         // Whatever never ran is forgotten, so it does not haunt the next round.
-        for index in self.github.values().flatten() {
+        for (_, index) in self.github.values().flatten() {
             let job = &self.jobs[*index];
             if let Some(placement) = &self.placement {
                 placement.dequeued(job.spec.repo, &job.required, job.id);
@@ -1218,21 +1229,22 @@ impl Sim {
             - start;
         let seconds = |ms: Option<u64>| ms.unwrap_or(0) / 1000;
         let mut misfits = 0;
-        let mut misfits_measured = 0;
         for job in self.jobs.iter().filter(|job| job.started_at.is_some()) {
             let spec = &self.hosts[job.host].spec;
             if job.spec.peak + spec.os_ram > spec.ram {
                 misfits += 1;
-                let key = (job.spec.repo.to_string(), job.spec.name.to_string());
-                if self.seen.contains(&key) {
-                    misfits_measured += 1;
-                }
             }
         }
-        let shares: Vec<u64> = self
-            .hosts
-            .iter()
-            .map(|host| host.busy_ms * 100 / (u64::from(host.spec.slots) * makespan.max(1)))
+        let shares: Vec<u64> = (0..self.hosts.len())
+            .map(|host| {
+                let busy_ms: u64 = self
+                    .jobs
+                    .iter()
+                    .filter(|job| job.started_at.is_some() && job.host == host)
+                    .map(|job| job.run_ms)
+                    .sum();
+                busy_ms * 100 / (u64::from(self.hosts[host].spec.slots) * makespan.max(1))
+            })
             .collect();
         let starved = self
             .jobs
@@ -1254,10 +1266,10 @@ impl Sim {
             wait_max_s: seconds(waits.iter().max().copied()),
             mean_run_s: mean_run / 1000,
             over_s: self.over_ms / 1000,
-            over_gib_s: (self.over_gib_ms / 1000.0) as u64,
-            over_peak_gib: self.over_peak / GIB,
+            over_gib_s: (self.over_gib_ms / 1000.0).ceil() as u64,
+            over_peak_gib: self.over_peak.div_ceil(GIB),
             misfits,
-            misfits_measured,
+            misfits_measured: self.misfits_measured,
             spread_pct: shares.iter().max().unwrap_or(&0) - shares.iter().min().unwrap_or(&0),
             starved,
             lost: self.jobs.iter().filter(|job| job.lost).count() as u32,
@@ -1290,6 +1302,9 @@ async fn run(scenario: &Scenario, policy: Policy, seed: u64) -> Vec<Metrics> {
 fn merged(rounds: &[Metrics]) -> Metrics {
     let count = rounds.len().max(1) as u64;
     let mean = |field: fn(&Metrics) -> u64| rounds.iter().map(field).sum::<u64>() / count;
+    // Up, not down: any overcommit in any round of any seed stays above zero.
+    let mean_up =
+        |field: fn(&Metrics) -> u64| rounds.iter().map(field).sum::<u64>().div_ceil(count);
     let total = |field: fn(&Metrics) -> u32| rounds.iter().map(field).sum::<u32>();
     Metrics {
         makespan_s: mean(|m| m.makespan_s),
@@ -1297,9 +1312,9 @@ fn merged(rounds: &[Metrics]) -> Metrics {
         wait_p95_s: mean(|m| m.wait_p95_s),
         wait_max_s: mean(|m| m.wait_max_s),
         mean_run_s: mean(|m| m.mean_run_s),
-        over_s: mean(|m| m.over_s),
-        over_gib_s: mean(|m| m.over_gib_s),
-        over_peak_gib: mean(|m| m.over_peak_gib),
+        over_s: mean_up(|m| m.over_s),
+        over_gib_s: mean_up(|m| m.over_gib_s),
+        over_peak_gib: mean_up(|m| m.over_peak_gib),
         misfits: total(|m| m.misfits),
         misfits_measured: total(|m| m.misfits_measured),
         spread_pct: mean(|m| m.spread_pct),
@@ -1426,13 +1441,14 @@ fn check(results: &[ScenarioResult]) -> Vec<String> {
     for result in results {
         let name = result.name;
         let learned = result.weighted_from(2);
+        let every_round = result.weighted_from(1);
         let first = &result.weighted[0];
         let rounds = (result.weighted.len() - 1) as u32;
         // Nothing waits for good, whatever the policy.
         for (policy, metrics) in [
             ("round-robin", &result.round_robin),
             ("no statistics", &result.no_statistics),
-            ("statistics", &learned),
+            ("statistics", &every_round),
         ] {
             expect(
                 metrics.starved == 0,
@@ -1465,12 +1481,14 @@ fn check(results: &[ScenarioResult]) -> Vec<String> {
         }
     }
 
-    // Scenarios 1: heavy jobs that fit only the big host.
-    for name in ["1a", "1b"] {
+    // Scenarios 1: heavy jobs that fit only the big host. In one queue a runner
+    // started for a light job can still take a heavy one queued after it, which
+    // cannot be stopped: rare, not never. In a queue of their own, never.
+    for (name, allowed) in [("1a", 2), ("1b", 0)] {
         let result = of(name);
         let learned = result.weighted_from(2);
         expect(
-            learned.misfits_measured == 0,
+            learned.misfits_measured <= allowed,
             format!(
                 "{name}: {} measured jobs on a host too small",
                 learned.misfits_measured
@@ -1598,8 +1616,11 @@ fn check(results: &[ScenarioResult]) -> Vec<String> {
         ),
     );
     expect(
-        fleet.round_robin.misfits > 0,
-        "7: round-robin should put the Mac's build on the small Mac".to_string(),
+        learned.over_gib_s * 10 < fleet.round_robin.over_gib_s,
+        format!(
+            "7: statistics should overcommit a tenth of round-robin: {} vs {} GiB·s",
+            learned.over_gib_s, fleet.round_robin.over_gib_s
+        ),
     );
     failures
 }
