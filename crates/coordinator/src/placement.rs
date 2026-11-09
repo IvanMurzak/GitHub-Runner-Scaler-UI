@@ -38,10 +38,12 @@
 //! their last heartbeat once the leases already sent to them are counted.
 //!
 //! Stage 4: with [`crate::stats::Statistics`] attached, the queue's demand is
-//! its heaviest queued job's p90 peak memory; a host that cannot hold it
+//! its heaviest queued job's expected peak memory; a host that cannot hold it
 //! (less what its launches whose runner took no job yet reserve: each the
-//! queue's next heaviest job, so `n` leases stand for its `n` heaviest) is
-//! passed over, and the rest are ranked by [`crate::stats::score`]. Each
+//! queue's next heaviest job, so `n` leases stand for its `n` heaviest, until
+//! a webhook names the job its runner took) is passed over, and the rest are
+//! ranked by [`crate::stats::score`]. A launch on a host too small for a job
+//! that joined the queue later is withdrawn. Each
 //! decision is logged with host ids and scores and kept for `stats`. With no
 //! statistics for the queue, the order is stage 3's: a warm workspace for
 //! the repository, then the most free RAM, then the fewest busy slots.
@@ -178,10 +180,13 @@ impl Queue {
     }
 
     /// One job left the queue: the named one if known, else an unnamed one.
-    fn take(&mut self, job_id: u64) {
-        if self.jobs.remove(&job_id).is_none() {
+    /// Returns its statistics key, when it had one.
+    fn take(&mut self, job_id: u64) -> Option<String> {
+        let taken = self.jobs.remove(&job_id);
+        if taken.is_none() {
             self.unnamed = self.unnamed.saturating_sub(1);
         }
+        taken.and_then(|(_, job_key)| job_key)
     }
 }
 
@@ -261,6 +266,8 @@ struct Runner {
     host_id: String,
     /// The queue of the lease it was started for, if any.
     queue: Option<JobKey>,
+    /// That lease.
+    lease_id: Option<String>,
     at: Instant,
 }
 
@@ -270,7 +277,10 @@ struct Ramping {
     lease_id: String,
     host_id: String,
     estimate: u64,
+    /// Until when it comes off the host's free memory as well.
     until: Instant,
+    /// When it is forgotten if its attempt's end was never heard.
+    forget: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -284,8 +294,8 @@ struct State {
     /// Runners whose `attempt_started` came in, by lower-cased name.
     runners: HashMap<String, Runner>,
     /// Jobs a webhook said a runner took before its host reported that
-    /// runner, by lower-cased runner name.
-    taken: HashMap<String, (JobKey, Instant)>,
+    /// runner, by lower-cased runner name, and what that job is expected to use.
+    taken: HashMap<String, (JobKey, Instant, Option<u64>)>,
     leases: HashMap<String, Lease>,
     /// When a webhook last changed a key's queue, so a sweep that read
     /// GitHub before that does not overwrite it.
@@ -325,8 +335,42 @@ impl State {
             .fold(leased, |sum, ramping| sum.saturating_add(ramping.estimate))
     }
 
+    /// What every launch of `host_id` whose job has not ended is expected to
+    /// use at its peak. Unlike [`Self::reserved_on`] it is held against the host's
+    /// total memory, never its free memory, so what a job has grown to so far
+    /// does not count twice.
+    fn committed_on(&self, host_id: &str) -> u64 {
+        let leased = self
+            .leases
+            .values()
+            .filter(|lease| lease.host_id == host_id)
+            .fold(0u64, |sum, lease| sum.saturating_add(lease.estimate));
+        self.ramping
+            .iter()
+            .filter(|ramping| ramping.host_id == host_id)
+            .fold(leased, |sum, ramping| sum.saturating_add(ramping.estimate))
+    }
+
+    /// The job `lease_id`'s runner took is known: it reserves what that job is
+    /// expected to use, not the queue's next heaviest it was placed for.
+    fn job_known(&mut self, lease_id: &str, estimate: Option<u64>) {
+        let Some(estimate) = estimate else {
+            return;
+        };
+        if let Some(lease) = self.leases.get_mut(lease_id) {
+            lease.estimate = estimate;
+        } else if let Some(ramping) = self
+            .ramping
+            .iter_mut()
+            .find(|ramping| ramping.lease_id == lease_id)
+        {
+            ramping.estimate = estimate;
+        }
+    }
+
     /// Removes a lease whose runner took its job; its estimate stays
-    /// reserved on its host until [`RAMP_HOLD`] after the claim.
+    /// reserved on its host until [`RAMP_HOLD`] after the claim, and counts
+    /// against its total memory until the job ends.
     fn release_claimed(&mut self, lease_id: &str, claimed_at: Instant) {
         if let Some(lease) = self.leases.remove(lease_id)
             && lease.estimate > 0
@@ -336,6 +380,7 @@ impl State {
                 host_id: lease.host_id,
                 estimate: lease.estimate,
                 until: claimed_at + RAMP_HOLD,
+                forget: claimed_at + JOB_MEMORY,
             });
         }
     }
@@ -614,8 +659,11 @@ impl Placement {
         let now = crate::clock::now();
         let mut state = self.state();
         state.touched.insert(key.clone(), now);
+        let mut estimate = None;
         if let Some(queue) = state.queues.get_mut(&key) {
-            queue.take(job_id);
+            estimate = queue
+                .take(job_id)
+                .and_then(|job_key| self.expected_peak(&job_key));
             if queue.len() == 0 {
                 state.queues.remove(&key);
             }
@@ -627,14 +675,21 @@ impl Placement {
             match state.runners.get(&name).cloned() {
                 // Started for no lease, or for another queue's.
                 Some(known) if known.queue.as_ref() != Some(&key) => {
+                    if let Some(lease_id) = &known.lease_id {
+                        state.job_known(lease_id, estimate);
+                    }
                     state.close_oldest_accepted(&self.registry, &known.host_id, &key);
                     return Some(key);
                 }
-                Some(_) => {}
+                Some(known) => {
+                    if let Some(lease_id) = &known.lease_id {
+                        state.job_known(lease_id, estimate);
+                    }
+                }
                 // Its host has not said yet: its `attempt_started` settles
                 // this job, whichever lease (or none) the runner had.
                 None if state.taken.len() < MAX_RUNNERS => {
-                    state.taken.insert(name, (key.clone(), now));
+                    state.taken.insert(name, (key.clone(), now, estimate));
                     return Some(key);
                 }
                 None => {}
@@ -656,6 +711,13 @@ impl Placement {
             None => state.credits.entry(key.clone()).or_default().push_back(now),
         }
         Some(key)
+    }
+
+    /// What the statistics expect the job `job_key` to use, if they know it.
+    fn expected_peak(&self, job_key: &str) -> Option<u64> {
+        self.stats
+            .as_ref()?
+            .with_aggregates(|aggregates| aggregates.expected_peak(job_key))
     }
 
     /// The sweep listed `listed` queued pool jobs per required label set in
@@ -783,6 +845,7 @@ impl Placement {
                 Runner {
                     host_id: host_id.to_string(),
                     queue,
+                    lease_id: started.lease_id.clone(),
                     at: crate::clock::now(),
                 },
             );
@@ -794,7 +857,10 @@ impl Placement {
             .filter(|lease| lease.host_id == host_id)
             .map(|lease| lease.key.clone());
         // A webhook already said this runner took a job of `taken`.
-        if let Some((taken, _)) = taken {
+        if let Some((taken, _, estimate)) = taken {
+            if let Some(lease_id) = started.lease_id.as_deref() {
+                state.job_known(lease_id, estimate);
+            }
             match (started.lease_id.as_deref(), lease_key) {
                 // Its own lease's job: that lease is done.
                 (Some(lease_id), Some(key)) if key == taken => {
@@ -901,9 +967,10 @@ impl Placement {
     /// launch, whatever an old half-open one held): its leases close, and a
     /// launch it was answering is refused at once.
     pub fn host_gone(&self, host_id: &str) {
-        self.state()
-            .leases
-            .retain(|_, lease| lease.host_id != host_id);
+        let mut state = self.state();
+        state.leases.retain(|_, lease| lease.host_id != host_id);
+        state.ramping.retain(|ramping| ramping.host_id != host_id);
+        drop(state);
         self.waiting().retain(|_, (host, _)| host != host_id);
     }
 
@@ -928,7 +995,7 @@ impl Placement {
             state.release_claimed(&id, at);
         }
         state.leases.retain(|_, lease| lease.expires > now);
-        state.ramping.retain(|ramping| ramping.until > now);
+        state.ramping.retain(|ramping| ramping.forget > now);
         for credits in state.credits.values_mut() {
             credits.retain(|at| now.saturating_duration_since(*at) < CLAIM_HOLD);
         }
@@ -941,7 +1008,7 @@ impl Placement {
             .retain(|_, runner| now.saturating_duration_since(runner.at) < RUNNER_MEMORY);
         state
             .taken
-            .retain(|_, (_, at)| now.saturating_duration_since(*at) < RUNNER_MEMORY);
+            .retain(|_, (_, at, _)| now.saturating_duration_since(*at) < RUNNER_MEMORY);
         let expired = before - state.leases.len();
         if expired > 0 {
             tracing::info!(expired, "placement leases expired");
@@ -1155,6 +1222,7 @@ impl Placement {
         // Read before the placement lock: the registry has its own.
         let candidates = self.registry.launch_candidates(&key.repository, &required);
         let mut state = self.state();
+        self.withdraw_from_too_small(&mut state, key, &candidates, report);
         let queued = state.queues.get(key).map_or(0, Queue::len);
         let open = state.leases_for(key);
         if open > queued {
@@ -1188,6 +1256,11 @@ impl Placement {
             state.note_unplaced(key, reason);
             return None;
         }
+        let fleet_ram = candidates
+            .iter()
+            .filter(|candidate| fit(candidate))
+            .map(|candidate| candidate.ram_bytes.unwrap_or(u64::MAX))
+            .max();
         let eligible: Vec<Candidate> = candidates
             .into_iter()
             .filter(|c| untried(c) && fit(c) && free(c))
@@ -1195,7 +1268,8 @@ impl Placement {
         let chosen = match &self.stats {
             Some(stats) => {
                 let mut fit = None;
-                let chosen = Self::weigh(stats, &state, key, eligible, decision, &mut fit);
+                let chosen =
+                    Self::weigh(stats, &state, key, eligible, fleet_ram, decision, &mut fit);
                 match fit {
                     Some(fit) => state.fit.insert(key.clone(), fit),
                     None => state.fit.remove(key),
@@ -1251,6 +1325,7 @@ impl Placement {
         state: &State,
         key: &JobKey,
         eligible: Vec<Candidate>,
+        fleet_ram: Option<u64>,
         decision: &mut Option<PlacementDecision>,
         figures: &mut Option<FitFigures>,
     ) -> Option<(Candidate, u64)> {
@@ -1263,7 +1338,10 @@ impl Placement {
                 let (job_keys, unnamed) = state.job_keys(key);
                 aggregates.demand(&key.repository, &job_keys, unnamed, config.default_job_ram)
             };
-            let demand = demand_of(key, aggregates);
+            let demand = Demand {
+                fleet_ram,
+                ..demand_of(key, aggregates)
+            };
             // The heaviest measured demand of every other queue still short of
             // runners: a host only it fits is spared for it.
             let heavier = state
@@ -1283,6 +1361,7 @@ impl Placement {
                     total_ram: candidate.ram_bytes,
                     busy_slots: candidate.heartbeat.busy_slots,
                     reserved: state.reserved_on(&candidate.host_id),
+                    committed: state.committed_on(&candidate.host_id),
                 })
                 .collect();
             let scored = score(&contenders, &demand, heavier, config, aggregates);
@@ -1355,6 +1434,60 @@ impl Placement {
                 .find(|candidate| candidate.host_id == chosen)
                 .map(|candidate| (candidate, state.lease_estimate(key, aggregates, config)))
         })
+    }
+
+    /// A heavier job joined the queue after its launches were placed, and the
+    /// runner of any of them can take it. Launches on a host whose memory can
+    /// never hold it are withdrawn, while another host could: they go back in the
+    /// queue, placed where it fits. A runner already up cannot be stopped.
+    fn withdraw_from_too_small(
+        &self,
+        state: &mut State,
+        key: &JobKey,
+        candidates: &[Candidate],
+        report: &mut Rebalanced,
+    ) {
+        let Some(stats) = &self.stats else {
+            return;
+        };
+        let config = stats.config();
+        let (job_keys, unnamed) = state.job_keys(key);
+        let needed = stats
+            .with_aggregates(|aggregates| {
+                aggregates
+                    .demand(&key.repository, &job_keys, unnamed, config.default_job_ram)
+                    .measured_job
+            })
+            .map(|bytes| bytes.saturating_add(config.ram_margin));
+        let Some(needed) = needed else {
+            return;
+        };
+        let holds = |candidate: &&Candidate| {
+            candidate.ram_bytes.is_none_or(|ram| ram >= needed)
+                && !candidate.heartbeat.unfit
+                && !candidate.heartbeat.draining
+        };
+        if !candidates.iter().any(|candidate| holds(&candidate)) {
+            return;
+        }
+        let too_small: Vec<String> = state
+            .leases
+            .iter()
+            .filter(|(_, lease)| &lease.key == key && lease.state == LeaseState::Accepted)
+            .filter(|(_, lease)| {
+                candidates.iter().any(|candidate| {
+                    candidate.host_id == lease.host_id
+                        && candidate.ram_bytes.is_some_and(|ram| ram < needed)
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for lease_id in too_small {
+            if state.cancel_lease(&self.registry, &lease_id) {
+                report.cancelled += 1;
+                tracing::info!(%lease_id, "a launch was withdrawn: its host cannot hold a job now queued");
+            }
+        }
     }
 
     fn cancel_surplus(
@@ -1450,6 +1583,19 @@ mod tests {
         free: u32,
         ram: u64,
     ) -> FakeHost {
+        connect_sized(registry, id, version, labels, free, ram, None)
+    }
+
+    /// [`connect`], saying how much memory the host has in all.
+    fn connect_sized(
+        registry: &Registry,
+        id: &str,
+        version: u32,
+        labels: &[&str],
+        free: u32,
+        ram: u64,
+        total: Option<u64>,
+    ) -> FakeHost {
         let (tx, rx) = mpsc::channel(64);
         let connection = registry.register(id, version, tx);
         registry.set_hello(
@@ -1461,7 +1607,7 @@ mod tests {
                 os: "linux".into(),
                 arch: "x64".into(),
                 cores: 8,
-                ram_bytes: None,
+                ram_bytes: total,
                 disk_free_bytes: None,
                 targets: vec![Target {
                     scope: TargetScope::Repo,
@@ -2643,5 +2789,173 @@ mod tests {
         assert_eq!(decision.method, "stage3");
         assert_eq!(decision.estimate_source, "default");
         assert!(decision.scores.iter().all(|score| score.fits));
+    }
+
+    /// One accepted launch for the one queued `mem` job on the only host; returns
+    /// everything around it, and that lease.
+    async fn one_lease() -> (
+        Arc<Placement>,
+        JobKey,
+        String,
+        tokio::task::JoinHandle<Vec<ServerMessage>>,
+    ) {
+        let (registry, placement) = light_and_mem();
+        let host = connect_sized(
+            &registry,
+            "h",
+            LAUNCH_VERSION,
+            POOL,
+            8,
+            20 << 30,
+            Some(20 << 30),
+        );
+        let host = answer(&placement, "h", host, Answer::Accept);
+        let key = placement
+            .queued_job("octo/app", &required(POOL), 1, Some("octo/app/mem".into()))
+            .expect("pool");
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        let lease = placement
+            .state()
+            .leases
+            .keys()
+            .next()
+            .cloned()
+            .expect("a lease");
+        (placement, key, lease, host)
+    }
+
+    fn started(lease: &str, runner: &str) -> AttemptStarted {
+        AttemptStarted {
+            lease_id: Some(lease.to_string()),
+            runner_name: runner.to_string(),
+            target: TargetRef {
+                scope: TargetScope::Repo,
+                name: "octo/app".into(),
+            },
+            profile: "pool".into(),
+        }
+    }
+
+    /// A lease is placed for the queue's next heaviest job, and its runner takes
+    /// any: once a webhook names that job, it reserves what that job needs.
+    /// Whichever of the host and the webhook says so first.
+    #[tokio::test]
+    async fn a_lease_reserves_the_job_its_runner_took_once_that_is_known() {
+        for host_first in [true, false] {
+            let (placement, _key, lease, host) = one_lease().await;
+            let pool = required(POOL);
+            assert_eq!(placement.state().reserved_on("h"), 7 << 29);
+            placement.queued_job("octo/app", &pool, 2, Some("octo/app/light".into()));
+            let runner = "runner-manager-took-light";
+            if host_first {
+                placement.attempt_started("h", &started(&lease, runner));
+            }
+            placement.dequeued_by("octo/app", &pool, 2, Some(runner));
+            if !host_first {
+                placement.attempt_started("h", &started(&lease, runner));
+            }
+            assert_eq!(placement.state().committed_on("h"), 1 << 29);
+            drop(host);
+        }
+    }
+
+    /// Past [`RAMP_HOLD`] it no longer comes off the host's free memory, by then
+    /// showing what it has grown to, but it is spoken for until its attempt ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_jobs_memory_stays_committed_until_it_ends_not_only_while_it_ramps() {
+        let (placement, _key, lease, host) = one_lease().await;
+        let pool = required(POOL);
+        let runner = "runner-manager-long";
+        placement.attempt_started("h", &started(&lease, runner));
+        placement.dequeued_by("octo/app", &pool, 1, Some(runner));
+        assert_eq!(placement.state().reserved_on("h"), 7 << 29);
+        assert_eq!(placement.state().committed_on("h"), 7 << 29);
+        tokio::time::advance(RAMP_HOLD + Duration::from_secs(1)).await;
+        placement.expire(crate::clock::now());
+        assert_eq!(placement.state().reserved_on("h"), 0);
+        assert_eq!(placement.state().committed_on("h"), 7 << 29);
+        placement.attempt_finished(
+            "h",
+            &AttemptFinished {
+                lease_id: Some(lease),
+                runner_name: runner.into(),
+                outcome:
+                    runner_manager_domain::coordinator_protocol::AttemptOutcomeKind::CompletedJob,
+                duration_secs: Some(600),
+                usage: None,
+            },
+        );
+        assert_eq!(placement.state().committed_on("h"), 0);
+        drop(host);
+    }
+
+    #[tokio::test]
+    async fn a_launch_on_a_host_too_small_for_a_job_now_queued_is_withdrawn() {
+        let (registry, placement) = light_and_mem();
+        let small = connect_sized(
+            &registry,
+            "small",
+            LAUNCH_VERSION,
+            POOL,
+            2,
+            2 << 30,
+            Some(2 << 30),
+        );
+        let small = answer(&placement, "small", small, Answer::Accept);
+        let pool = required(POOL);
+        let key = placement
+            .queued_job("octo/app", &pool, 1, Some("octo/app/light".into()))
+            .expect("pool");
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        // A heavy job joins, while its runner is on its way, and that runner would
+        // take it. The launch goes back in the queue, for the host that holds it.
+        let big = connect_sized(
+            &registry,
+            "big",
+            LAUNCH_VERSION,
+            POOL,
+            2,
+            20 << 30,
+            Some(20 << 30),
+        );
+        let big = answer(&placement, "big", big, Answer::Accept);
+        placement.queued_job("octo/app", &pool, 2, Some("octo/app/mem".into()));
+        let report = placement.rebalance(&key).await;
+        assert_eq!((report.cancelled, report.accepted), (1, 2));
+        assert!(
+            placement
+                .state()
+                .leases
+                .values()
+                .all(|lease| lease.host_id == "big")
+        );
+        drop((small, big));
+    }
+
+    /// Withdrawing needs somewhere better to go: with no host able to hold the job
+    /// the launch stays, and the job runs where it can.
+    #[tokio::test]
+    async fn a_launch_stays_when_no_host_could_hold_the_job_now_queued() {
+        let (registry, placement) = light_and_mem();
+        let small = connect_sized(
+            &registry,
+            "small",
+            LAUNCH_VERSION,
+            POOL,
+            2,
+            2 << 30,
+            Some(2 << 30),
+        );
+        let small = answer(&placement, "small", small, Answer::Accept);
+        let pool = required(POOL);
+        let key = placement
+            .queued_job("octo/app", &pool, 1, Some("octo/app/light".into()))
+            .expect("pool");
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        placement.queued_job("octo/app", &pool, 2, Some("octo/app/mem".into()));
+        let report = placement.rebalance(&key).await;
+        assert_eq!(report.cancelled, 0);
+        assert_eq!(placement.counts(&key), (2, 2));
+        drop(small);
     }
 }

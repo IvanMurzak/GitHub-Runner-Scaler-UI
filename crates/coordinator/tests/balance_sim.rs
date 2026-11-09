@@ -79,7 +79,7 @@ const LINUX: &str = "rm-pool-linux";
 const WINDOWS: &str = "rm-pool-windows";
 const MACOS: &str = "rm-pool-macos";
 
-/// A small PCG-free generator: all this needs is a seeded, stable stream.
+/// Xorshift: all this needs is a seeded, stable stream.
 struct Rng(u64);
 
 impl Rng {
@@ -291,7 +291,7 @@ fn scenarios() -> Vec<Scenario> {
         Scenario {
             name: "1a mixed, one queue",
             hosts: linux_trio(),
-            rounds: 6,
+            rounds: 4,
             jobs: mixed_one_queue,
             vanishes: None,
             history: &[],
@@ -299,7 +299,7 @@ fn scenarios() -> Vec<Scenario> {
         Scenario {
             name: "1b mixed, two queues",
             hosts: linux_trio(),
-            rounds: 6,
+            rounds: 4,
             jobs: mixed_two_queues,
             vanishes: None,
             history: &[],
@@ -307,7 +307,7 @@ fn scenarios() -> Vec<Scenario> {
         Scenario {
             name: "2 burst over capacity",
             hosts: linux_trio(),
-            rounds: 4,
+            rounds: 3,
             jobs: burst,
             vanishes: None,
             history: &[],
@@ -318,7 +318,7 @@ fn scenarios() -> Vec<Scenario> {
                 host("slow-64", 64, 8, 0.6, LINUX),
                 host("fast-23", 23, 4, 1.5, LINUX),
             ],
-            rounds: 4,
+            rounds: 3,
             jobs: one_at_a_time,
             vanishes: None,
             history: &[],
@@ -326,7 +326,7 @@ fn scenarios() -> Vec<Scenario> {
         Scenario {
             name: "4 repositories, warm",
             hosts: vec![host("big-64", 64, 8, 1.0, LINUX), warm_mid, warm_slow],
-            rounds: 5,
+            rounds: 4,
             jobs: several_repositories,
             vanishes: None,
             history: &[],
@@ -334,15 +334,18 @@ fn scenarios() -> Vec<Scenario> {
         Scenario {
             name: "5 grows heavier",
             hosts: linux_trio(),
-            rounds: 8,
+            rounds: 6,
             jobs: grows_heavier,
             vanishes: None,
-            history: &[("octo/app", "grower", 6, 30), ("octo/app", "filler", 18, 30)],
+            history: &[
+                ("octo/app", "grower", 6, 30),
+                ("octo/app", "filler", 18, 30),
+            ],
         },
         Scenario {
             name: "6 host vanishes",
             hosts: linux_trio(),
-            rounds: 4,
+            rounds: 3,
             jobs: steady_stream,
             vanishes: Some(("big-64", 120_000)),
             history: &[],
@@ -356,7 +359,7 @@ fn scenarios() -> Vec<Scenario> {
                 host("mac-m6-24", 24, 4, 1.4, MACOS),
                 host("mac-m1-8", 8, 1, 0.7, MACOS),
             ],
-            rounds: 6,
+            rounds: 4,
             jobs: owner_fleet,
             vanishes: None,
             history: &[],
@@ -369,16 +372,6 @@ enum Policy {
     RoundRobin,
     NoStatistics,
     Weighted,
-}
-
-impl Policy {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::RoundRobin => "round-robin",
-            Self::NoStatistics => "no statistics",
-            Self::Weighted => "statistics",
-        }
-    }
 }
 
 /// What one round measured.
@@ -436,8 +429,11 @@ struct Runner {
     host: usize,
     key: JobKey,
     lease: Option<String>,
-    /// Its lease's job was taken: no longer among the host's open launches.
+    /// It took a job.
     claimed: bool,
+    /// Its host said so (`attempt_started`): that launch is no longer among the
+    /// open ones its heartbeats list.
+    reported: bool,
     state: RunnerState,
 }
 
@@ -497,8 +493,7 @@ fn required_of(pool: &str) -> Vec<Label> {
 }
 
 fn wall(ms: u64) -> DateTime<Utc> {
-    DateTime::from_timestamp(1_800_000_000, 0).expect("a date")
-        + TimeDelta::milliseconds(ms as i64)
+    DateTime::from_timestamp(1_800_000_000, 0).expect("a date") + TimeDelta::milliseconds(ms as i64)
 }
 
 fn virtual_now() -> std::time::Instant {
@@ -700,7 +695,7 @@ impl Sim {
                 self.runners
                     .iter()
                     .filter(|runner| {
-                        runner.host == host && runner.state != RunnerState::Gone && !runner.claimed
+                        runner.host == host && runner.state != RunnerState::Gone && !runner.reported
                     })
                     .filter_map(|runner| runner.lease.clone())
                     .collect(),
@@ -736,6 +731,7 @@ impl Sim {
             key,
             lease,
             claimed: false,
+            reported: false,
             state: RunnerState::Booting,
         });
         self.after(BRING_UP_MS, Event::Online(self.runners.len() - 1));
@@ -840,9 +836,9 @@ impl Sim {
                     .find(|&index| {
                         let host = &self.hosts[index];
                         host.connected
-                            && key.labels.contains(
-                                &Label::new(host.spec.pool).expect("a pool label"),
-                            )
+                            && key
+                                .labels
+                                .contains(&Label::new(host.spec.pool).expect("a pool label"))
                             && self.slots_used(index) < host.spec.slots
                     });
                 let Some(index) = free else { break };
@@ -942,9 +938,10 @@ impl Sim {
                     placement.queued_job(repo, &required, id, Some(identity.key()));
                 }
                 // A runner already waiting takes it at once.
-                let idle = self.runners.iter().position(|runner| {
-                    runner.key == key && runner.state == RunnerState::Idle
-                });
+                let idle = self
+                    .runners
+                    .iter()
+                    .position(|runner| runner.key == key && runner.state == RunnerState::Idle);
                 if let Some(idle) = idle {
                     self.hand_out(idle);
                 }
@@ -995,6 +992,7 @@ impl Sim {
                 }
             }
             Event::AttemptStarted(index) => {
+                self.runners[index].reported = true;
                 let runner = &self.runners[index];
                 let host = &self.hosts[runner.host];
                 if !host.connected {
@@ -1068,7 +1066,8 @@ impl Sim {
                     AttemptOutcomeKind::CompletedJob
                 });
                 if let Some(job) = finished {
-                    self.seen.insert((job.spec.repo.into(), job.spec.name.into()));
+                    self.seen
+                        .insert((job.spec.repo.into(), job.spec.name.into()));
                 }
                 self.report_finished(host, lease, name, outcome, usage);
                 self.after(0, Event::RetryAll);
@@ -1206,17 +1205,15 @@ impl Sim {
         }
         let deadline = start + ROUND_DEADLINE_MS;
         while let Some(((at, _), event)) = self.events.pop_first() {
+            // No two events share a moment: "the oldest" always means one lease.
             let now = self.now();
-            if at > now {
-                advance(Duration::from_millis(at - now)).await;
-            }
+            advance(Duration::from_millis(at.max(now + 1) - now)).await;
             if self.round_finished() || at > deadline {
                 break;
             }
             self.drain_hosts();
             self.handle(event).await;
             self.drain_hosts();
-            advance(Duration::from_millis(1)).await;
         }
         self.finish_round(start)
     }
@@ -1258,7 +1255,11 @@ impl Sim {
         }
         for (job, seen) in self.jobs.iter().filter_map(|job| {
             job.started_at?;
-            Some((job, self.seen.contains(&(job.spec.repo.into(), job.spec.name.into()))))
+            Some((
+                job,
+                self.seen
+                    .contains(&(job.spec.repo.into(), job.spec.name.into())),
+            ))
         }) {
             let spec = &self.hosts[job.host].spec;
             if seen && job.peak + spec.os_ram > spec.ram {
@@ -1268,9 +1269,7 @@ impl Sim {
         let shares: Vec<u64> = self
             .hosts
             .iter()
-            .map(|host| {
-                host.busy_ms * 100 / (u64::from(host.spec.slots) * makespan.max(1))
-            })
+            .map(|host| host.busy_ms * 100 / (u64::from(host.spec.slots) * makespan.max(1)))
             .collect();
         let starved = self
             .jobs
@@ -1307,8 +1306,8 @@ impl Sim {
 /// the effects measured.
 const SEEDS: [u64; 3] = [0x5eed_0001, 0x5eed_0002, 0x5eed_0003];
 
-/// Baselines do not learn: their last two rounds say all they have to say.
-const BASELINE_ROUNDS: usize = 2;
+/// Baselines do not learn: their last round says all they have to say.
+const BASELINE_ROUNDS: usize = 1;
 
 async fn run(scenario: &Scenario, policy: Policy, seed: u64) -> Vec<Metrics> {
     let mut sim = Sim::new(scenario, policy, seed);
@@ -1389,10 +1388,18 @@ fn table(results: &[ScenarioResult]) -> String {
     );
     for result in results {
         let name = result.name;
-        writeln!(table, "{}", row(name, "round-robin", "all", &result.round_robin))
-            .expect("a string");
-        writeln!(table, "{}", row(name, "no statistics", "all", &result.no_statistics))
-            .expect("a string");
+        writeln!(
+            table,
+            "{}",
+            row(name, "round-robin", "all", &result.round_robin)
+        )
+        .expect("a string");
+        writeln!(
+            table,
+            "{}",
+            row(name, "no statistics", "all", &result.no_statistics)
+        )
+        .expect("a string");
         for (index, metrics) in result.weighted.iter().enumerate() {
             writeln!(
                 table,
@@ -1429,9 +1436,218 @@ async fn simulate() -> Vec<ScenarioResult> {
     results
 }
 
+/// What every placement here must do. Tolerances leave room for the seeds, not
+/// for a real change in behaviour: each was measured, see the PR's table.
+fn check(results: &[ScenarioResult]) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mut expect = |ok: bool, what: String| {
+        if !ok {
+            failures.push(what);
+        }
+    };
+    let of = |name: &str| {
+        results
+            .iter()
+            .find(|result| result.name.starts_with(name))
+            .expect("a scenario")
+    };
+
+    for result in results {
+        let name = result.name;
+        let learned = result.weighted_from(2);
+        let first = &result.weighted[0];
+        let rounds = (result.weighted.len() - 1) as u32;
+        // Nothing waits for good, whatever the policy.
+        for (policy, metrics) in [
+            ("round-robin", &result.round_robin),
+            ("no statistics", &result.no_statistics),
+            ("statistics", &learned),
+        ] {
+            expect(
+                metrics.starved == 0,
+                format!("{name}: {policy} starved a job"),
+            );
+        }
+        // Learning pays: later rounds are not worse than the first.
+        if !name.starts_with('5') {
+            expect(
+                learned.over_gib_s <= first.over_gib_s + 5,
+                format!(
+                    "{name}: more memory overcommit after learning: {} > {} GiB·s",
+                    learned.over_gib_s, first.over_gib_s
+                ),
+            );
+            expect(
+                learned.misfits <= first.misfits * rounds,
+                format!(
+                    "{name}: more misfits after learning: {} > {} over {rounds} rounds",
+                    learned.misfits, first.misfits
+                ),
+            );
+            expect(
+                learned.mean_run_s * 100 <= first.mean_run_s * 105,
+                format!(
+                    "{name}: jobs ran slower after learning: {} s > {} s",
+                    learned.mean_run_s, first.mean_run_s
+                ),
+            );
+        }
+    }
+
+    // Scenarios 1: heavy jobs that fit only the big host.
+    for name in ["1a", "1b"] {
+        let result = of(name);
+        let learned = result.weighted_from(2);
+        expect(
+            learned.misfits_measured == 0,
+            format!(
+                "{name}: {} measured jobs on a host too small",
+                learned.misfits_measured
+            ),
+        );
+        expect(
+            result.round_robin.misfits > 0,
+            format!("{name}: round-robin should misplace these jobs"),
+        );
+        expect(
+            learned.over_gib_s * 10 < result.round_robin.over_gib_s,
+            format!(
+                "{name}: statistics should overcommit a tenth of round-robin: {} vs {} GiB·s",
+                learned.over_gib_s, result.round_robin.over_gib_s
+            ),
+        );
+        expect(
+            learned.over_gib_s * 10 < result.no_statistics.over_gib_s,
+            format!(
+                "{name}: statistics should overcommit a tenth of none: {} vs {} GiB·s",
+                learned.over_gib_s, result.no_statistics.over_gib_s
+            ),
+        );
+    }
+    // Their own queue spares the light jobs the heavy ones' wait.
+    expect(
+        of("1b").weighted_from(2).wait_p50_s * 5 < of("1a").weighted_from(2).wait_p50_s,
+        "1: a queue of their own should spare light jobs the heavy ones' wait".to_string(),
+    );
+
+    // Scenario 2: over capacity, memory safe at little cost.
+    let burst = of("2");
+    let learned = burst.weighted_from(2);
+    expect(
+        learned.over_gib_s * 10 <= burst.round_robin.over_gib_s,
+        format!(
+            "2: statistics should overcommit a tenth of round-robin: {} vs {} GiB·s",
+            learned.over_gib_s, burst.round_robin.over_gib_s
+        ),
+    );
+    expect(
+        learned.makespan_s * 100 <= burst.round_robin.makespan_s * 120,
+        format!(
+            "2: safety should cost at most a fifth in makespan: {} vs {} s",
+            learned.makespan_s, burst.round_robin.makespan_s
+        ),
+    );
+
+    // Scenario 3: it finds the faster host, though the other has more memory.
+    let faster = of("3");
+    let learned = faster.weighted_from(2);
+    expect(
+        learned.mean_run_s * 100 <= faster.no_statistics.mean_run_s * 50,
+        format!(
+            "3: learning should halve run time against no statistics: {} vs {} s",
+            learned.mean_run_s, faster.no_statistics.mean_run_s
+        ),
+    );
+    expect(
+        learned.mean_run_s < faster.round_robin.mean_run_s,
+        format!(
+            "3: statistics should beat round-robin: {} vs {} s",
+            learned.mean_run_s, faster.round_robin.mean_run_s
+        ),
+    );
+
+    // Scenario 4: a warm host wins, unless measured slower than a cold one.
+    let warm = of("4");
+    let learned = warm.weighted_from(3);
+    expect(
+        learned.mean_run_s * 100 <= warm.no_statistics.mean_run_s * 92,
+        format!(
+            "4: statistics should beat none by 8%: {} vs {} s",
+            learned.mean_run_s, warm.no_statistics.mean_run_s
+        ),
+    );
+    expect(
+        learned.mean_run_s < warm.round_robin.mean_run_s,
+        format!(
+            "4: statistics should beat round-robin: {} vs {} s",
+            learned.mean_run_s, warm.round_robin.mean_run_s
+        ),
+    );
+
+    // Scenario 5: one run may surprise; the next ones know.
+    let grown = of("5");
+    let settled = grown.weighted_from(GROWS_AT_ROUND + 1);
+    expect(
+        settled.misfits == 0,
+        format!("5: {} misfits after the first heavy run", settled.misfits),
+    );
+    let settled = grown.weighted_from(GROWS_AT_ROUND + 2);
+    expect(
+        settled.over_gib_s == 0,
+        format!(
+            "5: {} GiB·s overcommitted after it was learned",
+            settled.over_gib_s
+        ),
+    );
+
+    // Scenario 6: every job is accounted for, the rest run on what is left.
+    let vanishes = of("6");
+    let learned = vanishes.weighted_from(2);
+    expect(
+        learned.misfits == 0 && learned.over_gib_s == 0,
+        format!(
+            "6: the survivors were overloaded: {} misfits, {} GiB·s",
+            learned.misfits, learned.over_gib_s
+        ),
+    );
+    expect(
+        learned.lost > 0,
+        "6: a host vanishing should lose its jobs".to_string(),
+    );
+
+    // Scenario 7: the owner's fleet stays inside its memory once measured.
+    let fleet = of("7");
+    let learned = fleet.weighted_from(2);
+    expect(
+        learned.misfits == 0 && learned.over_s <= 5,
+        format!(
+            "7: {} misfits and {} s overcommitted once measured",
+            learned.misfits, learned.over_s
+        ),
+    );
+    expect(
+        fleet.round_robin.misfits > 0,
+        "7: round-robin should put the Mac's build on the small Mac".to_string(),
+    );
+    failures
+}
+
 #[tokio::test(start_paused = true)]
 async fn placement_balances_load_across_hosts() {
     let results = simulate().await;
+    let table = table(&results);
     // Past the test harness's capture: the numbers are the point of this test.
-    writeln!(std::io::stderr().lock(), "\n{}", table(&results)).expect("stderr");
+    writeln!(std::io::stderr().lock(), "\n{table}").expect("stderr");
+    let failures = check(&results);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The same seed gives the same numbers: no real time, no hash order and no lease
+/// id reaches a result.
+#[tokio::test(start_paused = true)]
+async fn the_simulation_is_deterministic() {
+    let scenario = scenarios().swap_remove(0);
+    let first = run(&scenario, Policy::Weighted, SEEDS[0]).await;
+    let second = run(&scenario, Policy::Weighted, SEEDS[0]).await;
+    assert_eq!(first, second);
 }
