@@ -864,6 +864,15 @@ fn pool_labels_follow_the_host_os_and_belong_to_one_profile_per_target() {
     // An organization target has its own pool profile.
     let org = run_command(&["org", "set-pool", "octo", "--pool", "on"]);
     assert_eq!(org.code, 0, "{}", org.both());
+    let org_any = run_command(&["org", "set-pool", "octo", "--pool", "on", "--any"]);
+    assert_eq!(org_any.code, 0, "{}", org_any.both());
+    assert!(
+        org_any.stdout.contains("runs-on: rm-pool-any"),
+        "{}",
+        org_any.both()
+    );
+    let org_any_off = run_command(&["org", "set-pool", "octo", "--pool", "off", "--any"]);
+    assert_eq!(org_any_off.code, 0, "{}", org_any_off.both());
 
     let off = run_command(&[
         "repo",

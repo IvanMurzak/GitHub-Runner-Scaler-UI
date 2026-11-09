@@ -236,7 +236,11 @@ as statistics accumulate the host measured fastest at that job wins. Only opt in
 where those jobs really work. A host directs an `rm-pool-any` profile by launches only when its
 coordinator says it places that pool (`hello_ack.any_pool`, 0.4.52); with an older coordinator such a
 profile counts its own demand, as in `fallback` (every host carrying the label may start a runner and
-the surplus exits idle), so upgrade the coordinator before opting hosts in.
+the surplus exits idle), so upgrade the coordinator before opting hosts in. A profile carrying both its
+OS pool label and `rm-pool-any` stops being directed for its OS pool too under an older coordinator:
+that coordinator keeps offering it launches it refuses, and its OS pool jobs start from its own reading
+of the queue, at the coordinated poll interval (5 minutes) rather than at once. Keep the two labels on
+separate profiles while an older coordinator may be in use.
 
 Then switch the workflows that may run on any machine of that OS:
 
@@ -582,7 +586,8 @@ Connected hosts:
   machine reads the copy the server saves every minute (`as of ... ago`).
 - `--json` is schema version 3 since 0.4.47: `p50_duration_secs` is the job's run time,
   `p50_queue_wait_secs` / `p90_queue_wait_secs` are added (overall and per job), and `pending`,
-  `leases` and `live_at`.
+  `leases` and `live_at`. Schema version 4 since 0.4.52 adds `connected` and the scores'
+  `cpu`, `cpu_load_percent`, `disk_free_bytes` and `last_resort`.
 - Names are printed with control, bidirectional and zero-width characters removed: a workflow
   or job name is whatever a pull request wrote.
 - **Last placements**: what the queue was estimated to need and why (`job`, `repository` or

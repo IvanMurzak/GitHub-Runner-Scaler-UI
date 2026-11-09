@@ -437,6 +437,11 @@ fn scenarios() -> Vec<Scenario> {
                     os: "macos",
                     ..host("mac-slow-64", 64, 4, 0.6, MACOS)
                 },
+                // The roomiest of all, and not in the pool: never a candidate.
+                HostSpec {
+                    os: "windows",
+                    ..host("windows-128", 128, 8, 2.0, WINDOWS)
+                },
             ],
             rounds: 4,
             jobs: any_os,
@@ -868,10 +873,8 @@ impl Sim {
                                 .rsplit_once('#')
                                 .and_then(|(_, id)| id.parse::<u64>().ok())
                                 .and_then(|id| self.jobs.iter().find(|job| job.id == id))
-                                .map_or_else(
-                                    || JobKey::new(&launch.target.name, &required_of(spec.pool)),
-                                    |job| job.key.clone(),
-                                );
+                                .map(|job| job.key.clone())
+                                .expect("every queued job here is named: a launch names one");
                             self.start_runner(index, Some(launch.lease_id.clone()), key);
                             LaunchAck::accepted(launch.lease_id)
                         } else {

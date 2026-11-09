@@ -36,7 +36,11 @@ the version being prepared rather than the version in `Cargo.toml`.
   load and free disk, and its `--json` adds `connected`. `a pool queue was weighed` adds the chosen host's
   cores, CPU load, free disk and last-resort reason.
 
-All protocol changes are additive: an older host or coordinator ignores them and works as before.
+All protocol changes are additive: an older host or coordinator ignores them and works as before, with
+one exception: a profile carrying both its OS pool label and `rm-pool-any` under a coordinator older
+than 0.4.52 serves its OS pool jobs from its own polling, up to 5 minutes late; keep the labels on
+separate profiles until the coordinator is upgraded. `stats --json` is schema version 4.
+`hosts list` says how old its connected-host figures are.
 
 ## 0.4.51
 

@@ -296,15 +296,19 @@ struct HostsDocument<'a> {
     schema_version: u32,
     hosts: &'a [HostRecord],
     /// The connected hosts' last load reports, as the server last saved them
-    /// (within a minute); from 0.4.52.
+    /// (every minute while it runs); from 0.4.52.
     connected: &'a [ConnectedHostStats],
+    /// Unix seconds: when that copy was saved. A server that stopped leaves
+    /// its last copy, so an old one says the list is not live.
+    connected_at: Option<i64>,
 }
 
-/// The connected hosts as the running server last saved them.
-fn saved_connected(store: &Store) -> anyhow::Result<Vec<ConnectedHostStats>> {
+/// The connected hosts as the server last saved them, and when.
+fn saved_connected(
+    store: &Store,
+) -> anyhow::Result<(Vec<ConnectedHostStats>, Option<chrono::DateTime<Utc>>)> {
     Ok(stats::saved_live(store)?
-        .map(|(live, _)| live.connected)
-        .unwrap_or_default())
+        .map_or_else(Default::default, |(live, at)| (live.connected, Some(at))))
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
@@ -420,7 +424,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             match command {
                 HostsCommand::List { json } => {
                     let hosts = store.hosts()?;
-                    let connected = saved_connected(&store)?;
+                    let (connected, connected_at) = saved_connected(&store)?;
+                    let age = connected_at.map_or(0, |at| (Utc::now() - at).num_seconds().max(0));
                     if json {
                         serde_json::to_writer_pretty(
                             &mut out,
@@ -428,6 +433,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                                 schema_version: JSON_SCHEMA_VERSION,
                                 hosts: &hosts,
                                 connected: &connected,
+                                connected_at: connected_at.map(|at| at.timestamp()),
                             },
                         )?;
                         writeln!(out)?;
@@ -447,7 +453,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                                 .iter()
                                 .find(|live| live.host_id == host.id)
                                 .map_or_else(String::new, |live| {
-                                    format!("  connected: {}", live.load_text())
+                                    format!("  connected as of {age}s ago: {}", live.load_text())
                                 });
                             writeln!(
                                 out,

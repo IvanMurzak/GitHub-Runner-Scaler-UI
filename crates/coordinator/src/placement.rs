@@ -3346,5 +3346,23 @@ mod tests {
             seen.push(launches(&host.await.expect("host")));
         }
         assert_eq!(seen, [0, 1, 1]);
+
+        // The only host left with room is the one low on disk: it gets the job.
+        let (registry, placement) = setup();
+        let calm = connect_loaded(&registry, "calm", POOL, 8 << 30, Some(10), None);
+        let low_disk = connect_loaded(&registry, "low-disk", POOL, 64 << 30, None, Some(1 << 30));
+        let hosts = [
+            answer(&placement, "calm", calm, Answer::Refuse),
+            answer(&placement, "low-disk", low_disk, Answer::Accept),
+        ];
+        let key = placement
+            .queued("octo/app", &required(POOL), 2)
+            .expect("pool");
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        let mut seen = Vec::new();
+        for host in hosts {
+            seen.push(launches(&host.await.expect("host")));
+        }
+        assert_eq!(seen, [1, 1], "the calm host first, then the last resort");
     }
 }
