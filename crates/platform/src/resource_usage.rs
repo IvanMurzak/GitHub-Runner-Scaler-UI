@@ -110,6 +110,9 @@ fn parse_proc_stat(line: &str) -> Option<(u32, u64, u64)> {
     // After the name: state(3) ppid(4) ... utime(14) stime(15) cutime(16)
     // cstime(17) ... rss(24); index 0 here is field 3.
     let field = |number: usize| fields.get(number - 3).copied();
+    if matches!(field(3)?, "Z" | "X" | "x") {
+        return None;
+    }
     let parent = field(4)?.parse().ok()?;
     let ticks = [14, 15, 16, 17]
         .into_iter()
@@ -444,6 +447,16 @@ mod tests {
             |child, _| child != 11,
         );
         assert_eq!(cut[&10].processes, 1);
+    }
+
+    #[test]
+    fn a_stat_line_of_a_process_that_exited_is_not_a_process() {
+        let line = |state: &str| {
+            format!("7 (run.sh) {state} 1 7 7 0 -1 0 0 0 0 0 5 6 7 8 20 0 1 0 100 4096 42 0")
+        };
+        assert!(parse_proc_stat(&line("S")).is_some());
+        assert_eq!(parse_proc_stat(&line("Z")), None);
+        assert_eq!(parse_proc_stat(&line("X")), None);
     }
 
     /// A runner that exited stays in the process table until its parent reaps
