@@ -20,6 +20,18 @@ the version being prepared rather than the version in `Cargo.toml`.
   update it. Re-register with `sudo runner-manager service install --start-at
   boot` to create the accounts; until then runners keep sharing `rm-runner`.
 
+### Added
+
+- A Docker policy for native Linux jobs, checked by the per-attempt Docker
+  proxy: host bind mounts outside the job's own attempt and caches,
+  privileged containers and execs, added capabilities and devices, weakened
+  security profiles, host namespaces, LAN networks, containers the job did
+  not create, host-wide prunes and the swarm, plugin and secret APIs. It
+  starts in `audit`, recording each violation without refusing it;
+  `host docker-policy report` summarises them and `host docker-policy
+  set-mode --mode enforce` refuses them. `host docker-policy allow-path`
+  admits a host directory every job may mount.
+
 ## 0.4.56
 
 ### Changed

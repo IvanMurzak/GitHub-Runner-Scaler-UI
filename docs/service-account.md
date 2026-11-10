@@ -314,9 +314,17 @@ host is using:
 - Docker is reached through the per-attempt proxy, whose socket is handed to the
   attempt's account. **Access to a Docker engine is access to `root`**: a job
   that can start a container can mount the host into it, other jobs' attempts
-  included. On a host whose jobs use Docker, separate accounts protect jobs from
-  each other only against an ordinary job, not against one that sets out to
-  escape through Docker;
+  included. The proxy therefore checks every request against the Docker policy
+  (`host docker-policy`): a container may bind-mount only the job's own attempt,
+  its caches and paths the operator allowed, judged after the host resolves
+  links; it may not be privileged, add capabilities or devices, weaken its
+  security profile, or share the host's network, process, IPC, UTS, user or
+  cgroup namespace; a job may not touch a container it did not create, prune
+  the engine, or use its swarm, plugin or secret APIs. In the default `audit`
+  mode a violation is recorded in `state/docker-policy/violations.jsonl` and the
+  request still runs; `host docker-policy report` summarises them, and `host
+  docker-policy set-mode --mode enforce` refuses them. Only `enforce` makes
+  separate accounts hold against a job that sets out to escape through Docker;
 - the Git checkout cache is not offered to these runners. Preparing and
   capturing it runs `git` in the daemon over a checkout the job wrote, and
   repository configuration such as `core.fsmonitor` names a command.

@@ -620,6 +620,7 @@ pub fn dispatch(
         HostCommand::DockerCleanup(command) => {
             super::docker_cleanup::dispatch(context, command, out)
         }
+        HostCommand::DockerPolicy(command) => super::docker_policy::dispatch(context, command, out),
         HostCommand::ForgetLocal => super::service::forget_local(context, out),
     }
 }

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod http;
+pub mod policy;
 #[cfg(target_os = "linux")]
 mod proxy;
 #[cfg(test)]
@@ -58,6 +59,10 @@ pub struct DockerCleanup {
     pub host: HostId,
     pub root: PathBuf,
     pub config: PathBuf,
+    /// The Docker policy's settings. See [`policy`].
+    pub policy_config: PathBuf,
+    /// Where the Docker policy records violations.
+    pub policy_log: PathBuf,
     /// Embedders may supply the manager binary that implements companion mode.
     pub companion: Option<PathBuf>,
 }
@@ -68,6 +73,8 @@ impl DockerCleanup {
             host,
             root: state_dir.join("docker-cleanup"),
             config: config_dir.join("docker-cleanup.json"),
+            policy_config: config_dir.join(policy::CONFIG_FILE),
+            policy_log: state_dir.join(policy::LOG_DIR).join(policy::LOG_FILE),
             companion: None,
         }
     }
@@ -91,6 +98,7 @@ impl DockerCleanup {
             PathBuf,
             runner_manager_platform::runner_account::RunnerAccount,
         )>,
+        own_directories: &[PathBuf],
     ) -> io::Result<Option<std::ffi::OsString>> {
         if !Self::supported() || Config::load(&self.config)?.mode == Mode::Off {
             return Ok(None);
@@ -140,13 +148,42 @@ impl DockerCleanup {
         }
         #[cfg(target_os = "linux")]
         {
-            proxy::launch(self, attempt, repository, &socket, listen)
+            let policy = self.policy_context(own_directories)?;
+            proxy::launch(self, attempt, repository, &socket, listen, policy)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (attempt, repository, socket, listen);
+            let _ = (attempt, repository, socket, listen, own_directories);
             Ok(None)
         }
+    }
+
+    /// What this launch's proxy checks: the configured mode, and the job's own
+    /// directories and the operator's allowed ones, resolved as the host sees
+    /// them. `None` when the policy is off.
+    ///
+    /// # Errors
+    ///
+    /// When the policy's settings cannot be read: a launch then fails rather
+    /// than run with a policy nobody chose.
+    pub fn policy_context(
+        &self,
+        own_directories: &[PathBuf],
+    ) -> io::Result<Option<policy::Context>> {
+        let config = policy::Config::load(&self.policy_config)?;
+        if config.mode == policy::Mode::Off {
+            return Ok(None);
+        }
+        let allowed = own_directories
+            .iter()
+            .chain(&config.allow)
+            .filter_map(|path| policy::resolve(path))
+            .collect();
+        Ok(Some(policy::Context {
+            mode: config.mode,
+            allowed,
+            log: self.policy_log.clone(),
+        }))
     }
 
     /// Authoritative attempt states are supplied by Store, never inferred from
@@ -244,6 +281,9 @@ pub struct Journal {
     /// runner runs as another account; otherwise `s` beside this journal.
     #[serde(default)]
     pub listen: Option<Listen>,
+    /// What the proxy checks each request against. `None` checks nothing.
+    #[serde(default)]
+    pub policy: Option<policy::Context>,
 }
 
 /// A proxy socket outside `state/`, for a runner running as another account.
@@ -274,6 +314,7 @@ impl Journal {
             resources: Vec::new(),
             last_reported_secs: None,
             listen: None,
+            policy: None,
         }
     }
 

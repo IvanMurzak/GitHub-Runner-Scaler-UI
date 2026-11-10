@@ -333,6 +333,11 @@ runner-manager host docker-cleanup show                         # Show Linux Doc
 runner-manager host docker-cleanup set-mode --mode off|report|apply
 runner-manager host docker-cleanup report                       # Report tracked cleanup candidates without deleting them
 runner-manager host docker-cleanup sweep                        # Sweep cleaned attempts using the configured mode
+runner-manager host docker-policy show                           # Show what native Linux jobs may ask of Docker
+runner-manager host docker-policy set-mode --mode off|audit|enforce
+runner-manager host docker-policy allow-path <PATH>              # Let jobs bind-mount a host directory into containers
+runner-manager host docker-policy disallow-path <PATH>
+runner-manager host docker-policy report                        # Summarise recorded Docker policy violations
 runner-manager host forget-local                               # Move this account's unused configuration aside
 
 runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode

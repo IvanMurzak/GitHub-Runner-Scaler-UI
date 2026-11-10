@@ -462,7 +462,7 @@ fn explicit_context_and_remote_endpoints_never_start_a_proxy_or_change_routing()
     env.set("DOCKER_CONTEXT", "operator-selected").unwrap();
     assert!(
         cleanup
-            .launch_environment(AttemptId::from_u128(2), "owner/repo", &env, None)
+            .launch_environment(AttemptId::from_u128(2), "owner/repo", &env, None, &[])
             .unwrap()
             .is_none()
     );
@@ -472,7 +472,7 @@ fn explicit_context_and_remote_endpoints_never_start_a_proxy_or_change_routing()
         .unwrap();
     assert!(
         cleanup
-            .launch_environment(AttemptId::from_u128(2), "owner/repo", &env, None)
+            .launch_environment(AttemptId::from_u128(2), "owner/repo", &env, None, &[])
             .unwrap()
             .is_none()
     );
