@@ -7736,6 +7736,10 @@ mod tests {
                 include_str!("docker_cleanup/http.rs"),
             ),
             (
+                "docker_cleanup/policy.rs",
+                include_str!("docker_cleanup/policy.rs"),
+            ),
+            (
                 "docker_cleanup/proxy.rs",
                 include_str!("docker_cleanup/proxy.rs"),
             ),

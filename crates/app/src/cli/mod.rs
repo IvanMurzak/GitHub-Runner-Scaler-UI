@@ -46,6 +46,7 @@ pub mod cache;
 pub mod coordinator;
 pub mod daemon;
 pub mod docker_cleanup;
+pub mod docker_policy;
 pub mod doctor;
 pub mod host;
 pub mod launches;
@@ -902,6 +903,9 @@ pub enum HostCommand {
     /// Account for and clean temporary Docker resources of native Linux attempts.
     #[command(subcommand)]
     DockerCleanup(HostDockerCleanupCommand),
+    /// What native Linux jobs may ask of Docker; audit by default.
+    #[command(subcommand)]
+    DockerPolicy(HostDockerPolicyCommand),
     /// Move this account's configuration aside when no service runs against it.
     ///
     /// For an account whose earlier install was replaced by another
@@ -924,6 +928,39 @@ pub enum HostDockerCleanupCommand {
     Report,
     /// Sweep cleaned attempts using the configured mode; report mode never deletes.
     Sweep,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HostDockerPolicyCommand {
+    /// Show the mode, the allowed host paths and where violations are logged.
+    Show,
+    /// Choose off, audit (default: record, never refuse), or enforce.
+    SetMode(DockerPolicyModeArgs),
+    /// Let every job bind-mount this host directory into its containers.
+    AllowPath(DockerPolicyPathArgs),
+    /// Stop allowing a host directory added with `allow-path`.
+    DisallowPath(DockerPolicyPathArgs),
+    /// Summarise recorded violations by repository and rule.
+    Report(DockerPolicyReportArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DockerPolicyModeArgs {
+    #[arg(long, value_parser = ["off", "audit", "enforce"])]
+    pub mode: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DockerPolicyPathArgs {
+    /// An absolute host path.
+    pub path: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DockerPolicyReportArgs {
+    /// How many of the most recent violations to list.
+    #[arg(long, default_value_t = 20)]
+    pub last: usize,
 }
 
 #[derive(Debug, Args)]

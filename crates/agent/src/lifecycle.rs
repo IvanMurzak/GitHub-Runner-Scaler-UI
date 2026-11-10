@@ -3030,7 +3030,23 @@ impl NativeProcesses {
             let repository = cache_target.map(ToString::to_string).unwrap_or_default();
             let listen =
                 account.map(|account| (attempt.runtime_path().join(DOCKER_SOCKET_DIR), account));
-            match cleanup.launch_environment(attempt.id, &repository, &host_env, listen) {
+            // What the job may bind-mount into its containers: its attempt and
+            // the cache directories it was given.
+            let own_directories: Vec<PathBuf> =
+                std::iter::once(attempt.runtime_path().to_path_buf())
+                    .chain(cache_names.iter().filter_map(|name| {
+                        spec.configured_env(name)
+                            .map(PathBuf::from)
+                            .filter(|path| path.is_absolute())
+                    }))
+                    .collect();
+            match cleanup.launch_environment(
+                attempt.id,
+                &repository,
+                &host_env,
+                listen,
+                &own_directories,
+            ) {
                 Ok(Some(endpoint)) => (
                     spec.env("DOCKER_HOST", endpoint),
                     Some(cleanup.root.join(attempt.id.to_string())),

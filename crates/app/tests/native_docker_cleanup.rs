@@ -103,7 +103,7 @@ fn unresponsive_engine_startup_is_bounded_and_reaps_its_companion() {
         .unwrap();
     env.set("DOCKER_CONTEXT", "").unwrap();
     let started = Instant::now();
-    let result = cleanup.launch_environment(AttemptId::from_u128(2), "owner/repo", &env, None);
+    let result = cleanup.launch_environment(AttemptId::from_u128(2), "owner/repo", &env, None, &[]);
     assert!(result.unwrap_err().to_string().contains("timed out"));
     assert!(started.elapsed() < Duration::from_secs(15));
     // The companion is killed and waited by launch_environment, before its
@@ -267,6 +267,7 @@ mod live {
                 "fixture/repository",
                 &RunnerEnv::default(),
                 None,
+                &[],
             )
             .unwrap()
             .expect("local Docker proxy");
@@ -463,6 +464,7 @@ mod live {
                 "fixture/repository",
                 &RunnerEnv::default(),
                 None,
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -683,7 +685,13 @@ mod live {
             .build();
         store.record_attempt(&second).unwrap();
         cleanup
-            .launch_environment(second_id, "fixture/repository", &RunnerEnv::default(), None)
+            .launch_environment(
+                second_id,
+                "fixture/repository",
+                &RunnerEnv::default(),
+                None,
+                &[],
+            )
             .unwrap()
             .unwrap();
         let second_directory = cleanup.root.join(second_id.to_string());

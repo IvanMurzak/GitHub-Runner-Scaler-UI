@@ -411,6 +411,66 @@ pub const MANIFEST: &[Classification] = &[
             reason: "Sweeps journalled Docker resources instead of policy workspaces; dedicated CLI and engine-port tests cover mode gating, dependency-order deletion and no host-wide prune, with explicit live Linux acceptance for actual engine effects.",
         }),
     },
+    Classification {
+        leaf: "host docker-policy show",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/app/tests/native_docker_policy.rs",
+            "the_policy_defaults_to_audit_and_its_settings_round_trip",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::DockerResourceJournal,
+            reason: "Reports docker-policy.json and the violation log path, which are outside the generated policy oracle; the dedicated CLI test checks the audit default.",
+        }),
+    },
+    Classification {
+        leaf: "host docker-policy set-mode",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/app/tests/native_docker_policy.rs",
+            "the_policy_defaults_to_audit_and_its_settings_round_trip",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::DockerResourceJournal,
+            reason: "Changes docker-policy.json rather than policy state; the dedicated CLI test round-trips the modes and refuses an unknown one.",
+        }),
+    },
+    Classification {
+        leaf: "host docker-policy allow-path",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/app/tests/native_docker_policy.rs",
+            "the_policy_defaults_to_audit_and_its_settings_round_trip",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::DockerResourceJournal,
+            reason: "Adds a host path to docker-policy.json rather than policy state; the dedicated CLI test round-trips it and refuses a relative path.",
+        }),
+    },
+    Classification {
+        leaf: "host docker-policy disallow-path",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/app/tests/native_docker_policy.rs",
+            "the_policy_defaults_to_audit_and_its_settings_round_trip",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::DockerResourceJournal,
+            reason: "Removes a host path from docker-policy.json rather than policy state; the dedicated CLI test proves it is gone.",
+        }),
+    },
+    Classification {
+        leaf: "host docker-policy report",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/app/tests/native_docker_policy.rs",
+            "the_report_summarises_recorded_violations_by_repository_and_rule",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::DockerResourceJournal,
+            reason: "Reads the proxy's violation log, which is outside the generated policy oracle; the dedicated CLI test summarises a fixture log.",
+        }),
+    },
     // -- auth: sign-in state is modelled as credential presence -------------
     generated("auth login"),
     Classification {

@@ -20,6 +20,7 @@ pub fn launch(
         PathBuf,
         runner_manager_platform::runner_account::RunnerAccount,
     )>,
+    policy: Option<policy::Context>,
 ) -> io::Result<Option<std::ffi::OsString>> {
     if !socket.exists() {
         return Ok(None);
@@ -61,6 +62,7 @@ pub fn launch(
             gid: account.gid,
         });
     }
+    journal.policy = policy;
     let endpoint = journal.socket(&directory);
     write_json(&path, &journal)?;
     let binary = cleanup
@@ -417,12 +419,37 @@ fn handle(
         return Err(invalid("invalid Docker request"));
     }
     let method = parts[0];
-    let endpoint = parts[1].split('?').next().unwrap_or(parts[1]);
+    let (endpoint, query) = parts[1].split_once('?').unwrap_or((parts[1], ""));
+    let api = policy::unversioned(endpoint);
     let create = method == "POST"
-        && ["/containers/create", "/volumes/create", "/networks/create"]
-            .iter()
-            .any(|suffix| endpoint.ends_with(suffix));
-    if !create {
+        && ["/containers/create", "/volumes/create", "/networks/create"].contains(&api);
+    let exec_create = method == "POST"
+        && matches!(policy::target(api), policy::Target::Container(_))
+        && api.ends_with("/exec");
+    let (checked, attempt, repository) = {
+        let journal = shared
+            .lock()
+            .map_err(|_| invalid("Docker journal lock poisoned"))?;
+        (
+            journal
+                .policy
+                .clone()
+                .filter(|policy| policy.mode != policy::Mode::Off),
+            journal.attempt,
+            journal.repository.clone(),
+        )
+    };
+    let mut violations = Vec::new();
+    if checked.is_some() {
+        violations.extend(policy::check_endpoint(method, api, query));
+        foreign_target(engine, api, attempt, &mut violations)?;
+    }
+    if !create && !exec_create {
+        if let Some(policy) = &checked
+            && settle(stream, policy, attempt, &repository, &violations)?
+        {
+            return Ok(());
+        }
         return relay(stream, &head, &engine.0);
     }
     if head
@@ -432,6 +459,35 @@ fn handle(
         stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
     }
     let mut body: Value = serde_json::from_slice(&head.body(stream)?).map_err(invalid)?;
+    if let Some(policy) = &checked {
+        let allowed = |path: &Path| policy::inside(path, &policy.allowed);
+        match api {
+            "/containers/create" => {
+                violations.extend(policy::check_container_create(&body, &allowed));
+                for other in policy::referenced_containers(&body) {
+                    if !owned_container(engine, &percent_encode(&other), attempt)? {
+                        violations.push(policy::Violation {
+                            rule: "foreign_container".into(),
+                            detail: format!("joins or borrows from container {other}"),
+                        });
+                    }
+                }
+            }
+            "/volumes/create" => violations.extend(policy::check_volume_create(&body, &allowed)),
+            "/networks/create" => violations.extend(policy::check_network_create(&body)),
+            _ => violations.extend(policy::check_exec_create(&body)),
+        }
+        if settle(stream, policy, attempt, &repository, &violations)? {
+            return Ok(());
+        }
+    }
+    if api == "/containers/create" {
+        mark_job(&mut body, attempt)?;
+    }
+    if exec_create {
+        let response = engine.request(method, parts[1], Some(&body))?;
+        return reply(stream, response.status, &response.body);
+    }
     let intent = {
         let mut journal = shared
             .lock()
@@ -466,6 +522,114 @@ fn handle(
         write_json(path, &*journal)?;
     }
     reply(stream, response.status, &response.body)
+}
+
+/// Records `violations` and, in [`policy::Mode::Enforce`], refuses the request.
+/// Returns whether it was refused.
+fn settle(
+    stream: &mut UnixStream,
+    policy: &policy::Context,
+    attempt: AttemptId,
+    repository: &str,
+    violations: &[policy::Violation],
+) -> io::Result<bool> {
+    if violations.is_empty() {
+        return Ok(false);
+    }
+    let refused = policy.mode == policy::Mode::Enforce;
+    let at = chrono::Utc::now().to_rfc3339();
+    let records = violations
+        .iter()
+        .map(|violation| policy::Record {
+            at: at.clone(),
+            attempt: attempt.to_string(),
+            repository: repository.to_owned(),
+            rule: violation.rule.clone(),
+            detail: violation.detail.clone(),
+            refused,
+        })
+        .collect::<Vec<_>>();
+    // The record is evidence, not the gate: a log that cannot be written lets
+    // neither an enforced request through nor stops an audited one.
+    let _ = policy::record(&policy.log, &records);
+    if refused {
+        let rules = violations
+            .iter()
+            .map(|violation| format!("{} ({})", violation.rule, violation.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
+        reply(
+            stream,
+            403,
+            &serde_json::json!({
+                "message": format!("refused by the runner-manager Docker policy: {rules}")
+            }),
+        )?;
+    }
+    Ok(refused)
+}
+
+/// Adds a violation when `api` acts on a container, or an exec instance in
+/// one, that this job did not create.
+fn foreign_target(
+    engine: &UnixEngine,
+    api: &str,
+    attempt: AttemptId,
+    violations: &mut Vec<policy::Violation>,
+) -> io::Result<()> {
+    let container = match policy::target(api) {
+        policy::Target::Container(id) => Some(id.to_owned()),
+        policy::Target::Exec(id) => engine
+            .request("GET", &format!("/exec/{id}/json"), None)?
+            .body
+            .get("ContainerID")
+            .and_then(Value::as_str)
+            .map(percent_encode),
+        policy::Target::None => None,
+    };
+    if let Some(container) = container
+        && !owned_container(engine, &container, attempt)?
+    {
+        violations.push(policy::Violation {
+            rule: "foreign_container".into(),
+            detail: format!("{api} acts on a container this job did not create"),
+        });
+    }
+    Ok(())
+}
+
+/// Whether the container `id` (already encoded for a path) was created by this
+/// job. One the engine does not know is left for the engine to answer.
+fn owned_container(engine: &UnixEngine, id: &str, attempt: AttemptId) -> io::Result<bool> {
+    let reply = engine.request("GET", &format!("/containers/{id}/json"), None)?;
+    if reply.status == 404 {
+        return Ok(true);
+    }
+    Ok(reply
+        .body
+        .pointer("/Config/Labels")
+        .and_then(|labels| labels.get(policy::JOB_LABEL))
+        .and_then(Value::as_str)
+        == Some(attempt.to_string().as_str()))
+}
+
+/// Labels a container this job creates as its own, replacing any value the
+/// job supplied for the label itself.
+fn mark_job(body: &mut Value, attempt: AttemptId) -> io::Result<()> {
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| invalid("expected Docker creation object"))?;
+    let labels = object
+        .entry("Labels")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if labels.is_null() {
+        *labels = Value::Object(serde_json::Map::new());
+    }
+    labels
+        .as_object_mut()
+        .ok_or_else(|| invalid("invalid Docker labels"))?
+        .insert(policy::JOB_LABEL.into(), Value::String(attempt.to_string()));
+    Ok(())
 }
 
 fn reply(stream: &mut impl Write, status: u16, body: &Value) -> io::Result<()> {
