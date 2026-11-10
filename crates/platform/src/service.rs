@@ -1727,18 +1727,21 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
         out.push_str(directive);
         out.push('\n');
     }
-    let mut writable = directories.all().to_vec();
-    if let Some(secret_directory) = plan.secret_guard().and_then(Path::parent) {
-        writable.push(secret_directory);
-    }
-    out.push_str(&format!(
-        "ReadWritePaths={}\n",
-        writable
+    let quoted = |paths: &[String]| {
+        paths
             .iter()
-            .map(|path| quote_argument(&path.to_string_lossy()))
+            .map(|path| quote_argument(path))
             .collect::<Vec<_>>()
             .join(" ")
+    };
+    out.push_str(&format!(
+        "ReadWritePaths={}\n",
+        quoted(&permitted_paths(DefinitionKind::SystemdUnit, plan))
     ));
+    let binds = systemd_home_binds(plan);
+    if !binds.is_empty() {
+        out.push_str(&format!("BindPaths={}\n", quoted(&binds)));
+    }
 
     out.push_str("\n[Install]\n");
     out.push_str(match plan.start_mode() {
@@ -1748,16 +1751,9 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
     out
 }
 
-/// The login unit's hardening directives, in the order they are rendered.
-/// Boot units retain the filesystem capability added by `systemd_hardening`.
-///
-/// A constant rather than a sequence of `push_str` calls so that
-/// [`review_least_privilege`] can be written against the same list the renderer
-/// emits: a directive dropped from the unit is a directive the review then
-/// reports as missing, rather than one that silently stops being checked.
-pub const SYSTEMD_HARDENING: [&str; 13] = [
-    "NoNewPrivileges=yes",
-    "CapabilityBoundingSet=",
+/// The hardening directives every unit carries after its capability bounding
+/// set, in the order they are rendered. See [`systemd_hardening`].
+const SYSTEMD_HARDENING: [&str; 11] = [
     "AmbientCapabilities=",
     "PrivateTmp=yes",
     "PrivateDevices=yes",
@@ -1771,15 +1767,55 @@ pub const SYSTEMD_HARDENING: [&str; 13] = [
     "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
 ];
 
+/// The hardening directives a unit started in `mode` carries, in the order
+/// they are rendered.
+///
+/// One list so that [`review_least_privilege`] is written against the same
+/// directives the renderer emits: a directive dropped from the unit is one the
+/// review then reports as missing, rather than one that silently stops being
+/// checked.
+///
 /// Boot services must access private application directories owned by the
-/// operator as well as the root-owned machine credential. ReadWritePaths still
-/// limits writes; no other capability is retained, including SETUID/SETGID.
-fn systemd_hardening(mode: StartMode) -> [&'static str; 13] {
-    let mut directives = SYSTEMD_HARDENING;
+/// operator as well as the root-owned machine credential, so they keep
+/// `CAP_DAC_OVERRIDE`. ReadWritePaths still limits writes; no other capability
+/// is retained, including SETUID/SETGID.
+///
+/// That capability lets root *read* any file, and the runner and every workflow
+/// job it starts inherit it. `ProtectHome=tmpfs` therefore hides every home
+/// directory from a boot unit, and [`systemd_home_binds`] mounts back only the
+/// application directories that live there.
+fn systemd_hardening(mode: StartMode) -> Vec<&'static str> {
+    let mut directives = vec![
+        "NoNewPrivileges=yes",
+        match mode {
+            StartMode::Boot => "CapabilityBoundingSet=CAP_DAC_OVERRIDE",
+            StartMode::Login => "CapabilityBoundingSet=",
+        },
+    ];
+    directives.extend(SYSTEMD_HARDENING);
     if mode == StartMode::Boot {
-        directives[1] = "CapabilityBoundingSet=CAP_DAC_OVERRIDE";
+        directives.push("ProtectHome=tmpfs");
     }
     directives
+}
+
+/// The trees `ProtectHome=` hides.
+const SYSTEMD_HOME_ROOTS: [&str; 3] = ["/home", "/root", "/run/user"];
+
+/// The writable paths a boot unit's `ProtectHome=tmpfs` would hide, which the
+/// unit binds back with `BindPaths=` so the daemon can still reach them.
+fn systemd_home_binds(plan: &InstallPlan) -> Vec<String> {
+    if plan.start_mode() != StartMode::Boot {
+        return Vec::new();
+    }
+    permitted_paths(DefinitionKind::SystemdUnit, plan)
+        .into_iter()
+        .filter(|path| {
+            SYSTEMD_HOME_ROOTS
+                .iter()
+                .any(|root| Path::new(path).starts_with(root))
+        })
+        .collect()
 }
 
 // -- launchd -----------------------------------------------------------------
@@ -2423,16 +2459,17 @@ fn same_path_for(kind: DefinitionKind, left: &str, right: &str) -> bool {
     }
 }
 
-/// Checks a `ReadWritePaths`-style list against the permitted directories.
+/// Checks a `ReadWritePaths`-style list against exactly the paths it must
+/// name. `listed_as` says what being listed grants, for the findings' wording.
 fn review_writable_paths(
     kind: DefinitionKind,
     subject: &str,
     listed: &[String],
-    plan: &InstallPlan,
+    permitted: &[String],
+    listed_as: &str,
     controls: &mut Vec<String>,
     findings: &mut Vec<PrivilegeFinding>,
 ) {
-    let permitted = permitted_paths(kind, plan);
     for entry in listed {
         if !permitted
             .iter()
@@ -2442,12 +2479,12 @@ fn review_writable_paths(
                 kind: FindingKind::Excess,
                 subject: subject.to_string(),
                 detail: format!(
-                    "{entry} is writable but is not one of this registration's required paths"
+                    "{entry} is {listed_as} but is not one of this registration's required paths"
                 ),
             });
         }
     }
-    for allowed in &permitted {
+    for allowed in permitted {
         if !listed
             .iter()
             .any(|entry| same_path_for(kind, allowed, entry))
@@ -2456,7 +2493,7 @@ fn review_writable_paths(
                 kind: FindingKind::Shortfall,
                 subject: subject.to_string(),
                 detail: format!(
-                    "{allowed} is one of this registration's directories but is not writable, \
+                    "{allowed} is one of this registration's directories but is not {listed_as}, \
                      so the daemon cannot use it"
                 ),
             });
@@ -2513,15 +2550,16 @@ fn review_systemd(
             .expect("every hardening directive is written as key=value");
         match directives.get(key) {
             Some(actual) if actual == value => controls.push((*expected).to_string()),
-            Some(actual)
-                if key == "CapabilityBoundingSet"
-                    && plan.start_mode() == StartMode::Boot
-                    && actual.is_empty() =>
-            {
+            // Only reachable for a boot unit: a login unit expects the empty
+            // set, which the arm above already accepted.
+            Some(actual) if key == "CapabilityBoundingSet" && actual.is_empty() => {
                 findings.push(PrivilegeFinding {
                     kind: FindingKind::Shortfall,
                     subject: key.to_string(),
-                    detail: "drops CAP_DAC_OVERRIDE, so root cannot access operator-owned private application directories".to_string(),
+                    detail: format!(
+                        "is empty, not `{value}`, so root cannot access operator-owned \
+                         private application directories"
+                    ),
                 });
             }
             Some(actual) => findings.push(PrivilegeFinding {
@@ -2549,7 +2587,8 @@ fn review_systemd(
                 DefinitionKind::SystemdUnit,
                 "ReadWritePaths",
                 &listed,
-                plan,
+                &permitted_paths(DefinitionKind::SystemdUnit, plan),
+                "writable",
                 controls,
                 findings,
             );
@@ -2560,6 +2599,25 @@ fn review_systemd(
             detail: "is absent, so `ProtectSystem=strict` leaves the daemon nowhere to write"
                 .to_string(),
         }),
+    }
+
+    // `ProtectHome=tmpfs` hides these, so a boot unit must bind back exactly
+    // its own directories under a home tree and nothing else there.
+    let binds = systemd_home_binds(plan);
+    let listed = directives
+        .get("BindPaths")
+        .map(|value| split_quoted(value))
+        .unwrap_or_default();
+    if !(binds.is_empty() && listed.is_empty()) {
+        review_writable_paths(
+            DefinitionKind::SystemdUnit,
+            "BindPaths",
+            &listed,
+            &binds,
+            "bound back past `ProtectHome=tmpfs`",
+            controls,
+            findings,
+        );
     }
 
     // `User=` on a system unit is an escalation only in the other direction, so
@@ -2797,7 +2855,8 @@ fn review_windows_service(
                 DefinitionKind::WindowsService,
                 "ReadWritePaths",
                 &listed,
-                plan,
+                &permitted_paths(DefinitionKind::WindowsService, plan),
+                "writable",
                 controls,
                 findings,
             );
@@ -2836,6 +2895,68 @@ fn ini_directives(text: &str, section: &str) -> BTreeMap<String, String> {
         }
     }
     out
+}
+
+/// The command line in a systemd `ExecStart=`, without the prefixes systemd
+/// reads off its front (`-`, `@`, `:`, `+`, `!`, `!!`).
+///
+/// A drop-in may carry any of them, and left in place they become part of the
+/// executable's path. With `@` the second word is the `argv[0]` handed to the
+/// process rather than an argument, so it goes as well.
+fn systemd_exec_command_line(value: &str) -> String {
+    let value = value.trim();
+    let command = value.trim_start_matches(['-', '@', ':', '+', '!']);
+    if !value[..value.len() - command.len()].contains('@') {
+        return command.to_string();
+    }
+    let mut words = split_command_line(command);
+    if words.len() > 1 {
+        words.remove(1);
+    }
+    words
+        .iter()
+        .map(|word| quote_argument(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Parses a systemd time span such as `15`, `15s`, `500ms`, `1min 30s` or
+/// `2h`. A bare number is seconds. `None` for `infinity`, an empty value, or
+/// anything systemd would not accept either.
+fn systemd_timespan(value: &str) -> Option<Duration> {
+    let mut rest = value.trim();
+    if rest.is_empty() || rest == "infinity" {
+        return None;
+    }
+    let mut seconds = 0f64;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        let number: f64 = rest[..digits].parse().ok()?;
+        rest = rest[digits..].trim_start();
+        let letters = rest
+            .find(|c: char| !c.is_alphabetic())
+            .unwrap_or(rest.len());
+        let scale = match &rest[..letters] {
+            "" | "s" | "sec" | "second" | "seconds" => 1.0,
+            "us" | "usec" | "\u{3bc}s" | "\u{b5}s" => 1e-6,
+            "ms" | "msec" => 1e-3,
+            "m" | "min" | "minute" | "minutes" => 60.0,
+            "h" | "hr" | "hour" | "hours" => 3_600.0,
+            "d" | "day" | "days" => 86_400.0,
+            "w" | "week" | "weeks" => 604_800.0,
+            "M" | "month" | "months" => 2_629_800.0,
+            "y" | "year" | "years" => 31_557_600.0,
+            _ => return None,
+        };
+        seconds += number * scale;
+        rest = rest[letters..].trim_start();
+    }
+    Duration::try_from_secs_f64(seconds).ok()
 }
 
 /// Splits a whitespace-separated list that may contain arguments quoted by
@@ -4737,9 +4858,10 @@ impl ServiceOperations {
         let unattended = record.as_ref().and_then(|record| {
             // The account is only read where something was probed to judge
             // it against.
-            let account = probed
-                .as_ref()
-                .map_or_else(String::new, |_| service_account_name(&record.account));
+            let account = probed.as_ref().map_or_else(String::new, |_| {
+                systemd_registered_account(found.as_ref())
+                    .map_or_else(|| service_account_name(&record.account), str::to_owned)
+            });
             unattended_gap(record.start_mode, &account, probed.as_ref())
         });
         let now = Utc::now();
@@ -5567,6 +5689,21 @@ pub fn service_account_name(account: &ServiceAccount) -> String {
     }
 }
 
+/// The account a systemd system unit actually runs as, which an
+/// administrator's drop-in can change from the one the install record saved.
+///
+/// `None` for every other registration: the other managers name accounts in
+/// their own vocabulary (`LocalSystem`, a raw SID, a user unit's placeholder),
+/// so the record's spelling stays the one reported for them.
+fn systemd_registered_account(registration: Option<&Registration>) -> Option<&str> {
+    registration
+        .filter(|registration| {
+            registration.manager == DefinitionKind::SystemdUnit
+                && registration.start_mode == StartMode::Boot
+        })
+        .and_then(|registration| registration.account.as_deref())
+}
+
 /// Works out the gap for a registration in `mode` running as `account`.
 ///
 /// `found` is `None` where nothing could be probed (every platform but macOS):
@@ -6371,12 +6508,8 @@ impl fmt::Display for ServiceStatus {
         }
         if let Some(record) = &self.record {
             writeln!(f, "  start mode                {}", record.start_mode)?;
-            let account = self
-                .registration
-                .as_ref()
-                .and_then(|registration| registration.account.as_deref())
-                .map(str::to_owned)
-                .unwrap_or_else(|| record.account.to_string());
+            let account = systemd_registered_account(self.registration.as_ref())
+                .map_or_else(|| record.account.to_string(), str::to_owned);
             writeln!(f, "  account                   {account}")?;
             writeln!(f, "  restart on failure        {}", record.restart())?;
             writeln!(
@@ -7987,21 +8120,21 @@ mod sys {
     //! `/etc/systemd/system`, wanted by `multi-user.target`; `--start-at login`
     //! is a user unit in `~/.config/systemd/user`, wanted by `default.target`.
     //!
-    //! Every inspection here goes through `systemctl is-active` and
-    //! `systemctl is-enabled`, whose output is a fixed machine-readable word
-    //! rather than a sentence, so nothing in this module depends on the
-    //! machine's display language.
+    //! Every inspection here goes through `systemctl cat` and `systemctl show`,
+    //! whose output is machine-readable `key=value` text rather than a
+    //! sentence, so nothing in this module depends on the machine's display
+    //! language.
 
     use std::ffi::OsStr;
     use std::path::PathBuf;
-    use std::time::Duration;
 
     use runner_manager_domain::model::StartMode;
 
     use super::{
         DefinitionKind, InstallPlan, Registration, SUDO_REMEDY, SYSTEMD_SYSTEM_DIR,
         SYSTEMD_USER_SUBDIR, ServiceControl, ServiceDefinition, ServiceError, ServiceIdentity,
-        home_directory, ini_directives, run, write_definition,
+        home_directory, ini_directives, run, systemd_exec_command_line, systemd_timespan,
+        write_definition,
     };
 
     pub(super) fn control(mode: StartMode) -> Result<Box<dyn ServiceControl>, ServiceError> {
@@ -8118,37 +8251,59 @@ mod sys {
             let Some(path) = self.unit_path(identity) else {
                 return Ok(None);
             };
-            let Ok(document) = std::fs::read_to_string(&path) else {
+            if !path.exists() {
                 return Ok(None);
-            };
+            }
             let unit = identity.systemd_unit();
             // `cat` includes administrator drop-ins in systemd's order. Reading
-            // only our base file hides User/ExecStart/RestartSec overrides.
-            let (queried, effective) = self.systemctl(&["cat", &unit]);
-            let directives =
-                ini_directives(if queried { &effective } else { &document }, "Service");
-            let (_, active) = self.systemctl(&["is-active", &unit]);
-            let (_, enabled) = self.systemctl(&["is-enabled", &unit]);
+            // only our base file hides User/ExecStart/RestartSec overrides, so
+            // the file is read only when `systemctl` cannot answer.
+            let effective = match self.systemctl(&["cat", &unit]) {
+                (true, text) => text,
+                _ => match std::fs::read_to_string(&path) {
+                    Ok(document) => document,
+                    Err(_) => return Ok(None),
+                },
+            };
+            let directives = ini_directives(&effective, "Service");
+            // One `show` answers what `is-active` and `is-enabled` each did.
+            let (_, shown) = self.systemctl(&[
+                "show",
+                "--property=ActiveState",
+                "--property=UnitFileState",
+                &unit,
+            ]);
+            let state = |key: &str| {
+                shown
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+                    .map(str::trim)
+            };
             Ok(Some(Registration {
                 manager: DefinitionKind::SystemdUnit,
                 start_mode: self.mode,
-                command_line: directives.get("ExecStart").cloned().unwrap_or_default(),
-                account: directives
-                    .get("User")
-                    .filter(|user| !user.is_empty())
-                    .cloned()
-                    .or_else(|| {
-                        Some(match self.mode {
-                            StartMode::Boot => "root".to_string(),
-                            StartMode::Login => "the invoking user".to_string(),
-                        })
-                    }),
-                running: active.trim() == "active",
-                starts_automatically: enabled.trim() == "enabled",
+                command_line: directives
+                    .get("ExecStart")
+                    .map(|value| systemd_exec_command_line(value))
+                    .unwrap_or_default(),
+                account: Some(
+                    directives
+                        .get("User")
+                        .filter(|user| !user.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            match self.mode {
+                                StartMode::Boot => "root",
+                                StartMode::Login => "the invoking user",
+                            }
+                            .to_string()
+                        }),
+                ),
+                running: state("ActiveState") == Some("active"),
+                starts_automatically: state("UnitFileState") == Some("enabled"),
                 restart_delay: directives
                     .get("RestartSec")
-                    .and_then(|value| value.trim().trim_end_matches('s').parse::<u64>().ok())
-                    .map(Duration::from_secs),
+                    .and_then(|value| systemd_timespan(value)),
             }))
         }
 
@@ -9327,6 +9482,17 @@ mod tests {
         );
     }
 
+    /// Whether reviewing `unit` against `plan` reports `kind` for `subject`.
+    fn reports(unit: &str, plan: &InstallPlan, subject: &str, kind: FindingKind) -> bool {
+        review_least_privilege(
+            &ServiceDefinition::from_text(DefinitionKind::SystemdUnit, unit.to_string()),
+            plan,
+        )
+        .findings()
+        .iter()
+        .any(|finding| finding.subject == subject && finding.kind == kind)
+    }
+
     #[test]
     fn boot_units_retain_only_the_capability_needed_for_private_directories() {
         let boot = systemd_unit(&linux_plan(StartMode::Boot));
@@ -9346,41 +9512,128 @@ mod tests {
             "CapabilityBoundingSet=CAP_DAC_OVERRIDE",
             "CapabilityBoundingSet=",
         );
-        let review = review_least_privilege(
-            &ServiceDefinition::from_text(DefinitionKind::SystemdUnit, broken),
-            &linux_plan(StartMode::Boot),
-        );
         assert!(
-            review
-                .findings()
-                .iter()
-                .any(|finding| finding.subject == "CapabilityBoundingSet"
-                    && finding.kind == FindingKind::Shortfall),
+            reports(
+                &broken,
+                &linux_plan(StartMode::Boot),
+                "CapabilityBoundingSet",
+                FindingKind::Shortfall
+            ),
             "a boot unit that cannot access its data must report a shortfall"
         );
     }
 
     #[test]
-    fn status_reports_the_registered_account_instead_of_the_install_record() {
-        let host = Host::new();
-        let operations = host.operations();
-        operations.install(&host.request(StartMode::Boot)).unwrap();
-        host.controls.edit("runner-manager", |registration| {
-            registration.account = Some("ivan".to_string());
-        });
-        let status = operations.status().unwrap();
-        assert!(
-            status
-                .to_string()
-                .contains("account                   ivan"),
-            "{status}"
+    fn status_reports_a_registered_account_only_for_systemd_system_units() {
+        for (manager, account, shown) in [
+            (DefinitionKind::SystemdUnit, "ivan", true),
+            (DefinitionKind::WindowsScheduledTask, "S-1-5-21-1", false),
+        ] {
+            let host = Host::new();
+            let operations = host.operations();
+            operations.install(&host.request(StartMode::Boot)).unwrap();
+            host.controls.edit("runner-manager", |registration| {
+                registration.manager = manager;
+                registration.account = Some(account.to_string());
+            });
+            let status = operations.status().unwrap().to_string();
+            assert_eq!(
+                status.contains(&format!("account                   {account}")),
+                shown,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_start_prefixes_are_not_part_of_the_binary() {
+        for (value, expected) in [
+            ("/opt/rm daemon run", "/opt/rm daemon run"),
+            ("-/opt/rm daemon run", "/opt/rm daemon run"),
+            ("+!/opt/rm daemon run", "/opt/rm daemon run"),
+            ("!!/opt/rm daemon run", "/opt/rm daemon run"),
+            ("@/opt/rm runner-manager daemon run", "/opt/rm daemon run"),
+            ("-@\"/opt/my rm\" rm daemon", "\"/opt/my rm\" daemon"),
+        ] {
+            assert_eq!(systemd_exec_command_line(value), expected, "{value}");
+        }
+        assert_eq!(
+            executable_from_command_line(&systemd_exec_command_line("-/opt/rm daemon")),
+            Some(PathBuf::from("/opt/rm"))
         );
-        assert!(
-            !status
-                .to_string()
-                .contains("account                   root"),
-            "{status}"
+    }
+
+    #[test]
+    fn restart_sec_accepts_systemd_time_spans() {
+        for (value, expected) in [
+            ("15", Duration::from_secs(15)),
+            ("15s", Duration::from_secs(15)),
+            ("1min", Duration::from_secs(60)),
+            ("1min 30s", Duration::from_secs(90)),
+            ("1min30s", Duration::from_secs(90)),
+            ("2h", Duration::from_secs(7_200)),
+            ("500ms", Duration::from_millis(500)),
+            ("1.5s", Duration::from_millis(1_500)),
+        ] {
+            assert_eq!(systemd_timespan(value), Some(expected), "{value}");
+        }
+        for value in ["", "infinity", "soon", "5 parsecs", "s"] {
+            assert_eq!(systemd_timespan(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn boot_units_hide_home_trees_and_bind_back_only_their_own_directories() {
+        let plan = InstallPlan::unchecked(
+            ServiceIdentity::product(),
+            StartMode::Boot,
+            "/home/op/.local/share/runner-manager/state/bin/runner-manager",
+            ServiceDirectories {
+                config: PathBuf::from("/home/op/.config/runner-manager"),
+                state: PathBuf::from("/home/op/.local/share/runner-manager/state"),
+                runtime: PathBuf::from("/run/user/1000/runner-manager"),
+                logs: PathBuf::from("/var/log/runner-manager"),
+            },
+        )
+        .with_secret_guard("/etc/runner-manager/secrets/token");
+        let unit = systemd_unit(&plan);
+        let directives = ini_directives(&unit, "Service");
+        assert_eq!(directives["ProtectHome"], "tmpfs");
+        assert_eq!(
+            split_quoted(&directives["BindPaths"]),
+            [
+                "/home/op/.config/runner-manager",
+                "/home/op/.local/share/runner-manager/state",
+                "/run/user/1000/runner-manager",
+            ]
         );
+        let review = review_least_privilege(
+            &ServiceDefinition::from_text(DefinitionKind::SystemdUnit, unit.clone()),
+            &plan,
+        );
+        assert!(review.findings().is_empty(), "{:?}", review.findings());
+
+        let widened = unit.replace("BindPaths=", "BindPaths=/home/op/.ssh ");
+        assert!(reports(&widened, &plan, "BindPaths", FindingKind::Excess));
+        let narrowed = unit.replace("/run/user/1000/runner-manager\n", "\n");
+        assert!(reports(
+            &narrowed,
+            &plan,
+            "BindPaths",
+            FindingKind::Shortfall
+        ));
+        let unprotected = unit.replace("ProtectHome=tmpfs\n", "");
+        assert!(reports(
+            &unprotected,
+            &plan,
+            "ProtectHome",
+            FindingKind::Excess
+        ));
+
+        let login = systemd_unit(&linux_plan(StartMode::Login));
+        let directives = ini_directives(&login, "Service");
+        assert!(!directives.contains_key("ProtectHome"));
+        assert!(!directives.contains_key("BindPaths"));
     }
 
     #[test]

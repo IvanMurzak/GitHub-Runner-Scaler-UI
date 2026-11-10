@@ -381,7 +381,7 @@ fn an_unwritable_store_is_rejected_before_requesting_a_device_code() {
         "{}",
         outcome.both()
     );
-    assert!(outcome.stderr.contains("sudo --"), "{}", outcome.both());
+    assert!(outcome.stderr.contains("sudo '"), "{}", outcome.both());
     assert!(outcome.stderr.contains("--data-dir"), "{}", outcome.both());
     assert!(
         github.seen().is_empty(),

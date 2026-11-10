@@ -694,19 +694,13 @@ pub fn login(
         {
             // current_exe is the native binary, even behind the npm/nvm shim.
             // sudo's restricted PATH need not contain either Node or the CLI.
-            let quote = |path: &std::path::Path| {
-                format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
-            };
-            let data = context
-                .data_root
-                .as_ref()
-                .map_or_else(String::new, |root| format!(" --data-dir {}", quote(root)));
             return CliError::with_remedy(
                 Failure::SecretStore,
                 source.to_string(),
-                format!(
-                    "sudo -- {}{data} auth login --start-at boot",
-                    quote(&binary)
+                super::update::force::auth_command_line(
+                    context.data_root.as_deref(),
+                    start_mode,
+                    &binary,
                 ),
             );
         }

@@ -432,6 +432,13 @@ impl fmt::Display for AppPaths {
 fn restrict_directory(purpose: &'static str, path: &Path) -> Result<(), PathsError> {
     use std::os::unix::fs::PermissionsExt;
 
+    // chmod(2) needs ownership or CAP_FOWNER even when the mode is unchanged.
+    // A boot service runs as root with only CAP_DAC_OVERRIDE over the
+    // operator's directories, so an already-correct mode must not be re-set.
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o7777 == 0o700)
+    {
+        return Ok(());
+    }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
         PathsError::Create {
             purpose,

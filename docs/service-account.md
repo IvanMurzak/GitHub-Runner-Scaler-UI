@@ -237,6 +237,21 @@ makes even root fail with `Permission denied` there. `ProtectSystem=strict` and
 prevents elevation. Login units run as the directory owner and retain no
 capabilities. Ambient capabilities remain empty in both modes.
 
+`CAP_DAC_OVERRIDE` also lets root *read* any file, and the runner and every
+workflow job it starts inherit it. Boot units therefore add:
+
+```ini
+ProtectHome=tmpfs
+BindPaths=<each of the paths above that lives under /home, /root or /run/user>
+```
+
+`ProtectHome=tmpfs` replaces `/home`, `/root` and `/run/user` with empty
+directories inside the unit, so a workflow cannot read another account's
+`~/.ssh` or other private files. `BindPaths` mounts back only this
+installation's own directories that live there. `review_least_privilege` fails
+a boot unit without `ProtectHome=tmpfs`, or whose `BindPaths` names any other
+path.
+
 ### The consequence a Linux operator will actually notice
 
 **The runner inherits this sandbox.** The agent starts the GitHub Actions runner

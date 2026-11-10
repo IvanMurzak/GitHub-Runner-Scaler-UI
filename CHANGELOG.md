@@ -7,7 +7,7 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
-## Unreleased
+## 0.4.54
 
 ### Fixed
 
@@ -18,8 +18,16 @@ the version being prepared rather than the version in `Cargo.toml`.
 - Linux boot services retain `CAP_DAC_OVERRIDE` to access the operator's private
   application directories, while keeping filesystem confinement and dropping
   all other capabilities. Login services continue to drop every capability.
-- Service status includes systemd drop-ins and reports the registered account
-  instead of the account saved at installation time.
+  Boot units also set `ProtectHome=tmpfs` and bind back only their own
+  directories, so workflow jobs cannot use that capability to read other
+  accounts' home directories.
+- Service status includes systemd drop-ins and reports the account a systemd
+  system unit actually runs as instead of the account saved at installation
+  time. `ExecStart` prefixes such as `-` and `@` and `RestartSec` values with
+  units such as `1min` are read correctly.
+- Applying service directories no longer re-runs `chmod` on directories that
+  already have mode `0700`, which a boot service cannot do on operator-owned
+  directories.
 
 ## 0.4.53
 
