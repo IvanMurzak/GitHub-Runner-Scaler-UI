@@ -507,6 +507,30 @@ pub const MANIFEST: &[Classification] = &[
             reason: "Reports protected-paths.json against the install record, both outside the generated policy oracle; the dedicated CLI test checks both states.",
         }),
     },
+    Classification {
+        leaf: "host isolation prepare",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/agent/src/oci.rs",
+            "a_rootful_engine_needs_rootful_podman_and_room_for_every_runner",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::HostConfiguration,
+            reason: "Writes /etc/subuid and /etc/subgid and enables the system podman.socket as root; the readiness it establishes is proved by the agent's rootful-engine tests and by live acceptance, never against a developer's machine.",
+        }),
+    },
+    Classification {
+        leaf: "host isolation set-disk-quota",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/agent/src/oci.rs",
+            "storage_without_a_quota_is_refused_unless_the_operator_accepted_it",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::ProfileStateSpace,
+            reason: "Changes isolation.json rather than policy state; the agent test proves a quota-less store is refused until the operator accepts it.",
+        }),
+    },
     // -- auth: sign-in state is modelled as credential presence -------------
     generated("auth login"),
     Classification {

@@ -70,5 +70,6 @@ pub mod runner_root_access;
 pub mod secrets;
 pub mod service;
 pub mod service_request;
+pub mod settings_file;
 pub mod unattended_login;
 pub mod wsl;

@@ -263,6 +263,7 @@ fn isolated_configuration_is_pinned_and_cannot_arm_without_provider() {
                         | "not_installed"
                         | "permission_denied"
                         | "image_unavailable_or_incompatible"
+                        | "disk_quota_unavailable"
                         | "degraded"
                 )
             ),

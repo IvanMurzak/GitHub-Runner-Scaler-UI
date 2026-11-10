@@ -393,7 +393,7 @@ impl PolicySettings {
             cache_policy: policy.cache_policy,
             active_runners,
             execution_policy: policy.execution_policy().clone(),
-            provider_diagnostics: cli::host::isolation_capabilities(),
+            provider_diagnostics: cli::host::isolation_capabilities(context),
             workspace,
         })
     }
@@ -5747,7 +5747,8 @@ mod tests {
         CPU: 4000m  [-/+]
         Memory: 8192MiB  [-/+]
         Disk: 20480MiB  [-/+]
-        Selected provider: not installed; remedy: install and configure an OCI execution provider
+        Selected provider: not installed; remedy: install Podman (`apt install podman slirp4netns uidmap`),
+        then `sudo runner-manager host isolation prepare`
         Create profile [Enter/click]
         Cancel profile creation [Enter/click]
 
@@ -5808,8 +5809,9 @@ mod tests {
         CPU: 4000m  [-/+]
         Memory: 8192MiB  [-/+]
         Disk: 20480MiB  [-/+]
-        Selected provider: not installed; remedy: install and
-        configure an OCI execution provider
+        Selected provider: not installed; remedy: install Podman
+        (`apt install podman slirp4netns uidmap`), then `sudo
+        runner-manager host isolation prepare`
         Create profile [Enter/click]
         Git checkout cache: Default  [cycle]
         Save Git cache [Enter/click]

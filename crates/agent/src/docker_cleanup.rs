@@ -38,6 +38,9 @@ pub enum Mode {
     Apply,
 }
 
+/// Docker accounting's settings, in the configuration directory.
+pub const CONFIG_FILE: &str = "docker-cleanup.json";
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -46,11 +49,7 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: &Path) -> io::Result<Self> {
-        match fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(invalid),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error),
-        }
+        runner_manager_platform::settings_file::load(path)
     }
 }
 
@@ -63,6 +62,8 @@ pub struct DockerCleanup {
     pub policy_config: PathBuf,
     /// Where the Docker policy records violations.
     pub policy_log: PathBuf,
+    /// The configuration directory, where the protected paths are listed.
+    pub config_dir: PathBuf,
     /// Embedders may supply the manager binary that implements companion mode.
     pub companion: Option<PathBuf>,
 }
@@ -72,9 +73,10 @@ impl DockerCleanup {
         Self {
             host,
             root: state_dir.join("docker-cleanup"),
-            config: config_dir.join("docker-cleanup.json"),
+            config: config_dir.join(CONFIG_FILE),
             policy_config: config_dir.join(policy::CONFIG_FILE),
             policy_log: state_dir.join(policy::LOG_DIR).join(policy::LOG_FILE),
+            config_dir: config_dir.to_path_buf(),
             companion: None,
         }
     }
@@ -158,9 +160,10 @@ impl DockerCleanup {
         }
     }
 
-    /// What this launch's proxy checks: the configured mode, and the job's own
-    /// directories and the operator's allowed ones, resolved as the host sees
-    /// them. `None` when the policy is off.
+    /// What this launch's proxy checks: the configured mode, the job's own
+    /// directories and the operator's allowed ones, and the protected paths,
+    /// resolved as the host sees them. `None` when the policy is off and no
+    /// path is protected.
     ///
     /// # Errors
     ///
@@ -171,22 +174,18 @@ impl DockerCleanup {
         own_directories: &[PathBuf],
     ) -> io::Result<Option<policy::Context>> {
         let config = policy::Config::load(&self.policy_config)?;
-        if config.mode == policy::Mode::Off {
+        let protected: Vec<_> =
+            runner_manager_platform::service::ProtectedPaths::load(&self.config_dir)?
+                .paths
+                .iter()
+                .filter_map(|path| policy::resolve(path))
+                .collect();
+        if config.mode == policy::Mode::Off && protected.is_empty() {
             return Ok(None);
         }
         let allowed = own_directories
             .iter()
             .chain(&config.allow)
-            .filter_map(|path| policy::resolve(path))
-            .collect();
-        let protected = self
-            .policy_config
-            .parent()
-            .map(runner_manager_platform::service::ProtectedPaths::load)
-            .transpose()?
-            .unwrap_or_default()
-            .paths
-            .iter()
             .filter_map(|path| policy::resolve(path))
             .collect();
         Ok(Some(policy::Context {

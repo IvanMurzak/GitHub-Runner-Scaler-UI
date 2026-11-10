@@ -19,6 +19,10 @@ the version being prepared rather than the version in `Cargo.toml`.
   is set-group-ID and carries a default ACL, so every runner can use and
   update it. Re-register with `sudo runner-manager service install --start-at
   boot` to create the accounts; until then runners keep sharing `rm-runner`.
+- Handing an attempt to its account and sharing caches with the pool walk the
+  tree through directory descriptors and never follow a link at any depth, so
+  a job cannot redirect those `root` changes by swapping a directory for a
+  link mid-walk.
 
 ### Added
 
@@ -30,11 +34,24 @@ the version being prepared rather than the version in `Cargo.toml`.
   starts in `audit`, recording each violation without refusing it;
   `host docker-policy report` summarises them and `host docker-policy
   set-mode --mode enforce` refuses them. `host docker-policy allow-path`
-  admits a host directory every job may mount.
+  admits a host directory every job may mount. Podman's native API is
+  reported as `unchecked_api`.
+- The Docker socket the GitHub runner mounts into `container:` jobs and service
+  containers is now the job's proxy socket instead of the engine's own, so
+  Docker inside job containers is accounted and checked like any other step.
 - `host protect-path add|remove|list`: host directories no runner or job may
   reach on Linux. The systemd unit lists them in `InaccessiblePaths=`, applied
-  at the next `service install --start-at boot`, and the Docker policy treats
-  a container mount of one as a `protected_path` violation.
+  at the next `service install --start-at boot`, and the Docker proxy refuses
+  a container mount of one in every policy mode, `audit` and `off` included.
+- Isolated execution works under a Linux boot service: the daemon reaches the
+  system's rootful Podman service through its socket, and every isolated job
+  runs in a container with its own user namespace (`--userns=auto`) and its
+  own network namespace, so two jobs can listen on the same port without
+  colliding or reaching each other. `host isolation prepare` sets up the
+  subordinate id ranges and `podman.socket`; `host isolation set-disk-quota
+  --required false` accepts storage that cannot enforce a quota.
+  `host isolation status` now probes the OCI provider instead of always
+  reporting it not installed.
 
 ## 0.4.56
 

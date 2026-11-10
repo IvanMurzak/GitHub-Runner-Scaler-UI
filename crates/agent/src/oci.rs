@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
@@ -32,12 +32,80 @@ const BOUNDED_STORAGE_SCHEMA: u64 = 1;
 const BOUNDED_STORAGE_MODE: &str = "exclusive-filesystem-pool";
 const QUOTA_PROBE_MIB: u64 = 1024;
 
+/// The Podman service socket a rootful engine listens on.
+pub const ROOTFUL_SOCKET: &str = "/run/podman/podman.sock";
+
+/// How many host ids each isolated container's user namespace gets with a
+/// rootful engine: enough for any image's accounts, and 32768 containers in
+/// the conventional `containers` subordinate range.
+const AUTO_USERNS_SIZE: u64 = 65536;
+
+/// The operator's isolation settings, in `config/isolation.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IsolationSettings {
+    /// Whether an isolated job must have a hard writable-layer quota. Only
+    /// XFS with project quotas, or an attested bounded-storage helper, can
+    /// enforce one; elsewhere `false` lets isolated jobs run without it, so a
+    /// job can fill the engine's storage.
+    pub disk_quota_required: bool,
+}
+
+impl Default for IsolationSettings {
+    fn default() -> Self {
+        Self {
+            disk_quota_required: true,
+        }
+    }
+}
+
+impl IsolationSettings {
+    /// The file in the configuration directory.
+    pub const FILE: &'static str = "isolation.json";
+
+    /// The settings in `config_dir`, or the defaults when there are none.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read or does not parse.
+    pub fn load(config_dir: &Path) -> std::io::Result<Self> {
+        runner_manager_platform::settings_file::load(&config_dir.join(Self::FILE))
+    }
+
+    /// Writes the settings into `config_dir`.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be written.
+    pub fn save(&self, config_dir: &Path) -> std::io::Result<()> {
+        runner_manager_platform::settings_file::save(&config_dir.join(Self::FILE), self)
+    }
+}
+
+/// How the provider reaches Podman.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Engine {
+    /// Podman run by this process's own unprivileged account.
+    Rootless,
+    /// The system's rootful Podman service, reached as a client through its
+    /// socket. A Linux boot service runs this way: its sandbox forbids the
+    /// namespaces rootless Podman creates, and every container instead gets a
+    /// user namespace of its own (`--userns=auto`), so its root is an
+    /// unprivileged host id no other container shares.
+    Rootful(PathBuf),
+}
+
 #[derive(Debug)]
 pub struct OciProcesses {
     host: HostId,
     native: NativeProcesses,
     runtime: String,
     runtime_configuration_valid: bool,
+    engine: Engine,
+    /// Whether an isolated job must have a hard writable-layer quota.
+    disk_quota_required: bool,
+    /// Where a rootful engine's subordinate id ranges are read from.
+    subordinate_ids: [PathBuf; 2],
     attached: Mutex<BTreeMap<AttemptId, Child>>,
 }
 
@@ -57,12 +125,43 @@ impl OciProcesses {
             native: NativeProcesses::new(),
             runtime,
             runtime_configuration_valid,
+            engine: Self::engine_for_this_process(),
+            disk_quota_required: true,
+            subordinate_ids: [PathBuf::from("/etc/subuid"), PathBuf::from("/etc/subgid")],
             attached: Mutex::new(BTreeMap::new()),
         }
     }
 
+    /// The engine this process reaches: the rootful service for `root` on
+    /// Linux, rootless Podman for anyone else.
+    #[must_use]
+    pub fn engine_for_this_process() -> Engine {
+        #[cfg(target_os = "linux")]
+        if runner_manager_platform::host_fitness::is_elevated() {
+            return Engine::Rootful(PathBuf::from(ROOTFUL_SOCKET));
+        }
+        Engine::Rootless
+    }
+
+    /// Applies `settings`.
+    pub fn apply(&mut self, settings: IsolationSettings) {
+        self.disk_quota_required = settings.disk_quota_required;
+    }
+
+    /// Whether this host can run isolated jobs at all, before any image.
+    #[must_use]
+    pub fn host_capability(&self) -> ProviderCapability {
+        self.ready()
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new(&self.runtime);
+        if let Engine::Rootful(socket) = &self.engine {
+            command
+                .arg("--remote")
+                .arg("--url")
+                .arg(format!("unix://{}", socket.display()));
+        }
         command.stdin(Stdio::null()).stderr(Stdio::null());
         command
     }
@@ -93,125 +192,143 @@ impl OciProcesses {
         }
     }
 
-    fn rootless_ready(&self) -> ProviderCapability {
-        self.rootless_ready_for(QUOTA_PROBE_MIB)
+    fn ready(&self) -> ProviderCapability {
+        self.ready_for(QUOTA_PROBE_MIB)
     }
 
-    fn rootless_ready_for(&self, requested_mib: u64) -> ProviderCapability {
+    fn ready_for(&self, requested_mib: u64) -> ProviderCapability {
+        self.readiness(requested_mib)
+            .err()
+            .unwrap_or(ProviderCapability::Ready)
+    }
+
+    /// Whether a `requested_mib` writable-layer quota is enforced for isolated
+    /// jobs, or why they cannot run.
+    fn readiness(&self, requested_mib: u64) -> Result<bool, ProviderCapability> {
         if !cfg!(target_os = "linux") {
-            return ProviderCapability::Unsupported;
+            return Err(ProviderCapability::Unsupported);
         }
         if !self.runtime_configuration_valid {
-            return ProviderCapability::PermissionDenied;
+            return Err(ProviderCapability::PermissionDenied);
         }
         let info = match self.command().args(["info", "--format=json"]).output() {
             Ok(output) if output.status.success() && output.stdout.len() <= 64 * 1024 => {
                 match String::from_utf8(output.stdout) {
                     Ok(info) => info,
-                    Err(_) => return ProviderCapability::Degraded,
+                    Err(_) => return Err(ProviderCapability::Degraded),
                 }
             }
-            Ok(_) => return ProviderCapability::PermissionDenied,
+            Ok(_) => return Err(ProviderCapability::PermissionDenied),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return ProviderCapability::NotInstalled;
+                return Err(ProviderCapability::NotInstalled);
             }
-            Err(_) => return ProviderCapability::Degraded,
+            Err(_) => return Err(ProviderCapability::Degraded),
         };
         let Ok(info) = serde_json::from_str::<serde_json::Value>(&info) else {
-            return ProviderCapability::Degraded;
+            return Err(ProviderCapability::Degraded);
         };
-        if info
+        let rootless = info
             .pointer("/host/security/rootless")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-        {
-            return ProviderCapability::PermissionDenied;
+            .and_then(serde_json::Value::as_bool);
+        let rootful = matches!(self.engine, Engine::Rootful(_));
+        if rootless != Some(!rootful) {
+            return Err(ProviderCapability::PermissionDenied);
+        }
+        if rootful && !rootful_ranges_sufficient(&self.subordinate_ids) {
+            return Err(ProviderCapability::PermissionDenied);
         }
         let mappings = ["/host/idMappings/uidmap", "/host/idMappings/gidmap"];
-        if mappings.iter().any(|path| {
-            info.pointer(path)
-                .and_then(serde_json::Value::as_array)
-                .is_none_or(|ranges| {
-                    !ranges.iter().any(|range| {
-                        range
-                            .get("size")
-                            .and_then(serde_json::Value::as_u64)
-                            .is_some_and(|size| size >= 65536)
+        if !rootful
+            && mappings.iter().any(|path| {
+                info.pointer(path)
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(|ranges| {
+                        !ranges.iter().any(|range| {
+                            range
+                                .get("size")
+                                .and_then(serde_json::Value::as_u64)
+                                .is_some_and(|size| size >= 65536)
+                        })
                     })
-                })
-        }) {
-            return ProviderCapability::PermissionDenied;
+            })
+        {
+            return Err(ProviderCapability::PermissionDenied);
         }
         if info
             .pointer("/host/cgroupVersion")
             .and_then(serde_json::Value::as_str)
             != Some("v2")
         {
-            return ProviderCapability::Degraded;
+            return Err(ProviderCapability::Degraded);
         }
         let Some(controllers) = info
             .pointer("/host/cgroupControllers")
             .and_then(serde_json::Value::as_array)
         else {
-            return ProviderCapability::Degraded;
+            return Err(ProviderCapability::Degraded);
         };
         if ["cpu", "memory", "pids"].iter().any(|needed| {
             !controllers
                 .iter()
                 .any(|controller| controller.as_str() == Some(needed))
         }) {
-            return ProviderCapability::Degraded;
+            return Err(ProviderCapability::Degraded);
         }
         let Some(graph_root) = info
             .pointer("/store/graphRoot")
             .and_then(serde_json::Value::as_str)
         else {
-            return ProviderCapability::Degraded;
+            return Err(ProviderCapability::Degraded);
         };
         let Some(run_root) = info
             .pointer("/store/runRoot")
             .and_then(serde_json::Value::as_str)
         else {
-            return ProviderCapability::Degraded;
+            return Err(ProviderCapability::Degraded);
         };
         if !graph_root.starts_with('/')
             || !run_root.starts_with('/')
             || graph_root.starts_with("/mnt/")
             || run_root.starts_with("/mnt/")
         {
-            return ProviderCapability::PermissionDenied;
+            return Err(ProviderCapability::PermissionDenied);
         }
         let backing_filesystem = info
             .pointer("/store/graphStatus/Backing Filesystem")
             .and_then(serde_json::Value::as_str);
         let storage_size = format!("size={requested_mib}m");
+        let without_quota = if self.disk_quota_required {
+            Err(ProviderCapability::DiskQuotaUnavailable)
+        } else {
+            Ok(false)
+        };
         let quota_probe =
             match self.output(&["--storage-opt", &storage_size, "info", "--format=json"]) {
                 Ok(output) => output,
-                Err(_) => return ProviderCapability::DiskQuotaUnavailable,
+                Err(_) => return without_quota,
             };
         // Native Podman writable-layer quotas require XFS project quotas. XFS
         // alone is insufficient: rootless quota setup can still fail with
         // EPERM, which the command above catches before allocation or JIT.
         if backing_filesystem == Some("xfs") {
-            return ProviderCapability::Ready;
+            return Ok(true);
         }
         // Managed WSL can instead use an operator-provisioned runtime helper.
         // The helper routes every `size=...` create into an exclusive finite
         // filesystem and attests that contract in the quota-probe response.
         // Plain Podman on extfs has no attestation and remains fail-closed.
         let Ok(quota_info) = serde_json::from_str::<serde_json::Value>(&quota_probe) else {
-            return ProviderCapability::DiskQuotaUnavailable;
+            return without_quota;
         };
         if bounded_storage_attested(&quota_info, graph_root, run_root, requested_mib) {
-            ProviderCapability::Ready
+            Ok(true)
         } else {
-            ProviderCapability::DiskQuotaUnavailable
+            without_quota
         }
     }
 
     fn capability_or(&self, fallback: FailureReason) -> FailureReason {
-        let capability = self.rootless_ready();
+        let capability = self.ready();
         if capability == ProviderCapability::Ready {
             fallback
         } else {
@@ -368,6 +485,33 @@ impl OciProcesses {
     }
 }
 
+/// Whether `/etc/subuid` and `/etc/subgid` give the `containers` account the
+/// subordinate ids `--userns=auto` hands out: one namespace per concurrent
+/// container, for as many as the runner pool can run.
+fn rootful_ranges_sufficient(files: &[PathBuf]) -> bool {
+    let needed = containers_range_needed();
+    files.iter().all(|file| containers_range(file) >= needed)
+}
+
+/// How many subordinate ids the `containers` account needs for a rootful
+/// engine: one `--userns=auto` namespace for each runner the pool can run.
+#[must_use]
+pub fn containers_range_needed() -> u64 {
+    AUTO_USERNS_SIZE * u64::from(runner_manager_platform::runner_account::POOL_SIZE)
+}
+
+/// How many subordinate ids `file` (`/etc/subuid` or `/etc/subgid`) gives the
+/// `containers` account that `--userns=auto` allocates from; 0 when none.
+#[must_use]
+pub fn containers_range(file: &Path) -> u64 {
+    std::fs::read_to_string(file).map_or(0, |text| {
+        text.lines()
+            .filter_map(|line| line.strip_prefix("containers:"))
+            .filter_map(|range| range.split(':').nth(1)?.trim().parse::<u64>().ok())
+            .sum()
+    })
+}
+
 #[cfg(unix)]
 fn operator_runtime_is_trusted(path: &Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -459,12 +603,12 @@ impl ExecutionProvider for OciProcesses {
         if !matches!(backend, Backend::Auto | Backend::Oci) {
             return ProviderCapability::Unsupported;
         }
-        let capability = self.rootless_ready_for(u64::from(resources.disk_mib));
+        let capability = self.ready_for(u64::from(resources.disk_mib));
         if capability != ProviderCapability::Ready {
             return capability;
         }
         if self.image_ready(image).is_err() {
-            let capability = self.rootless_ready_for(u64::from(resources.disk_mib));
+            let capability = self.ready_for(u64::from(resources.disk_mib));
             if capability == ProviderCapability::Ready {
                 ProviderCapability::ImageUnavailableOrIncompatible
             } else {
@@ -487,7 +631,7 @@ impl ExecutionProvider for OciProcesses {
         if !matches!(backend, Backend::Auto | Backend::Oci) {
             return Err(ProviderCapability::Unsupported.refusal());
         }
-        let capability = self.rootless_ready_for(u64::from(resources.disk_mib));
+        let capability = self.ready_for(u64::from(resources.disk_mib));
         if capability != ProviderCapability::Ready {
             return Err(capability.refusal());
         }
@@ -525,10 +669,9 @@ impl ExecutionProvider for OciProcesses {
                 IsolationProviderFailure::UnsafeRuntimePath,
             ));
         }
-        let capability = self.rootless_ready_for(u64::from(resources.disk_mib));
-        if capability != ProviderCapability::Ready {
-            return Err(capability.refusal());
-        }
+        let quota = self
+            .readiness(u64::from(resources.disk_mib))
+            .map_err(ProviderCapability::refusal)?;
         let name = format!(
             "rm-{}-{}",
             attempt.id,
@@ -541,46 +684,52 @@ impl ExecutionProvider for OciProcesses {
         let attempt_label = format!("{ATTEMPT_LABEL}={}", attempt.id);
         let generation_label = format!("{GENERATION_LABEL}={generation}");
         let image_label = format!("{IMAGE_LABEL}={}", resolved_image.as_str());
+        let userns = match self.engine {
+            Engine::Rootless => "--userns=keep-id".to_owned(),
+            Engine::Rootful(_) => format!("--userns=auto:size={AUTO_USERNS_SIZE}"),
+        };
+        let mut arguments = vec![
+            "create",
+            "--interactive",
+            "--name",
+            &name,
+            "--pull=never",
+            "--entrypoint=sh",
+            "--log-driver=none",
+            "--image-volume=ignore",
+            "--http-proxy=false",
+            &userns,
+            "--user=0",
+            "--cap-drop=all",
+            "--cap-add=CHOWN",
+            "--cap-add=SETUID",
+            "--cap-add=SETGID",
+            "--cap-add=DAC_OVERRIDE",
+            "--cap-add=FOWNER",
+            "--security-opt=no-new-privileges",
+            "--network=slirp4netns",
+            "--pids-limit=128",
+            "--cpus",
+            &cpu,
+            "--memory",
+            &memory,
+            "--label",
+            &host_label,
+            "--label",
+            &attempt_label,
+            "--label",
+            &generation_label,
+            "--label",
+            &image_label,
+        ];
+        // Only where the storage enforces it: elsewhere `create` would fail,
+        // and running without one was the operator's explicit choice.
+        if quota {
+            arguments.extend(["--storage-opt", disk.as_str()]);
+        }
+        arguments.extend([resolved_image.as_str(), "-c", BOOTSTRAP]);
         let id = self
-            .output(&[
-                "create",
-                "--interactive",
-                "--name",
-                &name,
-                "--pull=never",
-                "--entrypoint=sh",
-                "--log-driver=none",
-                "--image-volume=ignore",
-                "--http-proxy=false",
-                "--userns=keep-id",
-                "--user=0",
-                "--cap-drop=all",
-                "--cap-add=CHOWN",
-                "--cap-add=SETUID",
-                "--cap-add=SETGID",
-                "--cap-add=DAC_OVERRIDE",
-                "--cap-add=FOWNER",
-                "--security-opt=no-new-privileges",
-                "--network=slirp4netns",
-                "--pids-limit=128",
-                "--cpus",
-                &cpu,
-                "--memory",
-                &memory,
-                "--storage-opt",
-                &disk,
-                "--label",
-                &host_label,
-                "--label",
-                &attempt_label,
-                "--label",
-                &generation_label,
-                "--label",
-                &image_label,
-                resolved_image.as_str(),
-                "-c",
-                BOOTSTRAP,
-            ])
+            .output(&arguments)
             .map_err(|reason| self.capability_or(reason))?
             .trim()
             .to_owned();
@@ -955,38 +1104,76 @@ mod tests {
         .to_string()
     }
 
+    /// A rootful-engine provider over the fixture runtime, with `range` ids
+    /// in the `containers` subordinate ranges.
+    fn rootful_fixture(
+        info: &str,
+        quota_ok: bool,
+        range: u64,
+    ) -> (tempfile::TempDir, OciProcesses) {
+        let (root, mut provider) = fixture_with_quota(info, quota_ok);
+        let ranges = root.path().join("subids");
+        std::fs::write(
+            &ranges,
+            format!("ivan:100000:65536\ncontainers:2147483647:{range}\n"),
+        )
+        .unwrap();
+        provider.subordinate_ids = [ranges.clone(), ranges];
+        provider.engine = Engine::Rootful(PathBuf::from(ROOTFUL_SOCKET));
+        (root, provider)
+    }
+
+    #[test]
+    fn a_rootful_engine_needs_rootful_podman_and_room_for_every_runner() {
+        let rootful_info = info(false, "/var/lib/containers/storage", 1);
+        let (_root, provider) = rootful_fixture(&rootful_info, true, 2_147_483_648);
+        assert_eq!(provider.ready(), ProviderCapability::Ready);
+        assert_eq!(provider.readiness(1024), Ok(true), "xfs enforces the quota");
+
+        let (_root, provider) = rootful_fixture(&rootful_info, true, 65_536);
+        assert_eq!(
+            provider.ready(),
+            ProviderCapability::PermissionDenied,
+            "one namespace's worth of ids cannot hold a namespace per runner"
+        );
+
+        let rootless_info = info(true, "/home/ivan/.local/share/containers", 65536);
+        let (_root, provider) = rootful_fixture(&rootless_info, true, 2_147_483_648);
+        assert_eq!(provider.ready(), ProviderCapability::PermissionDenied);
+    }
+
+    #[test]
+    fn storage_without_a_quota_is_refused_unless_the_operator_accepted_it() {
+        let ext4 = info(false, "/var/lib/containers/storage", 1).replace("xfs", "extfs");
+        let (_root, provider) = rootful_fixture(&ext4, false, 2_147_483_648);
+        assert_eq!(provider.ready(), ProviderCapability::DiskQuotaUnavailable);
+        let mut provider = provider;
+        provider.apply(IsolationSettings {
+            disk_quota_required: false,
+        });
+        assert_eq!(provider.readiness(1024), Ok(false));
+    }
+
     #[test]
     fn rootless_probe_refuses_rootful_and_drvfs_storage() {
         let (_root, provider) = fixture(&info(false, "/home/ivan/.local/share/containers", 65536));
-        assert_eq!(
-            provider.rootless_ready(),
-            ProviderCapability::PermissionDenied
-        );
+        assert_eq!(provider.ready(), ProviderCapability::PermissionDenied);
         let (_root, provider) = fixture(&info(true, "/mnt/c/containers", 65536));
-        assert_eq!(
-            provider.rootless_ready(),
-            ProviderCapability::PermissionDenied
-        );
+        assert_eq!(provider.ready(), ProviderCapability::PermissionDenied);
         let (_root, provider) = fixture(&info(true, "/home/ivan/.local/share/containers", 1));
-        assert_eq!(
-            provider.rootless_ready(),
-            ProviderCapability::PermissionDenied
-        );
+        assert_eq!(provider.ready(), ProviderCapability::PermissionDenied);
         let (_root, provider) = fixture(&info(true, "/home/ivan/.local/share/containers", 65536));
-        assert_eq!(provider.rootless_ready(), ProviderCapability::Ready);
+        assert_eq!(provider.ready(), ProviderCapability::Ready);
         let no_pids = info(true, "/home/ivan/.local/share/containers", 65536)
             .replace("\"pids\"", "\"missing\"");
         let (_root, provider) = fixture(&no_pids);
-        assert_eq!(provider.rootless_ready(), ProviderCapability::Degraded);
+        assert_eq!(provider.ready(), ProviderCapability::Degraded);
         let extfs = info(true, "/home/ivan/.local/share/containers", 65536).replace(
             "\"Backing Filesystem\":\"xfs\"",
             "\"Backing Filesystem\":\"extfs\"",
         );
         let (_root, provider) = fixture(&extfs);
-        assert_eq!(
-            provider.rootless_ready(),
-            ProviderCapability::DiskQuotaUnavailable
-        );
+        assert_eq!(provider.ready(), ProviderCapability::DiskQuotaUnavailable);
         let mut bounded: serde_json::Value = serde_json::from_str(&extfs).unwrap();
         bounded["runnerManagerStorage"] = serde_json::json!({
             "schema": BOUNDED_STORAGE_SCHEMA,
@@ -995,33 +1182,27 @@ mod tests {
             "hardCap": true
         });
         let (_root, provider) = fixture(&bounded.to_string());
-        assert_eq!(provider.rootless_ready(), ProviderCapability::Ready);
+        assert_eq!(provider.ready(), ProviderCapability::Ready);
         assert_eq!(
-            provider.rootless_ready_for(2048),
+            provider.ready_for(2048),
             ProviderCapability::DiskQuotaUnavailable,
             "the helper must attest the exact requested size"
         );
         bounded["runnerManagerStorage"]["hardCap"] = serde_json::json!(false);
         let (_root, provider) = fixture(&bounded.to_string());
-        assert_eq!(
-            provider.rootless_ready(),
-            ProviderCapability::DiskQuotaUnavailable
-        );
+        assert_eq!(provider.ready(), ProviderCapability::DiskQuotaUnavailable);
         let (_root, provider) = fixture_with_quota(
             &info(true, "/home/ivan/.local/share/containers", 65536),
             false,
         );
-        assert_eq!(
-            provider.rootless_ready(),
-            ProviderCapability::DiskQuotaUnavailable
-        );
+        assert_eq!(provider.ready(), ProviderCapability::DiskQuotaUnavailable);
     }
 
     #[test]
     fn missing_operator_runtime_is_not_treated_as_ready() {
         let mut provider = OciProcesses::new(HostId::from_u128(1));
         provider.runtime = "/a/path/that/cannot/be/podman".into();
-        assert_eq!(provider.rootless_ready(), ProviderCapability::NotInstalled);
+        assert_eq!(provider.ready(), ProviderCapability::NotInstalled);
     }
 
     #[test]
@@ -1049,7 +1230,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut provider = OciProcesses::new(host);
         provider.runtime = path.to_string_lossy().into_owned();
-        assert_eq!(provider.rootless_ready(), ProviderCapability::Degraded);
+        assert_eq!(provider.ready(), ProviderCapability::Degraded);
         let owned = provider.enumerate_owned(host);
         assert_eq!(owned.len(), 1);
         assert!(matches!(
@@ -2210,9 +2391,6 @@ mod tests {
     #[ignore = "requires a real rootless Podman fixture with unavailable writable-layer quota"]
     fn live_rootless_quota_refusal_is_typed_before_jit() {
         let provider = OciProcesses::new(HostId::from_u128(1));
-        assert_eq!(
-            provider.rootless_ready(),
-            ProviderCapability::DiskQuotaUnavailable
-        );
+        assert_eq!(provider.ready(), ProviderCapability::DiskQuotaUnavailable);
     }
 }

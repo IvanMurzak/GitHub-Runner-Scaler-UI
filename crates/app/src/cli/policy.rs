@@ -1433,7 +1433,9 @@ pub fn apply_policy_mutation_selected(
     if let Some(enabled) = mutation.enabled {
         if enabled {
             if !policy.execution_policy().is_native() {
-                let capability = PlatformExecutionProvider::new(policy.host_id).probe(&policy);
+                let capability = PlatformExecutionProvider::new(policy.host_id)
+                    .with_isolation_settings(super::host::isolation_settings(context)?)
+                    .probe(&policy);
                 if capability != ProviderCapability::Ready {
                     return Err(CliError::with_remedy(
                         Failure::Conflict,

@@ -324,7 +324,16 @@ host is using:
   mode a violation is recorded in `state/docker-policy/violations.jsonl` and the
   request still runs; `host docker-policy report` summarises them, and `host
   docker-policy set-mode --mode enforce` refuses them. Only `enforce` makes
-  separate accounts hold against a job that sets out to escape through Docker;
+  separate accounts hold against a job that sets out to escape through Docker.
+  The engine socket the GitHub runner mounts into a `container:` job and its
+  service containers is replaced by the job's proxy socket, so steps inside
+  them reach Docker through the same proxy. Podman's native API (`/libpod/`)
+  is not checked and counts as a violation of its own. One gap remains: a bind
+  source is judged when the container is created, and the engine follows links
+  only when it starts, so a job that swaps a directory of its own for a link in
+  between mounts the link's target. Protect what must stay out of reach with
+  `host protect-path` as well: the service's sandbox hides it from the job
+  itself;
 - the Git checkout cache is not offered to these runners. Preparing and
   capturing it runs `git` in the daemon over a checkout the job wrote, and
   repository configuration such as `core.fsmonitor` names a command.
@@ -354,9 +363,10 @@ protect-path list` says whether the registered service enforces the current
 list, and `review_least_privilege` reports a unit that has dropped one.
 
 The Docker engine runs outside the unit, so a container could still mount a
-protected path; the Docker policy (above) records such a mount as
-`protected_path` even inside an allowed directory, and refuses it in `enforce`
-mode.
+protected path. The Docker proxy refuses such a mount, even inside an allowed
+directory, in every policy mode (`off` and `audit` included), and records it as
+`protected_path`. That holds while Docker accounting runs the proxy: with
+`host docker-cleanup set-mode --mode off` jobs reach the engine directly.
 
 The command refuses `/`, the system directories every job needs (`/usr`,
 `/etc`, `/var`, `/tmp` and the like; protect a directory inside one instead),

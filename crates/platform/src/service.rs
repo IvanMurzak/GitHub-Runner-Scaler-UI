@@ -1909,11 +1909,7 @@ impl ProtectedPaths {
     ///
     /// When the file cannot be read or does not parse.
     pub fn load(config_dir: &Path) -> std::io::Result<Self> {
-        match std::fs::read(config_dir.join(Self::FILE)) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error),
-        }
+        crate::settings_file::load(&config_dir.join(Self::FILE))
     }
 
     /// Writes the list into `config_dir`.
@@ -1922,8 +1918,7 @@ impl ProtectedPaths {
     ///
     /// When the file cannot be written.
     pub fn save(&self, config_dir: &Path) -> std::io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(config_dir.join(Self::FILE), bytes)
+        crate::settings_file::save(&config_dir.join(Self::FILE), self)
     }
 
     /// Why `path` cannot be protected, or `None` when it can.

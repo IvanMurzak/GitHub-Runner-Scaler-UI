@@ -2693,6 +2693,13 @@ impl PlatformExecutionProvider {
         }
     }
 
+    /// Applies the operator's isolation settings to the OCI provider.
+    #[must_use]
+    pub fn with_isolation_settings(mut self, settings: crate::oci::IsolationSettings) -> Self {
+        self.oci.apply(settings);
+        self
+    }
+
     /// Applies the host's `runner.env` at `path` to every native runner.
     /// Isolated runners do not get it: their environment is the image's.
     #[must_use]
@@ -3383,42 +3390,29 @@ impl NativeProcesses {
             return Ok(Some(*account));
         }
         let runtime = attempt.runtime_path();
-        // Unless another live attempt holds that account now: a persistent slot
-        // kept since an earlier attempt then moves to a free one.
-        if let Some(account) = owner_in_pool(pool, runtime)
-            && (pool.accounts.is_empty()
-                || !assignments.values().any(|held| held.uid == account.uid))
-        {
-            assignments.insert(attempt.id, account);
-            return Ok(Some(account));
-        }
-        let assignable = pool.assignable();
-        let account = if pool.accounts.is_empty() {
-            assignable.first().copied()
-        } else {
-            let mut busy: std::collections::BTreeSet<u32> =
-                assignments.values().map(|account| account.uid).collect();
-            if let Some(root) = runtime.parent()
-                && let Ok(entries) = fs::read_dir(root)
-            {
-                busy.extend(
-                    entries
-                        .flatten()
-                        .filter_map(|entry| owner_in_pool(pool, &entry.path()))
-                        .map(|account| account.uid),
-                );
-            }
-            assignable
+        let held = assignments.values().map(|account| account.uid).collect();
+        // The accounts owning the other attempts' directories, including ones
+        // a previous daemon left behind.
+        let busy = || {
+            runtime
+                .parent()
+                .and_then(|root| fs::read_dir(root).ok())
                 .into_iter()
-                .find(|account| !busy.contains(&account.uid))
+                .flatten()
+                .flatten()
+                .filter_map(|entry| owner_in_pool(pool, &entry.path()))
+                .map(|account| account.uid)
+                .collect()
         };
-        let account = account.ok_or_else(|| {
-            FailureReason::Other(format!(
-                "every one of the {} runner accounts is in use by another attempt, and no two \
-                 runners share one",
-                pool.assignable().len()
-            ))
-        })?;
+        let account = pool
+            .allocate(owner_in_pool(pool, runtime), &held, busy)
+            .ok_or_else(|| {
+                FailureReason::Other(format!(
+                    "every one of the {} runner accounts is in use by another attempt, and no \
+                     two runners share one",
+                    pool.accounts.len()
+                ))
+            })?;
         assignments.insert(attempt.id, account);
         Ok(Some(account))
     }
