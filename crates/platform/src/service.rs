@@ -2903,6 +2903,7 @@ fn ini_directives(text: &str, section: &str) -> BTreeMap<String, String> {
 /// A drop-in may carry any of them, and left in place they become part of the
 /// executable's path. With `@` the second word is the `argv[0]` handed to the
 /// process rather than an argument, so it goes as well.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
 fn systemd_exec_command_line(value: &str) -> String {
     let value = value.trim();
     let command = value.trim_start_matches(['-', '@', ':', '+', '!']);
@@ -2923,6 +2924,7 @@ fn systemd_exec_command_line(value: &str) -> String {
 /// Parses a systemd time span such as `15`, `15s`, `500ms`, `1min 30s` or
 /// `2h`. A bare number is seconds. `None` for `infinity`, an empty value, or
 /// anything systemd would not accept either.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
 fn systemd_timespan(value: &str) -> Option<Duration> {
     let mut rest = value.trim();
     if rest.is_empty() || rest == "infinity" {
