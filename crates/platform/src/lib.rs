@@ -57,6 +57,7 @@ pub mod launch_health;
 pub mod lock;
 pub mod log_retention;
 pub mod logging;
+pub mod memory_admission;
 pub mod os;
 pub mod paths;
 pub mod polling;

@@ -55,6 +55,8 @@ const SURFACE: [(&str, &[&str]); 11] = [
             // Owner decision 2026-10-07: idle polling every 10 s on conditional
             // requests, with a host-level setting for both intervals.
             "set-poll-interval",
+            // 0.4.53: memory admission before every runner start.
+            "set-memory-margin",
             "set-auto-update",
             "set-runtime-root",
             "reset-runtime-root",

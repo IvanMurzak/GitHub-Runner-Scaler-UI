@@ -89,6 +89,7 @@ use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite;
 
 use super::launches::{AttemptReport, AttemptReports, Launches};
+use super::memory::HostMemory;
 use super::meters::{AttemptMeters, sample_attempts};
 use super::{CliError, Context, CoordinatorCommand, Failure, write_failed};
 
@@ -938,6 +939,9 @@ pub struct LinkPorts {
     pub coordination: Arc<Coordination>,
     /// The coordinator's launches on this host (stage 3).
     pub launches: Arc<Launches>,
+    /// The host's memory admission: its meters, and where the coordinator's
+    /// memory estimates go (0.4.53).
+    pub memory: Arc<HostMemory>,
 }
 
 /// Why one session ended, as fixed words for the link record.
@@ -1040,21 +1044,32 @@ impl Recorder {
     }
 }
 
-/// Keeps the link up while this host has joined a coordinator, and samples
-/// what its attempts use meanwhile. Never returns.
+/// Keeps the link up while this host has joined a coordinator. Never returns.
 pub async fn maintain_link(ports: LinkPorts) {
-    let meters = Arc::new(AttemptMeters::default());
-    let coordination = Arc::clone(&ports.coordination);
-    let routes = Arc::clone(&ports.routes);
-    let sampling = sample_attempts(
-        Arc::clone(&meters),
-        Arc::clone(&ports.store),
-        ports.host.id,
-        move || coordination.borrow().configured,
-        // A runner that exited holds its slot until a pass concludes it.
+    let meters = ports.memory.meters();
+    link(ports, &meters).await;
+}
+
+/// Samples what this host's attempts use while it has joined a coordinator
+/// (for the job statistics) or memory admission is on (for admission and its
+/// own estimates). Never returns.
+pub async fn sample_for(
+    memory: Arc<HostMemory>,
+    store: Arc<dyn runner_manager_domain::store::Store>,
+    host: runner_manager_domain::model::HostId,
+    coordination: Arc<Coordination>,
+    routes: Arc<WakeRoutes>,
+) {
+    sample_attempts(
+        memory.meters(),
+        store,
+        host,
+        move || coordination.borrow().configured || memory.settings().enabled,
+        // A runner that exited holds its slot, and its memory, until a pass
+        // concludes it.
         move |target| routes.pass_soon(&target_ref(target)),
-    );
-    tokio::join!(sampling, link(ports, &meters));
+    )
+    .await;
 }
 
 async fn link(ports: LinkPorts, meters: &AttemptMeters) {
@@ -1482,6 +1497,13 @@ async fn serve(
                             tracing::info!(lease = %cancel.lease_id, "the coordinator cancelled a launch");
                         }
                     }
+                    Ok(ServerMessage::MemoryEstimates(estimates)) => {
+                        tracing::info!(
+                            count = estimates.estimates.len(),
+                            "the coordinator sent memory estimates for this host's targets"
+                        );
+                        ports.memory.set_coordinator_estimates(estimates);
+                    }
                     Ok(ServerMessage::HelloAck(ack)) => {
                         tracing::info!(
                             covered = ack.covered.len(),
@@ -1764,6 +1786,7 @@ mod tests {
             host.clone(),
             coordination.subscribe(),
         ));
+        let memory = Arc::new(HostMemory::new(paths.clone(), Arc::clone(&store)));
         let link = tokio::spawn(maintain_link(LinkPorts {
             paths: paths.clone(),
             key_store,
@@ -1775,6 +1798,7 @@ mod tests {
             runner_root: dir.path().to_path_buf(),
             coordination: Arc::clone(&coordination),
             launches,
+            memory,
         }));
 
         // Connected and described.
@@ -1969,6 +1993,7 @@ mod tests {
             coordination.subscribe(),
         ));
         let draining = Arc::new(AtomicBool::new(false));
+        let memory = Arc::new(HostMemory::new(paths.clone(), Arc::clone(&store)));
         let link = tokio::spawn(maintain_link(LinkPorts {
             paths,
             key_store,
@@ -1980,6 +2005,7 @@ mod tests {
             runner_root: dir.path().to_path_buf(),
             coordination: Arc::clone(&coordination),
             launches: Arc::clone(&launches),
+            memory,
         }));
 
         // Connected at version 3, covered, and its heartbeat in.

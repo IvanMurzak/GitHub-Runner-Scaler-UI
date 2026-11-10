@@ -311,6 +311,7 @@ runner-manager host show                                       # Show capacity, 
 runner-manager host set-capacity N                             # Change the host limit without restarting the service
 runner-manager host set-auto-update BOOL                      # Daily automatic updates (default: true)
 runner-manager host set-poll-interval [--idle 10s] [--active 60s] [--coordinated 300s] # How often GitHub is polled: idle, busy, and covered by a coordinator
+runner-manager host set-memory-margin SIZE|off|on             # Free memory a runner needs beyond its estimate (default 1GiB), or off
 runner-manager host set-runtime-root --path PATH               # Put disposable runner workspaces under PATH
 runner-manager host reset-runtime-root                         # Return runner placement to the platform default
 runner-manager host isolation status [--json]                  # Report execution provider readiness
@@ -781,6 +782,32 @@ every poll on the host until the time GitHub names, or a minute when it names no
 time it comes back after a wait has ended. `host show` prints
 what polling actually cost: full and `304` responses per hour, the busiest minute against
 GitHub's 900-a-minute secondary limit, and what is left of the hourly limit.
+
+### Keep heavy jobs from crowding one machine
+
+Before it starts any runner (for a repository or organization label, a selector, or a launch the
+coordinator placed here) the service checks this machine's memory. It starts the runner only when
+free memory, less what the jobs already running may still grow into, holds the runner's expected
+peak plus a **margin** (1 GiB by default):
+
+```bash
+runner-manager host set-memory-margin 2GiB   # keep 2 GiB free beyond the estimate
+runner-manager host set-memory-margin off    # start runners by capacity alone, as before 0.4.53
+runner-manager host set-memory-margin on     # back on, with the margin kept
+```
+
+A runner takes any job its labels match, so the expected peak is per profile and stands for the
+heaviest of its jobs: the coordinator's figure for the target when this host has joined one (the
+heaviest job's p90 peak, from this host's own runs where it has them), otherwise the p90 of the
+last 20 peaks this host measured for the profile, otherwise 1 GiB. A running job holds its own
+estimate, less what it already uses, until it ends: a build's peak often comes late. A refused
+start is not a failure: the job stays queued and the next pass asks again, `status` shows
+`waiting for memory: … needs X GiB, Y GiB free less Z GiB reserved`, and the service logs
+`memory_deferred` with the byte figures. A launch from the coordinator that does not fit is
+refused with reason `memory`, so the coordinator places the job on another host. With nothing
+running on the machine a runner always starts, even one larger than the free memory (logged as
+`memory_admitted_alone`), so a job bigger than the machine is never starved. `host show` prints
+the setting and the free memory now.
 
 ### Choose where runners work
 

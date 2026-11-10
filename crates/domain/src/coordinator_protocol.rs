@@ -378,6 +378,10 @@ pub enum RefusalReason {
     Draining,
     /// The lease was already seen, or expired before it arrived.
     Stale,
+    /// From 0.4.53: the host's free memory, less what its running attempts
+    /// may still grow into, does not hold the profile's estimate and margin.
+    /// An older coordinator reads it as [`Self::Other`].
+    Memory,
     /// A reason this build does not know.
     #[serde(other)]
     Other,
@@ -395,6 +399,7 @@ impl RefusalReason {
             Self::Unfit => "unfit",
             Self::Draining => "draining",
             Self::Stale => "stale",
+            Self::Memory => "memory",
             Self::Other => "other",
         }
     }
@@ -488,6 +493,55 @@ pub struct AttemptUsage {
     pub cpu_peak_millicores: u32,
     /// How many samples were taken.
     pub samples: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Memory estimates (version 4, from 0.4.53)
+// ---------------------------------------------------------------------------
+
+/// The most estimates one [`MemoryEstimates`] carries.
+pub const MAX_MEMORY_ESTIMATES: usize = 256;
+
+/// What the jobs of each of a host's targets are expected to need at their
+/// peak, for the host's own memory admission: a runner the host starts for its
+/// own demand may take any job its labels match, so one figure per target
+/// stands for the heaviest of them.
+///
+/// Sent from 0.4.53 on a version-4 link after each `hello`, and again when the
+/// figures change. A host before 0.4.53 decodes it as
+/// [`ServerMessage::Unknown`] and skips it; a coordinator before 0.4.53 never
+/// sends it, and the host then estimates from its own measurements.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryEstimates {
+    /// Targets without statistics are absent.
+    pub estimates: Vec<TargetEstimate>,
+}
+
+/// One target's expected peak memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetEstimate {
+    /// As the host named it in its `hello`.
+    pub target: TargetRef,
+    /// The heaviest of the target's job keys by their expected peak (p90, or a
+    /// heavier recent run).
+    pub peak_rss_bytes: u64,
+    /// How many samples it was taken from.
+    #[serde(default)]
+    pub samples: u32,
+    /// Taken from this host's own runs only; otherwise from every host's.
+    #[serde(default)]
+    pub own: bool,
+}
+
+impl MemoryEstimates {
+    /// The estimate for `target`, compared the way GitHub compares names.
+    #[must_use]
+    pub fn for_target(&self, target: &TargetRef) -> Option<&TargetEstimate> {
+        self.estimates
+            .iter()
+            .find(|estimate| estimate.target.same_as(target))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1101,8 @@ pub enum ServerMessage {
     CancelLaunch(CancelLaunch),
     /// Version 4: the answer to a [`HostMessage::StatsRequest`].
     Stats(StatsReport),
+    /// Version 4, from 0.4.53: expected peak memory per target.
+    MemoryEstimates(MemoryEstimates),
     #[serde(other)]
     Unknown,
 }
@@ -1628,6 +1684,67 @@ mod tests {
             "a".repeat(MAX_MESSAGE_BYTES)
         );
         assert_eq!(HostMessage::decode(&huge), Err(ProtocolError::Malformed));
+    }
+
+    #[test]
+    fn memory_estimates_round_trip_and_older_peers_skip_them() {
+        let estimates = MemoryEstimates {
+            estimates: vec![TargetEstimate {
+                target: TargetRef {
+                    scope: TargetScope::Repo,
+                    name: "Acme/Unreal".into(),
+                },
+                peak_rss_bytes: 11 << 30,
+                samples: 12,
+                own: true,
+            }],
+        };
+        let frame = ServerMessage::MemoryEstimates(estimates.clone()).encode();
+        assert!(frame.contains(r#""type":"memory_estimates""#), "{frame}");
+        assert_eq!(
+            ServerMessage::decode(&frame),
+            Ok(ServerMessage::MemoryEstimates(estimates.clone()))
+        );
+        let lower = TargetRef {
+            scope: TargetScope::Repo,
+            name: "acme/unreal".into(),
+        };
+        assert_eq!(
+            estimates.for_target(&lower).map(|e| e.peak_rss_bytes),
+            Some(11 << 30)
+        );
+        // A newer coordinator's entry with fields this build does not know, and
+        // without the optional ones.
+        let newer = r#"{"type":"memory_estimates","estimates":[{"target":{"scope":"org","name":"acme"},"peak_rss_bytes":5,"p99":9}],"by_profile":[]}"#;
+        assert!(matches!(
+            ServerMessage::decode(newer),
+            Ok(ServerMessage::MemoryEstimates(MemoryEstimates { ref estimates }))
+                if estimates.len() == 1 && estimates[0].samples == 0 && !estimates[0].own
+        ));
+        // What a host before 0.4.53 sees: an unknown message type, skipped. The
+        // same holds for any type this build does not know.
+        assert_eq!(
+            ServerMessage::decode(r#"{"type":"memory_budget","estimates":[]}"#),
+            Ok(ServerMessage::Unknown)
+        );
+    }
+
+    #[test]
+    fn a_memory_refusal_reads_as_other_to_an_older_peer() {
+        let refused = HostMessage::LaunchAck(LaunchAck::refused("l", RefusalReason::Memory));
+        let frame = refused.encode();
+        assert!(frame.contains(r#""reason":"memory""#), "{frame}");
+        assert_eq!(HostMessage::decode(&frame), Ok(refused));
+        // An older coordinator has no `memory`; `#[serde(other)]` makes any
+        // reason it does not know `Other`, which this one shows the same way.
+        let unknown = r#"{"type":"launch_ack","lease_id":"l","accepted":false,"reason":"gpu"}"#;
+        assert!(matches!(
+            HostMessage::decode(unknown),
+            Ok(HostMessage::LaunchAck(LaunchAck {
+                reason: Some(RefusalReason::Other),
+                ..
+            }))
+        ));
     }
 
     #[test]

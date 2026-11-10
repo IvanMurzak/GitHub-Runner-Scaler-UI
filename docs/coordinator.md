@@ -269,8 +269,10 @@ every other candidate (0.4.52): a host whose last heartbeat reports its CPU load
 `COORDINATOR_MIN_DISK_FREE` (10 GiB; low disk is the worse). It is not excluded: when no other host can
 take the job now, it gets it. A host older than 0.4.52 reports its disk only at connect; that figure
 is used until a heartbeat carries one. It sends that host a `launch` and waits up to 10 seconds for the
-answer; a refusal (`max_capacity`, `host_capacity`, `unfit`, `draining`, `disabled`,
-`not_coordinated`, ...) or no answer moves on to the next candidate. A job no candidate can take
+answer; a refusal (`max_capacity`, `host_capacity`, `memory` from 0.4.53, `unfit`, `draining`,
+`disabled`, `not_coordinated`, ...) or no answer moves on to the next candidate. A host refuses with
+`memory` when its own [memory admission](#memory-estimates-for-the-hosts-own-admission) would not
+start the runner; like a capacity refusal it keeps the host a candidate for a job too big for the rest. A job no candidate can take
 waits and is retried every 5 seconds, and at once whenever a host reports a runner ended or a
 heartbeat with more free slots than its last one. A version-4 host of 0.4.47 or later sends that
 heartbeat right after its `attempt_finished`, so a freed slot takes the next queued job within
@@ -387,8 +389,8 @@ works as before and `coordinator stats` says the coordinator is too old.
 
 ### What a host measures
 
-While a host has joined a coordinator, every 2 seconds it looks at the process tree of each live
-**native** runner of its own policies, on a worker thread so its reconcile loop never waits:
+While a host has joined a coordinator (or, from 0.4.53, while its memory admission is on), every 2
+seconds it looks at the process tree of each live **native** runner of its own policies, on a worker thread so its reconcile loop never waits:
 
 | OS | How |
 |---|---|
@@ -538,6 +540,20 @@ chosen host's `chosen_cores`, `chosen_cpu_load_percent`, `chosen_disk_free_bytes
 (`cpu_busy`, `low_disk`, absent when none), how many candidates were `last_resorts`, and the
 `cpu_busy_percent` and `min_disk_free_bytes` in force; the per-host `placement score` lines carry
 `cores`, `cpu_load_percent`, `disk_free_bytes`, `last_resort` and the `cpu` points.
+
+### Memory estimates for the host's own admission
+
+From 0.4.53 a host checks its free memory before it starts any runner, its own demand included
+(README, "Keep heavy jobs from crowding one machine"). On a version-4 link the coordinator sends it,
+after each `hello` and whenever the figures change (looked at every 60 seconds), a
+`memory_estimates` message: for each of the host's targets with measured jobs, the heaviest job
+key's expected peak (its p90, or a heavier one of its newest three runs), taken from that host's own
+samples of each job where it has some and from every host's otherwise, with the sample count and
+whether only its own runs spoke. A runner takes any job its labels match, so one figure per target
+stands for its heaviest job. A target never measured is left out, and the host falls back to the
+p90 of the peaks it measured itself, then to 1 GiB. A host older than 0.4.53 skips the message as
+one it does not know; a coordinator older than 0.4.53 never sends it, and reads a `memory` refusal
+as `other`.
 
 ### Reading `stats`
 

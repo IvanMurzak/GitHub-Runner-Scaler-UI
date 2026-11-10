@@ -1266,9 +1266,14 @@ impl Placement {
                         "a host refused a launch; trying the next"
                     );
                     // Its slots are taken: a job too big for the rest waits for it.
+                    // So is one whose memory is spoken for by running jobs.
                     still_able = matches!(
                         ack.reason,
-                        Some(RefusalReason::MaxCapacity | RefusalReason::HostCapacity)
+                        Some(
+                            RefusalReason::MaxCapacity
+                                | RefusalReason::HostCapacity
+                                | RefusalReason::Memory
+                        )
                     );
                     last_failure = Some(Unplaced::Refused(
                         ack.reason.unwrap_or(RefusalReason::Other),

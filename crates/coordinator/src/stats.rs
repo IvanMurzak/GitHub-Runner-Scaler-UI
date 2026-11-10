@@ -53,7 +53,7 @@ use chrono::{DateTime, Utc};
 use runner_manager_domain::coordinator_protocol::{
     AttemptFinished, AttemptOutcomeKind, ConnectedHostStats, HostJobStats, HostScore, HostStats,
     JobStats, MAX_MESSAGE_BYTES, OpenLease, PendingQueue, PlacementDecision, ServerMessage,
-    StatsReport, is_managed_runner_name, printable,
+    StatsReport, TargetEstimate, TargetRef, is_managed_runner_name, printable,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
@@ -759,15 +759,48 @@ impl Aggregates {
     /// out-of-memory killer finds.
     #[must_use]
     pub fn expected_peak(&self, key: &str) -> Option<u64> {
-        let mut samples = self.speaking_for(key);
-        let p90 = field_percentile(&samples, |sample| sample.peak_rss_bytes, 90)?;
-        samples.sort_unstable_by_key(|sample| std::cmp::Reverse(sample.finished_at));
-        samples
-            .iter()
-            .filter_map(|sample| sample.peak_rss_bytes)
-            .take(RECENT_SAMPLES)
-            .chain([p90])
-            .max()
+        expected_of(self.speaking_for(key))
+    }
+
+    /// What a runner `host_id` starts for `target` is expected to need: the
+    /// heaviest of the target's job keys by [`Self::expected_peak`]'s rule, each
+    /// from `host_id`'s own samples of it when it has any, else every host's. A
+    /// runner takes any job its labels match, so the heaviest stands for them
+    /// all. `None` without any sample measuring memory.
+    #[must_use]
+    pub fn target_estimate(&self, host_id: &str, target: &TargetRef) -> Option<TargetEstimate> {
+        let mut heaviest: Option<u64> = None;
+        let mut samples = 0usize;
+        let mut own = true;
+        for key_samples in self.by_key.values() {
+            let measured: Vec<&JobSample> = key_samples
+                .iter()
+                .filter(|sample| sample.peak_rss_bytes.is_some())
+                .filter(|sample| target.covers(&sample.repository))
+                .collect();
+            if measured.is_empty() {
+                continue;
+            }
+            let mine: Vec<&JobSample> = measured
+                .iter()
+                .copied()
+                .filter(|sample| sample.host_id == host_id)
+                .collect();
+            let speaking = if mine.is_empty() {
+                own = false;
+                measured
+            } else {
+                mine
+            };
+            samples += speaking.len();
+            heaviest = heaviest.max(expected_of(speaking));
+        }
+        Some(TargetEstimate {
+            target: target.clone(),
+            peak_rss_bytes: heaviest?,
+            samples: u32::try_from(samples).unwrap_or(u32::MAX),
+            own,
+        })
     }
 
     /// What placement weighs `key` by. See [`Self::speaking_for`].
@@ -802,6 +835,19 @@ impl Aggregates {
     pub fn host_ratios(&self, key: &str) -> BTreeMap<String, HostRatio> {
         ratios_of(&self.speaking_for(key))
     }
+}
+
+/// The memory `samples` of one job are expected to need: their p90 peak, or
+/// more if one of the newest [`RECENT_SAMPLES`] needed more.
+fn expected_of(mut samples: Vec<&JobSample>) -> Option<u64> {
+    let p90 = field_percentile(&samples, |sample| sample.peak_rss_bytes, 90)?;
+    samples.sort_unstable_by_key(|sample| std::cmp::Reverse(sample.finished_at));
+    samples
+        .iter()
+        .filter_map(|sample| sample.peak_rss_bytes)
+        .take(RECENT_SAMPLES)
+        .chain([p90])
+        .max()
 }
 
 /// A job's figures from `samples`; `None` without any.
@@ -1872,6 +1918,53 @@ mod tests {
             cpu_avg_millicores: Some(1000),
             cpu_peak_millicores: None,
         }
+    }
+
+    #[test]
+    fn a_targets_estimate_is_its_heaviest_job_from_the_hosts_own_runs_first() {
+        use runner_manager_domain::coordinator_protocol::TargetScope;
+        let gib = 1u64 << 30;
+        let mut samples = Vec::new();
+        // The light job ran here; the heavy one only elsewhere.
+        for _ in 0..5 {
+            samples.push(sample("octo/app/smoke", "macm6", 10, gib / 4));
+            samples.push(sample("octo/app/smoke", "linux", 10, 3 * gib));
+            samples.push(sample("octo/app/build", "linux", 10, 12 * gib));
+        }
+        let mut other = sample("other/repo/x", "macm6", 10, 40 * gib);
+        other.repository = "other/repo".into();
+        samples.push(other);
+        let aggregates = Aggregates::from_samples(samples, 30);
+        let repo = TargetRef {
+            scope: TargetScope::Repo,
+            name: "Octo/App".into(),
+        };
+        let estimate = aggregates
+            .target_estimate("macm6", &repo)
+            .expect("measured");
+        assert_eq!(estimate.peak_rss_bytes, 12 * gib, "the heaviest job counts");
+        assert_eq!(estimate.samples, 10, "own smoke runs, every build run");
+        assert!(!estimate.own, "the build was measured elsewhere only");
+        let smoke_only = aggregates
+            .target_estimate("linux", &repo)
+            .expect("measured");
+        assert!(smoke_only.own);
+        // An organization covers every repository of its owner.
+        let org = TargetRef {
+            scope: TargetScope::Org,
+            name: "other".into(),
+        };
+        assert_eq!(
+            aggregates
+                .target_estimate("macm6", &org)
+                .map(|e| e.peak_rss_bytes),
+            Some(40 * gib)
+        );
+        let unknown = TargetRef {
+            scope: TargetScope::Repo,
+            name: "nobody/here".into(),
+        };
+        assert_eq!(aggregates.target_estimate("macm6", &unknown), None);
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub mod docker_cleanup;
 pub mod doctor;
 pub mod host;
 pub mod launches;
+pub mod memory;
 pub mod meters;
 pub mod policy;
 pub mod polling;
@@ -875,6 +876,8 @@ pub enum HostCommand {
     SetCapacity(HostSetCapacityArgs),
     /// Set how often GitHub is polled for work: when idle, and when busy.
     SetPollInterval(HostSetPollIntervalArgs),
+    /// Set the free memory a runner needs beyond its estimate, or `off`.
+    SetMemoryMargin(HostSetMemoryMarginArgs),
     /// Place disposable runner workspaces under a directory you choose.
     SetRuntimeRoot(HostSetRuntimeRootArgs),
     /// Return runner placement to this platform's default directory.
@@ -1197,6 +1200,15 @@ pub struct HostSetPollIntervalArgs {
     /// this host for new work meanwhile.
     #[arg(long, value_name = "DURATION", value_parser = polling::parse_interval)]
     pub coordinated: Option<u16>,
+}
+
+#[derive(Debug, Args)]
+pub struct HostSetMemoryMarginArgs {
+    /// Memory to keep free beyond a runner's expected peak before it starts,
+    /// e.g. `1GiB` or `512MiB` (binary units however spelled). `off` turns
+    /// memory admission off; `on` turns it back on with the margin kept.
+    #[arg(value_name = "SIZE|off|on")]
+    pub margin: String,
 }
 
 #[derive(Debug, Args)]
