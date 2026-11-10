@@ -427,13 +427,21 @@ pub struct Inherited {
     pub has_locale: bool,
     /// Whether [`POWERSHELL_TELEMETRY_OPTOUT`] is set to a non-empty value.
     pub has_powershell_telemetry_optout: bool,
+    /// Whether `HOME` names a directory this process may write.
+    ///
+    /// A Linux boot service runs as `root` with `HOME=/root`, which
+    /// `ProtectSystem=strict` makes read-only and `ProtectHome=tmpfs` empties,
+    /// so a job's `~/.bun`, `~/.docker` or global npm install has nowhere to go.
+    pub home_writable: bool,
 }
 
 impl Inherited {
     /// This process's environment.
     #[must_use]
     pub fn current() -> Self {
-        Self::from_env(|name| std::env::var_os(name))
+        let mut inherited = Self::from_env(|name| std::env::var_os(name));
+        inherited.home_writable = std::env::var_os("HOME").is_some_and(|home| writable(&home));
+        inherited
     }
 
     /// The environment `var` reads, one variable at a time.
@@ -443,11 +451,31 @@ impl Inherited {
             has_locale: var("LANG").is_some() || var("LC_ALL").is_some(),
             has_powershell_telemetry_optout: var(POWERSHELL_TELEMETRY_OPTOUT)
                 .is_some_and(|value| !value.is_empty()),
+            home_writable: false,
         }
     }
 }
 
-/// The directory inside an attempt that is its runner's profile on Windows.
+/// Whether this process may create entries in `directory`.
+fn writable(directory: &OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let Ok(path) = std::ffi::CString::new(directory.as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `path` is a valid NUL-terminated string that outlives the
+        // call, and `access` only reads it.
+        unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        Path::new(directory).is_dir()
+    }
+}
+
+/// The directory inside an attempt that is its runner's profile on Windows,
+/// and its home on Linux when the daemon's own cannot be written.
 pub const RUNNER_HOME_DIR: &str = "home";
 
 /// The variables [`platform_defaults`] sets on Windows, in order: the profile
@@ -456,7 +484,7 @@ pub const WINDOWS_PROFILE_VARIABLES: [&str; 4] = ["USERPROFILE", "HOME", "APPDAT
 
 /// The [`platform_defaults`] that name a directory the caller must create.
 /// Creating them creates the profile directory above them too.
-pub const DIRECTORY_VARIABLES: [&str; 2] = ["APPDATA", "LOCALAPPDATA"];
+pub const DIRECTORY_VARIABLES: [&str; 3] = ["HOME", "APPDATA", "LOCALAPPDATA"];
 
 /// The variables `platform` sets for a runner whose attempt directory is
 /// `runtime`, before `runner.env` is applied.
@@ -474,7 +502,9 @@ pub const DIRECTORY_VARIABLES: [&str; 2] = ["APPDATA", "LOCALAPPDATA"];
 ///   application data is the exception: measured on Windows 11, it follows
 ///   `USERPROFILE`, while roaming application data and the profile itself do
 ///   not.
-/// - **Linux:** nothing of its own.
+/// - **Linux:** `HOME` at `<runtime>/home` when the daemon's own `HOME` cannot
+///   be written ([`Inherited::home_writable`]); nothing otherwise. A login
+///   service's `HOME` is the operator's, and stays theirs.
 ///
 /// Then, on every platform, [`POWERSHELL_TELEMETRY_OPTOUT`] unless the daemon
 /// sets it.
@@ -486,7 +516,8 @@ pub fn platform_defaults(
     exists: impl Fn(&Path) -> bool,
 ) -> Vec<(&'static str, OsString)> {
     let mut defaults = match platform {
-        RunnerPlatform::Linux => Vec::new(),
+        RunnerPlatform::Linux if inherited.home_writable => Vec::new(),
+        RunnerPlatform::Linux => vec![("HOME", runtime.join(RUNNER_HOME_DIR).into_os_string())],
         RunnerPlatform::Windows => {
             let home = runtime.join(RUNNER_HOME_DIR);
             let app_data = home.join("AppData");
@@ -783,10 +814,35 @@ mod tests {
                 telemetry_optout(),
             ]
         );
+        let writable = Inherited {
+            home_writable: true,
+            ..Inherited::default()
+        };
         assert_eq!(
-            defaults(RunnerPlatform::Linux, &Inherited::default()),
+            defaults(RunnerPlatform::Linux, &writable),
             [telemetry_optout()]
         );
+    }
+
+    #[test]
+    fn linux_gives_a_runner_its_own_home_when_the_services_is_read_only() {
+        assert_eq!(
+            defaults(RunnerPlatform::Linux, &Inherited::default()),
+            [
+                (
+                    "HOME",
+                    Path::new("/rman/a1").join(RUNNER_HOME_DIR).into_os_string()
+                ),
+                telemetry_optout(),
+            ]
+        );
+        assert!(DIRECTORY_VARIABLES.contains(&"HOME"));
+        #[cfg(unix)]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            assert!(writable(directory.path().as_os_str()));
+            assert!(!writable(OsStr::new("/nonexistent/runner-manager-home")));
+        }
     }
 
     fn telemetry_optout() -> (&'static str, OsString) {

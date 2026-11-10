@@ -1762,7 +1762,20 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
 /// as `root` against `root`'s own system tree (see [`crate::paths`]), so it
 /// needs no capability to reach its directories, and the runner and every
 /// workflow job inherit none.
-const SYSTEMD_HARDENING: [&str; 13] = [
+///
+/// # Why not `RestrictSUIDSGID=yes`
+///
+/// Its seccomp filter cannot inspect `openat2`'s flags, so it answers every
+/// `openat2` with `ENOSYS`, expecting a fallback to `openat`. GNU tar 1.35
+/// extracts through `openat2(..., RESOLVE_BENEATH)` and has none, so every
+/// extraction in a job failed with "Cannot open: Function not implemented" --
+/// and the runner unpacks every action it downloads with `tar`. Measured on
+/// Ubuntu 26.04 with systemd 259. What the directive guarded against is
+/// covered without it: `NoNewPrivileges=yes` makes a set-user-ID bit inert for
+/// everything this unit starts, and the only places it can write are `root`'s
+/// own `0700` directories and its private `/tmp`, which no other account can
+/// reach to execute a file left there.
+const SYSTEMD_HARDENING: [&str; 12] = [
     "NoNewPrivileges=yes",
     "CapabilityBoundingSet=",
     "AmbientCapabilities=",
@@ -1774,7 +1787,6 @@ const SYSTEMD_HARDENING: [&str; 13] = [
     "ProtectControlGroups=yes",
     "RestrictNamespaces=yes",
     "RestrictRealtime=yes",
-    "RestrictSUIDSGID=yes",
     "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
 ];
 
@@ -9780,6 +9792,17 @@ mod tests {
         .findings()
         .iter()
         .any(|finding| finding.subject == subject && finding.kind == kind)
+    }
+
+    #[test]
+    fn no_unit_breaks_tar_by_answering_openat2_with_enosys() {
+        for mode in [StartMode::Boot, StartMode::Login] {
+            let unit = systemd_unit(&linux_plan(mode));
+            assert!(
+                !unit.contains("RestrictSUIDSGID"),
+                "RestrictSUIDSGID fails every tar extraction in a job: {unit}"
+            );
+        }
     }
 
     #[test]

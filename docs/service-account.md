@@ -222,9 +222,17 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ```
+
+`RestrictSUIDSGID=yes` is left out on purpose. Its seccomp filter answers every
+`openat2` call with `ENOSYS`, and GNU tar 1.35 extracts through `openat2` with no
+fallback, so every archive a job unpacked failed with `Cannot open: Function
+not implemented`, including each action the runner downloads. What it guarded
+against is covered anyway: `NoNewPrivileges=yes` makes a set-user-ID bit inert
+for everything the unit starts, and it can write only to `root`'s own `0700`
+directories and its private `/tmp`, where no other account can reach a file to
+execute it.
 
 `ProtectSystem=strict` makes the entire filesystem read-only except for the
 paths named in `ReadWritePaths`, plus the private `/tmp` that `PrivateTmp=yes`
@@ -286,8 +294,13 @@ restrictions:
   atomic refresh-token rotation; it cannot write elsewhere on the filesystem;
 - `NoNewPrivileges=yes` means it cannot `sudo`, and no setuid binary gains
   privilege inside it;
-- an action that installs tooling into `/usr`, `/opt`, or the account's home
-  directory fails.
+- an action that installs tooling into `/usr` or `/opt` fails.
+
+A boot service runs as `root`, whose `/root` is read-only and hidden in the
+unit, so each runner gets its own `HOME` at `<attempt>/home` instead. Actions
+that install into `~` (`setup-bun`'s `~/.bun`, `docker login`'s
+`~/.docker`) work there, and what they leave goes with the attempt. A login
+service keeps the operator's own `HOME`.
 
 `07-security.md` assumes a hostile workflow may run on this host, so that is the
 intended direction rather than an accident. It is still a real behavioural

@@ -7,6 +7,24 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.55
+
+### Fixed
+
+- Linux services no longer set `RestrictSUIDSGID=yes`. Its seccomp filter
+  answers `openat2` with `ENOSYS`, and GNU tar 1.35 extracts through `openat2`
+  with no fallback, so every job that unpacked an archive, including the
+  runner downloading an action, failed with `Cannot open: Function not
+  implemented`. `NoNewPrivileges=yes` and the read-only filesystem outside the
+  service's own `0700` directories still cover what it guarded against.
+  `service status` reports existing units as outdated; re-register them with
+  `sudo runner-manager service install --start-at boot`.
+- A Linux runner whose service cannot write its own `HOME` (a boot service's
+  `/root`, which the unit makes read-only and hides) gets its own `HOME` inside
+  its attempt directory, as a Windows runner already does. Actions that install
+  into `~`, such as `oven-sh/setup-bun` (`mkdir '/root/.bun/bin'`), no longer
+  fail. A login service keeps the operator's `HOME`.
+
 ## 0.4.54
 
 ### Fixed
