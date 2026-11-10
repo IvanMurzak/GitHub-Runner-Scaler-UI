@@ -493,6 +493,8 @@ pub struct SpawnSpec {
     working_dir: Option<PathBuf>,
     output: OutputMode,
     normal_scheduling: bool,
+    /// The account the child runs as, when not this process's own.
+    account: Option<crate::runner_account::RunnerAccount>,
 }
 
 impl SpawnSpec {
@@ -506,6 +508,7 @@ impl SpawnSpec {
             working_dir: None,
             output: OutputMode::Discard,
             normal_scheduling: false,
+            account: None,
         }
     }
 
@@ -603,6 +606,24 @@ impl SpawnSpec {
             .map(|(_, value)| value.as_os_str())
     }
 
+    /// Starts the child as `account` instead of as this process.
+    ///
+    /// The switch happens between `fork` and `exec`: the group first, then the
+    /// supplementary groups are cleared, then the user. Leaving `root` that
+    /// way clears every capability the kernel would have passed on. Requires
+    /// `CAP_SETUID` and `CAP_SETGID` in this process; no effect off Unix.
+    #[must_use]
+    pub fn run_as(mut self, account: crate::runner_account::RunnerAccount) -> Self {
+        self.account = Some(account);
+        self
+    }
+
+    /// The account [`Self::run_as`] named, if any.
+    #[must_use]
+    pub const fn account(&self) -> Option<crate::runner_account::RunnerAccount> {
+        self.account
+    }
+
     /// Whether [`Self::expect_normal_scheduling`] was asked for.
     #[doc(hidden)]
     #[must_use]
@@ -629,6 +650,13 @@ impl SpawnSpec {
         let mut command = Command::new(&self.program);
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        // `Command` clears the supplementary groups itself when a parent that
+        // is `root` sets a uid without naming groups.
+        #[cfg(unix)]
+        if let Some(account) = self.account {
+            std::os::unix::process::CommandExt::gid(&mut command, account.gid);
+            std::os::unix::process::CommandExt::uid(&mut command, account.uid);
+        }
 
         command.args(&self.args);
         for key in &self.removed_envs {

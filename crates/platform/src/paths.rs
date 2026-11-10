@@ -485,10 +485,13 @@ fn restrict_directory(purpose: &'static str, path: &Path) -> Result<(), PathsErr
 
     let metadata = std::fs::metadata(path).ok();
     // chmod(2) needs ownership or CAP_FOWNER even when the mode is unchanged,
-    // so an already-correct mode is not re-set.
+    // so an already-correct mode is not re-set. `0750` is correct too: a Linux
+    // boot service gives its runner root that mode with the runners' group, so
+    // that their account can reach its own attempt and no other account can,
+    // and re-tightening it here would cut every running job off.
     if metadata
         .as_ref()
-        .is_some_and(|metadata| metadata.permissions().mode() & 0o7777 == 0o700)
+        .is_some_and(|metadata| matches!(metadata.permissions().mode() & 0o7777, 0o700 | 0o750))
     {
         return Ok(());
     }

@@ -1758,10 +1758,8 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
 /// dropped from the unit is one the review then reports as missing, rather
 /// than one that silently stops being checked.
 ///
-/// The capability bounding set is empty in both start modes. A boot unit runs
-/// as `root` against `root`'s own system tree (see [`crate::paths`]), so it
-/// needs no capability to reach its directories, and the runner and every
-/// workflow job inherit none.
+/// The capability bounding set listed here is a login unit's: empty. A boot
+/// unit's is [`BOOT_CAPABILITIES`]; see [`systemd_hardening`].
 ///
 /// # Why not `RestrictSUIDSGID=yes`
 ///
@@ -1790,9 +1788,26 @@ const SYSTEMD_HARDENING: [&str; 12] = [
     "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
 ];
 
+/// The capabilities a boot unit's daemon keeps, all for one purpose: running
+/// its runners as [`crate::runner_account::RUNNER_ACCOUNT`] rather than as
+/// itself.
+///
+/// - `CAP_SETUID`, `CAP_SETGID`: to start a runner as that account.
+/// - `CAP_KILL`: to signal the runner's processes, which are no longer its own.
+/// - `CAP_CHOWN`: to hand the runner its attempt directory and caches.
+/// - `CAP_DAC_OVERRIDE`, `CAP_FOWNER`: to clean up what the runner left, and
+///   to prune caches, though the runner's account owns those files.
+///
+/// None reaches a job. Moving from `root` to another uid clears the permitted
+/// and effective sets, the ambient set is empty, and `NoNewPrivileges=yes`
+/// stops a set-user-ID or file-capability binary from granting any back.
+pub const BOOT_CAPABILITIES: &str =
+    "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID";
+
 /// The hardening directives a unit started in `mode` carries.
 ///
-/// A boot unit also hides every home directory behind an empty `tmpfs`: its
+/// A boot unit keeps [`BOOT_CAPABILITIES`] for its daemon, and hides every
+/// home directory behind an empty `tmpfs`: its
 /// data lives outside them, and a workflow running as `root` has no business
 /// reading the files there that DAC leaves world-readable. `tmpfs` rather than
 /// `yes`, because tools such as `git` treat an *unreadable* `$HOME/.gitconfig`
@@ -1800,10 +1815,19 @@ const SYSTEMD_HARDENING: [&str; 12] = [
 fn systemd_hardening(mode: StartMode) -> Vec<&'static str> {
     let mut directives = SYSTEMD_HARDENING.to_vec();
     if mode == StartMode::Boot {
+        for directive in &mut directives {
+            if *directive == "CapabilityBoundingSet=" {
+                *directive = BOOT_CAPABILITY_BOUNDING_SET;
+            }
+        }
         directives.push("ProtectHome=tmpfs");
     }
     directives
 }
+
+/// [`BOOT_CAPABILITIES`] as the directive that sets them.
+const BOOT_CAPABILITY_BOUNDING_SET: &str =
+    "CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID";
 
 /// The trees `ProtectHome=` hides, which a boot unit's directories must
 /// therefore lie outside.
@@ -8498,6 +8522,14 @@ mod sys {
                     ));
                 }
             }
+            // The account the daemon starts its runners as. Created here, from
+            // the elevated install, since the service itself can create no
+            // account; a daemon that finds none keeps its runners as root.
+            if self.mode == StartMode::Boot
+                && let Err(detail) = crate::runner_account::RunnerAccount::ensure()
+            {
+                return Err(self.failed("install", &name, detail));
+            }
             let definition = ServiceDefinition::systemd(plan, home_directory().as_deref());
             let Some(path) = definition.install_path().map(std::path::Path::to_path_buf) else {
                 return Err(self.failed(
@@ -9806,11 +9838,12 @@ mod tests {
     }
 
     #[test]
-    fn every_unit_drops_every_capability_and_boot_units_hide_home_trees() {
+    fn only_a_boot_daemon_keeps_capabilities_and_boot_units_hide_home_trees() {
         let boot = systemd_unit(&linux_plan(StartMode::Boot));
         let directives = ini_directives(&boot, "Service");
-        assert_eq!(directives["CapabilityBoundingSet"], "");
+        assert_eq!(directives["CapabilityBoundingSet"], BOOT_CAPABILITIES);
         assert_eq!(directives["AmbientCapabilities"], "");
+        assert_eq!(directives["NoNewPrivileges"], "yes");
         assert_eq!(directives["ProtectHome"], "tmpfs");
         assert!(!directives.contains_key("BindPaths"));
 
@@ -9826,15 +9859,30 @@ mod tests {
             "ProtectHome",
             FindingKind::Excess
         ));
-        let inverted = boot.replace(
-            "CapabilityBoundingSet=\n",
-            "CapabilityBoundingSet=~CAP_SYS_ADMIN\n",
-        );
+        let boot_set = format!("CapabilityBoundingSet={BOOT_CAPABILITIES}\n");
+        let inverted = boot.replace(&boot_set, "CapabilityBoundingSet=~CAP_SYS_ADMIN\n");
         assert!(reports(
             &inverted,
             &linux_plan(StartMode::Boot),
             "CapabilityBoundingSet",
             FindingKind::Excess
+        ));
+        let widened = boot.replace(
+            &boot_set,
+            &format!("CapabilityBoundingSet={BOOT_CAPABILITIES} CAP_SYS_ADMIN\n"),
+        );
+        assert!(reports(
+            &widened,
+            &linux_plan(StartMode::Boot),
+            "CapabilityBoundingSet",
+            FindingKind::Excess
+        ));
+        let narrowed = boot.replace(&boot_set, "CapabilityBoundingSet=CAP_SETUID\n");
+        assert!(reports(
+            &narrowed,
+            &linux_plan(StartMode::Boot),
+            "CapabilityBoundingSet",
+            FindingKind::Shortfall
         ));
     }
 
@@ -10018,7 +10066,7 @@ mod tests {
 
     #[test]
     fn a_unit_that_keeps_capabilities_is_not_least_privilege() {
-        let plan = linux_plan(StartMode::Boot);
+        let plan = linux_plan(StartMode::Login);
         let rendered = systemd_unit(&plan);
         let widened = edited(
             &rendered,

@@ -39,6 +39,7 @@ use runner_manager_github::rest::{CancelToken, InventoryGateway};
 use runner_manager_platform::process::{
     Adoption, ChildProcess, ProcessIdentity, RestrictiveHandoff, SpawnSpec, Termination,
 };
+use runner_manager_platform::runner_account::RunnerAccount;
 use runner_manager_platform::runner_env::{self, RunnerEnv, RunnerPlatform};
 use runner_manager_platform::runner_root::{
     self, RootOwner, RootPreflight, RunnerRootError, default_runner_root,
@@ -144,6 +145,66 @@ fn runner_listener_spec(
         spec = spec.env(name, value);
     }
     spec.env("TMPDIR", &tmp).env("TEMP", &tmp).env("TMP", &tmp)
+}
+
+/// Where in an attempt the Docker proxy listens when the runner runs as another
+/// account: `state/` is the daemon's alone, so the socket has to be somewhere
+/// the runner can reach.
+const DOCKER_SOCKET_DIR: &str = ".docker-proxy";
+
+/// Hands `runtime`, and every cache directory `spec` names, to `account`.
+///
+/// The attempt is handed over whole: the runner writes its configuration,
+/// `_diag` and `_work` beside its own binaries. A cache directory is handed
+/// over whole only while its top is not the account's yet, which is the first
+/// launch after the account was introduced; after that the runner is the only
+/// one writing there, so the walk would find nothing to change.
+fn hand_over(
+    account: RunnerAccount,
+    runtime: &Path,
+    spec: &SpawnSpec,
+    cache_names: &[&str],
+) -> std::io::Result<()> {
+    account.give_tree(runtime)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        // The attempt is the runner's alone. Its parent, the runner root, the
+        // runner's group may read and pass through, and nobody else may enter:
+        // root owns it, so no job can rename or replace another job's attempt.
+        // Read as well as search, because `Runner.Listener` refuses to start
+        // unless it can list every directory above its own.
+        fs::set_permissions(runtime, fs::Permissions::from_mode(0o700))?;
+        if let Some(root) = runtime.parent() {
+            let metadata = fs::symlink_metadata(root)?;
+            if metadata.is_dir() && metadata.uid() == 0 {
+                if metadata.gid() != account.gid {
+                    std::os::unix::fs::lchown(root, None, Some(account.gid))?;
+                }
+                if metadata.mode() & 0o7777 != 0o750 {
+                    fs::set_permissions(root, fs::Permissions::from_mode(0o750))?;
+                }
+            }
+        }
+    }
+    for name in cache_names {
+        let Some(value) = spec.configured_env(name) else {
+            continue;
+        };
+        let path = Path::new(value);
+        if !path.is_absolute() {
+            continue;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() && !account.owns(&metadata) => {
+                account.give_tree(path)?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Retry bounds for failures that can resolve without operator action.
@@ -2528,6 +2589,11 @@ pub struct NativeProcesses {
     /// Persistent dependency caches. `None` gives runners none.
     dependency_caches: Option<DependencyCaches>,
     docker_cleanup: Option<crate::docker_cleanup::DockerCleanup>,
+    /// The account runners run as when it is not the daemon's own: a Linux
+    /// boot service's. See [`runner_manager_platform::runner_account`].
+    runner_account: Option<RunnerAccount>,
+    /// Why no runner may start at all: a confined `root` without the account.
+    runner_account_missing: Option<String>,
     #[cfg(test)]
     post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
     #[cfg(test)]
@@ -2577,6 +2643,29 @@ impl PlatformExecutionProvider {
     #[must_use]
     pub fn with_docker_cleanup(mut self, cleanup: crate::docker_cleanup::DockerCleanup) -> Self {
         self.native.docker_cleanup = Some(cleanup);
+        self
+    }
+
+    /// Starts every native runner as `account`, which owns its attempt
+    /// directory and its caches. `None` keeps runners in the daemon's account.
+    #[must_use]
+    pub fn with_runner_account(mut self, account: Result<Option<RunnerAccount>, String>) -> Self {
+        let account = match account {
+            Ok(account) => account,
+            Err(why) => {
+                tracing::error!(reason = "runner_account_missing", "{why}");
+                self.native.runner_account_missing = Some(why);
+                None
+            }
+        };
+        if account.is_some() {
+            self.native.dependency_caches = self
+                .native
+                .dependency_caches
+                .take()
+                .map(DependencyCaches::without_git);
+        }
+        self.native.runner_account = account;
         self
     }
 
@@ -2801,6 +2890,11 @@ impl NativeProcesses {
         config: &EncodedJitConfig,
         cache_target: Option<&runner_manager_domain::model::ScaleTarget>,
     ) -> Result<u32, ProcessStartFailure> {
+        if let Some(why) = &self.runner_account_missing {
+            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
+                why.clone(),
+            )));
+        }
         let handoff = RestrictiveHandoff::create(
             attempt.runtime_path(),
             SecretString::from(config.expose().to_owned()),
@@ -2822,6 +2916,7 @@ impl NativeProcesses {
         }
         let host_env = self.host_env().map_err(ProcessStartFailure::before_spawn)?;
         let caches = self.cache_env(attempt, cache_target, &host_env);
+        let cache_names: Vec<&'static str> = caches.iter().map(|(name, _)| *name).collect();
         #[cfg(test)]
         let spec = if self
             .use_long_lived_test_listener
@@ -2844,9 +2939,21 @@ impl NativeProcesses {
         };
         #[cfg(not(test))]
         let spec = runner_listener_spec(program, attempt.runtime_path(), caches, &host_env);
+        let spec = match self.runner_account {
+            Some(account) => {
+                hand_over(account, attempt.runtime_path(), &spec, &cache_names).map_err(|_| {
+                    ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed)
+                })?;
+                spec.run_as(account)
+            }
+            None => spec,
+        };
         let (spec, docker_proxy) = if let Some(cleanup) = &self.docker_cleanup {
             let repository = cache_target.map(ToString::to_string).unwrap_or_default();
-            match cleanup.launch_environment(attempt.id, &repository, &host_env) {
+            let listen = self
+                .runner_account
+                .map(|account| (attempt.runtime_path().join(DOCKER_SOCKET_DIR), account));
+            match cleanup.launch_environment(attempt.id, &repository, &host_env, listen) {
                 Ok(Some(endpoint)) => (
                     spec.env("DOCKER_HOST", endpoint),
                     Some(cleanup.root.join(attempt.id.to_string())),
@@ -3105,10 +3212,41 @@ impl NativeProcesses {
         attempt.runtime_path().join(TERMINATE_INTENT_FILE)
     }
 
-    fn read_identity(attempt: &RunnerAttempt) -> Result<Option<ProcessIdentity>, FailureReason> {
-        match Self::read_identity_at(&Self::identity_path(attempt))? {
-            Some(identity) => Ok(Some(identity)),
-            None => Self::read_identity_at(&Self::fallback_identity_path(attempt)),
+    fn read_identity(
+        &self,
+        attempt: &RunnerAttempt,
+    ) -> Result<Option<ProcessIdentity>, FailureReason> {
+        let identity = match Self::read_identity_at(&Self::identity_path(attempt))? {
+            Some(identity) => Some(identity),
+            None => Self::read_identity_at(&Self::fallback_identity_path(attempt))?,
+        };
+        Ok(identity.filter(|identity| self.runs_as_runner(identity)))
+    }
+
+    /// Whether the process `identity` names belongs to the runner account.
+    ///
+    /// The identity files live in the attempt directory, which the runner's
+    /// account owns when it is not this process's, so a job could rewrite one
+    /// to name any process on the host for this process to signal. A recorded
+    /// process the account does not run is therefore not one this daemon
+    /// started, and is treated as gone. A process that has exited passes, and
+    /// the identity's own start-time check then reports it gone.
+    fn runs_as_runner(&self, identity: &ProcessIdentity) -> bool {
+        let Some(account) = self.runner_account else {
+            return true;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            match fs::metadata(format!("/proc/{}", identity.pid())) {
+                Ok(metadata) => metadata.uid() == account.uid,
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (account, identity);
+            true
         }
     }
 
@@ -3209,7 +3347,7 @@ impl ProcessSupervisor for NativeProcesses {
                 }
             };
         }
-        let Some(identity) = Self::read_identity(attempt)? else {
+        let Some(identity) = self.read_identity(attempt)? else {
             if attempt.process_id().is_some() || Self::unresolved_process_path(attempt).is_file() {
                 return Err(FailureReason::Other(
                     "runner process identity is missing; refusing recovery until the process is resolved"
@@ -3226,7 +3364,7 @@ impl ProcessSupervisor for NativeProcesses {
     }
 
     fn recovered_pid(&self, attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
-        Ok(Self::read_identity(attempt)?.map(|identity| identity.pid()))
+        Ok(self.read_identity(attempt)?.map(|identity| identity.pid()))
     }
 
     fn completed_successfully(&self, attempt: &RunnerAttempt) -> bool {
@@ -3258,7 +3396,7 @@ impl ProcessSupervisor for NativeProcesses {
                 .map_err(|_| FailureReason::Other("runner process could not be stopped".into()))?;
             return Ok(());
         }
-        let Some(identity) = Self::read_identity(attempt)? else {
+        let Some(identity) = self.read_identity(attempt)? else {
             return Ok(());
         };
         match identity
@@ -5419,11 +5557,14 @@ fn write_runner_id(runtime: &Path, runner_id: u64) -> Result<(), LifecycleError>
 }
 
 fn write_durable_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    // Never through a link: the attempt directory belongs to the runner's
+    // account when that is not this process's, and a link a job left at this
+    // name would otherwise turn the write onto any file this process can reach.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+    let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     let parent = path.parent().ok_or_else(|| {
@@ -9382,7 +9523,8 @@ mod tests {
         assert_long_lived_listener_ready(&processes, &attempt);
         assert!(NativeProcesses::identity_path(&attempt).is_file());
         assert_eq!(
-            NativeProcesses::read_identity(&attempt)
+            NativeProcesses::new()
+                .read_identity(&attempt)
                 .unwrap()
                 .unwrap()
                 .pid(),

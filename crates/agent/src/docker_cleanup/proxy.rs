@@ -16,6 +16,10 @@ pub fn launch(
     attempt: AttemptId,
     repository: &str,
     socket: &Path,
+    listen: Option<(
+        PathBuf,
+        runner_manager_platform::runner_account::RunnerAccount,
+    )>,
 ) -> io::Result<Option<std::ffi::OsString>> {
     if !socket.exists() {
         return Ok(None);
@@ -30,16 +34,31 @@ pub fn launch(
     fs::create_dir(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
     let path = directory.join("journal.json");
-    write_json(
-        &path,
-        &Journal::new(
-            cleanup.host,
-            attempt,
-            repository.into(),
-            socket.to_path_buf(),
-            PENDING_ENGINE.into(),
-        ),
-    )?;
+    let mut journal = Journal::new(
+        cleanup.host,
+        attempt,
+        repository.into(),
+        socket.to_path_buf(),
+        PENDING_ENGINE.into(),
+    );
+    if let Some((listen_directory, account)) = &listen {
+        // Created here, as the daemon, and handed to the runner's account with
+        // the socket inside it, so nothing of the runner's decides the path.
+        match fs::create_dir(listen_directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        fs::set_permissions(listen_directory, fs::Permissions::from_mode(0o700))?;
+        account.give(listen_directory)?;
+        journal.listen = Some(listen_directory.join("s"));
+        journal.listen_owner = Some((account.uid, account.gid));
+    }
+    let endpoint = journal
+        .listen
+        .clone()
+        .unwrap_or_else(|| directory.join("s"));
+    write_json(&path, &journal)?;
     let binary = cleanup
         .companion
         .clone()
@@ -68,9 +87,7 @@ pub fn launch(
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(Some(
-        format!("unix://{}", directory.join("s").display()).into(),
-    ))
+    Ok(Some(format!("unix://{}", endpoint.display()).into()))
 }
 
 pub fn sweep(
@@ -283,7 +300,10 @@ pub fn serve(path: &Path) -> io::Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| invalid("missing proxy directory"))?;
-    let socket = directory.join("s");
+    let socket = journal
+        .listen
+        .clone()
+        .unwrap_or_else(|| directory.join("s"));
     if socket.as_os_str().as_encoded_bytes().len() >= 108 {
         return Err(invalid("Docker proxy path too long"));
     }
@@ -310,6 +330,9 @@ pub fn serve(path: &Path) -> io::Result<()> {
     journal.engine = actual_engine.into();
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    if let Some((uid, gid)) = journal.listen_owner {
+        std::os::unix::fs::lchown(&socket, Some(uid), Some(gid))?;
+    }
     listener.set_nonblocking(true)?;
     journal.proxy = Some(ProcessIdentity::of_current_process().map_err(invalid)?);
     write_json(path, &journal)?;

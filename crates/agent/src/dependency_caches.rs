@@ -44,6 +44,8 @@ pub struct DependencyCaches {
     config_file: PathBuf,
     runner_root: RunnerRootSource,
     fallback: Option<PathBuf>,
+    /// Whether the Git checkout cache is withheld whatever `caches.toml` says.
+    without_git: bool,
 }
 
 impl fmt::Debug for DependencyCaches {
@@ -68,7 +70,20 @@ impl DependencyCaches {
             config_file,
             runner_root,
             fallback,
+            without_git: false,
         }
+    }
+
+    /// Withholds the Git checkout cache.
+    ///
+    /// Preparing and capturing it runs `git` in this process over a checkout
+    /// the job wrote. When the job runs as another, unprivileged account, that
+    /// would let it hand this process repository configuration to act on --
+    /// `core.fsmonitor` names a command -- so the cache is not offered at all.
+    #[must_use]
+    pub fn without_git(mut self) -> Self {
+        self.without_git = true;
+        self
     }
 
     /// The settings, read now.
@@ -130,6 +145,9 @@ impl DependencyCaches {
         let mut selection = dependency_cache::select(&config, target, platform);
         if selection.disabled.is_some() {
             return Vec::new();
+        }
+        if self.without_git {
+            selection.tools.retain(|state| state.tool.id != "git");
         }
         selection.defer_to_operator(platform, |name| {
             dependency_cache::inherited(name)
@@ -194,7 +212,7 @@ impl DependencyCaches {
     pub fn capture_git(&self, runtime: &Path) {
         // A partial cleanup retry may no longer own a cache lease. It must not
         // race pruning to publish a snapshot after the runner package is gone.
-        if !runtime_holds_runner(runtime) {
+        if self.without_git || !runtime_holds_runner(runtime) {
             return;
         }
         let result = (|| -> Result<(), String> {

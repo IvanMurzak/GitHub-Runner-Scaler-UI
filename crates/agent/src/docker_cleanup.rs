@@ -78,11 +78,19 @@ impl DockerCleanup {
 
     /// A remote endpoint or explicitly selected context stays under operator
     /// control. Dependency-cache environment variables are never changed.
+    ///
+    /// `listen`, when given, is where the proxy's socket goes and the account
+    /// it is handed to: a runner running as another account cannot reach the
+    /// default under `state/`.
     pub fn launch_environment(
         &self,
         attempt: AttemptId,
         repository: &str,
         host_env: &runner_manager_platform::runner_env::RunnerEnv,
+        listen: Option<(
+            PathBuf,
+            runner_manager_platform::runner_account::RunnerAccount,
+        )>,
     ) -> io::Result<Option<std::ffi::OsString>> {
         if !Self::supported() || Config::load(&self.config)?.mode == Mode::Off {
             return Ok(None);
@@ -132,11 +140,11 @@ impl DockerCleanup {
         }
         #[cfg(target_os = "linux")]
         {
-            proxy::launch(self, attempt, repository, &socket)
+            proxy::launch(self, attempt, repository, &socket, listen)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (attempt, repository, socket);
+            let _ = (attempt, repository, socket, listen);
             Ok(None)
         }
     }
@@ -232,6 +240,13 @@ pub struct Journal {
     pub resources: Vec<Resource>,
     #[serde(default)]
     pub last_reported_secs: Option<u64>,
+    /// Where the proxy listens, when not `s` beside this journal.
+    #[serde(default)]
+    pub listen: Option<PathBuf>,
+    /// The uid and gid its socket is handed to, when the runner runs as
+    /// another account.
+    #[serde(default)]
+    pub listen_owner: Option<(u32, u32)>,
 }
 
 impl Journal {
@@ -253,6 +268,8 @@ impl Journal {
             intents: Vec::new(),
             resources: Vec::new(),
             last_reported_secs: None,
+            listen: None,
+            listen_owner: None,
         }
     }
 
