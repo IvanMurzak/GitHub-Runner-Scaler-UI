@@ -1789,7 +1789,7 @@ const SYSTEMD_HARDENING: [&str; 12] = [
 ];
 
 /// The capabilities a boot unit's daemon keeps, all for one purpose: running
-/// its runners as [`crate::runner_account::RUNNER_ACCOUNT`] rather than as
+/// its runners as accounts of a [`crate::runner_account::RunnerPool`] rather than as
 /// itself.
 ///
 /// - `CAP_SETUID`, `CAP_SETGID`: to start a runner as that account.
@@ -8527,11 +8527,11 @@ mod sys {
                     ));
                 }
             }
-            // The account the daemon starts its runners as. Created here, from
-            // the elevated install, since the service itself can create no
-            // account; a daemon that finds none keeps its runners as root.
+            // The accounts the daemon starts its runners as, one per concurrent
+            // runner. Created here, from the elevated install, since the
+            // service itself can create no account.
             if self.mode == StartMode::Boot
-                && let Err(detail) = crate::runner_account::RunnerAccount::ensure()
+                && let Err(detail) = crate::runner_account::RunnerPool::ensure()
             {
                 return Err(self.failed("install", &name, detail));
             }

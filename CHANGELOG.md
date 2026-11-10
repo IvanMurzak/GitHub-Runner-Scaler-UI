@@ -7,6 +7,19 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.57
+
+### Changed
+
+- Linux boot services run each concurrent runner as an account of its own,
+  `rm-runner-1` to `rm-runner-32` in the group `rm-runner`, instead of every
+  runner as `rm-runner`. A job can no longer read another job's workspace or
+  its runner's credentials, read its processes' environment, or signal them.
+  Dependency caches stay shared: each cache directory belongs to the group,
+  is set-group-ID and carries a default ACL, so every runner can use and
+  update it. Re-register with `sudo runner-manager service install --start-at
+  boot` to create the accounts; until then runners keep sharing `rm-runner`.
+
 ## 0.4.56
 
 ### Changed

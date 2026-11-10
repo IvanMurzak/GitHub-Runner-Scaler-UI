@@ -39,7 +39,7 @@ use runner_manager_github::rest::{CancelToken, InventoryGateway};
 use runner_manager_platform::process::{
     Adoption, ChildProcess, ProcessIdentity, RestrictiveHandoff, SpawnSpec, Termination,
 };
-use runner_manager_platform::runner_account::RunnerAccount;
+use runner_manager_platform::runner_account::{RunnerAccount, RunnerPool};
 use runner_manager_platform::runner_env::{self, RunnerEnv, RunnerPlatform};
 use runner_manager_platform::runner_root::{
     self, RootOwner, RootPreflight, RunnerRootError, default_runner_root,
@@ -152,15 +152,16 @@ fn runner_listener_spec(
 /// the runner can reach.
 const DOCKER_SOCKET_DIR: &str = ".docker-proxy";
 
-/// Hands `runtime`, and every cache directory `spec` names, to `account`.
+/// Hands `runtime` to `account`, and shares every cache directory `spec`
+/// names with the whole `pool`.
 ///
-/// The attempt is handed over whole: the runner writes its configuration,
-/// `_diag` and `_work` beside its own binaries. A cache directory is handed
-/// over whole only while its top is not the account's yet, which is the first
-/// launch after the account was introduced; after that the runner is the only
-/// one writing there, so the walk would find nothing to change.
+/// The attempt is the account's alone: the runner writes its configuration,
+/// `_diag` and `_work` beside its own binaries. A cache is the opposite, the
+/// one thing runners are meant to share, so it goes to the pool's group
+/// instead. A cache directory already shared is not walked again.
 fn hand_over(
     account: RunnerAccount,
+    pool: &RunnerPool,
     runtime: &Path,
     spec: &SpawnSpec,
     cache_names: &[&str],
@@ -175,8 +176,8 @@ fn hand_over(
             continue;
         }
         match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() && !account.owns(&metadata) => {
-                account.give_tree(path)?;
+            Ok(metadata) if metadata.is_dir() && !pool.is_shared(&metadata) => {
+                pool.share_tree(path)?;
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -186,19 +187,19 @@ fn hand_over(
     Ok(())
 }
 
-/// Hands the attempt directory at `runtime` to `account`, and lets the
-/// account's group into the runner root above it.
+/// Hands the attempt directory at `runtime` to `account`, and lets the pool's
+/// group into the runner root above it.
 fn hand_over_attempt(account: RunnerAccount, runtime: &Path) -> std::io::Result<()> {
     account.give_tree(runtime)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        // The attempt belongs to the runners' account, which every runner on
-        // this host shares; no other account may enter it. Its parent, the
-        // runner root, that account's group may read and pass through: root
-        // owns it, so no job can rename or replace another job's attempt.
-        // Read as well as search, because `Runner.Listener` refuses to start
-        // unless it can list every directory above its own.
+        // The attempt is its account's alone; no other account, another
+        // runner's included, may enter it. Its parent, the runner root, the
+        // pool's group may read and pass through: root owns it, so no job can
+        // rename or replace another job's attempt. Read as well as search,
+        // because `Runner.Listener` refuses to start unless it can list every
+        // directory above its own.
         fs::set_permissions(runtime, fs::Permissions::from_mode(0o700))?;
         if let Some(root) = runtime.parent() {
             let metadata = fs::symlink_metadata(root)?;
@@ -213,6 +214,21 @@ fn hand_over_attempt(account: RunnerAccount, runtime: &Path) -> std::io::Result<
         }
     }
     Ok(())
+}
+
+/// The pool account that owns `path`, if any.
+fn owner_in_pool(pool: &RunnerPool, path: &Path) -> Option<RunnerAccount> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = fs::symlink_metadata(path).ok()?;
+        pool.account(metadata.uid()).filter(|_| metadata.is_dir())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pool, path);
+        None
+    }
 }
 
 /// What an attempt's process-identity records name.
@@ -242,20 +258,20 @@ enum RunnerIdentity {
     /// As the daemon itself.
     #[default]
     Daemon,
-    /// As this account, which owns the runner's attempt and caches.
-    Account(RunnerAccount),
-    /// As nobody: a confined `root` without the account starts no runner, and
+    /// As an account of this pool, its own for the life of its attempt.
+    Pool(RunnerPool),
+    /// As nobody: a confined `root` without the pool starts no runner, and
     /// this says why.
     Missing(String),
 }
 
 impl RunnerIdentity {
-    /// The account to start a runner as, `None` for the daemon's own, or why
-    /// no runner may start.
-    fn account(&self) -> Result<Option<RunnerAccount>, FailureReason> {
+    /// The pool runners run as, `None` for the daemon's own account, or why no
+    /// runner may start.
+    fn pool(&self) -> Result<Option<&RunnerPool>, FailureReason> {
         match self {
             Self::Daemon => Ok(None),
-            Self::Account(account) => Ok(Some(*account)),
+            Self::Pool(pool) => Ok(Some(pool)),
             Self::Missing(why) => Err(FailureReason::Other(why.clone())),
         }
     }
@@ -2645,6 +2661,8 @@ pub struct NativeProcesses {
     docker_cleanup: Option<crate::docker_cleanup::DockerCleanup>,
     /// Who runners run as. See [`runner_manager_platform::runner_account`].
     runner: RunnerIdentity,
+    /// The pool account each attempt with a runner runs as.
+    assignments: Mutex<BTreeMap<AttemptId, RunnerAccount>>,
     #[cfg(test)]
     post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
     #[cfg(test)]
@@ -2697,19 +2715,20 @@ impl PlatformExecutionProvider {
         self
     }
 
-    /// Starts every native runner as `account`, which owns its attempt
-    /// directory and its caches. `None` keeps runners in the daemon's account.
+    /// Starts every native runner as an account of `pool` of its own, which
+    /// owns its attempt directory; the pool shares the caches. `None` keeps
+    /// runners in the daemon's account.
     #[must_use]
-    pub fn with_runner_account(mut self, account: Result<Option<RunnerAccount>, String>) -> Self {
-        self.native.runner = match account {
+    pub fn with_runner_pool(mut self, pool: Result<Option<RunnerPool>, String>) -> Self {
+        self.native.runner = match pool {
             Ok(None) => RunnerIdentity::Daemon,
-            Ok(Some(account)) => {
+            Ok(Some(pool)) => {
                 self.native.dependency_caches = self
                     .native
                     .dependency_caches
                     .take()
                     .map(DependencyCaches::without_git);
-                RunnerIdentity::Account(account)
+                RunnerIdentity::Pool(pool)
             }
             Err(why) => {
                 tracing::error!(reason = "runner_account_missing", "{why}");
@@ -2915,7 +2934,7 @@ impl NativeProcesses {
     #[must_use]
     pub fn with_dependency_caches(mut self, caches: DependencyCaches) -> Self {
         self.dependency_caches = Some(match self.runner {
-            RunnerIdentity::Account(_) => caches.without_git(),
+            RunnerIdentity::Pool(_) => caches.without_git(),
             RunnerIdentity::Daemon | RunnerIdentity::Missing(_) => caches,
         });
         self
@@ -2944,9 +2963,12 @@ impl NativeProcesses {
         config: &EncodedJitConfig,
         cache_target: Option<&runner_manager_domain::model::ScaleTarget>,
     ) -> Result<u32, ProcessStartFailure> {
-        let account = self
+        let pool = self
             .runner
-            .account()
+            .pool()
+            .map_err(ProcessStartFailure::before_spawn)?;
+        let account = self
+            .account_for(attempt)
             .map_err(ProcessStartFailure::before_spawn)?;
         let handoff = RestrictiveHandoff::create(
             attempt.runtime_path(),
@@ -2992,9 +3014,9 @@ impl NativeProcesses {
         };
         #[cfg(not(test))]
         let spec = runner_listener_spec(program, attempt.runtime_path(), caches, &host_env);
-        let spec = match account {
-            Some(account) => {
-                hand_over(account, attempt.runtime_path(), &spec, &cache_names).map_err(
+        let spec = match account.zip(pool) {
+            Some((account, pool)) => {
+                hand_over(account, pool, attempt.runtime_path(), &spec, &cache_names).map_err(
                     |error| {
                         tracing::warn!(attempt_id = %attempt.id, event = "runner_hand_over_failed", %error, "the attempt could not be handed to the runner account");
                         ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed)
@@ -3282,7 +3304,9 @@ impl NativeProcesses {
         };
         Ok(match identity {
             None => RecordedProcess::None,
-            Some(identity) if self.runs_as_runner(&identity) => RecordedProcess::Runner(identity),
+            Some(identity) if self.runs_as_runner(attempt, &identity) => {
+                RecordedProcess::Runner(identity)
+            }
             Some(_) => RecordedProcess::Foreign,
         })
     }
@@ -3295,9 +3319,15 @@ impl NativeProcesses {
     /// process the account does not run is therefore not one this daemon
     /// started, and is treated as gone. A process that has exited passes, and
     /// the identity's own start-time check then reports it gone.
-    fn runs_as_runner(&self, identity: &ProcessIdentity) -> bool {
-        let RunnerIdentity::Account(account) = self.runner else {
+    fn runs_as_runner(&self, attempt: &RunnerAttempt, identity: &ProcessIdentity) -> bool {
+        let RunnerIdentity::Pool(pool) = &self.runner else {
             return true;
+        };
+        // The attempt's own account, read from its directory, since every
+        // runner on the host has one: a record naming another runner's process
+        // is as foreign as one naming any other process.
+        let Some(account) = owner_in_pool(pool, attempt.runtime_path()) else {
+            return false;
         };
         #[cfg(unix)]
         {
@@ -3312,6 +3342,69 @@ impl NativeProcesses {
             let _ = (account, identity);
             true
         }
+    }
+
+    /// The pool account `attempt`'s runner runs as, assigned now when it has
+    /// none yet; `None` when runners run as the daemon.
+    ///
+    /// An attempt directory a pool account already owns -- a retried launch, a
+    /// persistent slot, an attempt that outlived a restart -- keeps that
+    /// account. A new one gets the first account no live attempt holds: none
+    /// in this process's assignments, and none owning a directory beside it
+    /// under the runner root, which covers attempts that outlived a restart.
+    /// Two runners never share an account, so a launch with every account
+    /// busy fails rather than weaken that. A pool with only the legacy
+    /// single account, from before the pool existed, shares it as before.
+    fn account_for(&self, attempt: &RunnerAttempt) -> Result<Option<RunnerAccount>, FailureReason> {
+        let Some(pool) = self.runner.pool()? else {
+            return Ok(None);
+        };
+        let mut assignments = self
+            .assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(account) = assignments.get(&attempt.id) {
+            return Ok(Some(*account));
+        }
+        let runtime = attempt.runtime_path();
+        // Unless another live attempt holds that account now: a persistent slot
+        // kept since an earlier attempt then moves to a free one.
+        if let Some(account) = owner_in_pool(pool, runtime)
+            && (pool.accounts.is_empty()
+                || !assignments.values().any(|held| held.uid == account.uid))
+        {
+            assignments.insert(attempt.id, account);
+            return Ok(Some(account));
+        }
+        let assignable = pool.assignable();
+        let account = if pool.accounts.is_empty() {
+            assignable.first().copied()
+        } else {
+            let mut busy: std::collections::BTreeSet<u32> =
+                assignments.values().map(|account| account.uid).collect();
+            if let Some(root) = runtime.parent()
+                && let Ok(entries) = fs::read_dir(root)
+            {
+                busy.extend(
+                    entries
+                        .flatten()
+                        .filter_map(|entry| owner_in_pool(pool, &entry.path()))
+                        .map(|account| account.uid),
+                );
+            }
+            assignable
+                .into_iter()
+                .find(|account| !busy.contains(&account.uid))
+        };
+        let account = account.ok_or_else(|| {
+            FailureReason::Other(format!(
+                "every one of the {} runner accounts is in use by another attempt, and no two \
+                 runners share one",
+                pool.assignable().len()
+            ))
+        })?;
+        assignments.insert(attempt.id, account);
+        Ok(Some(account))
     }
 
     fn read_identity_at(path: &Path) -> Result<Option<ProcessIdentity>, FailureReason> {
@@ -3339,6 +3432,12 @@ impl ProcessSupervisor for NativeProcesses {
         if let Some(caches) = &self.dependency_caches {
             caches.capture_git(attempt.runtime_path());
         }
+        // The account is free for another attempt once its runner is gone; the
+        // directory it still owns until cleanup keeps it busy until then.
+        self.assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&attempt.id);
         Ok(ProviderDestroy::Destroyed)
     }
 
@@ -3357,7 +3456,7 @@ impl ProcessSupervisor for NativeProcesses {
         // the async thread and before the JIT registration: it is the one walk
         // over the whole package copy, and the launch repeats only the cheap
         // part of it for what it creates afterwards.
-        if let Some(account) = self.runner.account()? {
+        if let Some(account) = self.account_for(attempt)? {
             hand_over_attempt(account, attempt.runtime_path()).map_err(|error| {
                 tracing::warn!(attempt_id = %attempt.id, event = "runner_hand_over_failed", %error, "the attempt could not be handed to the runner account");
                 FailureReason::ProcessStartFailed
@@ -5682,6 +5781,116 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A native attempt whose directory, `name` under `root`, already exists.
+    #[cfg(unix)]
+    fn attempt_owned_in(root: &Path, name: &str) -> RunnerAttempt {
+        let runtime = root.join(name);
+        fs::create_dir_all(&runtime).unwrap();
+        RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            PolicyId::from_u128(0xfeed),
+            &runtime,
+            FakeClock::default().now(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_two_live_attempts_share_a_runner_account() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // This test cannot hand anything over, so every directory it makes is
+        // its own: its uid plays the account that owns them all.
+        let root = tempfile::tempdir().unwrap();
+        let me = fs::metadata(root.path()).unwrap();
+        let mine = RunnerAccount {
+            uid: me.uid(),
+            gid: me.gid(),
+        };
+        let other = RunnerAccount {
+            uid: me.uid().wrapping_add(1),
+            gid: me.gid(),
+        };
+        let processes = NativeProcesses {
+            runner: RunnerIdentity::Pool(RunnerPool {
+                gid: me.gid(),
+                accounts: vec![other, mine],
+                legacy: None,
+            }),
+            ..NativeProcesses::default()
+        };
+
+        let first = attempt_owned_in(root.path(), "a");
+        assert_eq!(
+            processes.account_for(&first).unwrap(),
+            Some(mine),
+            "an attempt an account already owns keeps it"
+        );
+        assert_eq!(processes.account_for(&first).unwrap(), Some(mine));
+        let second = attempt_owned_in(root.path(), "b");
+        assert_eq!(
+            processes.account_for(&second).unwrap(),
+            Some(other),
+            "the account a live attempt holds is not given to another"
+        );
+        let third = attempt_owned_in(root.path(), "c");
+        assert!(
+            processes.account_for(&third).is_err(),
+            "with every account busy no runner starts on a shared one"
+        );
+
+        processes.destroy(&first).unwrap();
+        fs::remove_dir(first.runtime_path()).unwrap();
+        assert_eq!(processes.account_for(&third).unwrap(), Some(mine));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pool_with_only_the_earlier_single_account_shares_it_as_before() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let me = fs::metadata(root.path()).unwrap();
+        let legacy = RunnerAccount {
+            uid: me.uid(),
+            gid: me.gid(),
+        };
+        let processes = NativeProcesses {
+            runner: RunnerIdentity::Pool(RunnerPool {
+                gid: me.gid(),
+                accounts: Vec::new(),
+                legacy: Some(legacy),
+            }),
+            ..NativeProcesses::default()
+        };
+        for name in ["a", "b"] {
+            assert_eq!(
+                processes
+                    .account_for(&attempt_owned_in(root.path(), name))
+                    .unwrap(),
+                Some(legacy)
+            );
+        }
+    }
+
+    #[test]
+    fn a_confined_root_without_the_pool_starts_no_runner() {
+        let processes = NativeProcesses {
+            runner: RunnerIdentity::Missing("no pool".into()),
+            ..NativeProcesses::default()
+        };
+        let attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            PolicyId::from_u128(0xfeed),
+            Path::new("/nonexistent/attempt"),
+            FakeClock::default().now(),
+        );
+        assert_eq!(
+            processes.account_for(&attempt),
+            Err(FailureReason::Other("no pool".into()))
+        );
+    }
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
