@@ -526,6 +526,7 @@ fn restrict_directory(_purpose: &'static str, _path: &Path) -> Result<(), PathsE
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn root_uses_the_system_tree_outside_every_home_directory() {
         let system = AppPaths::system();
@@ -571,7 +572,9 @@ mod tests {
         if crate::host_fitness::is_elevated() {
             return; // Root may chmod anything, so there is no refusal to see.
         }
-        let foreign = Path::new("/");
+        // `/tmp` rather than `/`: macOS mounts `/` read-only, and chmod there
+        // fails with EROFS whoever owns it.
+        let foreign = Path::new("/tmp");
         let before = std::fs::metadata(foreign).unwrap().permissions().mode();
         restrict_directory("state", foreign).expect("another account's directory");
         assert_eq!(
