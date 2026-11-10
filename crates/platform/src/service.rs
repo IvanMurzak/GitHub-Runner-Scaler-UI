@@ -980,6 +980,7 @@ pub struct InstallRequest {
     arguments: Vec<OsString>,
     restart: RestartPolicy,
     on_demand: bool,
+    protected: Vec<PathBuf>,
 }
 
 impl InstallRequest {
@@ -993,7 +994,16 @@ impl InstallRequest {
             arguments: DAEMON_ARGUMENTS.iter().map(OsString::from).collect(),
             restart: RestartPolicy::default(),
             on_demand: false,
+            protected: Vec::new(),
         }
+    }
+
+    /// Host paths the service, its runners and their jobs may not reach at
+    /// all. See [`ProtectedPaths`].
+    #[must_use]
+    pub fn protecting(mut self, paths: Vec<PathBuf>) -> Self {
+        self.protected = paths;
+        self
     }
 
     /// Registers the service but does not ask the manager to start it by
@@ -1089,6 +1099,7 @@ pub struct InstallPlan {
     directories: ServiceDirectories,
     secret_guard: Option<PathBuf>,
     on_demand: bool,
+    protected: Vec<PathBuf>,
 }
 
 impl InstallPlan {
@@ -1129,6 +1140,7 @@ impl InstallPlan {
             directories,
             secret_guard,
             on_demand: request.on_demand,
+            protected: request.protected.clone(),
         })
     }
 
@@ -1156,7 +1168,21 @@ impl InstallPlan {
             directories,
             secret_guard: None,
             on_demand: false,
+            protected: Vec::new(),
         }
+    }
+
+    /// The same plan with `paths` made inaccessible. See [`ProtectedPaths`].
+    #[must_use]
+    pub fn with_protected_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.protected = paths;
+        self
+    }
+
+    /// The host paths the service and its jobs may not reach.
+    #[must_use]
+    pub fn protected_paths(&self) -> &[PathBuf] {
+        &self.protected
     }
 
     /// Registers without arming the manager's automatic start. See
@@ -1742,6 +1768,12 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
         "ReadWritePaths={}\n",
         quoted(&permitted_paths(DefinitionKind::SystemdUnit, plan))
     ));
+    if !plan.protected_paths().is_empty() {
+        out.push_str(&format!(
+            "InaccessiblePaths={}\n",
+            inaccessible_entries(plan).join(" ")
+        ));
+    }
 
     out.push_str("\n[Install]\n");
     out.push_str(match plan.start_mode() {
@@ -1832,6 +1864,105 @@ fn systemd_hardening(mode: StartMode) -> Vec<&'static str> {
         directives.push("ProtectHome=tmpfs");
     }
     directives
+}
+
+/// `InaccessiblePaths=` entries for `plan`'s protected paths, each prefixed
+/// with `-` so that a path that does not exist yet is not an error.
+fn inaccessible_entries(plan: &InstallPlan) -> Vec<String> {
+    plan.protected_paths()
+        .iter()
+        .map(|path| quote_argument(&format!("-{}", path.to_string_lossy())))
+        .collect()
+}
+
+/// Host paths no runner or job may reach, which the operator names with
+/// `host protect-path`.
+///
+/// On Linux the systemd unit lists them in `InaccessiblePaths=`, so the kernel
+/// hides them from the daemon and from everything it starts, `root` and every
+/// pool account alike; no permission or link inside the unit reaches them. The
+/// list is read when the service is registered, so a change takes effect when
+/// it is registered again. Windows and macOS have no equivalent the installer
+/// can set, so there it is refused rather than written and silently ignored.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectedPaths {
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+}
+
+impl ProtectedPaths {
+    /// The file in the configuration directory.
+    pub const FILE: &'static str = "protected-paths.json";
+
+    /// Whether this platform can enforce protected paths.
+    #[must_use]
+    pub const fn supported() -> bool {
+        cfg!(all(unix, not(target_os = "macos")))
+    }
+
+    /// The list in `config_dir`, empty when there is none.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read or does not parse.
+    pub fn load(config_dir: &Path) -> std::io::Result<Self> {
+        match std::fs::read(config_dir.join(Self::FILE)) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Writes the list into `config_dir`.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be written.
+    pub fn save(&self, config_dir: &Path) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(config_dir.join(Self::FILE), bytes)
+    }
+
+    /// Why `path` cannot be protected, or `None` when it can.
+    ///
+    /// The paths every job needs to run at all, and the service's own
+    /// directories, are refused: hiding them would stop every runner rather
+    /// than keep jobs out of something.
+    #[must_use]
+    pub fn refusal(path: &Path, own: &[PathBuf]) -> Option<String> {
+        const SYSTEM: [&str; 16] = [
+            "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/opt", "/proc",
+            "/run", "/sbin", "/sys", "/tmp", "/usr", "/var",
+        ];
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Some(format!(
+                "{} is not an absolute path without `..`",
+                path.display()
+            ));
+        }
+        if SYSTEM.iter().any(|system| path == Path::new(system)) {
+            return Some(format!(
+                "{} is one every job needs to run; protect a directory inside it instead",
+                path.display()
+            ));
+        }
+        if let Some(needed) = own
+            .iter()
+            .find(|needed| needed.starts_with(path) || path.starts_with(needed))
+        {
+            return Some(format!(
+                "{} holds or lies inside {}, which the service itself uses",
+                path.display(),
+                needed.display()
+            ));
+        }
+        None
+    }
 }
 
 /// The trees `ProtectHome=` hides, which a boot unit's directories must
@@ -2736,6 +2867,33 @@ fn review_systemd(
         }),
     }
 
+    // Each path the operator protected must stay inaccessible: a unit that no
+    // longer lists one has let every job back into it.
+    if !plan.protected_paths().is_empty() {
+        let listed = directives
+            .get("InaccessiblePaths")
+            .map(|value| split_quoted(value))
+            .unwrap_or_default();
+        let missing = plan
+            .protected_paths()
+            .iter()
+            .filter(|path| {
+                let entry = format!("-{}", path.to_string_lossy());
+                !listed.contains(&entry)
+            })
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            controls.push("InaccessiblePaths keeps every protected path from every job".into());
+        } else {
+            findings.push(PrivilegeFinding {
+                kind: FindingKind::Excess,
+                subject: "InaccessiblePaths".to_string(),
+                detail: format!("no longer hides {}", missing.join(", ")),
+            });
+        }
+    }
+
     // `User=` on a system unit is an escalation only in the other direction, so
     // what is checked is the pair systemd actually treats as privileged.
     if directives.contains_key("PrivateUsers")
@@ -3235,6 +3393,10 @@ pub struct InstallRecord {
     pub starts_on_demand: bool,
     /// Where the platform's definition file was written, when there is one.
     pub definition_path: Option<PathBuf>,
+    /// The host paths the registration made inaccessible. See
+    /// [`ProtectedPaths`]; empty in a record written before they existed.
+    #[serde(default)]
+    pub protected_paths: Vec<PathBuf>,
     /// When the registration was made.
     pub installed_at: DateTime<Utc>,
     /// Which build of the product made it.
@@ -3274,6 +3436,7 @@ impl InstallRecord {
             source_binary: plan.source_binary().map(Path::to_path_buf),
             log_file: plan.directories().log_file(),
             definition_path: definition.install_path().map(Path::to_path_buf),
+            protected_paths: plan.protected_paths().to_vec(),
             installed_at: at,
             installed_by_version: env!("CARGO_PKG_VERSION").to_string(),
             directories: plan.directories().clone(),
@@ -3296,7 +3459,8 @@ impl InstallRecord {
             self.directories.clone(),
         )
         .with_arguments(self.arguments.clone())
-        .with_restart(self.restart());
+        .with_restart(self.restart())
+        .with_protected_paths(self.protected_paths.clone());
         let plan = if self.starts_on_demand {
             plan.started_on_demand()
         } else {
@@ -9829,6 +9993,77 @@ mod tests {
         .findings()
         .iter()
         .any(|finding| finding.subject == subject && finding.kind == kind)
+    }
+
+    #[test]
+    fn protected_paths_are_inaccessible_and_the_review_keeps_them_so() {
+        let plan = linux_plan(StartMode::Boot).with_protected_paths(vec![
+            PathBuf::from("/srv/keys"),
+            PathBuf::from("/data/my backups"),
+        ]);
+        let unit = systemd_unit(&plan);
+        let directives = ini_directives(&unit, "Service");
+        assert_eq!(
+            split_quoted(&directives["InaccessiblePaths"]),
+            ["-/srv/keys", "-/data/my backups"]
+        );
+        assert!(!reports(
+            &unit,
+            &plan,
+            "InaccessiblePaths",
+            FindingKind::Excess
+        ));
+        let dropped = unit.replace(
+            &format!("InaccessiblePaths={}\n", directives["InaccessiblePaths"]),
+            "",
+        );
+        assert!(reports(
+            &dropped,
+            &plan,
+            "InaccessiblePaths",
+            FindingKind::Excess
+        ));
+        assert!(
+            !ini_directives(&systemd_unit(&linux_plan(StartMode::Boot)), "Service")
+                .contains_key("InaccessiblePaths")
+        );
+    }
+
+    #[test]
+    fn a_path_every_job_or_the_service_needs_cannot_be_protected() {
+        let own = [PathBuf::from("/var/lib/runner-manager/config")];
+        for refused in [
+            "/",
+            "/usr",
+            "/etc",
+            "/tmp",
+            "relative",
+            "/srv/../etc",
+            "/var/lib",
+            "/var/lib/runner-manager/config/x",
+        ] {
+            assert!(
+                ProtectedPaths::refusal(Path::new(refused), &own).is_some(),
+                "{refused}"
+            );
+        }
+        for accepted in ["/srv/keys", "/home/ivan/.ssh", "/var/lib/postgresql"] {
+            assert_eq!(
+                ProtectedPaths::refusal(Path::new(accepted), &own),
+                None,
+                "{accepted}"
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ProtectedPaths::load(directory.path()).unwrap(),
+            ProtectedPaths::default()
+        );
+        let list = ProtectedPaths {
+            paths: vec![PathBuf::from("/srv/keys")],
+        };
+        list.save(directory.path()).unwrap();
+        assert_eq!(ProtectedPaths::load(directory.path()).unwrap(), list);
     }
 
     #[test]

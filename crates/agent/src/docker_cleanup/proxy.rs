@@ -460,7 +460,7 @@ fn handle(
     }
     let mut body: Value = serde_json::from_slice(&head.body(stream)?).map_err(invalid)?;
     if let Some(policy) = &checked {
-        let allowed = |path: &Path| policy::inside(path, &policy.allowed);
+        let allowed = |path: &Path| policy.access(path);
         match api {
             "/containers/create" => {
                 violations.extend(policy::check_container_create(&body, &allowed));

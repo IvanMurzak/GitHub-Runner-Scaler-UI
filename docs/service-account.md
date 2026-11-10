@@ -340,6 +340,28 @@ re-registered its jobs keep running as a capability-less `root`. A login service
 and `sudo runner-manager daemon run` in a terminal, keep their runners in their
 own account as before.
 
+### Protected paths
+
+`host protect-path add <PATH>` names a host directory no runner or job may
+reach at all. The unit lists it in `InaccessiblePaths=`, so the kernel hides it
+from the daemon and from everything it starts, whatever account and whatever
+file permissions: a job sees it as inaccessible. The list lives in
+`config/protected-paths.json` and is applied when the service is registered,
+so a change takes effect after `service install --start-at boot`; `host
+protect-path list` says whether the registered service enforces the current
+list, and `review_least_privilege` reports a unit that has dropped one.
+
+The Docker engine runs outside the unit, so a container could still mount a
+protected path; the Docker policy (above) records such a mount as
+`protected_path` even inside an allowed directory, and refuses it in `enforce`
+mode.
+
+The command refuses `/`, the system directories every job needs (`/usr`,
+`/etc`, `/var`, `/tmp` and the like; protect a directory inside one instead),
+and the service's own directories. Windows and macOS have no equivalent the
+installer can set, so there the command is refused rather than recorded and
+ignored.
+
 `service install --start-at boot` refuses directories a boot unit could not use
 — one another account owns, or one under a home tree — and says to drop
 `--data-dir`. A host whose boot service still runs against an older tree (the

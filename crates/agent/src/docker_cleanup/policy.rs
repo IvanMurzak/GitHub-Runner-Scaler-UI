@@ -107,8 +107,49 @@ pub struct Context {
     pub mode: Mode,
     /// The directories a container may bind-mount from, already resolved.
     pub allowed: Vec<PathBuf>,
+    /// Host paths the operator protected (`host protect-path`), already
+    /// resolved: never mountable, even inside an allowed directory. The
+    /// service's own sandbox hides them, but the engine runs outside it.
+    #[serde(default)]
+    pub protected: Vec<PathBuf>,
     /// The violation log.
     pub log: PathBuf,
+}
+
+/// Whether a container may bind-mount a host path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Allowed,
+    /// Outside the job's own directories and the operator's allowed ones.
+    Outside,
+    /// A protected path, or one inside or above it.
+    Protected,
+}
+
+impl Context {
+    /// Whether a container may bind-mount `source`.
+    #[must_use]
+    pub fn access(&self, source: &Path) -> Access {
+        let Some(resolved) = (source.is_absolute()
+            && !source
+                .components()
+                .any(|component| matches!(component, Component::ParentDir)))
+        .then(|| resolve(source))
+        .flatten() else {
+            return Access::Outside;
+        };
+        if self
+            .protected
+            .iter()
+            .any(|protected| resolved.starts_with(protected) || protected.starts_with(&resolved))
+        {
+            Access::Protected
+        } else if self.allowed.iter().any(|root| resolved.starts_with(root)) {
+            Access::Allowed
+        } else {
+            Access::Outside
+        }
+    }
 }
 
 /// A rule a request broke.
@@ -279,7 +320,7 @@ pub fn check_endpoint(method: &str, endpoint: &str, query: &str) -> Vec<Violatio
 /// Rules a container-create `body` breaks. `allowed` says whether a host path
 /// may be bind-mounted.
 #[must_use]
-pub fn check_container_create(body: &Value, allowed: &dyn Fn(&Path) -> bool) -> Vec<Violation> {
+pub fn check_container_create(body: &Value, allowed: &dyn Fn(&Path) -> Access) -> Vec<Violation> {
     let mut violations = Vec::new();
     let host = body.get("HostConfig").unwrap_or(&Value::Null);
     if host.get("Privileged").and_then(Value::as_bool) == Some(true) {
@@ -406,7 +447,7 @@ pub fn check_exec_create(body: &Value) -> Vec<Violation> {
 
 /// Rules a volume-create `body` breaks.
 #[must_use]
-pub fn check_volume_create(body: &Value, allowed: &dyn Fn(&Path) -> bool) -> Vec<Violation> {
+pub fn check_volume_create(body: &Value, allowed: &dyn Fn(&Path) -> Access) -> Vec<Violation> {
     let mut violations = Vec::new();
     if let Some(device) = bound_device(body.get("DriverOpts").unwrap_or(&Value::Null)) {
         check_host_path(Path::new(device), allowed, &mut violations);
@@ -444,7 +485,7 @@ const ENGINE_SOCKETS: [&str; 2] = ["/var/run/docker.sock", "/run/docker.sock"];
 
 fn check_host_path(
     source: &Path,
-    allowed: &dyn Fn(&Path) -> bool,
+    allowed: &dyn Fn(&Path) -> Access,
     violations: &mut Vec<Violation>,
 ) {
     if ENGINE_SOCKETS
@@ -455,7 +496,12 @@ fn check_host_path(
             "engine_socket",
             format!("{} is the Docker engine itself", source.display()),
         ));
-    } else if !allowed(source) {
+    } else if allowed(source) == Access::Protected {
+        violations.push(Violation::new(
+            "protected_path",
+            format!("{} is a protected host path", source.display()),
+        ));
+    } else if allowed(source) == Access::Outside {
         violations.push(Violation::new(
             "host_path",
             format!("{} is outside the job's own directories", source.display()),
@@ -569,7 +615,7 @@ mod tests {
                 "Mounts": [{"Type": "bind", "Source": "/root", "Target": "/r"}]
             }
         });
-        let found = check_container_create(&body, &|_| false);
+        let found = check_container_create(&body, &|_| Access::Outside);
         assert_eq!(
             rules(&found),
             [
@@ -596,7 +642,13 @@ mod tests {
                 "Mounts": [{"Type": "tmpfs", "Target": "/tmp"}]
             }
         });
-        let found = check_container_create(&body, &|path| path.starts_with("/attempt"));
+        let found = check_container_create(&body, &|path| {
+            if path.starts_with("/attempt") {
+                Access::Allowed
+            } else {
+                Access::Outside
+            }
+        });
         assert!(found.is_empty(), "{found:?}");
     }
 
@@ -614,10 +666,10 @@ mod tests {
     fn volumes_and_networks_that_bind_the_host_are_violations() {
         let bound = json!({"Driver": "local", "DriverOpts": {"type": "none", "o": "bind", "device": "/srv/secret"}});
         assert_eq!(
-            rules(&check_volume_create(&bound, &|_| false)),
+            rules(&check_volume_create(&bound, &|_| Access::Outside)),
             ["host_path"]
         );
-        assert!(check_volume_create(&json!({"Driver": "local"}), &|_| false).is_empty());
+        assert!(check_volume_create(&json!({"Driver": "local"}), &|_| Access::Outside).is_empty());
         assert_eq!(
             rules(&check_network_create(&json!({"Driver": "macvlan"}))),
             ["host_network"]
@@ -645,6 +697,35 @@ mod tests {
         assert!(!inside(&attempt.join("escape/inner"), &roots));
         assert!(!inside(&attempt.join("_work/../../etc"), &roots));
         assert!(!inside(Path::new("relative"), &roots));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_protected_path_is_refused_even_inside_an_allowed_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        fs::create_dir_all(shared.join("keys")).unwrap();
+        fs::create_dir_all(shared.join("data")).unwrap();
+        let context = Context {
+            mode: Mode::Enforce,
+            allowed: vec![fs::canonicalize(&shared).unwrap()],
+            protected: vec![fs::canonicalize(shared.join("keys")).unwrap()],
+            log: root.path().join("log"),
+        };
+        assert_eq!(context.access(&shared.join("data")), Access::Allowed);
+        assert_eq!(context.access(&shared.join("keys/id")), Access::Protected);
+        assert_eq!(
+            context.access(&shared),
+            Access::Protected,
+            "a parent exposes it too"
+        );
+        assert_eq!(context.access(Path::new("/etc")), Access::Outside);
+        let body =
+            json!({"HostConfig": {"Binds": [format!("{}:/k", shared.join("keys").display())]}});
+        assert_eq!(
+            rules(&check_container_create(&body, &|path| context.access(path))),
+            ["protected_path"]
+        );
     }
 
     #[test]

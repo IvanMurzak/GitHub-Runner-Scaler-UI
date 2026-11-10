@@ -338,6 +338,9 @@ runner-manager host docker-policy set-mode --mode off|audit|enforce
 runner-manager host docker-policy allow-path <PATH>              # Let jobs bind-mount a host directory into containers
 runner-manager host docker-policy disallow-path <PATH>
 runner-manager host docker-policy report                        # Summarise recorded Docker policy violations
+runner-manager host protect-path add <PATH>                      # Hide a host directory from every runner and job (Linux)
+runner-manager host protect-path remove <PATH>
+runner-manager host protect-path list                           # Show protected directories and whether the service enforces them
 runner-manager host forget-local                               # Move this account's unused configuration aside
 
 runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode

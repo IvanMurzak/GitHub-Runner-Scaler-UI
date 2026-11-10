@@ -471,6 +471,42 @@ pub const MANIFEST: &[Classification] = &[
             reason: "Reads the proxy's violation log, which is outside the generated policy oracle; the dedicated CLI test summarises a fixture log.",
         }),
     },
+    Classification {
+        leaf: "host protect-path add",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/app/tests/native_protect_path.rs",
+            "protected_paths_round_trip_and_refuse_what_every_job_needs",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::HostConfiguration,
+            reason: "Adds a host path to protected-paths.json rather than policy state; the dedicated CLI test round-trips it, refuses system and service paths, and proves Windows and macOS refuse it.",
+        }),
+    },
+    Classification {
+        leaf: "host protect-path remove",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/app/tests/native_protect_path.rs",
+            "protected_paths_round_trip_and_refuse_what_every_job_needs",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::HostConfiguration,
+            reason: "Removes a host path from protected-paths.json rather than policy state; the dedicated CLI test proves it is gone.",
+        }),
+    },
+    Classification {
+        leaf: "host protect-path list",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            "crates/app/tests/native_protect_path.rs",
+            "protected_paths_round_trip_and_refuse_what_every_job_needs",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::HostConfiguration,
+            reason: "Reports protected-paths.json against the install record, both outside the generated policy oracle; the dedicated CLI test checks both states.",
+        }),
+    },
     // -- auth: sign-in state is modelled as credential presence -------------
     generated("auth login"),
     Classification {
