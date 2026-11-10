@@ -129,9 +129,10 @@ pub fn local_estimate(peaks: &[u64]) -> Option<u64> {
         .max()
 }
 
-/// The `p`th percentile of `values` by nearest rank; `None` when empty.
+/// The `p`th percentile (0-100) of `values` by nearest rank; `None` when
+/// empty. The coordinator's statistics use the same rule.
 #[must_use]
-pub fn percentile(values: &[u64], p: u32) -> Option<u64> {
+pub fn percentile<T: Copy + Ord>(values: &[T], p: u32) -> Option<T> {
     if values.is_empty() {
         return None;
     }

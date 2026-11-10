@@ -595,17 +595,7 @@ impl Correlator {
 // Aggregates
 // ---------------------------------------------------------------------------
 
-/// The nearest-rank percentile `p` (0-100) of `values`.
-#[must_use]
-pub fn percentile<T: Copy + Ord>(values: &[T], p: u32) -> Option<T> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    let rank = (sorted.len() * p.min(100) as usize).div_ceil(100).max(1);
-    sorted.get(rank - 1).copied()
-}
+pub use runner_manager_domain::memory::percentile;
 
 /// The percentile `p` of one optional field over `samples`.
 fn field_percentile<T: Copy + Ord>(

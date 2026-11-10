@@ -196,8 +196,9 @@ impl MemoryGate for HostMemory {
     fn admit(&self, policy: &ScalePolicy, attempts: &[RunnerAttempt]) -> MemoryVerdict {
         let verdict = self.verdict(policy, attempts, &[]);
         if let MemoryVerdict::Defer(figures) = verdict {
-            note_waiting(&mut self.waiting(), policy, &figures);
-            self.write_waiting(&self.waiting());
+            let mut waiting = self.waiting();
+            note_waiting(&mut waiting, policy, &figures);
+            self.write_waiting(&waiting);
         }
         verdict
     }
@@ -348,13 +349,15 @@ impl MemorySnapshot {
         };
         let shown_for =
             chrono::TimeDelta::from_std(WAIT_SHOWN_FOR).unwrap_or(chrono::TimeDelta::MAX);
-        let waiting = records::last_waiting(paths)
-            .ok()
+        // Off: nothing waits, whatever an earlier run recorded.
+        let recorded = settings
+            .enabled
+            .then(|| records::last_waiting(paths).ok().flatten())
             .flatten()
             .map(|state| state.waiting)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let waiting = recorded
             .into_iter()
-            .filter(|_| settings.enabled)
             .filter(|waiting| waiting.at.is_some_and(|at| now - at <= shown_for))
             .collect();
         Self {

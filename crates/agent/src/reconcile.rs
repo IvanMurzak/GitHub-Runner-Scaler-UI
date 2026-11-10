@@ -1931,13 +1931,13 @@ pub enum LifecycleEvent {
     AllocationDeferred { policy: PolicyId, count: u16 },
     /// The host lacks the memory for one more runner of this policy: free
     /// memory less what its running attempts may still grow into is under
-    /// the estimate plus the margin. The demand stays queued; a later pass
-    /// tries again. `alone` is the opposite case: nothing runs that could free
+    /// the estimate plus the margin. Not `started`: the demand stays queued
+    /// and a later pass tries again. `started`: nothing runs that could free
     /// memory, so the runner was started anyway.
-    MemoryDeferred {
+    MemoryShort {
         policy: PolicyId,
         figures: MemoryFigures,
-        alone: bool,
+        started: bool,
     },
     /// The host's attempt set could not be read at all.
     ///
@@ -1982,8 +1982,8 @@ impl LifecycleEvent {
             Self::RunnerStarted { .. } => "runner_started",
             Self::RunnerStartFailed { .. } => "runner_start_failed",
             Self::AllocationDeferred { .. } => "allocation_deferred",
-            Self::MemoryDeferred { alone: false, .. } => "memory_deferred",
-            Self::MemoryDeferred { alone: true, .. } => "memory_admitted_alone",
+            Self::MemoryShort { started: false, .. } => "memory_deferred",
+            Self::MemoryShort { started: true, .. } => "memory_admitted_alone",
             Self::AttemptsUnreadable { .. } => "attempts_unreadable",
             Self::HostCapacityUnreadable { .. } => "host_capacity_unreadable",
             Self::AttemptCleaned { .. } => "attempt_cleaned",
@@ -2005,7 +2005,7 @@ impl LifecycleEvent {
             | Self::RunnerStarted { policy, .. }
             | Self::RunnerStartFailed { policy, .. }
             | Self::AllocationDeferred { policy, .. }
-            | Self::MemoryDeferred { policy, .. }
+            | Self::MemoryShort { policy, .. }
             | Self::AttemptCleaned { policy, .. }
             | Self::AttemptCleanFailed { policy, .. }
             | Self::ScaleDownRefused { policy, .. } => Some(*policy),
@@ -2079,15 +2079,15 @@ impl fmt::Display for LifecycleEvent {
                 "policy {policy}: the allocation lock was held; {count} granted runners \
                  were not created"
             ),
-            Self::MemoryDeferred {
+            Self::MemoryShort {
                 policy,
                 figures,
-                alone: false,
+                started: false,
             } => write!(f, "policy {policy}: waiting for memory: {figures}"),
-            Self::MemoryDeferred {
+            Self::MemoryShort {
                 policy,
                 figures,
-                alone: true,
+                started: true,
             } => write!(
                 f,
                 "policy {policy}: started although the host lacks the memory, because \
@@ -2279,12 +2279,12 @@ impl EventSink for TracingEvents {
                     count
                 );
             }
-            LifecycleEvent::MemoryDeferred {
+            LifecycleEvent::MemoryShort {
                 policy,
                 figures,
-                alone,
+                started,
             } => {
-                let reason = if alone {
+                let reason = if started {
                     "larger_than_free_memory_nothing_else_running"
                 } else {
                     "insufficient_memory"
@@ -3477,10 +3477,10 @@ impl Reconciler {
                 MemoryVerdict::Defer(figures) => {
                     drop(guard);
                     report.memory_deferred = report.memory_deferred.saturating_add(budget);
-                    self.events.emit(LifecycleEvent::MemoryDeferred {
+                    self.events.emit(LifecycleEvent::MemoryShort {
                         policy: policy.id,
                         figures,
-                        alone: false,
+                        started: false,
                     });
                     // A directed launch waits like one that could not start:
                     // past `START_LIMIT` it is dropped, and the coordinator
@@ -3489,10 +3489,10 @@ impl Reconciler {
                     break;
                 }
                 MemoryVerdict::AdmitAlone(figures) => {
-                    self.events.emit(LifecycleEvent::MemoryDeferred {
+                    self.events.emit(LifecycleEvent::MemoryShort {
                         policy: policy.id,
                         figures,
-                        alone: true,
+                        started: true,
                     });
                     self.memory.admitted(policy);
                 }
@@ -5341,9 +5341,9 @@ mod tests {
             .events()
             .into_iter()
             .filter_map(|event| match event {
-                LifecycleEvent::MemoryDeferred {
+                LifecycleEvent::MemoryShort {
                     figures,
-                    alone: false,
+                    started: false,
                     ..
                 } => Some(figures),
                 _ => None,
