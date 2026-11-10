@@ -15,10 +15,10 @@ the version being prepared rather than the version in `Cargo.toml`.
   device code. Boot-mode permission errors suggest the absolute native binary
   with `sudo`, so npm installations managed by nvm do not require Node on
   root's PATH. `auth logout` gives the same `sudo` command when it cannot
-  remove a boot-mode credential, and so does every other remedy that says to
-  run `sudo runner-manager …` — re-registering a drifted service, signing in
-  again, granting workspace access, updating — whenever the binary is not on
-  `sudo`'s `secure_path`.
+  remove a boot-mode credential. Every other remedy that says to run
+  `sudo runner-manager …` (re-registering a drifted service, signing in again,
+  granting workspace access, updating) also names the native binary whenever
+  it is not on `sudo`'s `secure_path`.
 - On Linux, `root` keeps its data in `/var/lib/runner-manager` and
   `/var/log/runner-manager` instead of whichever home directory `sudo` left in
   `$HOME`, so a boot service no longer fails with `Permission denied` on an
