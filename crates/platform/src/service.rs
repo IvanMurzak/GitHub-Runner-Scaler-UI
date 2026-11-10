@@ -3693,17 +3693,70 @@ pub fn credential_unreadable_path(paths: &AppPaths) -> PathBuf {
 #[must_use]
 pub fn sign_in_instruction(mode: StartMode) -> String {
     let (command, place) = match mode {
-        StartMode::Boot if cfg!(unix) => ("sudo runner-manager auth login --start-at boot", ""),
+        StartMode::Boot if cfg!(unix) => (sudo_command("auth login --start-at boot"), ""),
         StartMode::Boot => (
-            "runner-manager auth login --start-at boot",
+            "runner-manager auth login --start-at boot".to_owned(),
             " from an elevated terminal",
         ),
         StartMode::Login => (
-            "runner-manager auth login --start-at login",
+            "runner-manager auth login --start-at login".to_owned(),
             MACOS_LOGIN_PLACE,
         ),
     };
     format!("`{command}`{place}")
+}
+
+/// `sudo`, then this program, then `arguments`: a command an operator can
+/// paste.
+///
+/// `sudo` searches only its own `secure_path`, which an npm or nvm
+/// installation is not on, and the npm command is a Node shim that root's
+/// `PATH` could not run either. So the command names this executable -- the
+/// native binary, even behind that shim -- unless it already lives on
+/// `secure_path`, where the bare name reads better and works.
+#[must_use]
+pub fn sudo_command(arguments: &str) -> String {
+    // A test binary is not the product; its own path would only make every
+    // remedy a test compares depend on where the build directory is.
+    let executable = if cfg!(test) {
+        None
+    } else {
+        std::env::current_exe().ok()
+    };
+    format!("sudo {} {arguments}", sudo_program(executable.as_deref()))
+}
+
+/// How a `sudo` command names `executable`. See [`sudo_command`].
+fn sudo_program(executable: Option<&Path>) -> String {
+    /// Ubuntu's and Debian's `secure_path`, which other distributions'
+    /// defaults are a subset of.
+    const SECURE_PATH: [&str; 7] = [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+        "/snap/bin",
+    ];
+    let Some(executable) = executable else {
+        return "runner-manager".to_owned();
+    };
+    if executable
+        .parent()
+        .is_some_and(|directory| SECURE_PATH.iter().any(|path| directory == Path::new(path)))
+    {
+        return "runner-manager".to_owned();
+    }
+    let text = executable.to_string_lossy();
+    if text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+@".contains(c))
+    {
+        text.into_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 /// Where a login-mode sign-in has to happen on macOS, as a phrase to follow
@@ -6379,15 +6432,14 @@ impl ServiceStatus {
                 return self;
             }
             let repair = match drift.start_mode {
-                StartMode::Boot => {
-                    "`sudo systemctl stop runner-manager && sudo runner-manager service install \
-                     --start-at boot` (for a managed WSL host, run `runner-manager wsl install \
-                     --distribution <name>` from Windows)"
-                }
-                StartMode::Login => {
-                    "`systemctl --user stop runner-manager && runner-manager service install \
-                     --start-at login`"
-                }
+                StartMode::Boot => format!(
+                    "`sudo systemctl stop runner-manager && {}` (for a managed WSL host, run \
+                     `runner-manager wsl install --distribution <name>` from Windows)",
+                    sudo_command("service install --start-at boot")
+                ),
+                StartMode::Login => "`systemctl --user stop runner-manager && runner-manager \
+                                     service install --start-at login`"
+                    .to_owned(),
             };
             self.problems.push(StatusProblem {
                 subject: "definition",
@@ -8423,11 +8475,11 @@ mod sys {
                         "install",
                         &name,
                         format!(
-                            "{}. Run `sudo runner-manager service install --start-at boot` \
-                             without --data-dir, which uses {} and {}; a directory there that \
-                             root does not own is handed back with `sudo chown -R root:root \
-                             <directory>`",
+                            "{}. Run `{}` without --data-dir, which uses {} and {}; a \
+                             directory there that root does not own is handed back with \
+                             `sudo chown -R root:root <directory>`",
                             refusals.join("; "),
+                            super::sudo_command("service install --start-at boot"),
                             crate::paths::SYSTEM_DATA_ROOT,
                             crate::paths::SYSTEM_LOGS_DIR,
                         ),
@@ -10421,6 +10473,31 @@ mod tests {
                 .iter()
                 .any(|problem| problem.subject == CREDENTIAL_UNREADABLE_SUBJECT),
             "{healthy}"
+        );
+    }
+
+    #[test]
+    fn a_sudo_command_names_a_binary_sudo_would_not_find() {
+        assert_eq!(sudo_program(None), "runner-manager");
+        assert_eq!(
+            sudo_program(Some(Path::new("/usr/local/bin/runner-manager"))),
+            "runner-manager"
+        );
+        assert_eq!(
+            sudo_program(Some(Path::new(
+                "/home/op/.nvm/versions/node/v26.13.0/lib/node_modules/@ivan-murzak/\
+                 runner-manager-linux-x64/bin/runner-manager"
+            ))),
+            "/home/op/.nvm/versions/node/v26.13.0/lib/node_modules/@ivan-murzak/\
+             runner-manager-linux-x64/bin/runner-manager"
+        );
+        assert_eq!(
+            sudo_program(Some(Path::new("/home/o'p/my bin/runner-manager"))),
+            "'/home/o'\\''p/my bin/runner-manager'"
+        );
+        assert_eq!(
+            sudo_command("service status"),
+            "sudo runner-manager service status"
         );
     }
 

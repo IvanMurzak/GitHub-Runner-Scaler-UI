@@ -57,7 +57,7 @@ use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::runner_root::{
     RootOwner, RootPreflight, default_runner_root, is_on_privacy_gated_volume,
 };
-use runner_manager_platform::service::{InstallRecord, ServiceError};
+use runner_manager_platform::service::{InstallRecord, ServiceError, sudo_command};
 
 use super::{CliError, Context, Failure, Styling, write_failed};
 
@@ -1041,15 +1041,18 @@ pub fn write_service_access_warning(
             line("     the binary this host's service is registered to run, which")?;
             line(&format!(
                 "     {} prints as `binary`. It is not the one on your PATH.",
-                styling.code("sudo runner-manager service status")
+                styling.code(&sudo_command("service status"))
             ))?;
         }
     }
     line("  2. Restart the service so it picks the grant up:")?;
     line(&format!(
         "     {}",
-        styling
-            .code("sudo runner-manager service uninstall && sudo runner-manager service install")
+        styling.code(&format!(
+            "{} && {}",
+            sudo_command("service uninstall"),
+            sudo_command("service install")
+        ))
     ))?;
     line("")?;
     line("The grant follows the binary, not the path: an upgrade that replaces the service")?;
