@@ -918,9 +918,13 @@ impl ServiceDirectories {
 
     /// The deepest directory all four sit under: what an operator would call
     /// the installation's data root. The configuration directory when they
-    /// share nothing.
+    /// share nothing, and [`crate::paths::SYSTEM_DATA_ROOT`] for the system
+    /// tree, whose logs are under `/var/log` rather than beside the rest.
     #[must_use]
     pub fn root(&self) -> PathBuf {
+        if *self == Self::of(&AppPaths::system()) {
+            return PathBuf::from(crate::paths::SYSTEM_DATA_ROOT);
+        }
         let mut shared: Vec<std::path::Component<'_>> = self.config.components().collect();
         for other in [&self.state, &self.runtime, &self.logs] {
             let common = shared
@@ -1738,10 +1742,6 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
         "ReadWritePaths={}\n",
         quoted(&permitted_paths(DefinitionKind::SystemdUnit, plan))
     ));
-    let binds = systemd_home_binds(plan);
-    if !binds.is_empty() {
-        out.push_str(&format!("BindPaths={}\n", quoted(&binds)));
-    }
 
     out.push_str("\n[Install]\n");
     out.push_str(match plan.start_mode() {
@@ -1751,9 +1751,20 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
     out
 }
 
-/// The hardening directives every unit carries after its capability bounding
-/// set, in the order they are rendered. See [`systemd_hardening`].
-const SYSTEMD_HARDENING: [&str; 11] = [
+/// The hardening directives every unit carries, in the order they are rendered.
+///
+/// One list, used by [`systemd_hardening`], so that [`review_least_privilege`]
+/// is written against the same directives the renderer emits: a directive
+/// dropped from the unit is one the review then reports as missing, rather
+/// than one that silently stops being checked.
+///
+/// The capability bounding set is empty in both start modes. A boot unit runs
+/// as `root` against `root`'s own system tree (see [`crate::paths`]), so it
+/// needs no capability to reach its directories, and the runner and every
+/// workflow job inherit none.
+const SYSTEMD_HARDENING: [&str; 13] = [
+    "NoNewPrivileges=yes",
+    "CapabilityBoundingSet=",
     "AmbientCapabilities=",
     "PrivateTmp=yes",
     "PrivateDevices=yes",
@@ -1767,55 +1778,82 @@ const SYSTEMD_HARDENING: [&str; 11] = [
     "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
 ];
 
-/// The hardening directives a unit started in `mode` carries, in the order
-/// they are rendered.
+/// The hardening directives a unit started in `mode` carries.
 ///
-/// One list so that [`review_least_privilege`] is written against the same
-/// directives the renderer emits: a directive dropped from the unit is one the
-/// review then reports as missing, rather than one that silently stops being
-/// checked.
-///
-/// Boot services must access private application directories owned by the
-/// operator as well as the root-owned machine credential, so they keep
-/// `CAP_DAC_OVERRIDE`. ReadWritePaths still limits writes; no other capability
-/// is retained, including SETUID/SETGID.
-///
-/// That capability lets root *read* any file, and the runner and every workflow
-/// job it starts inherit it. `ProtectHome=tmpfs` therefore hides every home
-/// directory from a boot unit, and [`systemd_home_binds`] mounts back only the
-/// application directories that live there.
+/// A boot unit also hides every home directory behind an empty `tmpfs`: its
+/// data lives outside them, and a workflow running as `root` has no business
+/// reading the files there that DAC leaves world-readable. `tmpfs` rather than
+/// `yes`, because tools such as `git` treat an *unreadable* `$HOME/.gitconfig`
+/// as fatal and an absent one as nothing.
 fn systemd_hardening(mode: StartMode) -> Vec<&'static str> {
-    let mut directives = vec![
-        "NoNewPrivileges=yes",
-        match mode {
-            StartMode::Boot => "CapabilityBoundingSet=CAP_DAC_OVERRIDE",
-            StartMode::Login => "CapabilityBoundingSet=",
-        },
-    ];
-    directives.extend(SYSTEMD_HARDENING);
+    let mut directives = SYSTEMD_HARDENING.to_vec();
     if mode == StartMode::Boot {
         directives.push("ProtectHome=tmpfs");
     }
     directives
 }
 
-/// The trees `ProtectHome=` hides.
+/// The trees `ProtectHome=` hides, which a boot unit's directories must
+/// therefore lie outside.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
 const SYSTEMD_HOME_ROOTS: [&str; 3] = ["/home", "/root", "/run/user"];
 
-/// The writable paths a boot unit's `ProtectHome=tmpfs` would hide, which the
-/// unit binds back with `BindPaths=` so the daemon can still reach them.
-fn systemd_home_binds(plan: &InstallPlan) -> Vec<String> {
-    if plan.start_mode() != StartMode::Boot {
-        return Vec::new();
+/// Copies the tree at `from` into `to`, except a top-level entry named `skip`.
+/// Directories are created `0700`, files keep their mode, and symbolic links
+/// are copied as links rather than followed.
+#[cfg(any(all(test, unix), target_os = "linux"))]
+fn copy_tree(from: &Path, to: &Path, skip: Option<&str>) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        if skip.is_some_and(|skip| entry.file_name() == skip) {
+            continue;
+        }
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&source)?, &target)?;
+        } else if kind.is_dir() {
+            copy_tree(&source, &target, None)?;
+        } else {
+            std::fs::copy(&source, &target)?;
+        }
     }
-    permitted_paths(DefinitionKind::SystemdUnit, plan)
-        .into_iter()
-        .filter(|path| {
-            SYSTEMD_HOME_ROOTS
-                .iter()
-                .any(|root| Path::new(path).starts_with(root))
-        })
-        .collect()
+    Ok(())
+}
+
+/// Why a boot unit could not use `path`, owned by `owner`, or `None` when it
+/// can.
+///
+/// A boot unit runs as `root` with no capability at all, so a directory
+/// another account owns is one it cannot open, and one under a home tree is
+/// one its `ProtectHome=` hides.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn boot_directory_refusal(path: &Path, owner: Option<u32>) -> Option<String> {
+    if let Some(root) = SYSTEMD_HOME_ROOTS
+        .iter()
+        .find(|root| path.starts_with(root))
+    {
+        return Some(format!(
+            "{} is under {root}, which a boot service cannot see",
+            path.display()
+        ));
+    }
+    match owner {
+        Some(0) => None,
+        Some(uid) => Some(format!(
+            "{} belongs to uid {uid}, and a boot service runs as root with no capability \
+             to open another account's directory",
+            path.display()
+        )),
+        None => Some(format!("{} cannot be inspected", path.display())),
+    }
 }
 
 // -- launchd -----------------------------------------------------------------
@@ -2459,17 +2497,16 @@ fn same_path_for(kind: DefinitionKind, left: &str, right: &str) -> bool {
     }
 }
 
-/// Checks a `ReadWritePaths`-style list against exactly the paths it must
-/// name. `listed_as` says what being listed grants, for the findings' wording.
+/// Checks a `ReadWritePaths`-style list against the permitted directories.
 fn review_writable_paths(
     kind: DefinitionKind,
     subject: &str,
     listed: &[String],
-    permitted: &[String],
-    listed_as: &str,
+    plan: &InstallPlan,
     controls: &mut Vec<String>,
     findings: &mut Vec<PrivilegeFinding>,
 ) {
+    let permitted = permitted_paths(kind, plan);
     for entry in listed {
         if !permitted
             .iter()
@@ -2479,12 +2516,12 @@ fn review_writable_paths(
                 kind: FindingKind::Excess,
                 subject: subject.to_string(),
                 detail: format!(
-                    "{entry} is {listed_as} but is not one of this registration's required paths"
+                    "{entry} is writable but is not one of this registration's required paths"
                 ),
             });
         }
     }
-    for allowed in permitted {
+    for allowed in &permitted {
         if !listed
             .iter()
             .any(|entry| same_path_for(kind, allowed, entry))
@@ -2493,7 +2530,7 @@ fn review_writable_paths(
                 kind: FindingKind::Shortfall,
                 subject: subject.to_string(),
                 detail: format!(
-                    "{allowed} is one of this registration's directories but is not {listed_as}, \
+                    "{allowed} is one of this registration's directories but is not writable, \
                      so the daemon cannot use it"
                 ),
             });
@@ -2543,11 +2580,7 @@ fn review_capabilities(
         findings.push(PrivilegeFinding {
             kind: FindingKind::Shortfall,
             subject: subject.to_string(),
-            detail: format!(
-                "drops {}, so root cannot access operator-owned private application \
-                 directories",
-                missing.join(" ")
-            ),
+            detail: format!("drops {}, which the daemon needs", missing.join(" ")),
         });
     }
     if extra.is_empty() && missing.is_empty() {
@@ -2627,8 +2660,7 @@ fn review_systemd(
                 DefinitionKind::SystemdUnit,
                 "ReadWritePaths",
                 &listed,
-                &permitted_paths(DefinitionKind::SystemdUnit, plan),
-                "writable",
+                plan,
                 controls,
                 findings,
             );
@@ -2639,25 +2671,6 @@ fn review_systemd(
             detail: "is absent, so `ProtectSystem=strict` leaves the daemon nowhere to write"
                 .to_string(),
         }),
-    }
-
-    // `ProtectHome=tmpfs` hides these, so a boot unit must bind back exactly
-    // its own directories under a home tree and nothing else there.
-    let binds = systemd_home_binds(plan);
-    let listed = directives
-        .get("BindPaths")
-        .map(|value| split_quoted(value))
-        .unwrap_or_default();
-    if !(binds.is_empty() && listed.is_empty()) {
-        review_writable_paths(
-            DefinitionKind::SystemdUnit,
-            "BindPaths",
-            &listed,
-            &binds,
-            "bound back past `ProtectHome=tmpfs`",
-            controls,
-            findings,
-        );
     }
 
     // `User=` on a system unit is an escalation only in the other direction, so
@@ -2895,8 +2908,7 @@ fn review_windows_service(
                 DefinitionKind::WindowsService,
                 "ReadWritePaths",
                 &listed,
-                &permitted_paths(DefinitionKind::WindowsService, plan),
-                "writable",
+                plan,
                 controls,
                 findings,
             );
@@ -4429,10 +4441,13 @@ impl ServiceOperations {
         // Item 1. The guard lives until the end of this function; dropping it is
         // the release, so an early return releases it too.
         let _guard = self.refuse_while_an_agent_runs()?;
+        let adopted = self.adopt_boot_installation(request.start_mode())?;
         // Replacing applies to this account's own registration only: over
         // another installation's it would re-register that service against
         // this account's directories.
-        self.refuse_foreign("replace")?;
+        if !adopted {
+            self.refuse_foreign("replace")?;
+        }
 
         // --------------------------------------------------------------------
         // AN INSTALL OVER THE SAME START MODE REPLACES; IT DOES NOT REFUSE.
@@ -5123,6 +5138,71 @@ impl ServiceOperations {
         }))
     }
 
+    /// Moves a Linux boot service registered against another tree onto this
+    /// one, which for `root` is the system tree. Returns whether it did.
+    ///
+    /// `service install` calls this before it opens anything in this tree, so
+    /// that the copy lands in an empty one; the install itself calls it again,
+    /// which then only confirms the registration is to be replaced.
+    ///
+    /// Before the system tree, a boot service ran against whichever tree
+    /// `sudo` resolved: `/root`'s on some distributions, the operator's own on
+    /// others. A boot unit with no capabilities cannot open the operator's, and
+    /// `ProtectHome=` hides both, so the service is stopped, its configuration
+    /// and state are copied here unless this tree already has its own, and the
+    /// install then replaces the registration. The old tree is left as it was.
+    ///
+    /// # Errors
+    ///
+    /// Whatever stopping the old service or copying its tree reports.
+    pub fn adopt_boot_installation(&self, mode: StartMode) -> Result<bool, ServiceError> {
+        #[cfg(target_os = "linux")]
+        return self.adopt_boot_installation_on_linux(mode);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = mode;
+            Ok(false)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn adopt_boot_installation_on_linux(&self, mode: StartMode) -> Result<bool, ServiceError> {
+        if mode != StartMode::Boot || !crate::host_fitness::is_elevated() {
+            return Ok(false);
+        }
+        let Some((StartMode::Boot, found)) = self.find_registration()? else {
+            return Ok(false);
+        };
+        let Some(old) = self.foreign_directories(&found) else {
+            return Ok(false);
+        };
+        self.controls
+            .control(StartMode::Boot)?
+            .stop(&self.identity)?;
+        let empty = std::fs::read_dir(self.paths.config_dir())
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if empty {
+            for (from, to, skip) in [
+                (&old.config, self.paths.config_dir(), None),
+                // `service install` copies the binary in again.
+                (&old.state, self.paths.state_dir(), Some("bin")),
+            ] {
+                copy_tree(from, to, skip).map_err(|error| ServiceError::Control {
+                    operation: "move the data of",
+                    name: self.identity.name().to_string(),
+                    manager: "systemd",
+                    detail: format!(
+                        "cannot copy {} to {}: {error}",
+                        from.display(),
+                        to.display()
+                    ),
+                })?;
+            }
+        }
+        Ok(true)
+    }
+
     /// Refuses `operation` when the machine's registration is another
     /// installation's. See [`ServiceError::ForeignInstallation`].
     fn refuse_foreign(&self, operation: &'static str) -> Result<(), ServiceError> {
@@ -5528,9 +5608,14 @@ pub fn data_root_owner(root: &Path, home: Option<&Path>) -> Option<String> {
         {
             return Some("LocalSystem".to_owned());
         }
-    } else if ["/root", "/var/root", "/private/var/root"]
-        .iter()
-        .any(|home| root.starts_with(home))
+    } else if [
+        "/root",
+        "/var/root",
+        "/private/var/root",
+        crate::paths::SYSTEM_DATA_ROOT,
+    ]
+    .iter()
+    .any(|home| root.starts_with(home))
     {
         return Some("root".to_owned());
     }
@@ -8259,7 +8344,33 @@ mod sys {
         }
 
         fn install(&self, plan: &InstallPlan) -> Result<ServiceDefinition, ServiceError> {
+            use std::os::unix::fs::MetadataExt as _;
+
             let name = plan.identity().name().to_string();
+            if self.mode == StartMode::Boot {
+                let refusals = plan
+                    .directories()
+                    .all()
+                    .iter()
+                    .filter_map(|path| {
+                        let owner = std::fs::metadata(path).ok().map(|metadata| metadata.uid());
+                        super::boot_directory_refusal(path, owner)
+                    })
+                    .collect::<Vec<_>>();
+                if !refusals.is_empty() {
+                    return Err(self.failed(
+                        "install",
+                        &name,
+                        format!(
+                            "{}. Run `sudo runner-manager service install --start-at boot` \
+                             without --data-dir, which uses {} and {}",
+                            refusals.join("; "),
+                            crate::paths::SYSTEM_DATA_ROOT,
+                            crate::paths::SYSTEM_LOGS_DIR,
+                        ),
+                    ));
+                }
+            }
             let definition = ServiceDefinition::systemd(plan, home_directory().as_deref());
             let Some(path) = definition.install_path().map(std::path::Path::to_path_buf) else {
                 return Err(self.failed(
@@ -9557,49 +9668,29 @@ mod tests {
     }
 
     #[test]
-    fn boot_units_retain_only_the_capability_needed_for_private_directories() {
+    fn every_unit_drops_every_capability_and_boot_units_hide_home_trees() {
         let boot = systemd_unit(&linux_plan(StartMode::Boot));
         let directives = ini_directives(&boot, "Service");
-        assert_eq!(directives["CapabilityBoundingSet"], "CAP_DAC_OVERRIDE");
+        assert_eq!(directives["CapabilityBoundingSet"], "");
         assert_eq!(directives["AmbientCapabilities"], "");
-        assert_eq!(directives["ProtectSystem"], "strict");
-        assert_eq!(directives["NoNewPrivileges"], "yes");
+        assert_eq!(directives["ProtectHome"], "tmpfs");
+        assert!(!directives.contains_key("BindPaths"));
 
         let login = systemd_unit(&linux_plan(StartMode::Login));
-        assert_eq!(
-            ini_directives(&login, "Service")["CapabilityBoundingSet"],
-            ""
-        );
+        let directives = ini_directives(&login, "Service");
+        assert_eq!(directives["CapabilityBoundingSet"], "");
+        assert!(!directives.contains_key("ProtectHome"));
 
-        let broken = boot.replace(
-            "CapabilityBoundingSet=CAP_DAC_OVERRIDE",
-            "CapabilityBoundingSet=",
-        );
-        assert!(
-            reports(
-                &broken,
-                &linux_plan(StartMode::Boot),
-                "CapabilityBoundingSet",
-                FindingKind::Shortfall
-            ),
-            "a boot unit that cannot access its data must report a shortfall"
-        );
-
-        let swapped = boot.replace(
-            "CapabilityBoundingSet=CAP_DAC_OVERRIDE",
-            "CapabilityBoundingSet=CAP_CHOWN",
-        );
-        for kind in [FindingKind::Shortfall, FindingKind::Excess] {
-            assert!(reports(
-                &swapped,
-                &linux_plan(StartMode::Boot),
-                "CapabilityBoundingSet",
-                kind
-            ));
-        }
+        let unprotected = boot.replace("ProtectHome=tmpfs\n", "");
+        assert!(reports(
+            &unprotected,
+            &linux_plan(StartMode::Boot),
+            "ProtectHome",
+            FindingKind::Excess
+        ));
         let inverted = boot.replace(
-            "CapabilityBoundingSet=CAP_DAC_OVERRIDE",
-            "CapabilityBoundingSet=~CAP_SYS_ADMIN",
+            "CapabilityBoundingSet=\n",
+            "CapabilityBoundingSet=~CAP_SYS_ADMIN\n",
         );
         assert!(reports(
             &inverted,
@@ -9681,58 +9772,64 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn boot_units_hide_home_trees_and_bind_back_only_their_own_directories() {
-        let plan = InstallPlan::unchecked(
-            ServiceIdentity::product(),
-            StartMode::Boot,
-            "/home/op/.local/share/runner-manager/state/bin/runner-manager",
-            ServiceDirectories {
-                config: PathBuf::from("/home/op/.config/runner-manager"),
-                state: PathBuf::from("/home/op/.local/share/runner-manager/state"),
-                runtime: PathBuf::from("/run/user/1000/runner-manager"),
-                logs: PathBuf::from("/var/log/runner-manager"),
-            },
-        )
-        .with_secret_guard("/etc/runner-manager/secrets/token");
-        let unit = systemd_unit(&plan);
-        let directives = ini_directives(&unit, "Service");
-        assert_eq!(directives["ProtectHome"], "tmpfs");
+    fn the_system_tree_is_reported_as_roots_installation_under_var_lib() {
+        let system = ServiceDirectories::of(&AppPaths::system());
+        assert_eq!(system.root(), Path::new("/var/lib/runner-manager"));
         assert_eq!(
-            split_quoted(&directives["BindPaths"]),
-            [
-                "/home/op/.config/runner-manager",
-                "/home/op/.local/share/runner-manager/state",
-                "/run/user/1000/runner-manager",
-            ]
+            data_root_owner(&system.root(), Some(Path::new("/home/op"))).as_deref(),
+            Some("root")
         );
-        let review = review_least_privilege(
-            &ServiceDefinition::from_text(DefinitionKind::SystemdUnit, unit.clone()),
-            &plan,
+    }
+
+    #[test]
+    fn a_boot_service_refuses_directories_it_could_not_open() {
+        let var = Path::new("/var/lib/runner-manager/state");
+        assert_eq!(boot_directory_refusal(var, Some(0)), None);
+        let refused = boot_directory_refusal(var, Some(1000)).expect("another owner");
+        assert!(refused.contains("uid 1000"), "{refused}");
+        assert!(boot_directory_refusal(var, None).is_some());
+        for hidden in ["/home/op/.config/runner-manager", "/root/.local/state/rm"] {
+            let refused =
+                boot_directory_refusal(Path::new(hidden), Some(0)).expect("a hidden tree");
+            assert!(refused.contains("cannot see"), "{refused}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_tree_keeps_files_modes_and_links_but_not_the_skipped_entry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        let target = to.path().join("state");
+        std::fs::create_dir_all(from.path().join("journal/2026")).unwrap();
+        std::fs::write(from.path().join("journal/2026/attempt"), b"entry").unwrap();
+        std::fs::write(from.path().join("secret"), b"x").unwrap();
+        std::fs::set_permissions(
+            from.path().join("secret"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("journal", from.path().join("latest")).unwrap();
+        std::fs::create_dir(from.path().join("bin")).unwrap();
+
+        copy_tree(from.path(), &target, Some("bin")).unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("journal/2026/attempt")).unwrap(),
+            b"entry"
         );
-        assert!(review.findings().is_empty(), "{:?}", review.findings());
-
-        let widened = unit.replace("BindPaths=", "BindPaths=/home/op/.ssh ");
-        assert!(reports(&widened, &plan, "BindPaths", FindingKind::Excess));
-        let narrowed = unit.replace("/run/user/1000/runner-manager\n", "\n");
-        assert!(reports(
-            &narrowed,
-            &plan,
-            "BindPaths",
-            FindingKind::Shortfall
-        ));
-        let unprotected = unit.replace("ProtectHome=tmpfs\n", "");
-        assert!(reports(
-            &unprotected,
-            &plan,
-            "ProtectHome",
-            FindingKind::Excess
-        ));
-
-        let login = systemd_unit(&linux_plan(StartMode::Login));
-        let directives = ini_directives(&login, "Service");
-        assert!(!directives.contains_key("ProtectHome"));
-        assert!(!directives.contains_key("BindPaths"));
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&target.join("secret")), 0o600);
+        assert_eq!(mode(&target.join("journal")), 0o700);
+        assert_eq!(
+            std::fs::read_link(target.join("latest")).unwrap(),
+            Path::new("journal")
+        );
+        assert!(!target.join("bin").exists());
     }
 
     #[test]
@@ -9752,12 +9849,12 @@ mod tests {
     }
 
     #[test]
-    fn a_unit_that_keeps_extra_capabilities_is_not_least_privilege() {
+    fn a_unit_that_keeps_capabilities_is_not_least_privilege() {
         let plan = linux_plan(StartMode::Boot);
         let rendered = systemd_unit(&plan);
         let widened = edited(
             &rendered,
-            "CapabilityBoundingSet=CAP_DAC_OVERRIDE\n",
+            "CapabilityBoundingSet=\n",
             "CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN\n",
         );
         let review = review_least_privilege(

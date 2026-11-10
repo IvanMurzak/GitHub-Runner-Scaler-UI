@@ -177,9 +177,10 @@ credential file alone is not sufficient.
 
 ### Two accounts write into one `logs/`
 
-On a boot-mode host those four directories are in the **operator's** profile —
-`service install` records the paths it resolved and the plist repeats them — and
-the daemon writes into them as `root`. `logs/` is the one place where that
+On a macOS boot-mode host those four directories are in the **operator's**
+profile — `service install` records the paths it resolved and the plist repeats
+them — and the daemon writes into them as `root`. (On Linux they are `root`'s
+system tree instead; see below.) `logs/` is the one place where that
 collides, because the rotating appender creates its file at the umask default:
 whichever account opens the day's file first owns it, and if that was `root`
 then the operator's own commands cannot append to it. On 0.1.17 that did not
@@ -212,7 +213,7 @@ On Linux the confinement below is enforced, not merely intended:
 ProtectSystem=strict
 ReadWritePaths=<config> <state> <runtime> <logs> <credential-store-directory>
 NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_DAC_OVERRIDE
+CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateTmp=yes
 PrivateDevices=yes
@@ -230,27 +231,49 @@ paths named in `ReadWritePaths`, plus the private `/tmp` that `PrivateTmp=yes`
 supplies. `review_least_privilege` fails a unit that names any other path there,
 that drops any of the directives above, or that weakens one of them.
 
-Boot units retain only `CAP_DAC_OVERRIDE`: root needs it to traverse and write
-operator-owned `0700` application directories. An empty capability bounding set
-makes even root fail with `Permission denied` there. `ProtectSystem=strict` and
-`ReadWritePaths` still limit filesystem writes, and `NoNewPrivileges=yes` still
-prevents elevation. Login units run as the directory owner and retain no
-capabilities. Ambient capabilities remain empty in both modes.
+Every unit drops every capability, boot units included. A boot unit runs as
+`root`, and without `CAP_DAC_OVERRIDE` `root` is held to ordinary file
+permissions like any other account: it can open its own directories and not
+another account's private ones. That is why, on Linux, `root` keeps its data in
+a system tree rather than in anyone's home directory:
 
-`CAP_DAC_OVERRIDE` also lets root *read* any file, and the runner and every
-workflow job it starts inherit it. Boot units therefore add:
+```text
+/var/lib/runner-manager/config
+/var/lib/runner-manager/state
+/var/lib/runner-manager/runtime
+/var/log/runner-manager
+```
+
+`sudo runner-manager …` resolves that tree whichever `$HOME` `sudo` leaves
+behind, so the service, `sudo runner-manager service status`, and `sudo
+runner-manager auth login --start-at boot` all agree on it. A host whose `root`
+already used the older per-account tree — a WSL distribution provisioned by an
+earlier release, say — keeps using it until `service install --start-at boot`
+moves it, so its commands and its service never disagree. A command the
+operator runs *without* `sudo` sees the boot service as another
+installation's and says to use `sudo`.
+
+Boot units also add:
 
 ```ini
 ProtectHome=tmpfs
-BindPaths=<each of the paths above that lives under /home, /root or /run/user>
 ```
 
-`ProtectHome=tmpfs` replaces `/home`, `/root` and `/run/user` with empty
-directories inside the unit, so a workflow cannot read another account's
-`~/.ssh` or other private files. `BindPaths` mounts back only this
-installation's own directories that live there. `review_least_privilege` fails
-a boot unit without `ProtectHome=tmpfs`, or whose `BindPaths` names any other
-path.
+which replaces `/home`, `/root` and `/run/user` with empty directories inside
+the unit, so a workflow cannot read whatever DAC leaves world-readable in
+anyone's home directory. `tmpfs` rather than `yes`: tools such as `git` treat an
+unreadable `$HOME/.gitconfig` as fatal and an absent one as nothing.
+`review_least_privilege` fails a boot unit without it, and a unit that keeps any
+capability.
+
+`service install --start-at boot` refuses directories a boot unit could not use
+— one another account owns, or one under a home tree — and says to drop
+`--data-dir`. A host whose boot service still runs against an older tree (the
+operator's, or `/root`'s) is moved by re-running `sudo runner-manager service
+install --start-at boot`: it stops the service, copies `config/` and `state/`
+into the system tree unless that tree already has its own configuration, and
+registers the service again. The old tree is left in place for the operator to
+remove.
 
 ### The consequence a Linux operator will actually notice
 

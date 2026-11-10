@@ -16,23 +16,25 @@ the version being prepared rather than the version in `Cargo.toml`.
   with `sudo`, so npm installations managed by nvm do not require Node on
   root's PATH. `auth logout` gives the same `sudo` command when it cannot
   remove a boot-mode credential.
-- Linux boot services retain `CAP_DAC_OVERRIDE` to access the operator's private
-  application directories, while keeping filesystem confinement and dropping
-  all other capabilities. Login services continue to drop every capability.
-  Boot units also set `ProtectHome=tmpfs` and bind back only their own
-  directories, so workflow jobs cannot use that capability to read other
-  accounts' home directories. The least-privilege review compares the
-  capability bounding set as a set, so a unit that swaps the required
-  capability for another reports both the missing and the extra one.
+- On Linux, `root` keeps its data in `/var/lib/runner-manager` and
+  `/var/log/runner-manager` instead of whichever home directory `sudo` left in
+  `$HOME`, so a boot service no longer fails with `Permission denied` on an
+  operator's private directories. Boot units keep no capabilities and hide
+  every home directory with `ProtectHome=tmpfs`, so workflow jobs cannot read
+  other accounts' files. `service install --start-at boot` refuses directories
+  a boot service could not use, and re-running it moves an existing boot
+  service's configuration and state into the system tree. The least-privilege
+  review compares the capability bounding set as a set.
 - Service status includes systemd drop-ins and reports the account the service
   manager says the service runs as, instead of the account saved at
   installation time. Every manager now reports it in the same spelling, and a
-  placeholder such as a raw SID falls back to the saved account. `ExecStart` prefixes such as `-` and `@` and `RestartSec` values with
-  units such as `1min` are read correctly.
-- Applying service directories no longer re-runs `chmod` on directories that
-  already have mode `0700`, and a directory another account owns is used as it
-  is when it cannot be tightened. A boot service cannot `chmod` the
-  operator's directories, so it no longer fails to start on them.
+  placeholder such as a raw SID falls back to the saved account. `ExecStart`
+  prefixes such as `-` and `@` and `RestartSec` values with units such as
+  `1min` are read correctly.
+- Applying the data directories no longer re-runs `chmod` on directories that
+  already have mode `0700`, and a directory another account owns, such as one
+  reached with `--data-dir` under `sudo`, is used as it is rather than failing
+  the command.
 
 ## 0.4.53
 
