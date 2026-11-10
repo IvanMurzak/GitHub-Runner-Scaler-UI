@@ -19,6 +19,10 @@ the version being prepared rather than the version in `Cargo.toml`.
   is set-group-ID and carries a default ACL, so every runner can use and
   update it. Re-register with `sudo runner-manager service install --start-at
   boot` to create the accounts; until then runners keep sharing `rm-runner`.
+- Handing an attempt to its account and sharing caches with the pool walk the
+  tree through directory descriptors and never follow a link at any depth, so
+  a job cannot redirect those `root` changes by swapping a directory for a
+  link mid-walk.
 
 ### Added
 
@@ -30,7 +34,11 @@ the version being prepared rather than the version in `Cargo.toml`.
   starts in `audit`, recording each violation without refusing it;
   `host docker-policy report` summarises them and `host docker-policy
   set-mode --mode enforce` refuses them. `host docker-policy allow-path`
-  admits a host directory every job may mount.
+  admits a host directory every job may mount. Podman's native API is
+  reported as `unchecked_api`.
+- The Docker socket the GitHub runner mounts into `container:` jobs and service
+  containers is now the job's proxy socket instead of the engine's own, so
+  Docker inside job containers is accounted and checked like any other step.
 - `host protect-path add|remove|list`: host directories no runner or job may
   reach on Linux. The systemd unit lists them in `InaccessiblePaths=`, applied
   at the next `service install --start-at boot`, and the Docker proxy refuses

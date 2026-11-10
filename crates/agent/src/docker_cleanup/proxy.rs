@@ -346,8 +346,13 @@ pub fn serve(path: &Path) -> io::Result<()> {
     write_json(path, &journal)?;
     let session = Arc::new(Session {
         attempt: journal.attempt,
+        socket: socket.clone(),
         repository: journal.repository.clone(),
-        policy: journal.policy.clone(),
+        // The proxy's own socket is the job's to mount, wherever it lives.
+        policy: journal.policy.clone().map(|mut policy| {
+            policy.allowed.extend(policy::resolve(&socket));
+            policy
+        }),
         owned: Mutex::new(std::collections::HashSet::new()),
     });
     let shared = Arc::new(Mutex::new(journal));
@@ -415,6 +420,9 @@ pub fn serve(path: &Path) -> io::Result<()> {
 /// What every request of one proxy shares, fixed when it starts.
 struct Session {
     attempt: AttemptId,
+    /// The proxy's own socket, which a job container gets in place of the
+    /// engine's.
+    socket: PathBuf,
     repository: String,
     policy: Option<policy::Context>,
     /// Container and exec ids already known to be this job's own. Only full
@@ -510,6 +518,9 @@ fn handle(
         stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
     }
     let mut body: Value = serde_json::from_slice(&head.body(stream)?).map_err(invalid)?;
+    if api == "/containers/create" {
+        policy::redirect_engine_socket(&mut body, &session.socket);
+    }
     if let Some(policy) = checked {
         let allowed = |path: &Path| policy.access(path);
         match api {
@@ -539,9 +550,13 @@ fn handle(
     }
     if exec_create {
         let response = engine.request(method, parts[1], Some(&body))?;
-        // Created in one of the job's own containers, or the policy would
-        // have refused it: its later start and inspect need no lookup.
-        if let Some(id) = response.body.get("Id").and_then(Value::as_str) {
+        // Created in one of the job's own containers: its later start and
+        // inspect need no lookup. One in another's container, let through by
+        // an audit, is looked up again so each later request is recorded too.
+        let foreign = violations
+            .iter()
+            .any(|violation| violation.rule == "foreign_container");
+        if !foreign && let Some(id) = response.body.get("Id").and_then(Value::as_str) {
             session.remember(id);
         }
         return reply(stream, response.status, &response.body);

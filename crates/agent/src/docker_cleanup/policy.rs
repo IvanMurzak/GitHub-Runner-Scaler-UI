@@ -326,10 +326,23 @@ pub fn check_endpoint(method: &str, endpoint: &str, query: &str) -> Vec<Violatio
             format!("{method} {endpoint} acts on the engine itself"),
         ));
     }
+    // Podman's native API takes the same requests in another shape, which
+    // none of the checks below read: a container created through it would
+    // pass every rule unseen.
+    if first == "libpod" {
+        violations.push(Violation::new(
+            "unchecked_api",
+            format!("{method} {endpoint} is Podman's native API, which this policy cannot check"),
+        ));
+    }
     if method == "POST"
         && matches!(
             endpoint,
-            "/containers/prune" | "/volumes/prune" | "/networks/prune"
+            "/containers/prune"
+                | "/volumes/prune"
+                | "/networks/prune"
+                | "/images/prune"
+                | "/build/prune"
         )
     {
         violations.push(Violation::new(
@@ -408,6 +421,16 @@ pub fn check_container_create(body: &Value, allowed: &dyn Fn(&Path) -> Access) -
                     format!("SecurityOpt={option}"),
                 ));
             }
+        }
+    }
+    // An array, even an empty one, replaces the engine's defaults: what they
+    // mask or keep read-only in `/proc` and `/sys` is then exposed.
+    for key in ["MaskedPaths", "ReadonlyPaths"] {
+        if host.get(key).is_some_and(Value::is_array) {
+            violations.push(Violation::new(
+                "weakened_security",
+                format!("{key} replaces the engine's defaults"),
+            ));
         }
     }
     if let Some(binds) = host.get("Binds").and_then(Value::as_array) {
@@ -501,21 +524,62 @@ pub fn check_network_create(body: &Value) -> Vec<Violation> {
     }
 }
 
-/// The host path a `local` volume's options bind, if they bind one.
+/// The host path a `local` volume's options mount, if they mount one: a
+/// directory bound with `o=bind`, or a block device mounted as a filesystem
+/// (`type=ext4,device=/dev/sda1`), which needs no bind option at all.
 fn bound_device(options: &Value) -> Option<&str> {
-    let bind = options.get("o").and_then(Value::as_str).is_some_and(|o| {
-        o.split(',')
-            .any(|option| option == "bind" || option == "rbind")
-    });
     options
         .get("device")
         .and_then(Value::as_str)
-        .filter(|device| bind && device.starts_with('/'))
+        .filter(|device| device.starts_with('/'))
 }
 
 /// The engine sockets a container must never be handed: either one is the
 /// whole engine, with none of these rules.
 const ENGINE_SOCKETS: [&str; 2] = ["/var/run/docker.sock", "/run/docker.sock"];
+
+/// Points every bind of the engine's own socket in a container-create `body`
+/// at `proxy`, the job's proxy socket, and returns how many it changed.
+///
+/// The GitHub runner mounts `/var/run/docker.sock` into every job container
+/// (`container:` jobs and service containers) so steps can use Docker. The
+/// raw socket would let those steps reach the engine past this proxy and its
+/// rules; the proxy's own socket gives them the same API, through the proxy.
+pub fn redirect_engine_socket(body: &mut Value, proxy: &Path) -> usize {
+    let is_engine = |source: &str| ENGINE_SOCKETS.contains(&source);
+    let proxy = proxy.display().to_string();
+    let mut changed = 0;
+    let Some(host) = body.get_mut("HostConfig").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+    if let Some(binds) = host.get_mut("Binds").and_then(Value::as_array_mut) {
+        for bind in binds {
+            let Some(text) = bind.as_str() else { continue };
+            let (source, rest) = text.split_once(':').unwrap_or((text, ""));
+            if is_engine(source) {
+                *bind = Value::String(if rest.is_empty() {
+                    proxy.clone()
+                } else {
+                    format!("{proxy}:{rest}")
+                });
+                changed += 1;
+            }
+        }
+    }
+    if let Some(mounts) = host.get_mut("Mounts").and_then(Value::as_array_mut) {
+        for mount in mounts {
+            let bind = mount.get("Type").and_then(Value::as_str) == Some("bind");
+            if let Some(source) = mount.get_mut("Source")
+                && bind
+                && source.as_str().is_some_and(is_engine)
+            {
+                *source = Value::String(proxy.clone());
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
 
 fn check_host_path(
     source: &Path,
@@ -612,6 +676,14 @@ mod tests {
             ["host_network"]
         );
         assert!(check_endpoint("POST", "/build", "t=x").is_empty());
+        assert_eq!(
+            rules(&check_endpoint("POST", "/images/prune", "")),
+            ["host_wide_prune"]
+        );
+        assert_eq!(
+            rules(&check_endpoint("POST", "/libpod/containers/create", "")),
+            ["unchecked_api"]
+        );
         assert!(check_endpoint("GET", "/containers/json", "").is_empty());
         assert!(check_endpoint("POST", "/images/create", "fromImage=x").is_empty());
     }
@@ -685,6 +757,20 @@ mod tests {
             ["host_path"]
         );
         assert!(check_volume_create(&json!({"Driver": "local"}), &|_| Access::Outside).is_empty());
+        let disk =
+            json!({"Driver": "local", "DriverOpts": {"type": "ext4", "device": "/dev/sda1"}});
+        assert_eq!(
+            rules(&check_volume_create(&disk, &|_| Access::Outside)),
+            ["host_path"],
+            "a host block device is mounted without any bind option"
+        );
+        assert_eq!(
+            rules(&check_container_create(
+                &json!({"HostConfig": {"MaskedPaths": [], "ReadonlyPaths": null}}),
+                &|_| Access::Outside
+            )),
+            ["weakened_security"]
+        );
         assert_eq!(
             rules(&check_network_create(&json!({"Driver": "macvlan"}))),
             ["host_network"]
@@ -768,6 +854,36 @@ mod tests {
             assert_eq!(context.records(&privileged), recorded, "{mode:?}");
             assert_eq!(context.refuses(&privileged), refused, "{mode:?}");
         }
+    }
+
+    #[test]
+    fn the_engine_socket_a_job_container_is_given_becomes_the_proxy() {
+        let mut body = json!({"HostConfig": {
+            "Binds": ["/var/run/docker.sock:/var/run/docker.sock", "/attempt/_work:/__w"],
+            "Mounts": [{"Type": "bind", "Source": "/run/docker.sock", "Target": "/d.sock"}]
+        }});
+        let proxy = Path::new("/attempt/.docker-proxy/s");
+        assert_eq!(redirect_engine_socket(&mut body, proxy), 2);
+        assert_eq!(
+            body.pointer("/HostConfig/Binds/0").unwrap(),
+            "/attempt/.docker-proxy/s:/var/run/docker.sock"
+        );
+        assert_eq!(
+            body.pointer("/HostConfig/Binds/1").unwrap(),
+            "/attempt/_work:/__w"
+        );
+        assert_eq!(
+            body.pointer("/HostConfig/Mounts/0/Source").unwrap(),
+            "/attempt/.docker-proxy/s"
+        );
+        let allowed = |path: &Path| {
+            if path == proxy || path.starts_with("/attempt") {
+                Access::Allowed
+            } else {
+                Access::Outside
+            }
+        };
+        assert!(check_container_create(&body, &allowed).is_empty());
     }
 
     #[test]

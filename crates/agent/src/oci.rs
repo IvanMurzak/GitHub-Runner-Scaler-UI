@@ -489,8 +489,15 @@ impl OciProcesses {
 /// subordinate ids `--userns=auto` hands out: one namespace per concurrent
 /// container, for as many as the runner pool can run.
 fn rootful_ranges_sufficient(files: &[PathBuf]) -> bool {
-    let needed = AUTO_USERNS_SIZE * u64::from(runner_manager_platform::runner_account::POOL_SIZE);
+    let needed = containers_range_needed();
     files.iter().all(|file| containers_range(file) >= needed)
+}
+
+/// How many subordinate ids the `containers` account needs for a rootful
+/// engine: one `--userns=auto` namespace for each runner the pool can run.
+#[must_use]
+pub fn containers_range_needed() -> u64 {
+    AUTO_USERNS_SIZE * u64::from(runner_manager_platform::runner_account::POOL_SIZE)
 }
 
 /// How many subordinate ids `file` (`/etc/subuid` or `/etc/subgid`) gives the

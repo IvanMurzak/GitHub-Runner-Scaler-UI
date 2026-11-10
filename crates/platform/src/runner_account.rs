@@ -23,6 +23,9 @@
 //! runner gets a `HOME` inside its own attempt (see
 //! [`crate::runner_env::platform_defaults`]).
 
+#[cfg(unix)]
+mod walk;
+
 use std::io;
 use std::path::Path;
 
@@ -95,21 +98,24 @@ impl RunnerAccount {
     ///
     /// The first error met, after which the rest of the tree is not visited.
     pub fn give_tree(&self, path: &Path) -> io::Result<()> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if !self.owns(&metadata) {
-            self.give(path)?;
-        }
-        if metadata.is_dir() {
-            for entry in std::fs::read_dir(path)? {
-                let child = entry?.path();
-                let owned_directory = std::fs::symlink_metadata(&child)
-                    .is_ok_and(|metadata| metadata.is_dir() && self.owns(&metadata));
-                if !owned_directory {
-                    self.give_tree(&child)?;
+        #[cfg(unix)]
+        {
+            let mut root = true;
+            walk::walk(path, &mut |node| {
+                let below = !std::mem::take(&mut root);
+                let stat = node.stat();
+                let owned = stat.st_uid == self.uid && stat.st_gid == self.gid;
+                if !owned {
+                    node.chown(self.uid, self.gid)?;
                 }
-            }
+                Ok(!(below && owned))
+            })
         }
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(())
+        }
     }
 
     /// Whether this account already owns what `metadata` describes.
@@ -351,7 +357,7 @@ fn run(program: &str, arguments: &[&str]) -> Result<(), String> {
 #[cfg(unix)]
 mod sys {
     use std::io;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::Path;
 
     use super::RunnerAccount;
@@ -360,47 +366,37 @@ mod sys {
         metadata.is_dir() && metadata.gid() == gid && metadata.mode() & 0o2070 == 0o2070
     }
 
+    /// Shares `path` and what is under it that is not shared yet. A
+    /// directory below `path` that is already shared is not entered.
     pub(super) fn share_tree(gid: u32, path: &Path) -> io::Result<()> {
-        share_entry(gid, path, &std::fs::symlink_metadata(path)?)
-    }
-
-    /// Shares `path`, whose `metadata` the caller already has, and what is
-    /// under it that is not shared yet: one `lstat` per entry.
-    fn share_entry(gid: u32, path: &Path, metadata: &std::fs::Metadata) -> io::Result<()> {
-        share(gid, path, metadata)?;
-        if metadata.is_dir() {
-            for entry in std::fs::read_dir(path)? {
-                let child = entry?.path();
-                let metadata = std::fs::symlink_metadata(&child)?;
-                if !is_shared(gid, &metadata) {
-                    share_entry(gid, &child, &metadata)?;
-                }
+        let mut root = true;
+        super::walk::walk(path, &mut |node| {
+            let below = !std::mem::take(&mut root);
+            let stat = node.stat();
+            let directory = matches!(node, super::walk::Node::Directory { .. });
+            // `mode_t` is narrower than `u32` on macOS.
+            #[allow(clippy::useless_conversion)]
+            let mode = u32::from(stat.st_mode) & 0o7777;
+            if below && directory && stat.st_gid == gid && mode & 0o2070 == 0o2070 {
+                return Ok(false);
             }
-        }
-        Ok(())
-    }
-
-    fn share(gid: u32, path: &Path, metadata: &std::fs::Metadata) -> io::Result<()> {
-        if metadata.gid() != gid {
-            std::os::unix::fs::lchown(path, None, Some(gid))?;
-        }
-        if metadata.file_type().is_symlink() {
-            return Ok(());
-        }
-        let mode = metadata.mode() & 0o7777;
-        let wanted = if metadata.is_dir() {
-            mode | 0o2070
-        } else {
-            // The group gets what the owner has, short of the special bits.
-            mode | ((mode & 0o700) >> 3)
-        };
-        if wanted != mode {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(wanted))?;
-        }
-        if metadata.is_dir() {
-            set_default_acl(path)?;
-        }
-        Ok(())
+            if stat.st_gid != gid {
+                node.chown(u32::MAX, gid)?;
+            }
+            let wanted = if directory {
+                mode | 0o2070
+            } else {
+                // The group gets what the owner has, short of the special bits.
+                mode | ((mode & 0o700) >> 3)
+            };
+            if wanted != mode {
+                node.chmod(wanted)?;
+            }
+            if let super::walk::Node::Directory { fd, .. } = node {
+                set_default_acl(fd)?;
+            }
+            Ok(true)
+        })
     }
 
     /// The default ACL `user::rwx group::rwx other::---`, in the kernel's
@@ -419,36 +415,17 @@ mod sys {
         acl
     }
 
-    fn set_default_acl(path: &Path) -> io::Result<()> {
+    fn set_default_acl(directory: &std::os::fd::OwnedFd) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::ffi::OsStrExt as _;
-            let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let acl = default_acl();
-            // SAFETY: both strings are NUL-terminated and `acl` is valid for
-            // its length for the duration of the call.
-            let status = unsafe {
-                libc::lsetxattr(
-                    path.as_ptr(),
-                    c"system.posix_acl_default".as_ptr(),
-                    acl.as_ptr().cast(),
-                    acl.len(),
-                    0,
-                )
-            };
-            if status != 0 {
-                let error = io::Error::last_os_error();
-                // A filesystem without ACLs still gets the group and the
-                // set-group-ID bit; what one account creates there is then
-                // readable by the others, though not writable.
-                if !matches!(error.raw_os_error(), Some(libc::ENOTSUP)) {
-                    return Err(error);
-                }
-            }
+        match super::walk::set_attribute(directory, c"system.posix_acl_default", &default_acl()) {
+            // A filesystem without ACLs still gets the group and the
+            // set-group-ID bit; what one account creates there is then
+            // readable by the others, though not writable.
+            Err(error) if error.raw_os_error() != Some(libc::ENOTSUP) => return Err(error),
+            _ => {}
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = path;
+        let _ = directory;
         Ok(())
     }
 
@@ -650,7 +627,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sharing_a_tree_opens_it_to_the_group_once_and_never_follows_links() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::fs::MetadataExt as _;
 
         let directory = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -659,7 +636,7 @@ mod tests {
         std::fs::write(root.join("npm/_cacache/entry"), b"x").unwrap();
         std::fs::set_permissions(
             root.join("npm/_cacache/entry"),
-            std::fs::Permissions::from_mode(0o600),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
         )
         .unwrap();
         std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();

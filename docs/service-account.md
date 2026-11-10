@@ -324,7 +324,16 @@ host is using:
   mode a violation is recorded in `state/docker-policy/violations.jsonl` and the
   request still runs; `host docker-policy report` summarises them, and `host
   docker-policy set-mode --mode enforce` refuses them. Only `enforce` makes
-  separate accounts hold against a job that sets out to escape through Docker;
+  separate accounts hold against a job that sets out to escape through Docker.
+  The engine socket the GitHub runner mounts into a `container:` job and its
+  service containers is replaced by the job's proxy socket, so steps inside
+  them reach Docker through the same proxy. Podman's native API (`/libpod/`)
+  is not checked and counts as a violation of its own. One gap remains: a bind
+  source is judged when the container is created, and the engine follows links
+  only when it starts, so a job that swaps a directory of its own for a link in
+  between mounts the link's target. Protect what must stay out of reach with
+  `host protect-path` as well: the service's sandbox hides it from the job
+  itself;
 - the Git checkout cache is not offered to these runners. Preparing and
   capturing it runs `git` in the daemon over a checkout the job wrote, and
   repository configuration such as `core.fsmonitor` names a command.

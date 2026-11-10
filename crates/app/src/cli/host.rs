@@ -1050,9 +1050,22 @@ fn isolation_prepare(context: &Context, out: &mut dyn Write) -> Result<(), CliEr
     };
     let version = run("podman", &["--version"])?;
     writeln!(out, "Podman: {version}").map_err(failed)?;
+    let needed = runner_manager_agent::oci::containers_range_needed();
     for file in ["/etc/subuid", "/etc/subgid"] {
-        if runner_manager_agent::oci::containers_range(std::path::Path::new(file)) > 0 {
+        let range = runner_manager_agent::oci::containers_range(std::path::Path::new(file));
+        if range >= needed {
             writeln!(out, "{file}: the containers account already has a range").map_err(failed)?;
+        } else if range > 0 {
+            // Another range would have to avoid the existing one and every
+            // other account's; that choice is the operator's to make.
+            return Err(CliError::new(
+                Failure::LocalState,
+                format!(
+                    "{file}: the containers account has {range} subordinate ids, fewer than the \
+                     {needed} isolated jobs need; widen its range, for example to \
+                     {CONTAINERS_RANGE}, and run this again"
+                ),
+            ));
         } else {
             use std::io::Write as _;
             let mut handle = std::fs::OpenOptions::new()
