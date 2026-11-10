@@ -10031,6 +10031,8 @@ mod tests {
         );
     }
 
+    // Unix paths: protected paths are a systemd mechanism.
+    #[cfg(unix)]
     #[test]
     fn a_path_every_job_or_the_service_needs_cannot_be_protected() {
         let own = [PathBuf::from("/var/lib/runner-manager/config")];
