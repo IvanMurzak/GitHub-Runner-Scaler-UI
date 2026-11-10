@@ -2008,9 +2008,10 @@ fn system_keychain_write_refused(source: &str) -> String {
     format!(
         "{source}. The machine-scoped store is the System keychain, and only root may write \
          it. It holds the credential for a service that starts at boot; sign in for that one \
-         with `sudo runner-manager auth login --start-at boot`. For a service that runs as you \
+         with `{}`. For a service that runs as you \
          (`runner-manager service install --start-at login`), sign in to your own login \
-         keychain instead: `runner-manager auth login --start-at login`"
+         keychain instead: `runner-manager auth login --start-at login`",
+        crate::service::sudo_command("auth login --start-at boot")
     )
 }
 

@@ -7,6 +7,38 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.54
+
+### Fixed
+
+- GitHub sign-in checks credential-store write permissions before requesting a
+  device code. Boot-mode permission errors suggest the absolute native binary
+  with `sudo`, so npm installations managed by nvm do not require Node on
+  root's PATH. `auth logout` gives the same `sudo` command when it cannot
+  remove a boot-mode credential. Every other remedy that says to run
+  `sudo runner-manager …` (re-registering a drifted service, signing in again,
+  granting workspace access, updating) also names the native binary whenever
+  it is not on `sudo`'s `secure_path`.
+- On Linux, `root` keeps its data in `/var/lib/runner-manager` and
+  `/var/log/runner-manager` instead of whichever home directory `sudo` left in
+  `$HOME`, so a boot service no longer fails with `Permission denied` on an
+  operator's private directories. Boot units keep no capabilities and hide
+  every home directory with `ProtectHome=tmpfs`, so workflow jobs cannot read
+  other accounts' files. `service install --start-at boot` refuses directories
+  a boot service could not use, and re-running it moves an existing boot
+  service's configuration and state into the system tree. The least-privilege
+  review compares the capability bounding set as a set.
+- Service status includes systemd drop-ins and reports the account the service
+  manager says the service runs as, instead of the account saved at
+  installation time. Every manager now reports it in the same spelling, and a
+  placeholder such as a raw SID falls back to the saved account. `ExecStart`
+  prefixes such as `-` and `@` and `RestartSec` values with units such as
+  `1min` are read correctly.
+- Applying the data directories no longer re-runs `chmod` on directories that
+  already have mode `0700`, and a directory another account owns, such as one
+  reached with `--data-dir` under `sudo`, is used as it is rather than failing
+  the command.
+
 ## 0.4.53
 
 ### Added

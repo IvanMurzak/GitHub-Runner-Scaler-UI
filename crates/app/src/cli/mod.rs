@@ -1845,6 +1845,29 @@ impl Context {
         })
     }
 
+    /// The same context against `root`'s Linux system tree, created.
+    ///
+    /// `service install --start-at boot` uses it when `root` still resolves an
+    /// older per-account tree: the service always runs against the system
+    /// tree. See [`AppPaths::system`].
+    ///
+    /// # Errors
+    /// [`Failure::LocalState`] when the directories cannot be created.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn in_system_tree(&self) -> Result<Self, CliError> {
+        let paths = AppPaths::system();
+        paths.create_all().map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("cannot create the system data directories: {source}"),
+            )
+        })?;
+        Ok(Self {
+            paths,
+            ..self.clone()
+        })
+    }
+
     /// A context rooted at `root` and pointed at a fixture server.
     ///
     /// # Why a constructor rather than the environment variable

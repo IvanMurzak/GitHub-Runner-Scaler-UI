@@ -245,6 +245,24 @@ pub fn install(
     // fix them. It never refuses the install; the daemon holds runners back
     // until a required check passes.
     super::doctor::before_service_install(context, args.start_at.into(), out)?;
+    #[cfg(target_os = "linux")]
+    let system;
+    #[cfg(target_os = "linux")]
+    let context = if StartMode::from(args.start_at) == StartMode::Boot
+        && context.data_root.is_none()
+        && runner_manager_platform::host_fitness::is_elevated()
+    {
+        // A boot service always runs against the system tree. An earlier
+        // tree's data is moved in before this command opens the database there,
+        // on a retry as much as on the first attempt.
+        system = context.in_system_tree()?;
+        operations(&system)
+            .adopt_boot_installation(StartMode::Boot)
+            .map_err(service_failure)?;
+        &system
+    } else {
+        context
+    };
     install_from(context, args, out, &source)
 }
 

@@ -361,6 +361,22 @@ pub(in crate::cli) fn auth_command_line(
     mode: StartMode,
     binary: &Path,
 ) -> String {
+    command_line_for(
+        data_root,
+        mode,
+        binary,
+        &format!("auth login --start-at {}", mode_name(mode)),
+    )
+}
+
+/// `binary` running `arguments` against `data_root`, quoted for this
+/// platform's shell, under `sudo` where `mode` needs root on Unix.
+pub(in crate::cli) fn command_line_for(
+    data_root: Option<&Path>,
+    mode: StartMode,
+    binary: &Path,
+    arguments: &str,
+) -> String {
     let elevation = if mode == StartMode::Boot && cfg!(unix) {
         "sudo "
     } else {
@@ -371,22 +387,15 @@ pub(in crate::cli) fn auth_command_line(
     } else {
         format!("'{}'", display_path(binary).replace('\'', "'\\''"))
     };
-    match data_root {
-        Some(root) if cfg!(windows) => format!(
-            "{elevation}{executable} --data-dir \"{}\" auth login --start-at {mode}",
-            display_path(root),
-            mode = mode_name(mode)
-        ),
+    let data = match data_root {
+        Some(root) if cfg!(windows) => format!(" --data-dir \"{}\"", display_path(root)),
         Some(root) => format!(
-            "{elevation}{executable} --data-dir '{}' auth login --start-at {mode}",
-            display_path(root).replace('\'', "'\\''"),
-            mode = mode_name(mode)
+            " --data-dir '{}'",
+            display_path(root).replace('\'', "'\\''")
         ),
-        None => format!(
-            "{elevation}{executable} auth login --start-at {}",
-            mode_name(mode)
-        ),
-    }
+        None => String::new(),
+    };
+    format!("{elevation}{executable}{data} {arguments}")
 }
 
 fn mode_name(mode: StartMode) -> &'static str {
@@ -450,6 +459,29 @@ fn back_up_and_stage_source(candidate: &Path, source: &Path) -> Result<PathBuf, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_commands_run_the_named_binary_under_sudo() {
+        let binary = Path::new("/opt/it's/runner-manager");
+        assert_eq!(
+            command_line_for(
+                Some(Path::new("/home/op/data")),
+                StartMode::Boot,
+                binary,
+                "auth logout"
+            ),
+            "sudo '/opt/it'\\''s/runner-manager' --data-dir '/home/op/data' auth logout"
+        );
+        assert_eq!(
+            command_line_for(None, StartMode::Login, binary, "auth logout"),
+            "'/opt/it'\\''s/runner-manager' auth logout"
+        );
+        assert_eq!(
+            auth_command_line(None, StartMode::Boot, binary),
+            "sudo '/opt/it'\\''s/runner-manager' auth login --start-at boot"
+        );
+    }
 
     #[test]
     fn a_published_release_can_replace_an_older_source_build_without_downgrading() {

@@ -1473,7 +1473,7 @@ fn install_over(new_binary: &Path, destination: &Path) -> Result<(), CliError> {
                     "cannot write into {}, so the binary there cannot be replaced: {error}",
                     display_path(directory)
                 ),
-                "sudo runner-manager update",
+                runner_manager_platform::service::sudo_command("update"),
             );
         }
         failed("stage the new binary beside the old one")(error)

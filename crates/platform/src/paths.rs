@@ -35,6 +35,16 @@
 //! | Windows | `%LOCALAPPDATA%\IvanMurzak\runner-manager\config` | `…\data\state` | `…\data\{runtime,logs}` |
 //! | macOS | `~/Library/Application Support/io.github.IvanMurzak.runner-manager` | `…/state` | `…/{runtime,logs}` |
 //! | Linux | `$XDG_CONFIG_HOME/runner-manager` | `$XDG_STATE_HOME/runner-manager` | `$XDG_DATA_HOME/runner-manager/{runtime,logs}` |
+//! | Linux, as `root` | `/var/lib/runner-manager/config` | `/var/lib/runner-manager/state` | `/var/lib/runner-manager/runtime`, `/var/log/runner-manager` |
+//!
+//! **`root` on Linux uses the system tree.** A boot service runs as `root`
+//! with an empty capability bounding set, so it can use only directories
+//! `root` owns. Under `sudo`, `$HOME` is the operator's on some distributions
+//! and `/root` on others, and an operator-owned tree is one the service cannot
+//! open. The system tree is the same whichever `sudo` ran, and lies outside
+//! the home directories a boot unit hides with `ProtectHome=`. A host whose
+//! `root` already has the per-account tree keeps it until `service install
+//! --start-at boot` moves it into the system tree.
 //!
 //! Three choices in that table are deliberate:
 //!
@@ -81,6 +91,12 @@ const CONFIG: &str = "config";
 const STATE: &str = "state";
 const RUNTIME: &str = "runtime";
 const LOGS: &str = "logs";
+
+/// Where `root`'s configuration, state and runtime directories live on Linux.
+/// The machine-scoped secret store is under the same directory.
+pub const SYSTEM_DATA_ROOT: &str = "/var/lib/runner-manager";
+/// Where `root`'s diagnostics live on Linux.
+pub const SYSTEM_LOGS_DIR: &str = "/var/log/runner-manager";
 
 /// Something went wrong resolving or creating an application-data directory.
 #[derive(Debug, thiserror::Error)]
@@ -194,6 +210,28 @@ impl AppPaths {
     /// home directory, which is the only way this can fail: nothing is touched
     /// on disk here. Use [`AppPaths::create_all`] for that.
     pub fn discover() -> Result<Self, PathsError> {
+        #[cfg(target_os = "linux")]
+        if crate::host_fitness::is_elevated() {
+            return Ok(Self::for_root(Self::system(), Self::standard().ok()));
+        }
+        Self::standard()
+    }
+
+    /// `system`, unless only `earlier` exists yet.
+    ///
+    /// An installation from before the system tree keeps the tree it has -- a
+    /// WSL distribution's service among them -- until `service install
+    /// --start-at boot` moves it.
+    #[cfg(any(test, target_os = "linux"))]
+    fn for_root(system: Self, earlier: Option<Self>) -> Self {
+        match earlier {
+            Some(earlier) if !system.config.exists() && earlier.config.exists() => earlier,
+            _ => system,
+        }
+    }
+
+    /// The per-account locations in the module documentation's table.
+    fn standard() -> Result<Self, PathsError> {
         let dirs = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(PathsError::NoHomeDirectory)?;
 
@@ -208,6 +246,19 @@ impl AppPaths {
             runtime: dirs.data_local_dir().join(RUNTIME),
             logs: dirs.data_local_dir().join(LOGS),
         })
+    }
+
+    /// The tree `root` uses on Linux: [`SYSTEM_DATA_ROOT`] for the first three
+    /// and [`SYSTEM_LOGS_DIR`] for diagnostics. See the module documentation.
+    #[must_use]
+    pub fn system() -> Self {
+        let root = Path::new(SYSTEM_DATA_ROOT);
+        Self {
+            config: root.join(CONFIG),
+            state: root.join(STATE),
+            runtime: root.join(RUNTIME),
+            logs: PathBuf::from(SYSTEM_LOGS_DIR),
+        }
     }
 
     /// Places all four directories under one root, using the names
@@ -430,15 +481,38 @@ impl fmt::Display for AppPaths {
 /// owner bits are present.
 #[cfg(unix)]
 fn restrict_directory(purpose: &'static str, path: &Path) -> Result<(), PathsError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
-        PathsError::Create {
+    let metadata = std::fs::metadata(path).ok();
+    // chmod(2) needs ownership or CAP_FOWNER even when the mode is unchanged,
+    // so an already-correct mode is not re-set.
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.permissions().mode() & 0o7777 == 0o700)
+    {
+        return Ok(());
+    }
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+        Ok(()) => Ok(()),
+        // Another account's directory -- one reached through `--data-dir`, say
+        // -- is not this process's to tighten. Its owner's own next command
+        // does that instead.
+        Err(source)
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+                && metadata.is_some_and(|metadata| {
+                    // SAFETY: `geteuid` reads this process's own credentials,
+                    // takes no argument and cannot fail.
+                    metadata.uid() != unsafe { libc::geteuid() }
+                }) =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(PathsError::Create {
             purpose,
             path: path.to_path_buf(),
             source,
-        }
-    })
+        }),
+    }
 }
 
 // Returns `Result` only so that the two arms share one signature; the Windows
@@ -451,6 +525,63 @@ fn restrict_directory(_purpose: &'static str, _path: &Path) -> Result<(), PathsE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn root_uses_the_system_tree_outside_every_home_directory() {
+        let system = AppPaths::system();
+        for (_, path) in system.all() {
+            assert!(is_clean_absolute(path), "{}", path.display());
+            assert!(!path.starts_with("/home") && !path.starts_with("/root"));
+        }
+        assert_eq!(
+            system.config_dir(),
+            Path::new("/var/lib/runner-manager/config")
+        );
+        assert_eq!(system.logs_dir(), Path::new("/var/log/runner-manager"));
+    }
+
+    #[test]
+    fn root_keeps_an_earlier_tree_only_until_the_system_tree_exists() {
+        let host = tempfile::tempdir().unwrap();
+        let system = AppPaths::rooted_at(host.path().join("var"));
+        let earlier = AppPaths::rooted_at(host.path().join("root"));
+        assert_eq!(
+            AppPaths::for_root(system.clone(), Some(earlier.clone())),
+            system,
+            "a fresh host uses the system tree"
+        );
+        earlier.create_all().unwrap();
+        assert_eq!(
+            AppPaths::for_root(system.clone(), Some(earlier.clone())),
+            earlier,
+            "an earlier installation keeps its tree"
+        );
+        system.create_all().unwrap();
+        assert_eq!(AppPaths::for_root(system.clone(), Some(earlier)), system);
+        assert_eq!(AppPaths::for_root(system.clone(), None), system);
+    }
+
+    /// A directory another account owns is used as it is rather than refused:
+    /// a `--data-dir` tree another account owns is not this process's to chmod.
+    #[cfg(unix)]
+    #[test]
+    fn another_accounts_directory_is_not_a_failure_to_tighten() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if crate::host_fitness::is_elevated() {
+            return; // Root may chmod anything, so there is no refusal to see.
+        }
+        // `/tmp` rather than `/`: macOS mounts `/` read-only, and chmod there
+        // fails with EROFS whoever owns it.
+        let foreign = Path::new("/tmp");
+        let before = std::fs::metadata(foreign).unwrap().permissions().mode();
+        restrict_directory("state", foreign).expect("another account's directory");
+        assert_eq!(
+            std::fs::metadata(foreign).unwrap().permissions().mode(),
+            before
+        );
+    }
 
     /// True when a path has no `.` or `..` component and is absolute — the
     /// shape a resolved application-data path must have before anything else

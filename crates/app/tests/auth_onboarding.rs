@@ -352,3 +352,41 @@ fn the_login_offers_one_place_to_type_the_code() {
         "and it must say the code goes nowhere else:\n{prompt}"
     );
 }
+
+/// A denied store must fail before any GitHub request or browser approval.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unwritable_store_is_rejected_before_requesting_a_device_code() {
+    use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope};
+    use std::os::unix::fs::PermissionsExt;
+
+    if runner_manager_platform::host_fitness::is_elevated() {
+        return; // Root can write a mode-0500 directory.
+    }
+    let data = tempfile::tempdir().expect("temporary data");
+    let store = PlatformSecretStore::rooted_at(SecretScope::Machine, data.path()).unwrap();
+    let directory = store.guard().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let github = FakeGithub::start();
+    let outcome = run({
+        let mut command = runner_manager_against(data.path(), &github);
+        command.args(["auth", "login", "--start-at", "boot"]);
+        command
+    });
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_ne!(outcome.code, 0, "{}", outcome.both());
+    assert!(
+        outcome.stderr.contains("store would refuse"),
+        "{}",
+        outcome.both()
+    );
+    assert!(outcome.stderr.contains("sudo '"), "{}", outcome.both());
+    assert!(outcome.stderr.contains("--data-dir"), "{}", outcome.both());
+    assert!(
+        github.seen().is_empty(),
+        "approval must not precede the permissions check"
+    );
+    assert!(!outcome.stdout.contains("Action 2"));
+    assert!(!store.guard().exists(), "no token should be written");
+}

@@ -87,7 +87,7 @@
 //! the agent actually resumes is human gate 3 in `06-migration-rollout.md`, and
 //! nothing in this file is evidence for it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -918,9 +918,13 @@ impl ServiceDirectories {
 
     /// The deepest directory all four sit under: what an operator would call
     /// the installation's data root. The configuration directory when they
-    /// share nothing.
+    /// share nothing, and [`crate::paths::SYSTEM_DATA_ROOT`] for the system
+    /// tree, whose logs are under `/var/log` rather than beside the rest.
     #[must_use]
     pub fn root(&self) -> PathBuf {
+        if *self == Self::of(&AppPaths::system()) {
+            return PathBuf::from(crate::paths::SYSTEM_DATA_ROOT);
+        }
         let mut shared: Vec<std::path::Component<'_>> = self.config.components().collect();
         for other in [&self.state, &self.runtime, &self.logs] {
             let common = shared
@@ -1723,21 +1727,20 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
     out.push_str(&format!("RestartSec={}\n", restart.delay().as_secs()));
 
     out.push_str("\n# Least privilege. See docs/service-account.md.\n");
-    for directive in SYSTEMD_HARDENING {
+    for directive in systemd_hardening(plan.start_mode()) {
         out.push_str(directive);
         out.push('\n');
     }
-    let mut writable = directories.all().to_vec();
-    if let Some(secret_directory) = plan.secret_guard().and_then(Path::parent) {
-        writable.push(secret_directory);
-    }
-    out.push_str(&format!(
-        "ReadWritePaths={}\n",
-        writable
+    let quoted = |paths: &[String]| {
+        paths
             .iter()
-            .map(|path| quote_argument(&path.to_string_lossy()))
+            .map(|path| quote_argument(path))
             .collect::<Vec<_>>()
             .join(" ")
+    };
+    out.push_str(&format!(
+        "ReadWritePaths={}\n",
+        quoted(&permitted_paths(DefinitionKind::SystemdUnit, plan))
     ));
 
     out.push_str("\n[Install]\n");
@@ -1750,11 +1753,16 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
 
 /// The hardening directives every unit carries, in the order they are rendered.
 ///
-/// A constant rather than a sequence of `push_str` calls so that
-/// [`review_least_privilege`] can be written against the same list the renderer
-/// emits: a directive dropped from the unit is a directive the review then
-/// reports as missing, rather than one that silently stops being checked.
-pub const SYSTEMD_HARDENING: [&str; 13] = [
+/// One list, used by [`systemd_hardening`], so that [`review_least_privilege`]
+/// is written against the same directives the renderer emits: a directive
+/// dropped from the unit is one the review then reports as missing, rather
+/// than one that silently stops being checked.
+///
+/// The capability bounding set is empty in both start modes. A boot unit runs
+/// as `root` against `root`'s own system tree (see [`crate::paths`]), so it
+/// needs no capability to reach its directories, and the runner and every
+/// workflow job inherit none.
+const SYSTEMD_HARDENING: [&str; 13] = [
     "NoNewPrivileges=yes",
     "CapabilityBoundingSet=",
     "AmbientCapabilities=",
@@ -1769,6 +1777,106 @@ pub const SYSTEMD_HARDENING: [&str; 13] = [
     "RestrictSUIDSGID=yes",
     "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
 ];
+
+/// The hardening directives a unit started in `mode` carries.
+///
+/// A boot unit also hides every home directory behind an empty `tmpfs`: its
+/// data lives outside them, and a workflow running as `root` has no business
+/// reading the files there that DAC leaves world-readable. `tmpfs` rather than
+/// `yes`, because tools such as `git` treat an *unreadable* `$HOME/.gitconfig`
+/// as fatal and an absent one as nothing.
+fn systemd_hardening(mode: StartMode) -> Vec<&'static str> {
+    let mut directives = SYSTEMD_HARDENING.to_vec();
+    if mode == StartMode::Boot {
+        directives.push("ProtectHome=tmpfs");
+    }
+    directives
+}
+
+/// The trees `ProtectHome=` hides, which a boot unit's directories must
+/// therefore lie outside.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+const SYSTEMD_HOME_ROOTS: [&str; 3] = ["/home", "/root", "/run/user"];
+
+/// Renames a non-empty directory at `path` to `<name>.before-move-<stamp>`
+/// beside it, leaving nothing at `path`.
+#[cfg(any(all(test, unix), target_os = "linux"))]
+fn set_aside(path: &Path, stamp: &str) -> std::io::Result<()> {
+    let occupied = match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if occupied {
+        let name = path.file_name().map_or_else(
+            || std::borrow::Cow::Borrowed("directory"),
+            |name| name.to_string_lossy(),
+        );
+        std::fs::rename(
+            path,
+            path.with_file_name(format!("{name}.before-move-{stamp}")),
+        )?;
+    }
+    Ok(())
+}
+
+/// Copies the tree at `from` into `to`, except a top-level entry named `skip`.
+/// Directories are created `0700`, files keep their mode, and symbolic links
+/// are copied as links rather than followed.
+#[cfg(any(all(test, unix), target_os = "linux"))]
+fn copy_tree(from: &Path, to: &Path, skip: Option<&str>) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        if skip.is_some_and(|skip| entry.file_name() == skip) {
+            continue;
+        }
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&source)?, &target)?;
+        } else if kind.is_dir() {
+            copy_tree(&source, &target, None)?;
+        } else {
+            std::fs::copy(&source, &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Why a boot unit could not use `path`, owned by `owner`, or `None` when it
+/// can.
+///
+/// A boot unit runs as `root` with no capability at all, so a directory
+/// another account owns is one it cannot open, and one under a home tree is
+/// one its `ProtectHome=` hides.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn boot_directory_refusal(path: &Path, owner: Option<u32>) -> Option<String> {
+    if let Some(root) = SYSTEMD_HOME_ROOTS
+        .iter()
+        .find(|root| path.starts_with(root))
+    {
+        return Some(format!(
+            "{} is under {root}, which a boot service cannot see",
+            path.display()
+        ));
+    }
+    match owner {
+        Some(0) => None,
+        Some(uid) => Some(format!(
+            "{} belongs to uid {uid}, and a boot service runs as root with no capability \
+             to open another account's directory",
+            path.display()
+        )),
+        None => Some(format!("{} cannot be inspected", path.display())),
+    }
+}
 
 // -- launchd -----------------------------------------------------------------
 
@@ -2457,6 +2565,51 @@ fn review_writable_paths(
     }
 }
 
+/// Compares a unit's capability bounding set with the one it should keep, as
+/// sets: a capability it lacks is a shortfall, one it adds is an excess.
+fn review_capabilities(
+    expected: &str,
+    wanted: &str,
+    actual: &str,
+    controls: &mut Vec<String>,
+    findings: &mut Vec<PrivilegeFinding>,
+) {
+    let subject = "CapabilityBoundingSet";
+    // `~` inverts the list, keeping every capability *except* those named.
+    if actual.trim_start().starts_with('~') {
+        findings.push(PrivilegeFinding {
+            kind: FindingKind::Excess,
+            subject: subject.to_string(),
+            detail: format!("is `{actual}`, which keeps every capability it does not name"),
+        });
+        return;
+    }
+    let wanted: BTreeSet<&str> = wanted.split_whitespace().collect();
+    let actual: BTreeSet<&str> = actual.split_whitespace().collect();
+    let extra = actual.difference(&wanted).copied().collect::<Vec<_>>();
+    let missing = wanted.difference(&actual).copied().collect::<Vec<_>>();
+    if !extra.is_empty() {
+        findings.push(PrivilegeFinding {
+            kind: FindingKind::Excess,
+            subject: subject.to_string(),
+            detail: format!(
+                "keeps {}, which the requirement does not ask for",
+                extra.join(" ")
+            ),
+        });
+    }
+    if !missing.is_empty() {
+        findings.push(PrivilegeFinding {
+            kind: FindingKind::Shortfall,
+            subject: subject.to_string(),
+            detail: format!("drops {}, which the daemon needs", missing.join(" ")),
+        });
+    }
+    if extra.is_empty() && missing.is_empty() {
+        controls.push(expected.to_string());
+    }
+}
+
 /// The one inbound-surface rule, applied to whichever platform names it.
 ///
 /// `07-security.md` handling rule 2: *"The product exposes no inbound HTTP,
@@ -2495,11 +2648,14 @@ fn review_systemd(
     findings: &mut Vec<PrivilegeFinding>,
 ) {
     let directives = ini_directives(text, "Service");
-    for expected in SYSTEMD_HARDENING {
+    for expected in systemd_hardening(plan.start_mode()) {
         let (key, value) = expected
             .split_once('=')
             .expect("every hardening directive is written as key=value");
         match directives.get(key) {
+            Some(actual) if key == "CapabilityBoundingSet" => {
+                review_capabilities(expected, value, actual, controls, findings);
+            }
             Some(actual) if actual == value => controls.push((*expected).to_string()),
             Some(actual) => findings.push(PrivilegeFinding {
                 kind: FindingKind::Excess,
@@ -2813,6 +2969,70 @@ fn ini_directives(text: &str, section: &str) -> BTreeMap<String, String> {
         }
     }
     out
+}
+
+/// The command line in a systemd `ExecStart=`, without the prefixes systemd
+/// reads off its front (`-`, `@`, `:`, `+`, `!`, `!!`).
+///
+/// A drop-in may carry any of them, and left in place they become part of the
+/// executable's path. With `@` the second word is the `argv[0]` handed to the
+/// process rather than an argument, so it goes as well.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn systemd_exec_command_line(value: &str) -> String {
+    let value = value.trim();
+    let command = value.trim_start_matches(['-', '@', ':', '+', '!']);
+    if !value[..value.len() - command.len()].contains('@') {
+        return command.to_string();
+    }
+    let mut words = split_command_line(command);
+    if words.len() > 1 {
+        words.remove(1);
+    }
+    words
+        .iter()
+        .map(|word| quote_argument(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Parses a systemd time span such as `15`, `15s`, `500ms`, `1min 30s` or
+/// `2h`. A bare number is seconds. `None` for `infinity`, an empty value, or
+/// anything systemd would not accept either.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn systemd_timespan(value: &str) -> Option<Duration> {
+    let mut rest = value.trim();
+    if rest.is_empty() || rest == "infinity" {
+        return None;
+    }
+    let mut seconds = 0f64;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        let number: f64 = rest[..digits].parse().ok()?;
+        rest = rest[digits..].trim_start();
+        let letters = rest
+            .find(|c: char| !c.is_alphabetic())
+            .unwrap_or(rest.len());
+        let scale = match &rest[..letters] {
+            "" | "s" | "sec" | "second" | "seconds" => 1.0,
+            "us" | "usec" | "\u{3bc}s" | "\u{b5}s" => 1e-6,
+            "ms" | "msec" => 1e-3,
+            "m" | "min" | "minute" | "minutes" => 60.0,
+            "h" | "hr" | "hour" | "hours" => 3_600.0,
+            "d" | "day" | "days" => 86_400.0,
+            "w" | "week" | "weeks" => 604_800.0,
+            "M" | "month" | "months" => 2_629_800.0,
+            "y" | "year" | "years" => 31_557_600.0,
+            _ => return None,
+        };
+        seconds += number * scale;
+        rest = rest[letters..].trim_start();
+    }
+    Duration::try_from_secs_f64(seconds).ok()
 }
 
 /// Splits a whitespace-separated list that may contain arguments quoted by
@@ -3473,17 +3693,70 @@ pub fn credential_unreadable_path(paths: &AppPaths) -> PathBuf {
 #[must_use]
 pub fn sign_in_instruction(mode: StartMode) -> String {
     let (command, place) = match mode {
-        StartMode::Boot if cfg!(unix) => ("sudo runner-manager auth login --start-at boot", ""),
+        StartMode::Boot if cfg!(unix) => (sudo_command("auth login --start-at boot"), ""),
         StartMode::Boot => (
-            "runner-manager auth login --start-at boot",
+            "runner-manager auth login --start-at boot".to_owned(),
             " from an elevated terminal",
         ),
         StartMode::Login => (
-            "runner-manager auth login --start-at login",
+            "runner-manager auth login --start-at login".to_owned(),
             MACOS_LOGIN_PLACE,
         ),
     };
     format!("`{command}`{place}")
+}
+
+/// `sudo`, then this program, then `arguments`: a command an operator can
+/// paste.
+///
+/// `sudo` searches only its own `secure_path`, which an npm or nvm
+/// installation is not on, and the npm command is a Node shim that root's
+/// `PATH` could not run either. So the command names this executable -- the
+/// native binary, even behind that shim -- unless it already lives on
+/// `secure_path`, where the bare name reads better and works.
+#[must_use]
+pub fn sudo_command(arguments: &str) -> String {
+    // A test binary is not the product; its own path would only make every
+    // remedy a test compares depend on where the build directory is.
+    let executable = if cfg!(test) {
+        None
+    } else {
+        std::env::current_exe().ok()
+    };
+    format!("sudo {} {arguments}", sudo_program(executable.as_deref()))
+}
+
+/// How a `sudo` command names `executable`. See [`sudo_command`].
+fn sudo_program(executable: Option<&Path>) -> String {
+    /// Ubuntu's and Debian's `secure_path`, which other distributions'
+    /// defaults are a subset of.
+    const SECURE_PATH: [&str; 7] = [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+        "/snap/bin",
+    ];
+    let Some(executable) = executable else {
+        return "runner-manager".to_owned();
+    };
+    if executable
+        .parent()
+        .is_some_and(|directory| SECURE_PATH.iter().any(|path| directory == Path::new(path)))
+    {
+        return "runner-manager".to_owned();
+    }
+    let text = executable.to_string_lossy();
+    if text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+@".contains(c))
+    {
+        text.into_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 /// Where a login-mode sign-in has to happen on macOS, as a phrase to follow
@@ -3912,7 +4185,12 @@ pub struct Registration {
     pub start_mode: StartMode,
     /// The full command line, as the manager stores it.
     pub command_line: String,
-    /// The account it runs under, when the manager reports one.
+    /// The account it runs under, spelled as [`ServiceAccount`] spells it, when
+    /// the manager names a real account.
+    ///
+    /// `None` where the manager reports only a placeholder: a login
+    /// registration that runs as whoever signs in, or a Task Scheduler `UserId`
+    /// that is a raw SID. Status then reports the install record's account.
     pub account: Option<String>,
     /// Whether it is running now.
     pub running: bool,
@@ -4238,10 +4516,13 @@ impl ServiceOperations {
         // Item 1. The guard lives until the end of this function; dropping it is
         // the release, so an early return releases it too.
         let _guard = self.refuse_while_an_agent_runs()?;
+        let adopted = self.adopt_boot_installation(request.start_mode())?;
         // Replacing applies to this account's own registration only: over
         // another installation's it would re-register that service against
         // this account's directories.
-        self.refuse_foreign("replace")?;
+        if !adopted {
+            self.refuse_foreign("replace")?;
+        }
 
         // --------------------------------------------------------------------
         // AN INSTALL OVER THE SAME START MODE REPLACES; IT DOES NOT REFUSE.
@@ -4714,9 +4995,12 @@ impl ServiceOperations {
         let unattended = record.as_ref().and_then(|record| {
             // The account is only read where something was probed to judge
             // it against.
-            let account = probed
-                .as_ref()
-                .map_or_else(String::new, |_| service_account_name(&record.account));
+            let account = probed.as_ref().map_or_else(String::new, |_| {
+                found
+                    .as_ref()
+                    .and_then(|registration| registration.account.clone())
+                    .unwrap_or_else(|| service_account_name(&record.account))
+            });
             unattended_gap(record.start_mode, &account, probed.as_ref())
         });
         let now = Utc::now();
@@ -4927,6 +5211,109 @@ impl ServiceOperations {
             Some(own) => (own, None),
             None => (found, Some(directories)),
         }))
+    }
+
+    /// Moves a Linux boot service registered against another tree onto this
+    /// one, which for `root` is the system tree. Returns whether it did.
+    ///
+    /// `service install` calls this before it opens anything in this tree, so
+    /// that the copy lands in an empty one; the install itself calls it again,
+    /// which then only confirms the registration is to be replaced.
+    ///
+    /// Before the system tree, a boot service ran against whichever tree
+    /// `sudo` resolved: `/root`'s on some distributions, the operator's own on
+    /// others. A boot unit with no capabilities cannot open the operator's, and
+    /// `ProtectHome=` hides both, so the service is stopped, its configuration
+    /// and state are copied here unless this tree already has its own, and the
+    /// install then replaces the registration. The old tree is left as it was.
+    ///
+    /// # Errors
+    ///
+    /// Whatever stopping the old service or copying its tree reports.
+    pub fn adopt_boot_installation(&self, mode: StartMode) -> Result<bool, ServiceError> {
+        #[cfg(target_os = "linux")]
+        return self.adopt_boot_installation_on_linux(mode);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = mode;
+            Ok(false)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn adopt_boot_installation_on_linux(&self, mode: StartMode) -> Result<bool, ServiceError> {
+        if mode != StartMode::Boot {
+            return Ok(false);
+        }
+        self.refuse_overridden_account()?;
+        if !crate::host_fitness::is_elevated() {
+            return Ok(false);
+        }
+        let Some((StartMode::Boot, found)) = self.find_registration()? else {
+            return Ok(false);
+        };
+        let Some(old) = self.foreign_directories(&found) else {
+            return Ok(false);
+        };
+        self.controls
+            .control(StartMode::Boot)?
+            .stop(&self.identity)?;
+        // No service was ever installed against this tree, so whatever is in it
+        // is what an interrupted attempt or a stray command left: set aside,
+        // never deleted, in favour of the data the running service used. A
+        // tree with its own install record keeps it.
+        if matches!(InstallRecord::read(&self.paths), Ok(None)) {
+            let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            for (from, to, skip) in [
+                (&old.config, self.paths.config_dir(), None),
+                // `service install` copies the binary in again.
+                (&old.state, self.paths.state_dir(), Some("bin")),
+            ] {
+                set_aside(to, &stamp)
+                    .and_then(|()| copy_tree(from, to, skip))
+                    .map_err(|error| ServiceError::Control {
+                        operation: "move the data of",
+                        name: self.identity.name().to_string(),
+                        manager: "systemd",
+                        detail: format!(
+                            "cannot copy {} to {}: {error}",
+                            from.display(),
+                            to.display()
+                        ),
+                    })?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Refuses a Linux boot install over a unit an administrator's drop-in made
+    /// run as another account.
+    ///
+    /// A drop-in outlives the unit file `service install` rewrites, so the new
+    /// unit would run as that account too, and that account cannot open the
+    /// system tree `root` owns. Said before anything is stopped or copied.
+    #[cfg(target_os = "linux")]
+    fn refuse_overridden_account(&self) -> Result<(), ServiceError> {
+        let Some((StartMode::Boot, found)) = self.find_registration()? else {
+            return Ok(());
+        };
+        match found.account.as_deref() {
+            Some(account) if account != ServiceAccount::Root.as_str() => {
+                Err(ServiceError::Control {
+                    operation: "install",
+                    name: self.identity.name().to_string(),
+                    manager: "systemd",
+                    detail: format!(
+                        "a drop-in under {SYSTEMD_SYSTEM_DIR}/{}.d/ makes it run as {account}, and \
+                         a boot service must run as root to use {}. Remove `User=` and `Group=` \
+                         from that drop-in, run `sudo systemctl daemon-reload`, and install again",
+                        self.identity.systemd_unit(),
+                        crate::paths::SYSTEM_DATA_ROOT,
+                    ),
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Refuses `operation` when the machine's registration is another
@@ -5334,9 +5721,14 @@ pub fn data_root_owner(root: &Path, home: Option<&Path>) -> Option<String> {
         {
             return Some("LocalSystem".to_owned());
         }
-    } else if ["/root", "/var/root", "/private/var/root"]
-        .iter()
-        .any(|home| root.starts_with(home))
+    } else if [
+        "/root",
+        "/var/root",
+        "/private/var/root",
+        crate::paths::SYSTEM_DATA_ROOT,
+    ]
+    .iter()
+    .any(|home| root.starts_with(home))
     {
         return Some("root".to_owned());
     }
@@ -5542,6 +5934,33 @@ pub fn service_account_name(account: &ServiceAccount) -> String {
             .unwrap_or_else(|| "the operator".to_owned()),
         other => other.as_str().to_owned(),
     }
+}
+
+/// The account `registration` names, which an administrator can change from
+/// the one the install record saved, and otherwise the record's.
+fn registered_account<'a>(registration: Option<&'a Registration>, recorded: &'a str) -> &'a str {
+    registration
+        .and_then(|registration| registration.account.as_deref())
+        .unwrap_or(recorded)
+}
+
+/// A Windows service account as `QueryServiceConfigW` names it, spelled the
+/// way [`ServiceAccount`] does, so a service nobody edited reports the account
+/// the record holds.
+#[cfg(any(windows, test))]
+fn windows_service_account(name: &str) -> String {
+    if name.eq_ignore_ascii_case("LocalSystem") || name.eq_ignore_ascii_case(".\\LocalSystem") {
+        ServiceAccount::LocalSystem.as_str().to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// A Task Scheduler `UserId`, unless it is a raw SID, which names no account
+/// an operator would recognise.
+#[cfg(any(windows, test))]
+fn scheduled_task_account(user_id: Option<String>) -> Option<String> {
+    user_id.filter(|id| !id.to_ascii_uppercase().starts_with("S-1-"))
 }
 
 /// Works out the gap for a registration in `mode` running as `account`.
@@ -6013,15 +6432,14 @@ impl ServiceStatus {
                 return self;
             }
             let repair = match drift.start_mode {
-                StartMode::Boot => {
-                    "`sudo systemctl stop runner-manager && sudo runner-manager service install \
-                     --start-at boot` (for a managed WSL host, run `runner-manager wsl install \
-                     --distribution <name>` from Windows)"
-                }
-                StartMode::Login => {
-                    "`systemctl --user stop runner-manager && runner-manager service install \
-                     --start-at login`"
-                }
+                StartMode::Boot => format!(
+                    "`sudo systemctl stop runner-manager && {}` (for a managed WSL host, run \
+                     `runner-manager wsl install --distribution <name>` from Windows)",
+                    sudo_command("service install --start-at boot")
+                ),
+                StartMode::Login => "`systemctl --user stop runner-manager && runner-manager \
+                                     service install --start-at login`"
+                    .to_owned(),
             };
             self.problems.push(StatusProblem {
                 subject: "definition",
@@ -6348,7 +6766,9 @@ impl fmt::Display for ServiceStatus {
         }
         if let Some(record) = &self.record {
             writeln!(f, "  start mode                {}", record.start_mode)?;
-            writeln!(f, "  account                   {}", record.account)?;
+            let recorded = record.account.to_string();
+            let account = registered_account(self.registration.as_ref(), &recorded);
+            writeln!(f, "  account                   {account}")?;
             writeln!(f, "  restart on failure        {}", record.restart())?;
             writeln!(
                 f,
@@ -6576,7 +6996,8 @@ impl ServiceControl for RecordingControl {
                 manager: host_definition_kind(self.mode),
                 start_mode: self.mode,
                 command_line: plan.command_line(),
-                account: Some(plan.account().as_str().to_string()),
+                account: (*plan.account() != ServiceAccount::InvokingUser)
+                    .then(|| plan.account().as_str().to_string()),
                 running: false,
                 starts_automatically: true,
                 restart_delay: Some(plan.restart().delay()),
@@ -7230,7 +7651,7 @@ mod sys {
                 command_line: config.executable_path.to_string_lossy().into_owned(),
                 account: config
                     .account_name
-                    .map(|account| account.to_string_lossy().into_owned()),
+                    .map(|account| super::windows_service_account(&account.to_string_lossy())),
                 running: status.current_state == ServiceState::Running,
                 starts_automatically: config.start_type == ServiceStartType::AutoStart,
                 restart_delay,
@@ -7422,7 +7843,7 @@ mod sys {
                 manager: DefinitionKind::WindowsScheduledTask,
                 start_mode: StartMode::Login,
                 command_line,
-                account: xml_value(&document, "UserId"),
+                account: super::scheduled_task_account(xml_value(&document, "UserId")),
                 running: task_is_running(&name),
                 starts_automatically: super::windows_login_task_starts_automatically(&document),
                 restart_delay: xml_value(&document, "Interval")
@@ -7803,8 +8224,12 @@ mod sys {
                 manager: DefinitionKind::LaunchdPlist,
                 start_mode: self.mode,
                 command_line: program_arguments(&document),
-                account: plist_string_value(&document, "UserName")
-                    .or_else(|| Some("the invoking user".to_string())),
+                // A LaunchDaemon without `UserName` runs as root; a LaunchAgent
+                // runs as whoever signs in, which names no one in particular.
+                account: plist_string_value(&document, "UserName").or_else(|| {
+                    (self.mode == StartMode::Boot)
+                        .then(|| super::ServiceAccount::Root.as_str().to_string())
+                }),
                 running: loaded && printed.contains("state = running"),
                 starts_automatically: document.contains("<key>RunAtLoad</key>")
                     && super::plist_bool_value(&document, "RunAtLoad") == Some(true),
@@ -7958,21 +8383,21 @@ mod sys {
     //! `/etc/systemd/system`, wanted by `multi-user.target`; `--start-at login`
     //! is a user unit in `~/.config/systemd/user`, wanted by `default.target`.
     //!
-    //! Every inspection here goes through `systemctl is-active` and
-    //! `systemctl is-enabled`, whose output is a fixed machine-readable word
-    //! rather than a sentence, so nothing in this module depends on the
-    //! machine's display language.
+    //! Every inspection here goes through `systemctl cat` and `systemctl show`,
+    //! whose output is machine-readable `key=value` text rather than a
+    //! sentence, so nothing in this module depends on the machine's display
+    //! language.
 
     use std::ffi::OsStr;
     use std::path::PathBuf;
-    use std::time::Duration;
 
     use runner_manager_domain::model::StartMode;
 
     use super::{
         DefinitionKind, InstallPlan, Registration, SUDO_REMEDY, SYSTEMD_SYSTEM_DIR,
         SYSTEMD_USER_SUBDIR, ServiceControl, ServiceDefinition, ServiceError, ServiceIdentity,
-        home_directory, ini_directives, run, write_definition,
+        home_directory, ini_directives, run, systemd_exec_command_line, systemd_timespan,
+        write_definition,
     };
 
     pub(super) fn control(mode: StartMode) -> Result<Box<dyn ServiceControl>, ServiceError> {
@@ -8031,7 +8456,36 @@ mod sys {
         }
 
         fn install(&self, plan: &InstallPlan) -> Result<ServiceDefinition, ServiceError> {
+            use std::os::unix::fs::MetadataExt as _;
+
             let name = plan.identity().name().to_string();
+            if self.mode == StartMode::Boot {
+                // The credential store's directory as well as the four: the
+                // service rewrites the credential there when GitHub rotates it.
+                let refusals = super::permitted_paths(DefinitionKind::SystemdUnit, plan)
+                    .iter()
+                    .filter_map(|path| {
+                        let path = std::path::Path::new(path);
+                        let owner = std::fs::metadata(path).ok().map(|metadata| metadata.uid());
+                        super::boot_directory_refusal(path, owner)
+                    })
+                    .collect::<Vec<_>>();
+                if !refusals.is_empty() {
+                    return Err(self.failed(
+                        "install",
+                        &name,
+                        format!(
+                            "{}. Run `{}` without --data-dir, which uses {} and {}; a \
+                             directory there that root does not own is handed back with \
+                             `sudo chown -R root:root <directory>`",
+                            refusals.join("; "),
+                            super::sudo_command("service install --start-at boot"),
+                            crate::paths::SYSTEM_DATA_ROOT,
+                            crate::paths::SYSTEM_LOGS_DIR,
+                        ),
+                    ));
+                }
+            }
             let definition = ServiceDefinition::systemd(plan, home_directory().as_deref());
             let Some(path) = definition.install_path().map(std::path::Path::to_path_buf) else {
                 return Err(self.failed(
@@ -8089,29 +8543,56 @@ mod sys {
             let Some(path) = self.unit_path(identity) else {
                 return Ok(None);
             };
-            let Ok(document) = std::fs::read_to_string(&path) else {
+            if !path.exists() {
                 return Ok(None);
-            };
+            }
             let unit = identity.systemd_unit();
-            let directives = ini_directives(&document, "Service");
-            let (_, active) = self.systemctl(&["is-active", &unit]);
-            let (_, enabled) = self.systemctl(&["is-enabled", &unit]);
+            // `cat` includes administrator drop-ins in systemd's order. Reading
+            // only our base file hides User/ExecStart/RestartSec overrides, so
+            // the file is read only when `systemctl` cannot answer.
+            let effective = match self.systemctl(&["cat", &unit]) {
+                (true, text) => text,
+                _ => match std::fs::read_to_string(&path) {
+                    Ok(document) => document,
+                    Err(_) => return Ok(None),
+                },
+            };
+            let directives = ini_directives(&effective, "Service");
+            // One `show` answers what `is-active` and `is-enabled` each did.
+            let (_, shown) = self.systemctl(&[
+                "show",
+                "--property=ActiveState",
+                "--property=UnitFileState",
+                &unit,
+            ]);
+            let state = |key: &str| {
+                shown
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+                    .map(str::trim)
+            };
             Ok(Some(Registration {
                 manager: DefinitionKind::SystemdUnit,
                 start_mode: self.mode,
-                command_line: directives.get("ExecStart").cloned().unwrap_or_default(),
-                account: directives.get("User").cloned().or_else(|| {
-                    Some(match self.mode {
-                        StartMode::Boot => "root".to_string(),
-                        StartMode::Login => "the invoking user".to_string(),
-                    })
-                }),
-                running: active.trim() == "active",
-                starts_automatically: enabled.trim() == "enabled",
+                command_line: directives
+                    .get("ExecStart")
+                    .map(|value| systemd_exec_command_line(value))
+                    .unwrap_or_default(),
+                // A system unit without `User=` runs as root; a user unit runs
+                // as whoever owns the session, which names no one in particular.
+                account: directives
+                    .get("User")
+                    .filter(|user| !user.is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        (self.mode == StartMode::Boot)
+                            .then(|| super::ServiceAccount::Root.as_str().to_string())
+                    }),
+                running: state("ActiveState") == Some("active"),
+                starts_automatically: state("UnitFileState") == Some("enabled"),
                 restart_delay: directives
                     .get("RestartSec")
-                    .and_then(|value| value.trim().trim_end_matches('s').parse::<u64>().ok())
-                    .map(Duration::from_secs),
+                    .and_then(|value| systemd_timespan(value)),
             }))
         }
 
@@ -9290,6 +9771,228 @@ mod tests {
         );
     }
 
+    /// Whether reviewing `unit` against `plan` reports `kind` for `subject`.
+    fn reports(unit: &str, plan: &InstallPlan, subject: &str, kind: FindingKind) -> bool {
+        review_least_privilege(
+            &ServiceDefinition::from_text(DefinitionKind::SystemdUnit, unit.to_string()),
+            plan,
+        )
+        .findings()
+        .iter()
+        .any(|finding| finding.subject == subject && finding.kind == kind)
+    }
+
+    #[test]
+    fn every_unit_drops_every_capability_and_boot_units_hide_home_trees() {
+        let boot = systemd_unit(&linux_plan(StartMode::Boot));
+        let directives = ini_directives(&boot, "Service");
+        assert_eq!(directives["CapabilityBoundingSet"], "");
+        assert_eq!(directives["AmbientCapabilities"], "");
+        assert_eq!(directives["ProtectHome"], "tmpfs");
+        assert!(!directives.contains_key("BindPaths"));
+
+        let login = systemd_unit(&linux_plan(StartMode::Login));
+        let directives = ini_directives(&login, "Service");
+        assert_eq!(directives["CapabilityBoundingSet"], "");
+        assert!(!directives.contains_key("ProtectHome"));
+
+        let unprotected = boot.replace("ProtectHome=tmpfs\n", "");
+        assert!(reports(
+            &unprotected,
+            &linux_plan(StartMode::Boot),
+            "ProtectHome",
+            FindingKind::Excess
+        ));
+        let inverted = boot.replace(
+            "CapabilityBoundingSet=\n",
+            "CapabilityBoundingSet=~CAP_SYS_ADMIN\n",
+        );
+        assert!(reports(
+            &inverted,
+            &linux_plan(StartMode::Boot),
+            "CapabilityBoundingSet",
+            FindingKind::Excess
+        ));
+    }
+
+    #[test]
+    fn status_reports_the_registered_account_and_falls_back_to_the_record() {
+        let recorded = ServiceAccount::for_start_mode(StartMode::Boot).to_string();
+        for (registered, shown) in [(Some("ivan"), "ivan"), (None, recorded.as_str())] {
+            let host = Host::new();
+            let operations = host.operations();
+            operations.install(&host.request(StartMode::Boot)).unwrap();
+            host.controls.edit("runner-manager", |registration| {
+                registration.account = registered.map(str::to_string);
+            });
+            let status = operations.status().unwrap().to_string();
+            assert!(
+                status.contains(&format!("account                   {shown}\n")),
+                "{status}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_boot_install_refuses_a_unit_a_drop_in_runs_as_another_account() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations.install(&host.request(StartMode::Boot)).unwrap();
+        host.controls.edit("runner-manager", |registration| {
+            registration.account = Some("ivan".to_string());
+        });
+        let refused = operations
+            .install(&host.request(StartMode::Boot))
+            .expect_err("a unit running as ivan cannot use root's tree");
+        let message = refused.to_string();
+        assert!(message.contains("run as ivan"), "{message}");
+        assert!(message.contains("Remove `User=`"), "{message}");
+    }
+
+    #[test]
+    fn manager_account_spellings_match_the_record() {
+        assert_eq!(
+            windows_service_account("LocalSystem"),
+            ServiceAccount::LocalSystem.as_str()
+        );
+        assert_eq!(windows_service_account(".\\svc-runner"), ".\\svc-runner");
+        assert_eq!(
+            scheduled_task_account(Some("S-1-5-21-1-2-3-1001".into())),
+            None
+        );
+        assert_eq!(
+            scheduled_task_account(Some("HOST\\op".into())),
+            Some("HOST\\op".to_string())
+        );
+    }
+
+    #[test]
+    fn exec_start_prefixes_are_not_part_of_the_binary() {
+        for (value, expected) in [
+            ("/opt/rm daemon run", "/opt/rm daemon run"),
+            ("-/opt/rm daemon run", "/opt/rm daemon run"),
+            ("+!/opt/rm daemon run", "/opt/rm daemon run"),
+            ("!!/opt/rm daemon run", "/opt/rm daemon run"),
+            ("@/opt/rm runner-manager daemon run", "/opt/rm daemon run"),
+            ("-@\"/opt/my rm\" rm daemon", "\"/opt/my rm\" daemon"),
+        ] {
+            assert_eq!(systemd_exec_command_line(value), expected, "{value}");
+        }
+        assert_eq!(
+            executable_from_command_line(&systemd_exec_command_line("-/opt/rm daemon")),
+            Some(PathBuf::from("/opt/rm"))
+        );
+    }
+
+    #[test]
+    fn restart_sec_accepts_systemd_time_spans() {
+        for (value, expected) in [
+            ("15", Duration::from_secs(15)),
+            ("15s", Duration::from_secs(15)),
+            ("1min", Duration::from_secs(60)),
+            ("1min 30s", Duration::from_secs(90)),
+            ("1min30s", Duration::from_secs(90)),
+            ("2h", Duration::from_secs(7_200)),
+            ("500ms", Duration::from_millis(500)),
+            ("1.5s", Duration::from_millis(1_500)),
+        ] {
+            assert_eq!(systemd_timespan(value), Some(expected), "{value}");
+        }
+        for value in ["", "infinity", "soon", "5 parsecs", "s"] {
+            assert_eq!(systemd_timespan(value), None, "{value}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_system_tree_is_reported_as_roots_installation_under_var_lib() {
+        let system = ServiceDirectories::of(&AppPaths::system());
+        assert_eq!(system.root(), Path::new("/var/lib/runner-manager"));
+        assert_eq!(
+            data_root_owner(&system.root(), Some(Path::new("/home/op"))).as_deref(),
+            Some("root")
+        );
+    }
+
+    #[test]
+    fn a_boot_service_refuses_directories_it_could_not_open() {
+        let var = Path::new("/var/lib/runner-manager/state");
+        assert_eq!(boot_directory_refusal(var, Some(0)), None);
+        let refused = boot_directory_refusal(var, Some(1000)).expect("another owner");
+        assert!(refused.contains("uid 1000"), "{refused}");
+        assert!(boot_directory_refusal(var, None).is_some());
+        for hidden in ["/home/op/.config/runner-manager", "/root/.local/state/rm"] {
+            let refused =
+                boot_directory_refusal(Path::new(hidden), Some(0)).expect("a hidden tree");
+            assert!(refused.contains("cannot see"), "{refused}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_tree_keeps_files_modes_and_links_but_not_the_skipped_entry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        let target = to.path().join("state");
+        std::fs::create_dir_all(from.path().join("journal/2026")).unwrap();
+        std::fs::write(from.path().join("journal/2026/attempt"), b"entry").unwrap();
+        std::fs::write(from.path().join("secret"), b"x").unwrap();
+        std::fs::set_permissions(
+            from.path().join("secret"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("journal", from.path().join("latest")).unwrap();
+        std::fs::create_dir(from.path().join("bin")).unwrap();
+
+        copy_tree(from.path(), &target, Some("bin")).unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("journal/2026/attempt")).unwrap(),
+            b"entry"
+        );
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&target.join("secret")), 0o600);
+        assert_eq!(mode(&target.join("journal")), 0o700);
+        assert_eq!(
+            std::fs::read_link(target.join("latest")).unwrap(),
+            Path::new("journal")
+        );
+        assert!(!target.join("bin").exists());
+
+        // An occupied target is set aside whole, not merged into or deleted.
+        std::fs::write(target.join("stale.sqlite3-wal"), b"stale").unwrap();
+        set_aside(&target, "20261110T000000Z").unwrap();
+        assert!(!target.exists());
+        let aside = to.path().join("state.before-move-20261110T000000Z");
+        assert_eq!(
+            std::fs::read(aside.join("stale.sqlite3-wal")).unwrap(),
+            b"stale"
+        );
+        copy_tree(from.path(), &target, Some("bin")).unwrap();
+        assert!(!target.join("stale.sqlite3-wal").exists());
+        set_aside(&to.path().join("absent"), "x").unwrap();
+    }
+
+    #[test]
+    fn systemd_drop_ins_replace_base_service_directives() {
+        let base = systemd_unit(&linux_plan(StartMode::Boot));
+        let combined = format!(
+            "# /etc/systemd/system/runner-manager.service\n{base}\n\
+             # /etc/systemd/system/runner-manager.service.d/account.conf\n\
+             [Service]\nUser=ivan\nRestartSec=30\nExecStart=\n\
+             ExecStart=/opt/runner-manager daemon run\n"
+        );
+        let directives = ini_directives(&combined, "Service");
+        assert_eq!(directives["User"], "ivan");
+        assert_eq!(directives["RestartSec"], "30");
+        assert_eq!(directives["ExecStart"], "/opt/runner-manager daemon run");
+        assert_eq!(directives["ProtectSystem"], "strict");
+    }
+
     #[test]
     fn a_unit_that_keeps_capabilities_is_not_least_privilege() {
         let plan = linux_plan(StartMode::Boot);
@@ -9770,6 +10473,31 @@ mod tests {
                 .iter()
                 .any(|problem| problem.subject == CREDENTIAL_UNREADABLE_SUBJECT),
             "{healthy}"
+        );
+    }
+
+    #[test]
+    fn a_sudo_command_names_a_binary_sudo_would_not_find() {
+        assert_eq!(sudo_program(None), "runner-manager");
+        assert_eq!(
+            sudo_program(Some(Path::new("/usr/local/bin/runner-manager"))),
+            "runner-manager"
+        );
+        assert_eq!(
+            sudo_program(Some(Path::new(
+                "/home/op/.nvm/versions/node/v26.13.0/lib/node_modules/@ivan-murzak/\
+                 runner-manager-linux-x64/bin/runner-manager"
+            ))),
+            "/home/op/.nvm/versions/node/v26.13.0/lib/node_modules/@ivan-murzak/\
+             runner-manager-linux-x64/bin/runner-manager"
+        );
+        assert_eq!(
+            sudo_program(Some(Path::new("/home/o'p/my bin/runner-manager"))),
+            "'/home/o'\\''p/my bin/runner-manager'"
+        );
+        assert_eq!(
+            sudo_command("service status"),
+            "sudo runner-manager service status"
         );
     }
 
