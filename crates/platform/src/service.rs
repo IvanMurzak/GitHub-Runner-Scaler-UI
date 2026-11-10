@@ -1878,9 +1878,11 @@ fn inaccessible_entries(plan: &InstallPlan) -> Vec<String> {
 /// Host paths no runner or job may reach, which the operator names with
 /// `host protect-path`.
 ///
-/// On Linux the systemd unit lists them in `InaccessiblePaths=`, so the kernel
-/// hides them from the daemon and from everything it starts, `root` and every
-/// pool account alike; no permission or link inside the unit reaches them. The
+/// On Linux the systemd unit lists them in `InaccessiblePaths=`, so inside the
+/// unit the kernel replaces each with a node of mode `000`: no runner or job,
+/// in any pool account, reaches it, whatever its own permissions. Measured on
+/// Ubuntu 26.04: `rm-runner-1` reads such a file on the host and gets
+/// `Permission denied` inside the unit. The
 /// list is read when the service is registered, so a change takes effect when
 /// it is registered again. Windows and macOS have no equivalent the installer
 /// can set, so there it is refused rather than written and silently ignored.

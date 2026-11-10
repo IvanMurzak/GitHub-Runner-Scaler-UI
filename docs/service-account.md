@@ -343,9 +343,11 @@ own account as before.
 ### Protected paths
 
 `host protect-path add <PATH>` names a host directory no runner or job may
-reach at all. The unit lists it in `InaccessiblePaths=`, so the kernel hides it
-from the daemon and from everything it starts, whatever account and whatever
-file permissions: a job sees it as inaccessible. The list lives in
+reach at all. The unit lists it in `InaccessiblePaths=`, so inside the unit the
+kernel replaces it with an empty node of mode `000`: every runner and every
+job, whatever pool account and whatever the path's own permissions, gets
+`Permission denied`. The daemon itself keeps `CAP_DAC_OVERRIDE` and so is not
+held out by mode `000`; it never reads these paths. The list lives in
 `config/protected-paths.json` and is applied when the service is registered,
 so a change takes effect after `service install --start-at boot`; `host
 protect-path list` says whether the registered service enforces the current
