@@ -19,6 +19,11 @@ the version being prepared rather than the version in `Cargo.toml`.
   service's own `0700` directories still cover what it guarded against.
   `service status` reports existing units as outdated; re-register them with
   `sudo runner-manager service install --start-at boot`.
+- A Linux runner whose service cannot write its own `HOME` (a boot service's
+  `/root`, which the unit makes read-only and hides) gets its own `HOME` inside
+  its attempt directory, as a Windows runner already does. Actions that install
+  into `~`, such as `oven-sh/setup-bun` (`mkdir '/root/.bun/bin'`), no longer
+  fail. A login service keeps the operator's `HOME`.
 
 ## 0.4.54
 

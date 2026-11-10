@@ -128,9 +128,9 @@ fn runner_listener_spec(
         &runner_env::Inherited::current(),
         Path::exists,
     );
-    // The Windows profile the defaults point at. Created even when
-    // `runner.env` overrides part of it: it is inside the attempt, so it costs
-    // nothing and goes with the attempt.
+    // The Windows profile, or the Linux home, the defaults point at. Created
+    // even when `runner.env` overrides part of it: it is inside the attempt, so
+    // it costs nothing and goes with the attempt.
     for (name, dir) in &defaults {
         if runner_env::DIRECTORY_VARIABLES.contains(name) {
             let _ = std::fs::create_dir_all(dir);

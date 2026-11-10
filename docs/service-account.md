@@ -294,8 +294,13 @@ restrictions:
   atomic refresh-token rotation; it cannot write elsewhere on the filesystem;
 - `NoNewPrivileges=yes` means it cannot `sudo`, and no setuid binary gains
   privilege inside it;
-- an action that installs tooling into `/usr`, `/opt`, or the account's home
-  directory fails.
+- an action that installs tooling into `/usr` or `/opt` fails.
+
+A boot service runs as `root`, whose `/root` is read-only and hidden in the
+unit, so each runner gets its own `HOME` at `<attempt>/home` instead. Actions
+that install into `~` (`setup-bun`'s `~/.bun`, `docker login`'s
+`~/.docker`) work there, and what they leave goes with the attempt. A login
+service keeps the operator's own `HOME`.
 
 `07-security.md` assumes a hostile workflow may run on this host, so that is the
 intended direction rather than an accident. It is still a real behavioural
