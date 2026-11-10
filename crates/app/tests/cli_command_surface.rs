@@ -70,6 +70,9 @@ const SURFACE: [(&str, &[&str]); 11] = [
             // Owner decision 2026-10-30: track native Linux Docker resources
             // per attempt and preserve shared caches; report before applying.
             "docker-cleanup",
+            // Owner decision 2026-11-10: check what native Linux jobs ask of
+            // Docker through their proxy; record before refusing.
+            "docker-policy",
             // Owner decision 2026-10-10: an account whose earlier install was
             // replaced by another installation's service archives its unused
             // configuration instead of following remedies meant for the service.
@@ -119,10 +122,14 @@ const SURFACE: [(&str, &[&str]); 11] = [
 
 /// Profile and provider leaves added by the runner-sandbox architecture, and
 /// the host runner environment (`runner.env`), and the dependency caches.
-const NESTED_SURFACE: [(&str, &[&str]); 7] = [
+const NESTED_SURFACE: [(&str, &[&str]); 8] = [
     (
         "host docker-cleanup",
         &["show", "set-mode", "report", "sweep"],
+    ),
+    (
+        "host docker-policy",
+        &["show", "set-mode", "allow-path", "disallow-path", "report"],
     ),
     ("host isolation", &["status"]),
     ("host env", &["show", "set", "unset"]),
