@@ -103,7 +103,7 @@ fn unresponsive_engine_startup_is_bounded_and_reaps_its_companion() {
         .unwrap();
     env.set("DOCKER_CONTEXT", "").unwrap();
     let started = Instant::now();
-    let result = cleanup.launch_environment(AttemptId::from_u128(2), "owner/repo", &env);
+    let result = cleanup.launch_environment(AttemptId::from_u128(2), "owner/repo", &env, None);
     assert!(result.unwrap_err().to_string().contains("timed out"));
     assert!(started.elapsed() < Duration::from_secs(15));
     // The companion is killed and waited by launch_environment, before its
@@ -262,7 +262,12 @@ mod live {
         let mut cleanup = DockerCleanup::new(host.id, &root.join("config"), &root.join("state"));
         cleanup.companion = Some(env!("CARGO_BIN_EXE_runner-manager").into());
         let endpoint = cleanup
-            .launch_environment(attempt_id, "fixture/repository", &RunnerEnv::default())
+            .launch_environment(
+                attempt_id,
+                "fixture/repository",
+                &RunnerEnv::default(),
+                None,
+            )
             .unwrap()
             .expect("local Docker proxy");
         fixture.endpoint = endpoint.to_string_lossy().into_owned();
@@ -453,7 +458,12 @@ mod live {
             .build();
         store.record_attempt(&parallel_attempt).unwrap();
         let parallel_endpoint = cleanup
-            .launch_environment(parallel_id, "fixture/repository", &RunnerEnv::default())
+            .launch_environment(
+                parallel_id,
+                "fixture/repository",
+                &RunnerEnv::default(),
+                None,
+            )
             .unwrap()
             .unwrap();
         let parallel_directory = cleanup.root.join(parallel_id.to_string());
@@ -673,7 +683,7 @@ mod live {
             .build();
         store.record_attempt(&second).unwrap();
         cleanup
-            .launch_environment(second_id, "fixture/repository", &RunnerEnv::default())
+            .launch_environment(second_id, "fixture/repository", &RunnerEnv::default(), None)
             .unwrap()
             .unwrap();
         let second_directory = cleanup.root.join(second_id.to_string());

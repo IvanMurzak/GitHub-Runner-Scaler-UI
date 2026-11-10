@@ -469,6 +469,9 @@ async fn run_generation(
                                         target_paths.config_dir(),
                                         target_paths.state_dir(),
                                     ),
+                                )
+                                .with_runner_account(
+                                    runner_manager_platform::runner_account::RunnerAccount::for_this_daemon(),
                                 ),
                         ),
                         clock: Arc::clone(&clock),

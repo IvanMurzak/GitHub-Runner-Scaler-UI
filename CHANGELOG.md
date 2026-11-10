@@ -7,6 +7,22 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.56
+
+### Changed
+
+- Linux boot services run every job as a new system account, `rm-runner`,
+  instead of as `root`. `service install --start-at boot` creates it, and the
+  daemon keeps only the capabilities it needs to start runners as that account
+  and to hand them their directories: `CAP_SETUID`, `CAP_SETGID`, `CAP_KILL`,
+  `CAP_CHOWN`, `CAP_FOWNER` and `CAP_DAC_OVERRIDE`. A job runs with no
+  capabilities at all. npm, `node-gyp` and `tar`, which failed as a
+  capability-less `root` with `EPERM` changing the owner of extracted files,
+  now work. Re-register existing services with
+  `sudo runner-manager service install --start-at boot`.
+- The Git checkout cache is not offered to `rm-runner` jobs: preparing it ran
+  `git` as the daemon over a checkout the job wrote.
+
 ## 0.4.55
 
 ### Fixed

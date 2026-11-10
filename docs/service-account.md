@@ -239,11 +239,16 @@ paths named in `ReadWritePaths`, plus the private `/tmp` that `PrivateTmp=yes`
 supplies. `review_least_privilege` fails a unit that names any other path there,
 that drops any of the directives above, or that weakens one of them.
 
-Every unit drops every capability, boot units included. A boot unit runs as
-`root`, and without `CAP_DAC_OVERRIDE` `root` is held to ordinary file
-permissions like any other account: it can open its own directories and not
-another account's private ones. That is why, on Linux, `root` keeps its data in
-a system tree rather than in anyone's home directory:
+A login unit drops every capability. A boot unit's daemon keeps exactly these,
+all to run its jobs as a separate account (next section):
+
+```ini
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID
+```
+
+The daemon itself never needs `CAP_DAC_OVERRIDE` to reach its own data, which
+is why, on Linux, `root` keeps that data in a system tree rather than in
+anyone's home directory:
 
 ```text
 /var/lib/runner-manager/config
@@ -271,8 +276,48 @@ which replaces `/home`, `/root` and `/run/user` with empty directories inside
 the unit, so a workflow cannot read whatever DAC leaves world-readable in
 anyone's home directory. `tmpfs` rather than `yes`: tools such as `git` treat an
 unreadable `$HOME/.gitconfig` as fatal and an absent one as nothing.
-`review_least_privilege` fails a boot unit without it, and a unit that keeps any
-capability.
+`review_least_privilege` fails a boot unit without it, and compares the
+capability bounding set as a set: a capability missing from the list above is a
+shortfall, any other is an excess.
+
+### Jobs run as `rm-runner`, with no capabilities
+
+A boot service's daemon runs as `root`, because only `root` can read the
+machine-scoped credential. Its jobs do not. `service install --start-at boot`
+creates a system account, `rm-runner`, with no password, no login shell and no
+home directory, and the daemon starts every runner as it:
+
+- the runner's attempt directory is handed to `rm-runner` (`0700`), and so are
+  the dependency-cache directories it is given. The runner root,
+  `/var/lib/runner-manager/runtime`, is `root:rm-runner 0750`: no other local
+  account can enter it, and no job can rename another job's attempt.
+  **Every runner on the host shares `rm-runner`**, so a job can still read and
+  change another job's attempt that runs at the same time, including that
+  runner's credentials. That was as true when every job ran as `root`; a
+  separate account per concurrent runner would close it, and is not done yet;
+- moving from `root` to `rm-runner` clears every capability the daemon holds,
+  and `NoNewPrivileges=yes` stops a set-user-ID or file-capability binary from
+  granting one back. A job runs with none, and as an ordinary account it can
+  change the owner of the files it extracts only to itself, which is what
+  `tar`, npm and `node-gyp` running as `root` expected and could not do;
+- the daemon signals a runner through a recorded process identity only while
+  that process is still `rm-runner`'s, and never writes its records through a
+  link, since a job owns the directory they are in;
+- Docker is reached through the per-attempt proxy, whose socket is handed to
+  `rm-runner`. **Access to a Docker engine is access to `root`**: a job that can
+  start a container can mount the host into it. On a host whose jobs use
+  Docker, `rm-runner` protects the host's files from an ordinary job, not from
+  one that sets out to escape through Docker;
+- the Git checkout cache is not offered to these runners. Preparing and
+  capturing it runs `git` in the daemon over a checkout the job wrote, and
+  repository configuration such as `core.fsmonitor` names a command.
+
+If `rm-runner` is removed, the service starts no runner, rather than run jobs as
+`root` with its capabilities, and says to re-run `service install`. A boot
+unit registered by an earlier release keeps no capability at all, so until it is
+re-registered its jobs keep running as a capability-less `root`, as before. A login
+service, and `sudo runner-manager daemon run` in a terminal, keep their runners
+in their own account as before.
 
 `service install --start-at boot` refuses directories a boot unit could not use
 — one another account owns, or one under a home tree — and says to drop
@@ -296,8 +341,8 @@ restrictions:
   privilege inside it;
 - an action that installs tooling into `/usr` or `/opt` fails.
 
-A boot service runs as `root`, whose `/root` is read-only and hidden in the
-unit, so each runner gets its own `HOME` at `<attempt>/home` instead. Actions
+A boot service's runners run as `rm-runner`, which has no home directory, so
+each runner gets its own `HOME` at `<attempt>/home` instead. Actions
 that install into `~` (`setup-bun`'s `~/.bun`, `docker login`'s
 `~/.docker`) work there, and what they leave goes with the attempt. A login
 service keeps the operator's own `HOME`.
