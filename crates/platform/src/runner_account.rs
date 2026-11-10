@@ -59,15 +59,23 @@ impl RunnerAccount {
             if !crate::host_fitness::is_elevated() {
                 return Ok(None);
             }
-            if let Some(account) = Self::lookup(RUNNER_ACCOUNT) {
+            // A unit registered before this account existed has an empty
+            // bounding set: it can switch to no account, and a runner it starts
+            // as itself holds no capability, so it keeps doing that.
+            if sys::bounding_set_is_narrowed() && !sys::bounding_set_holds_any() {
+                return Ok(None);
+            }
+            if sys::can_switch_account()
+                && let Some(account) = Self::lookup(RUNNER_ACCOUNT)
+            {
                 return Ok(Some(account));
             }
             if sys::bounding_set_is_narrowed() {
                 return Err(format!(
                     "the {RUNNER_ACCOUNT} account that this service runs jobs as does not exist, \
-                     so no runner starts rather than run as root with the service's \
-                     capabilities. Run `sudo runner-manager service install --start-at boot` \
-                     to create it"
+                     or the service lacks the capabilities to start jobs as it, so no runner \
+                     starts rather than run as root with the service's capabilities. Run \
+                     `sudo runner-manager service install --start-at boot` to set both up"
                 ));
             }
         }
@@ -195,8 +203,33 @@ mod sys {
     #[cfg(target_os = "linux")]
     pub(super) fn bounding_set_is_narrowed() -> bool {
         const CAP_SYS_ADMIN: libc::c_ulong = 21;
+        !in_bounding_set(CAP_SYS_ADMIN)
+    }
+
+    /// Whether this process's bounding set holds any capability at all.
+    #[cfg(target_os = "linux")]
+    pub(super) fn bounding_set_holds_any() -> bool {
+        // CAP_LAST_CAP has grown over kernel releases; an unknown number reads
+        // as an error, which `in_bounding_set` reports as absent.
+        (0..64).any(in_bounding_set)
+    }
+
+    /// Whether this process may start a child as another account and hand it
+    /// its directories: `CAP_CHOWN`, `CAP_SETGID` and `CAP_SETUID`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn can_switch_account() -> bool {
+        const CAP_CHOWN: libc::c_ulong = 0;
+        const CAP_SETGID: libc::c_ulong = 6;
+        const CAP_SETUID: libc::c_ulong = 7;
+        [CAP_CHOWN, CAP_SETGID, CAP_SETUID]
+            .into_iter()
+            .all(in_bounding_set)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn in_bounding_set(capability: libc::c_ulong) -> bool {
         // SAFETY: PR_CAPBSET_READ only reads this process's bounding set.
-        unsafe { libc::prctl(libc::PR_CAPBSET_READ, CAP_SYS_ADMIN, 0, 0, 0) == 0 }
+        unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) == 1 }
     }
 
     pub(super) fn lookup(name: &str) -> Option<RunnerAccount> {

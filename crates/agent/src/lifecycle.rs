@@ -193,9 +193,10 @@ fn hand_over_attempt(account: RunnerAccount, runtime: &Path) -> std::io::Result<
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        // The attempt is the runner's alone. Its parent, the runner root, the
-        // runner's group may read and pass through, and nobody else may enter:
-        // root owns it, so no job can rename or replace another job's attempt.
+        // The attempt belongs to the runners' account, which every runner on
+        // this host shares; no other account may enter it. Its parent, the
+        // runner root, that account's group may read and pass through: root
+        // owns it, so no job can rename or replace another job's attempt.
         // Read as well as search, because `Runner.Listener` refuses to start
         // unless it can list every directory above its own.
         fs::set_permissions(runtime, fs::Permissions::from_mode(0o700))?;
@@ -212,6 +213,27 @@ fn hand_over_attempt(account: RunnerAccount, runtime: &Path) -> std::io::Result<
         }
     }
     Ok(())
+}
+
+/// What an attempt's process-identity records name.
+#[derive(Debug)]
+enum RecordedProcess {
+    /// Nothing is recorded.
+    None,
+    /// A process the runner account runs, or one that has exited.
+    Runner(ProcessIdentity),
+    /// A live process the runner account does not run: not this daemon's
+    /// runner, so never signalled, and treated as gone.
+    Foreign,
+}
+
+impl RecordedProcess {
+    fn runner(self) -> Option<ProcessIdentity> {
+        match self {
+            Self::Runner(identity) => Some(identity),
+            Self::None | Self::Foreign => None,
+        }
+    }
 }
 
 /// Who a native runner runs as.
@@ -2888,10 +2910,14 @@ impl NativeProcesses {
         self
     }
 
-    /// Gives every runner launched persistent dependency caches.
+    /// Gives every runner launched persistent dependency caches, without the
+    /// Git checkout cache when runners run as another account.
     #[must_use]
     pub fn with_dependency_caches(mut self, caches: DependencyCaches) -> Self {
-        self.dependency_caches = Some(caches);
+        self.dependency_caches = Some(match self.runner {
+            RunnerIdentity::Account(_) => caches.without_git(),
+            RunnerIdentity::Daemon | RunnerIdentity::Missing(_) => caches,
+        });
         self
     }
 
@@ -2968,9 +2994,12 @@ impl NativeProcesses {
         let spec = runner_listener_spec(program, attempt.runtime_path(), caches, &host_env);
         let spec = match account {
             Some(account) => {
-                hand_over(account, attempt.runtime_path(), &spec, &cache_names).map_err(|_| {
-                    ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed)
-                })?;
+                hand_over(account, attempt.runtime_path(), &spec, &cache_names).map_err(
+                    |error| {
+                        tracing::warn!(attempt_id = %attempt.id, event = "runner_hand_over_failed", %error, "the attempt could not be handed to the runner account");
+                        ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed)
+                    },
+                )?;
                 spec.run_as(account)
             }
             None => spec,
@@ -3238,15 +3267,24 @@ impl NativeProcesses {
         attempt.runtime_path().join(TERMINATE_INTENT_FILE)
     }
 
-    fn read_identity(
-        &self,
-        attempt: &RunnerAttempt,
-    ) -> Result<Option<ProcessIdentity>, FailureReason> {
+    /// The recorded runner process, `None` when none was recorded.
+    ///
+    /// A recorded process that is alive but not the runner account's -- a
+    /// forged record, or a PID the kernel has since given to another account
+    /// -- is reported as [`RecordedProcess::Foreign`], which every caller
+    /// treats as a runner that is gone. It is not `None`: an attempt that has
+    /// a PID and no record refuses recovery, and an exited runner whose PID was
+    /// reused must not be held up that way.
+    fn read_identity(&self, attempt: &RunnerAttempt) -> Result<RecordedProcess, FailureReason> {
         let identity = match Self::read_identity_at(&Self::identity_path(attempt))? {
             Some(identity) => Some(identity),
             None => Self::read_identity_at(&Self::fallback_identity_path(attempt))?,
         };
-        Ok(identity.filter(|identity| self.runs_as_runner(identity)))
+        Ok(match identity {
+            None => RecordedProcess::None,
+            Some(identity) if self.runs_as_runner(&identity) => RecordedProcess::Runner(identity),
+            Some(_) => RecordedProcess::Foreign,
+        })
     }
 
     /// Whether the process `identity` names belongs to the runner account.
@@ -3320,8 +3358,10 @@ impl ProcessSupervisor for NativeProcesses {
         // over the whole package copy, and the launch repeats only the cheap
         // part of it for what it creates afterwards.
         if let Some(account) = self.runner.account()? {
-            hand_over_attempt(account, attempt.runtime_path())
-                .map_err(|_| FailureReason::ProcessStartFailed)?;
+            hand_over_attempt(account, attempt.runtime_path()).map_err(|error| {
+                tracing::warn!(attempt_id = %attempt.id, event = "runner_hand_over_failed", %error, "the attempt could not be handed to the runner account");
+                FailureReason::ProcessStartFailed
+            })?;
         }
         // Asked here, before the JIT registration, for the reason `host_env`
         // is: a broken file must cost no registration.
@@ -3381,14 +3421,20 @@ impl ProcessSupervisor for NativeProcesses {
                 }
             };
         }
-        let Some(identity) = self.read_identity(attempt)? else {
-            if attempt.process_id().is_some() || Self::unresolved_process_path(attempt).is_file() {
-                return Err(FailureReason::Other(
-                    "runner process identity is missing; refusing recovery until the process is resolved"
-                        .into(),
-                ));
+        let identity = match self.read_identity(attempt)? {
+            RecordedProcess::Runner(identity) => identity,
+            RecordedProcess::Foreign => return Ok(false),
+            RecordedProcess::None => {
+                if attempt.process_id().is_some()
+                    || Self::unresolved_process_path(attempt).is_file()
+                {
+                    return Err(FailureReason::Other(
+                        "runner process identity is missing; refusing recovery until the process is resolved"
+                            .into(),
+                    ));
+                }
+                return Ok(false);
             }
-            return Ok(false);
         };
         match identity.recheck() {
             Ok(Adoption::Live) => Ok(true),
@@ -3398,7 +3444,10 @@ impl ProcessSupervisor for NativeProcesses {
     }
 
     fn recovered_pid(&self, attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
-        Ok(self.read_identity(attempt)?.map(|identity| identity.pid()))
+        Ok(self
+            .read_identity(attempt)?
+            .runner()
+            .map(|identity| identity.pid()))
     }
 
     fn completed_successfully(&self, attempt: &RunnerAttempt) -> bool {
@@ -3430,7 +3479,7 @@ impl ProcessSupervisor for NativeProcesses {
                 .map_err(|_| FailureReason::Other("runner process could not be stopped".into()))?;
             return Ok(());
         }
-        let Some(identity) = self.read_identity(attempt)? else {
+        let Some(identity) = self.read_identity(attempt)?.runner() else {
             return Ok(());
         };
         match identity
@@ -9560,6 +9609,7 @@ mod tests {
             NativeProcesses::new()
                 .read_identity(&attempt)
                 .unwrap()
+                .runner()
                 .unwrap()
                 .pid(),
             live_pid

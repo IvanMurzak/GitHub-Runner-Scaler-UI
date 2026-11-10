@@ -290,7 +290,11 @@ home directory, and the daemon starts every runner as it:
 - the runner's attempt directory is handed to `rm-runner` (`0700`), and so are
   the dependency-cache directories it is given. The runner root,
   `/var/lib/runner-manager/runtime`, is `root:rm-runner 0750`: no other local
-  account can enter it, and no job can rename another job's attempt;
+  account can enter it, and no job can rename another job's attempt.
+  **Every runner on the host shares `rm-runner`**, so a job can still read and
+  change another job's attempt that runs at the same time, including that
+  runner's credentials. That was as true when every job ran as `root`; a
+  separate account per concurrent runner would close it, and is not done yet;
 - moving from `root` to `rm-runner` clears every capability the daemon holds,
   and `NoNewPrivileges=yes` stops a set-user-ID or file-capability binary from
   granting one back. A job runs with none, and as an ordinary account it can
@@ -309,7 +313,9 @@ home directory, and the daemon starts every runner as it:
   repository configuration such as `core.fsmonitor` names a command.
 
 If `rm-runner` is removed, the service starts no runner, rather than run jobs as
-`root` with its capabilities, and says to re-run `service install`. A login
+`root` with its capabilities, and says to re-run `service install`. A boot
+unit registered by an earlier release keeps no capability at all, so until it is
+re-registered its jobs keep running as a capability-less `root`, as before. A login
 service, and `sudo runner-manager daemon run` in a terminal, keep their runners
 in their own account as before.
 
