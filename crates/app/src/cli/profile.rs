@@ -206,7 +206,14 @@ pub fn dispatch(
                 .map_err(|error| CliError::new(Failure::InvalidArgument, error.to_string()))?;
             if policy.enabled()
                 && !policy.execution_policy().is_native()
-                && PlatformExecutionProvider::new(policy.host_id).probe(&policy)
+                && PlatformExecutionProvider::new(policy.host_id)
+                    .with_isolation_settings(
+                        runner_manager_agent::oci::IsolationSettings::load(
+                            context.paths().config_dir(),
+                        )
+                        .unwrap_or_default(),
+                    )
+                    .probe(&policy)
                     != ProviderCapability::Ready
             {
                 return Err(CliError::with_remedy(

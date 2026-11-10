@@ -256,6 +256,20 @@ enabled until its execution provider reports ready; provider failure never start
 native runner. Keep fork and untrusted pull-request workflows off a personal host unless
 you explicitly accept that trust boundary.
 
+A Linux boot service reaches the system's **rootful** Podman service instead, through
+`/run/podman/podman.sock`: the service's sandbox forbids the namespaces rootless Podman
+creates. Each isolated job then gets a container with a user namespace of its own
+(`--userns=auto:size=65536`), so its root is an unprivileged host id no other job shares,
+and its own network namespace (`slirp4netns`), so two jobs can each listen on the same
+port and neither reaches the other or the host's loopback. Set it up once with
+`sudo runner-manager host isolation prepare`, which gives the `containers` account its
+subordinate id ranges in `/etc/subuid` and `/etc/subgid` and enables `podman.socket`.
+Rootful Podman enforces `--storage-opt size=...` only on XFS with project quotas; on other
+storage `host isolation status` reports `disk_quota_unavailable` until the operator either
+moves Podman's storage or accepts running without a disk quota with
+`host isolation set-disk-quota --required false`, in which case a job can fill the
+engine's storage. Isolated jobs get no dependency caches, no Docker and no `runner.env`.
+
 Rootless Podman normally has to enforce `--storage-opt size=...` itself. On managed WSL,
 Podman 4.9 cannot initialize that project quota as a rootless user, even on an XFS loop
 mount. An operator may instead set `RUNNER_MANAGER_OCI_RUNTIME` in the managed service to
@@ -315,6 +329,8 @@ runner-manager host set-memory-margin SIZE|off|on             # Free memory a ru
 runner-manager host set-runtime-root --path PATH               # Put disposable runner workspaces under PATH
 runner-manager host reset-runtime-root                         # Return runner placement to the platform default
 runner-manager host isolation status [--json]                  # Report execution provider readiness
+runner-manager host isolation prepare                           # Set up rootful Podman for a Linux boot service (sudo)
+runner-manager host isolation set-disk-quota --required true|false
 runner-manager host env show                                   # Show what native runners add to their environment
 runner-manager host env set NAME=VALUE                         # Give every native runner a variable
 runner-manager host env unset NAME                             # Remove a runner variable

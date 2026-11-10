@@ -2693,6 +2693,13 @@ impl PlatformExecutionProvider {
         }
     }
 
+    /// Applies the operator's isolation settings to the OCI provider.
+    #[must_use]
+    pub fn with_isolation_settings(mut self, settings: crate::oci::IsolationSettings) -> Self {
+        self.oci.apply(settings);
+        self
+    }
+
     /// Applies the host's `runner.env` at `path` to every native runner.
     /// Isolated runners do not get it: their environment is the image's.
     #[must_use]

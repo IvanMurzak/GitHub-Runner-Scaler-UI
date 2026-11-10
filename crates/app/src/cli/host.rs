@@ -608,7 +608,28 @@ pub fn dispatch(
         HostCommand::ResetRuntimeRoot => runtime_root(context, None, styling, out),
         HostCommand::Show => show(context, out),
         HostCommand::Isolation(super::HostIsolationCommand::Status(args)) => {
-            isolation_status(args.json, out)
+            isolation_status(args.json, isolation_settings(context)?, out)
+        }
+        HostCommand::Isolation(super::HostIsolationCommand::Prepare) => {
+            isolation_prepare(context, out)
+        }
+        HostCommand::Isolation(super::HostIsolationCommand::SetDiskQuota(args)) => {
+            let mut settings = isolation_settings(context)?;
+            settings.disk_quota_required = args.required;
+            settings
+                .save(context.paths().config_dir())
+                .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?;
+            writeln!(
+                out,
+                "{}",
+                if args.required {
+                    "Isolated jobs need a hard disk quota; on storage without one they do not start."
+                } else {
+                    "Isolated jobs may run without a disk quota where the storage cannot enforce one; \
+                     such a job can fill the engine's storage."
+                }
+            )
+            .map_err(write_failed("the isolation settings"))
         }
         HostCommand::Env(command) => runner_env_command(context, command, out),
         HostCommand::Doctor(args) => super::doctor::doctor(context, args, out),
@@ -835,12 +856,15 @@ pub(crate) const fn sanitize_isolation_observation(
     let _ = observation.raw_output;
     let remedy = match (observation.backend, observation.state) {
         (_, IsolationReadiness::Ready) => None,
-        (IsolationBackend::Oci, IsolationReadiness::NotInstalled) => {
-            Some("install and configure an OCI execution provider")
-        }
-        (IsolationBackend::Oci, IsolationReadiness::DiskQuotaUnavailable) => {
-            Some("configure the required bounded OCI storage quota")
-        }
+        (IsolationBackend::Oci, IsolationReadiness::NotInstalled) => Some(
+            "install Podman (`apt install podman slirp4netns uidmap`), then `sudo runner-manager host isolation prepare`",
+        ),
+        (IsolationBackend::Oci, IsolationReadiness::PermissionDenied) => Some(
+            "`sudo runner-manager host isolation prepare` for a boot service; rootless Podman with subordinate ids otherwise",
+        ),
+        (IsolationBackend::Oci, IsolationReadiness::DiskQuotaUnavailable) => Some(
+            "put Podman storage on XFS with project quotas, or accept no quota with `host isolation set-disk-quota --required false`",
+        ),
         (IsolationBackend::WindowsHyperVContainer, IsolationReadiness::Unsupported) => {
             Some("use a supported host and provider")
         }
@@ -908,8 +932,38 @@ const fn readiness_from_provider_capability(capability: ProviderCapability) -> I
     }
 }
 
+/// The OCI provider's readiness on this host, as the daemon would see it.
+fn oci_capability(settings: runner_manager_agent::oci::IsolationSettings) -> IsolationCapability {
+    #[cfg(test)]
+    let state = {
+        let _ = settings;
+        IsolationReadiness::NotInstalled
+    };
+    #[cfg(not(test))]
+    let state = {
+        let mut provider = runner_manager_agent::oci::OciProcesses::new(
+            runner_manager_domain::model::HostId::from_u128(0),
+        );
+        provider.apply(settings);
+        readiness_from_provider_capability(provider.host_capability())
+    };
+    sanitize_isolation_observation(IsolationObservation {
+        backend: IsolationBackend::Oci,
+        state,
+        raw_output: None,
+    })
+}
+
 #[must_use]
 pub fn isolation_capabilities() -> Vec<IsolationCapability> {
+    isolation_capabilities_with(runner_manager_agent::oci::IsolationSettings::default())
+}
+
+/// [`isolation_capabilities`] under the operator's `settings`.
+#[must_use]
+pub fn isolation_capabilities_with(
+    settings: runner_manager_agent::oci::IsolationSettings,
+) -> Vec<IsolationCapability> {
     let capability = |backend, state| {
         sanitize_isolation_observation(IsolationObservation {
             backend,
@@ -919,7 +973,7 @@ pub fn isolation_capabilities() -> Vec<IsolationCapability> {
     };
     vec![
         capability(IsolationBackend::Native, IsolationReadiness::Ready),
-        capability(IsolationBackend::Oci, IsolationReadiness::NotInstalled),
+        oci_capability(settings),
         windows_hyper_v_capability(),
         capability(
             IsolationBackend::VirtualMachine,
@@ -928,8 +982,106 @@ pub fn isolation_capabilities() -> Vec<IsolationCapability> {
     ]
 }
 
-pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
-    let providers = isolation_capabilities();
+fn isolation_settings(
+    context: &Context,
+) -> Result<runner_manager_agent::oci::IsolationSettings, CliError> {
+    runner_manager_agent::oci::IsolationSettings::load(context.paths().config_dir()).map_err(
+        |error| {
+            CliError::new(
+                Failure::LocalState,
+                format!("the isolation settings cannot be read: {error}"),
+            )
+        },
+    )
+}
+
+/// The subordinate id ranges `host isolation prepare` gives the `containers`
+/// account: 2^31 ids from 2^31 - 1, the range Podman's documentation uses.
+const CONTAINERS_RANGE: &str = "containers:2147483647:2147483648";
+
+/// `host isolation prepare`: what a Linux boot service needs to run isolated
+/// jobs through rootful Podman. Each step is idempotent.
+fn isolation_prepare(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+    let failed = write_failed("the isolation setup");
+    if !cfg!(target_os = "linux") {
+        return Err(CliError::new(
+            Failure::UnsupportedHost,
+            "rootful Podman isolation is set up on Linux only",
+        ));
+    }
+    if !runner_manager_platform::host_fitness::is_elevated() {
+        return Err(CliError::with_remedy(
+            Failure::HostUnfit,
+            "setting up the system Podman service needs root",
+            runner_manager_platform::service::sudo_command("host isolation prepare"),
+        ));
+    }
+    let run = |program: &str, args: &[&str]| -> Result<String, CliError> {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|error| {
+                CliError::with_remedy(
+                    Failure::UnsupportedHost,
+                    format!("cannot run {program}: {error}"),
+                    "apt install podman slirp4netns uidmap",
+                )
+            })?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        } else {
+            Err(CliError::new(
+                Failure::LocalState,
+                format!(
+                    "{program} {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ))
+        }
+    };
+    let version = run("podman", &["--version"])?;
+    writeln!(out, "Podman: {version}").map_err(failed)?;
+    for file in ["/etc/subuid", "/etc/subgid"] {
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        if text.lines().any(|line| line.starts_with("containers:")) {
+            writeln!(out, "{file}: the containers account already has a range").map_err(failed)?;
+        } else {
+            use std::io::Write as _;
+            let mut handle = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(file)
+                .map_err(|error| CliError::new(Failure::LocalState, format!("{file}: {error}")))?;
+            let separator = if text.is_empty() || text.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            writeln!(handle, "{separator}{CONTAINERS_RANGE}")
+                .map_err(|error| CliError::new(Failure::LocalState, format!("{file}: {error}")))?;
+            writeln!(out, "{file}: added {CONTAINERS_RANGE}").map_err(failed)?;
+        }
+    }
+    run("systemctl", &["enable", "--now", "podman.socket"])?;
+    writeln!(out, "podman.socket: enabled and listening").map_err(failed)?;
+    let provider = {
+        let mut provider = runner_manager_agent::oci::OciProcesses::new(
+            runner_manager_domain::model::HostId::from_u128(0),
+        );
+        provider.apply(isolation_settings(context)?);
+        provider
+    };
+    writeln!(out, "Isolated execution: {:?}", provider.host_capability()).map_err(failed)?;
+    Ok(())
+}
+
+pub fn isolation_status(
+    json: bool,
+    settings: runner_manager_agent::oci::IsolationSettings,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let providers = isolation_capabilities_with(settings);
     let document = serde_json::json!({
         "schema_version": 1,
         "providers": providers,
@@ -1389,7 +1541,12 @@ mod tests {
     #[test]
     fn isolation_status_keeps_windows_client_and_server_requirements_distinct() {
         let mut text = Vec::new();
-        isolation_status(false, &mut text).expect("text status");
+        isolation_status(
+            false,
+            runner_manager_agent::oci::IsolationSettings::default(),
+            &mut text,
+        )
+        .expect("text status");
         let text = String::from_utf8(text).expect("UTF-8 status");
         assert!(
             text.contains(
@@ -1406,7 +1563,12 @@ mod tests {
         assert!(!text.contains("Education"), "{text}");
 
         let mut json = Vec::new();
-        isolation_status(true, &mut json).expect("JSON status");
+        isolation_status(
+            true,
+            runner_manager_agent::oci::IsolationSettings::default(),
+            &mut json,
+        )
+        .expect("JSON status");
         let document: serde_json::Value =
             serde_json::from_slice(&json).expect("parseable JSON status");
         let windows = document["providers"]
@@ -1439,7 +1601,9 @@ mod tests {
         assert_eq!(capability.state.display_name(), "disk quota unavailable");
         assert_eq!(
             capability.remedy,
-            Some("configure the required bounded OCI storage quota")
+            Some(
+                "put Podman storage on XFS with project quotas, or accept no quota with `host isolation set-disk-quota --required false`"
+            )
         );
     }
 

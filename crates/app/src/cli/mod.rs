@@ -1231,6 +1231,17 @@ pub struct HostEnvUnsetArgs {
 pub enum HostIsolationCommand {
     /// Report provider readiness and installation remedies.
     Status(StatusArgs),
+    /// Set up rootful Podman for a Linux boot service (run with sudo).
+    Prepare,
+    /// Whether isolated jobs need a hard disk quota (XFS project quotas).
+    SetDiskQuota(DiskQuotaArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DiskQuotaArgs {
+    /// `false` lets isolated jobs run on storage that cannot enforce a quota.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub required: bool,
 }
 
 /// `host set-poll-interval --idle 10s --active 60s --coordinated 300s`.

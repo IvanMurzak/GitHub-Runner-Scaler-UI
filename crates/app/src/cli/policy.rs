@@ -1433,7 +1433,14 @@ pub fn apply_policy_mutation_selected(
     if let Some(enabled) = mutation.enabled {
         if enabled {
             if !policy.execution_policy().is_native() {
-                let capability = PlatformExecutionProvider::new(policy.host_id).probe(&policy);
+                let capability = PlatformExecutionProvider::new(policy.host_id)
+                    .with_isolation_settings(
+                        runner_manager_agent::oci::IsolationSettings::load(
+                            context.paths().config_dir(),
+                        )
+                        .unwrap_or_default(),
+                    )
+                    .probe(&policy);
                 if capability != ProviderCapability::Ready {
                     return Err(CliError::with_remedy(
                         Failure::Conflict,

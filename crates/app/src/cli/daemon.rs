@@ -459,6 +459,12 @@ async fn run_generation(
                         packages: Arc::new(CachedRuntimePackages::new(cache, shared_packages)),
                         processes: Arc::new(
                             PlatformExecutionProvider::new(host.id)
+                                .with_isolation_settings(
+                                    runner_manager_agent::oci::IsolationSettings::load(
+                                        target_paths.config_dir(),
+                                    )
+                                    .unwrap_or_default(),
+                                )
                                 .with_runner_env_file(runner_manager_platform::runner_env::path_in(
                                     target_paths.config_dir(),
                                 ))

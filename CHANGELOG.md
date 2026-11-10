@@ -35,6 +35,15 @@ the version being prepared rather than the version in `Cargo.toml`.
   reach on Linux. The systemd unit lists them in `InaccessiblePaths=`, applied
   at the next `service install --start-at boot`, and the Docker policy treats
   a container mount of one as a `protected_path` violation.
+- Isolated execution works under a Linux boot service: the daemon reaches the
+  system's rootful Podman service through its socket, and every isolated job
+  runs in a container with its own user namespace (`--userns=auto`) and its
+  own network namespace, so two jobs can listen on the same port without
+  colliding or reaching each other. `host isolation prepare` sets up the
+  subordinate id ranges and `podman.socket`; `host isolation set-disk-quota
+  --required false` accepts storage that cannot enforce a quota.
+  `host isolation status` now probes the OCI provider instead of always
+  reporting it not installed.
 
 ## 0.4.56
 

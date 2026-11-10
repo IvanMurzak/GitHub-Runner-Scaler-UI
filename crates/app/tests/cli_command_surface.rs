@@ -135,7 +135,7 @@ const NESTED_SURFACE: [(&str, &[&str]); 9] = [
         "host docker-policy",
         &["show", "set-mode", "allow-path", "disallow-path", "report"],
     ),
-    ("host isolation", &["status"]),
+    ("host isolation", &["status", "prepare", "set-disk-quota"]),
     ("host env", &["show", "set", "unset"]),
     (
         "host cache",
