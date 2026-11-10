@@ -1723,7 +1723,7 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
     out.push_str(&format!("RestartSec={}\n", restart.delay().as_secs()));
 
     out.push_str("\n# Least privilege. See docs/service-account.md.\n");
-    for directive in SYSTEMD_HARDENING {
+    for directive in systemd_hardening(plan.start_mode()) {
         out.push_str(directive);
         out.push('\n');
     }
@@ -1748,7 +1748,8 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
     out
 }
 
-/// The hardening directives every unit carries, in the order they are rendered.
+/// The login unit's hardening directives, in the order they are rendered.
+/// Boot units retain the filesystem capability added by `systemd_hardening`.
 ///
 /// A constant rather than a sequence of `push_str` calls so that
 /// [`review_least_privilege`] can be written against the same list the renderer
@@ -1769,6 +1770,17 @@ pub const SYSTEMD_HARDENING: [&str; 13] = [
     "RestrictSUIDSGID=yes",
     "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
 ];
+
+/// Boot services must access private application directories owned by the
+/// operator as well as the root-owned machine credential. ReadWritePaths still
+/// limits writes; no other capability is retained, including SETUID/SETGID.
+fn systemd_hardening(mode: StartMode) -> [&'static str; 13] {
+    let mut directives = SYSTEMD_HARDENING;
+    if mode == StartMode::Boot {
+        directives[1] = "CapabilityBoundingSet=CAP_DAC_OVERRIDE";
+    }
+    directives
+}
 
 // -- launchd -----------------------------------------------------------------
 
@@ -2495,12 +2507,23 @@ fn review_systemd(
     findings: &mut Vec<PrivilegeFinding>,
 ) {
     let directives = ini_directives(text, "Service");
-    for expected in SYSTEMD_HARDENING {
+    for expected in systemd_hardening(plan.start_mode()) {
         let (key, value) = expected
             .split_once('=')
             .expect("every hardening directive is written as key=value");
         match directives.get(key) {
             Some(actual) if actual == value => controls.push((*expected).to_string()),
+            Some(actual)
+                if key == "CapabilityBoundingSet"
+                    && plan.start_mode() == StartMode::Boot
+                    && actual.is_empty() =>
+            {
+                findings.push(PrivilegeFinding {
+                    kind: FindingKind::Shortfall,
+                    subject: key.to_string(),
+                    detail: "drops CAP_DAC_OVERRIDE, so root cannot access operator-owned private application directories".to_string(),
+                });
+            }
             Some(actual) => findings.push(PrivilegeFinding {
                 kind: FindingKind::Excess,
                 subject: key.to_string(),
@@ -6348,7 +6371,13 @@ impl fmt::Display for ServiceStatus {
         }
         if let Some(record) = &self.record {
             writeln!(f, "  start mode                {}", record.start_mode)?;
-            writeln!(f, "  account                   {}", record.account)?;
+            let account = self
+                .registration
+                .as_ref()
+                .and_then(|registration| registration.account.as_deref())
+                .map(str::to_owned)
+                .unwrap_or_else(|| record.account.to_string());
+            writeln!(f, "  account                   {account}")?;
             writeln!(f, "  restart on failure        {}", record.restart())?;
             writeln!(
                 f,
@@ -8093,19 +8122,27 @@ mod sys {
                 return Ok(None);
             };
             let unit = identity.systemd_unit();
-            let directives = ini_directives(&document, "Service");
+            // `cat` includes administrator drop-ins in systemd's order. Reading
+            // only our base file hides User/ExecStart/RestartSec overrides.
+            let (queried, effective) = self.systemctl(&["cat", &unit]);
+            let directives =
+                ini_directives(if queried { &effective } else { &document }, "Service");
             let (_, active) = self.systemctl(&["is-active", &unit]);
             let (_, enabled) = self.systemctl(&["is-enabled", &unit]);
             Ok(Some(Registration {
                 manager: DefinitionKind::SystemdUnit,
                 start_mode: self.mode,
                 command_line: directives.get("ExecStart").cloned().unwrap_or_default(),
-                account: directives.get("User").cloned().or_else(|| {
-                    Some(match self.mode {
-                        StartMode::Boot => "root".to_string(),
-                        StartMode::Login => "the invoking user".to_string(),
-                    })
-                }),
+                account: directives
+                    .get("User")
+                    .filter(|user| !user.is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        Some(match self.mode {
+                            StartMode::Boot => "root".to_string(),
+                            StartMode::Login => "the invoking user".to_string(),
+                        })
+                    }),
                 running: active.trim() == "active",
                 starts_automatically: enabled.trim() == "enabled",
                 restart_delay: directives
@@ -9291,12 +9328,84 @@ mod tests {
     }
 
     #[test]
-    fn a_unit_that_keeps_capabilities_is_not_least_privilege() {
+    fn boot_units_retain_only_the_capability_needed_for_private_directories() {
+        let boot = systemd_unit(&linux_plan(StartMode::Boot));
+        let directives = ini_directives(&boot, "Service");
+        assert_eq!(directives["CapabilityBoundingSet"], "CAP_DAC_OVERRIDE");
+        assert_eq!(directives["AmbientCapabilities"], "");
+        assert_eq!(directives["ProtectSystem"], "strict");
+        assert_eq!(directives["NoNewPrivileges"], "yes");
+
+        let login = systemd_unit(&linux_plan(StartMode::Login));
+        assert_eq!(
+            ini_directives(&login, "Service")["CapabilityBoundingSet"],
+            ""
+        );
+
+        let broken = boot.replace(
+            "CapabilityBoundingSet=CAP_DAC_OVERRIDE",
+            "CapabilityBoundingSet=",
+        );
+        let review = review_least_privilege(
+            &ServiceDefinition::from_text(DefinitionKind::SystemdUnit, broken),
+            &linux_plan(StartMode::Boot),
+        );
+        assert!(
+            review
+                .findings()
+                .iter()
+                .any(|finding| finding.subject == "CapabilityBoundingSet"
+                    && finding.kind == FindingKind::Shortfall),
+            "a boot unit that cannot access its data must report a shortfall"
+        );
+    }
+
+    #[test]
+    fn status_reports_the_registered_account_instead_of_the_install_record() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations.install(&host.request(StartMode::Boot)).unwrap();
+        host.controls.edit("runner-manager", |registration| {
+            registration.account = Some("ivan".to_string());
+        });
+        let status = operations.status().unwrap();
+        assert!(
+            status
+                .to_string()
+                .contains("account                   ivan"),
+            "{status}"
+        );
+        assert!(
+            !status
+                .to_string()
+                .contains("account                   root"),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn systemd_drop_ins_replace_base_service_directives() {
+        let base = systemd_unit(&linux_plan(StartMode::Boot));
+        let combined = format!(
+            "# /etc/systemd/system/runner-manager.service\n{base}\n\
+             # /etc/systemd/system/runner-manager.service.d/account.conf\n\
+             [Service]\nUser=ivan\nRestartSec=30\nExecStart=\n\
+             ExecStart=/opt/runner-manager daemon run\n"
+        );
+        let directives = ini_directives(&combined, "Service");
+        assert_eq!(directives["User"], "ivan");
+        assert_eq!(directives["RestartSec"], "30");
+        assert_eq!(directives["ExecStart"], "/opt/runner-manager daemon run");
+        assert_eq!(directives["ProtectSystem"], "strict");
+    }
+
+    #[test]
+    fn a_unit_that_keeps_extra_capabilities_is_not_least_privilege() {
         let plan = linux_plan(StartMode::Boot);
         let rendered = systemd_unit(&plan);
         let widened = edited(
             &rendered,
-            "CapabilityBoundingSet=\n",
+            "CapabilityBoundingSet=CAP_DAC_OVERRIDE\n",
             "CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN\n",
         );
         let review = review_least_privilege(

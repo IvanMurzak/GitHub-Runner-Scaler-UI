@@ -7,6 +7,20 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## Unreleased
+
+### Fixed
+
+- GitHub sign-in checks credential-store write permissions before requesting a
+  device code. Boot-mode permission errors suggest the absolute native binary
+  with `sudo`, so npm installations managed by nvm do not require Node on
+  root's PATH.
+- Linux boot services retain `CAP_DAC_OVERRIDE` to access the operator's private
+  application directories, while keeping filesystem confinement and dropping
+  all other capabilities. Login services continue to drop every capability.
+- Service status includes systemd drop-ins and reports the registered account
+  instead of the account saved at installation time.
+
 ## 0.4.53
 
 ### Added

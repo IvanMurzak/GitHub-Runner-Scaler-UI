@@ -682,6 +682,37 @@ pub fn login(
         return Ok(());
     }
 
+    // Refuse before asking GitHub for a code: approval is wasted if this
+    // account cannot persist the token. Keep this after the resume path so a
+    // valid credential in a read-only store can still be inspected.
+    secrets.ensure_writable().map_err(|source| {
+        #[cfg(unix)]
+        if start_mode == StartMode::Boot
+            && let SecretStoreError::Store { source: error, .. } = &source
+            && error.kind() == io::ErrorKind::PermissionDenied
+            && let Ok(binary) = std::env::current_exe()
+        {
+            // current_exe is the native binary, even behind the npm/nvm shim.
+            // sudo's restricted PATH need not contain either Node or the CLI.
+            let quote = |path: &std::path::Path| {
+                format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+            };
+            let data = context
+                .data_root
+                .as_ref()
+                .map_or_else(String::new, |root| format!(" --data-dir {}", quote(root)));
+            return CliError::with_remedy(
+                Failure::SecretStore,
+                source.to_string(),
+                format!(
+                    "sudo -- {}{data} auth login --start-at boot",
+                    quote(&binary)
+                ),
+            );
+        }
+        secret_store_failure(&source)
+    })?;
+
     // Counted only once the sign-in is actually going to happen. A host that
     // short-circuits above prints no `Action 1 of 3`, because actions 2 and 3
     // are not coming and a budget with two thirds of it missing reads as a

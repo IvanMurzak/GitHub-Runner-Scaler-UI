@@ -212,7 +212,7 @@ On Linux the confinement below is enforced, not merely intended:
 ProtectSystem=strict
 ReadWritePaths=<config> <state> <runtime> <logs> <credential-store-directory>
 NoNewPrivileges=yes
-CapabilityBoundingSet=
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
 AmbientCapabilities=
 PrivateTmp=yes
 PrivateDevices=yes
@@ -229,6 +229,13 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 paths named in `ReadWritePaths`, plus the private `/tmp` that `PrivateTmp=yes`
 supplies. `review_least_privilege` fails a unit that names any other path there,
 that drops any of the directives above, or that weakens one of them.
+
+Boot units retain only `CAP_DAC_OVERRIDE`: root needs it to traverse and write
+operator-owned `0700` application directories. An empty capability bounding set
+makes even root fail with `Permission denied` there. `ProtectSystem=strict` and
+`ReadWritePaths` still limit filesystem writes, and `NoNewPrivileges=yes` still
+prevents elevation. Login units run as the directory owner and retain no
+capabilities. Ambient capabilities remain empty in both modes.
 
 ### The consequence a Linux operator will actually notice
 
