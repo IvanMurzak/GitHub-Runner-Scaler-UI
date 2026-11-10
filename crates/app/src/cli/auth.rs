@@ -685,27 +685,10 @@ pub fn login(
     // Refuse before asking GitHub for a code: approval is wasted if this
     // account cannot persist the token. Keep this after the resume path so a
     // valid credential in a read-only store can still be inspected.
-    secrets.ensure_writable().map_err(|source| {
-        #[cfg(unix)]
-        if start_mode == StartMode::Boot
-            && let SecretStoreError::Store { source: error, .. } = &source
-            && error.kind() == io::ErrorKind::PermissionDenied
-            && let Ok(binary) = std::env::current_exe()
-        {
-            // current_exe is the native binary, even behind the npm/nvm shim.
-            // sudo's restricted PATH need not contain either Node or the CLI.
-            return CliError::with_remedy(
-                Failure::SecretStore,
-                source.to_string(),
-                super::update::force::auth_command_line(
-                    context.data_root.as_deref(),
-                    start_mode,
-                    &binary,
-                ),
-            );
-        }
-        secret_store_failure(&source)
-    })?;
+    let login_again = format!("auth login --start-at {start_mode}");
+    secrets
+        .ensure_writable()
+        .map_err(|source| store_failure_in(context, start_mode, &login_again, &source))?;
 
     // Counted only once the sign-in is actually going to happen. A host that
     // short-circuits above prints no `Action 1 of 3`, because actions 2 and 3
@@ -726,7 +709,7 @@ pub fn login(
         // the two expiry instants when the App issues them, and reads back as a
         // bare token when it does not. See `UserAccessToken::to_stored_document`.
         .store(&token.to_stored_document())
-        .map_err(|source| secret_store_failure(&source))?;
+        .map_err(|source| store_failure_in(context, start_mode, &login_again, &source))?;
     record_start_mode(context, &store, recorded, start_mode)?;
 
     // ---- what the credential reaches, and the third action if any --------
@@ -1902,7 +1885,7 @@ pub fn logout(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
 
     let removal = secrets
         .delete()
-        .map_err(|source| secret_store_failure(&source))?;
+        .map_err(|source| store_failure_in(context, start_mode, "auth logout", &source))?;
 
     match removal {
         Removal::Removed => writeln!(
@@ -2040,6 +2023,42 @@ fn github_failure(source: &GithubError) -> CliError {
 /// None of these carries the stored value — `d2` documents that as an invariant
 /// of its error type, *"no variant carries the stored value, and none ever
 /// may"* — so rendering `source` verbatim cannot leak one.
+/// [`secret_store_failure`], except that a boot-mode store this account may
+/// not write names `arguments` re-run as root.
+///
+/// The command names `current_exe`, the native binary even behind an npm/nvm
+/// shim, because `sudo`'s restricted `PATH` need not contain Node or the CLI.
+fn store_failure_in(
+    context: &Context,
+    mode: StartMode,
+    arguments: &str,
+    source: &SecretStoreError,
+) -> CliError {
+    let denied = matches!(
+        source,
+        SecretStoreError::Store { source: error, .. }
+            | SecretStoreError::Delete { source: error, .. }
+            if error.kind() == io::ErrorKind::PermissionDenied
+    );
+    if cfg!(unix)
+        && mode == StartMode::Boot
+        && denied
+        && let Ok(binary) = std::env::current_exe()
+    {
+        return CliError::with_remedy(
+            Failure::SecretStore,
+            source.to_string(),
+            super::update::force::command_line_for(
+                context.data_root.as_deref(),
+                mode,
+                &binary,
+                arguments,
+            ),
+        );
+    }
+    secret_store_failure(source)
+}
+
 fn secret_store_failure(source: &SecretStoreError) -> CliError {
     match source {
         SecretStoreError::Corrupt { .. } => CliError::with_remedy(

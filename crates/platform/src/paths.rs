@@ -430,22 +430,38 @@ impl fmt::Display for AppPaths {
 /// owner bits are present.
 #[cfg(unix)]
 fn restrict_directory(purpose: &'static str, path: &Path) -> Result<(), PathsError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    // chmod(2) needs ownership or CAP_FOWNER even when the mode is unchanged.
-    // A boot service runs as root with only CAP_DAC_OVERRIDE over the
-    // operator's directories, so an already-correct mode must not be re-set.
-    if std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o7777 == 0o700)
+    let metadata = std::fs::metadata(path).ok();
+    // chmod(2) needs ownership or CAP_FOWNER even when the mode is unchanged,
+    // so an already-correct mode is not re-set.
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.permissions().mode() & 0o7777 == 0o700)
     {
         return Ok(());
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
-        PathsError::Create {
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+        Ok(()) => Ok(()),
+        // A boot service runs as root with only CAP_DAC_OVERRIDE over the
+        // operator's directories: it may use them but not chmod them. The
+        // owner's own next command tightens the directory instead.
+        Err(source)
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+                && metadata.is_some_and(|metadata| {
+                    // SAFETY: `geteuid` reads this process's own credentials,
+                    // takes no argument and cannot fail.
+                    metadata.uid() != unsafe { libc::geteuid() }
+                }) =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(PathsError::Create {
             purpose,
             path: path.to_path_buf(),
             source,
-        }
-    })
+        }),
+    }
 }
 
 // Returns `Result` only so that the two arms share one signature; the Windows
@@ -458,6 +474,25 @@ fn restrict_directory(_purpose: &'static str, _path: &Path) -> Result<(), PathsE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory another account owns is used as it is rather than refused:
+    /// a boot service may reach the operator's tree but not chmod it.
+    #[cfg(unix)]
+    #[test]
+    fn another_accounts_directory_is_not_a_failure_to_tighten() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if crate::host_fitness::is_elevated() {
+            return; // Root may chmod anything, so there is no refusal to see.
+        }
+        let foreign = Path::new("/");
+        let before = std::fs::metadata(foreign).unwrap().permissions().mode();
+        restrict_directory("state", foreign).expect("another account's directory");
+        assert_eq!(
+            std::fs::metadata(foreign).unwrap().permissions().mode(),
+            before
+        );
+    }
 
     /// True when a path has no `.` or `..` component and is absolute — the
     /// shape a resolved application-data path must have before anything else

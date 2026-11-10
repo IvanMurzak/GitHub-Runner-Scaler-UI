@@ -87,7 +87,7 @@
 //! the agent actually resumes is human gate 3 in `06-migration-rollout.md`, and
 //! nothing in this file is evidence for it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -2506,6 +2506,55 @@ fn review_writable_paths(
     }
 }
 
+/// Compares a unit's capability bounding set with the one it should keep, as
+/// sets: a capability it lacks is a shortfall, one it adds is an excess.
+fn review_capabilities(
+    expected: &str,
+    wanted: &str,
+    actual: &str,
+    controls: &mut Vec<String>,
+    findings: &mut Vec<PrivilegeFinding>,
+) {
+    let subject = "CapabilityBoundingSet";
+    // `~` inverts the list, keeping every capability *except* those named.
+    if actual.trim_start().starts_with('~') {
+        findings.push(PrivilegeFinding {
+            kind: FindingKind::Excess,
+            subject: subject.to_string(),
+            detail: format!("is `{actual}`, which keeps every capability it does not name"),
+        });
+        return;
+    }
+    let wanted: BTreeSet<&str> = wanted.split_whitespace().collect();
+    let actual: BTreeSet<&str> = actual.split_whitespace().collect();
+    let extra = actual.difference(&wanted).copied().collect::<Vec<_>>();
+    let missing = wanted.difference(&actual).copied().collect::<Vec<_>>();
+    if !extra.is_empty() {
+        findings.push(PrivilegeFinding {
+            kind: FindingKind::Excess,
+            subject: subject.to_string(),
+            detail: format!(
+                "keeps {}, which the requirement does not ask for",
+                extra.join(" ")
+            ),
+        });
+    }
+    if !missing.is_empty() {
+        findings.push(PrivilegeFinding {
+            kind: FindingKind::Shortfall,
+            subject: subject.to_string(),
+            detail: format!(
+                "drops {}, so root cannot access operator-owned private application \
+                 directories",
+                missing.join(" ")
+            ),
+        });
+    }
+    if extra.is_empty() && missing.is_empty() {
+        controls.push(expected.to_string());
+    }
+}
+
 /// The one inbound-surface rule, applied to whichever platform names it.
 ///
 /// `07-security.md` handling rule 2: *"The product exposes no inbound HTTP,
@@ -2549,19 +2598,10 @@ fn review_systemd(
             .split_once('=')
             .expect("every hardening directive is written as key=value");
         match directives.get(key) {
-            Some(actual) if actual == value => controls.push((*expected).to_string()),
-            // Only reachable for a boot unit: a login unit expects the empty
-            // set, which the arm above already accepted.
-            Some(actual) if key == "CapabilityBoundingSet" && actual.is_empty() => {
-                findings.push(PrivilegeFinding {
-                    kind: FindingKind::Shortfall,
-                    subject: key.to_string(),
-                    detail: format!(
-                        "is empty, not `{value}`, so root cannot access operator-owned \
-                         private application directories"
-                    ),
-                });
+            Some(actual) if key == "CapabilityBoundingSet" => {
+                review_capabilities(expected, value, actual, controls, findings);
             }
+            Some(actual) if actual == value => controls.push((*expected).to_string()),
             Some(actual) => findings.push(PrivilegeFinding {
                 kind: FindingKind::Excess,
                 subject: key.to_string(),
@@ -4058,7 +4098,12 @@ pub struct Registration {
     pub start_mode: StartMode,
     /// The full command line, as the manager stores it.
     pub command_line: String,
-    /// The account it runs under, when the manager reports one.
+    /// The account it runs under, spelled as [`ServiceAccount`] spells it, when
+    /// the manager names a real account.
+    ///
+    /// `None` where the manager reports only a placeholder: a login
+    /// registration that runs as whoever signs in, or a Task Scheduler `UserId`
+    /// that is a raw SID. Status then reports the install record's account.
     pub account: Option<String>,
     /// Whether it is running now.
     pub running: bool,
@@ -4861,8 +4906,10 @@ impl ServiceOperations {
             // The account is only read where something was probed to judge
             // it against.
             let account = probed.as_ref().map_or_else(String::new, |_| {
-                systemd_registered_account(found.as_ref())
-                    .map_or_else(|| service_account_name(&record.account), str::to_owned)
+                found
+                    .as_ref()
+                    .and_then(|registration| registration.account.clone())
+                    .unwrap_or_else(|| service_account_name(&record.account))
             });
             unattended_gap(record.start_mode, &account, probed.as_ref())
         });
@@ -5691,19 +5738,31 @@ pub fn service_account_name(account: &ServiceAccount) -> String {
     }
 }
 
-/// The account a systemd system unit actually runs as, which an
-/// administrator's drop-in can change from the one the install record saved.
-///
-/// `None` for every other registration: the other managers name accounts in
-/// their own vocabulary (`LocalSystem`, a raw SID, a user unit's placeholder),
-/// so the record's spelling stays the one reported for them.
-fn systemd_registered_account(registration: Option<&Registration>) -> Option<&str> {
+/// The account `registration` names, which an administrator can change from
+/// the one the install record saved, and otherwise the record's.
+fn registered_account<'a>(registration: Option<&'a Registration>, recorded: &'a str) -> &'a str {
     registration
-        .filter(|registration| {
-            registration.manager == DefinitionKind::SystemdUnit
-                && registration.start_mode == StartMode::Boot
-        })
         .and_then(|registration| registration.account.as_deref())
+        .unwrap_or(recorded)
+}
+
+/// A Windows service account as `QueryServiceConfigW` names it, spelled the
+/// way [`ServiceAccount`] does, so a service nobody edited reports the account
+/// the record holds.
+#[cfg(any(windows, test))]
+fn windows_service_account(name: &str) -> String {
+    if name.eq_ignore_ascii_case("LocalSystem") || name.eq_ignore_ascii_case(".\\LocalSystem") {
+        ServiceAccount::LocalSystem.as_str().to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// A Task Scheduler `UserId`, unless it is a raw SID, which names no account
+/// an operator would recognise.
+#[cfg(any(windows, test))]
+fn scheduled_task_account(user_id: Option<String>) -> Option<String> {
+    user_id.filter(|id| !id.to_ascii_uppercase().starts_with("S-1-"))
 }
 
 /// Works out the gap for a registration in `mode` running as `account`.
@@ -6510,8 +6569,8 @@ impl fmt::Display for ServiceStatus {
         }
         if let Some(record) = &self.record {
             writeln!(f, "  start mode                {}", record.start_mode)?;
-            let account = systemd_registered_account(self.registration.as_ref())
-                .map_or_else(|| record.account.to_string(), str::to_owned);
+            let recorded = record.account.to_string();
+            let account = registered_account(self.registration.as_ref(), &recorded);
             writeln!(f, "  account                   {account}")?;
             writeln!(f, "  restart on failure        {}", record.restart())?;
             writeln!(
@@ -6740,7 +6799,8 @@ impl ServiceControl for RecordingControl {
                 manager: host_definition_kind(self.mode),
                 start_mode: self.mode,
                 command_line: plan.command_line(),
-                account: Some(plan.account().as_str().to_string()),
+                account: (*plan.account() != ServiceAccount::InvokingUser)
+                    .then(|| plan.account().as_str().to_string()),
                 running: false,
                 starts_automatically: true,
                 restart_delay: Some(plan.restart().delay()),
@@ -7394,7 +7454,7 @@ mod sys {
                 command_line: config.executable_path.to_string_lossy().into_owned(),
                 account: config
                     .account_name
-                    .map(|account| account.to_string_lossy().into_owned()),
+                    .map(|account| super::windows_service_account(&account.to_string_lossy())),
                 running: status.current_state == ServiceState::Running,
                 starts_automatically: config.start_type == ServiceStartType::AutoStart,
                 restart_delay,
@@ -7586,7 +7646,7 @@ mod sys {
                 manager: DefinitionKind::WindowsScheduledTask,
                 start_mode: StartMode::Login,
                 command_line,
-                account: xml_value(&document, "UserId"),
+                account: super::scheduled_task_account(xml_value(&document, "UserId")),
                 running: task_is_running(&name),
                 starts_automatically: super::windows_login_task_starts_automatically(&document),
                 restart_delay: xml_value(&document, "Interval")
@@ -7967,8 +8027,12 @@ mod sys {
                 manager: DefinitionKind::LaunchdPlist,
                 start_mode: self.mode,
                 command_line: program_arguments(&document),
-                account: plist_string_value(&document, "UserName")
-                    .or_else(|| Some("the invoking user".to_string())),
+                // A LaunchDaemon without `UserName` runs as root; a LaunchAgent
+                // runs as whoever signs in, which names no one in particular.
+                account: plist_string_value(&document, "UserName").or_else(|| {
+                    (self.mode == StartMode::Boot)
+                        .then(|| super::ServiceAccount::Root.as_str().to_string())
+                }),
                 running: loaded && printed.contains("state = running"),
                 starts_automatically: document.contains("<key>RunAtLoad</key>")
                     && super::plist_bool_value(&document, "RunAtLoad") == Some(true),
@@ -8288,19 +8352,16 @@ mod sys {
                     .get("ExecStart")
                     .map(|value| systemd_exec_command_line(value))
                     .unwrap_or_default(),
-                account: Some(
-                    directives
-                        .get("User")
-                        .filter(|user| !user.is_empty())
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            match self.mode {
-                                StartMode::Boot => "root",
-                                StartMode::Login => "the invoking user",
-                            }
-                            .to_string()
-                        }),
-                ),
+                // A system unit without `User=` runs as root; a user unit runs
+                // as whoever owns the session, which names no one in particular.
+                account: directives
+                    .get("User")
+                    .filter(|user| !user.is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        (self.mode == StartMode::Boot)
+                            .then(|| super::ServiceAccount::Root.as_str().to_string())
+                    }),
                 running: state("ActiveState") == Some("active"),
                 starts_automatically: state("UnitFileState") == Some("enabled"),
                 restart_delay: directives
@@ -9523,28 +9584,64 @@ mod tests {
             ),
             "a boot unit that cannot access its data must report a shortfall"
         );
+
+        let swapped = boot.replace(
+            "CapabilityBoundingSet=CAP_DAC_OVERRIDE",
+            "CapabilityBoundingSet=CAP_CHOWN",
+        );
+        for kind in [FindingKind::Shortfall, FindingKind::Excess] {
+            assert!(reports(
+                &swapped,
+                &linux_plan(StartMode::Boot),
+                "CapabilityBoundingSet",
+                kind
+            ));
+        }
+        let inverted = boot.replace(
+            "CapabilityBoundingSet=CAP_DAC_OVERRIDE",
+            "CapabilityBoundingSet=~CAP_SYS_ADMIN",
+        );
+        assert!(reports(
+            &inverted,
+            &linux_plan(StartMode::Boot),
+            "CapabilityBoundingSet",
+            FindingKind::Excess
+        ));
     }
 
     #[test]
-    fn status_reports_a_registered_account_only_for_systemd_system_units() {
-        for (manager, account, shown) in [
-            (DefinitionKind::SystemdUnit, "ivan", true),
-            (DefinitionKind::WindowsScheduledTask, "S-1-5-21-1", false),
-        ] {
+    fn status_reports_the_registered_account_and_falls_back_to_the_record() {
+        let recorded = ServiceAccount::for_start_mode(StartMode::Boot).to_string();
+        for (registered, shown) in [(Some("ivan"), "ivan"), (None, recorded.as_str())] {
             let host = Host::new();
             let operations = host.operations();
             operations.install(&host.request(StartMode::Boot)).unwrap();
             host.controls.edit("runner-manager", |registration| {
-                registration.manager = manager;
-                registration.account = Some(account.to_string());
+                registration.account = registered.map(str::to_string);
             });
             let status = operations.status().unwrap().to_string();
-            assert_eq!(
-                status.contains(&format!("account                   {account}")),
-                shown,
+            assert!(
+                status.contains(&format!("account                   {shown}\n")),
                 "{status}"
             );
         }
+    }
+
+    #[test]
+    fn manager_account_spellings_match_the_record() {
+        assert_eq!(
+            windows_service_account("LocalSystem"),
+            ServiceAccount::LocalSystem.as_str()
+        );
+        assert_eq!(windows_service_account(".\\svc-runner"), ".\\svc-runner");
+        assert_eq!(
+            scheduled_task_account(Some("S-1-5-21-1-2-3-1001".into())),
+            None
+        );
+        assert_eq!(
+            scheduled_task_account(Some("HOST\\op".into())),
+            Some("HOST\\op".to_string())
+        );
     }
 
     #[test]
