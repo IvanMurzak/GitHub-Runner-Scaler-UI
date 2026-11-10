@@ -222,9 +222,17 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ```
+
+`RestrictSUIDSGID=yes` is left out on purpose. Its seccomp filter answers every
+`openat2` call with `ENOSYS`, and GNU tar 1.35 extracts through `openat2` with no
+fallback, so every archive a job unpacked failed with `Cannot open: Function
+not implemented`, including each action the runner downloads. What it guarded
+against is covered anyway: `NoNewPrivileges=yes` makes a set-user-ID bit inert
+for everything the unit starts, and it can write only to `root`'s own `0700`
+directories and its private `/tmp`, where no other account can reach a file to
+execute it.
 
 `ProtectSystem=strict` makes the entire filesystem read-only except for the
 paths named in `ReadWritePaths`, plus the private `/tmp` that `PrivateTmp=yes`
