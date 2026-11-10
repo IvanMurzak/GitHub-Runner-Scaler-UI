@@ -798,11 +798,12 @@ runner-manager host set-memory-margin on     # back on, with the margin kept
 
 A runner takes any job its labels match, so the expected peak is per profile and stands for the
 heaviest of its jobs: the coordinator's figure for the target when this host has joined one (the
-heaviest job's p90 peak, from this host's own runs where it has them), otherwise the p90 of the
-last 20 peaks this host measured for the profile, otherwise 1 GiB. A running job holds its own
+heaviest job's p90 peak, from this host's own runs once it has any), otherwise the p90 of the
+last 20 peaks this host measured for the profile's jobs (or the newest of three, if heavier),
+otherwise 1 GiB. Sizes take a unit (`512MiB`, `2G`); a bare `2` is refused. A running job holds its own
 estimate, less what it already uses, until it ends: a build's peak often comes late. A refused
 start is not a failure: the job stays queued and the next pass asks again, `status` shows
-`waiting for memory: … needs X GiB, Y GiB free less Z GiB reserved`, and the service logs
+`waiting for memory: … needs X GiB (… estimate + … margin), Y GiB free less Z GiB reserved for running jobs`, and the service logs
 `memory_deferred` with the byte figures. A launch from the coordinator that does not fit is
 refused with reason `memory`, so the coordinator places the job on another host. With nothing
 running on the machine a runner always starts, even one larger than the free memory (logged as

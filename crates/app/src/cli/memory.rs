@@ -150,9 +150,12 @@ impl HostMemory {
             .into_iter()
             .map(|policy| (policy.id, policy))
             .collect();
+        // A concluded attempt still awaiting cleanup holds a slot, but what it
+        // still holds of memory (an isolated environment not yet removed) is
+        // in `free` already, and it grows no more.
         let running: Vec<Running> = attempts
             .iter()
-            .filter(|attempt| attempt.counts_against_capacity())
+            .filter(|attempt| attempt.counts_against_capacity() && !attempt.state().is_terminal())
             .map(|attempt| Running {
                 estimate: policies
                     .get(&attempt.policy_id)
@@ -163,10 +166,16 @@ impl HostMemory {
                     .bytes,
                 current_rss: self.meters.current_rss(attempt.id),
             })
-            .chain(pending.iter().map(|&estimate| Running {
-                estimate,
-                current_rss: None,
-            }))
+            .chain(
+                pending
+                    .iter()
+                    .copied()
+                    .chain(self.claim_ahead_of(policy.id))
+                    .map(|estimate| Running {
+                        estimate,
+                        current_rss: None,
+                    }),
+            )
             .collect();
         admit(
             (self.free)(),
@@ -174,6 +183,25 @@ impl HostMemory {
             self.estimate(policy),
             settings.margin_bytes,
         )
+    }
+
+    /// The estimate of the profile that has waited longest for memory, when
+    /// it began waiting before `policy` did and was refused recently: it is
+    /// served first. Without this a heavy profile could wait for ever behind
+    /// light ones, each taking the memory the last one freed.
+    fn claim_ahead_of(&self, policy: PolicyId) -> Option<u64> {
+        let now = Utc::now();
+        let fresh = chrono::TimeDelta::from_std(CLAIM_HELD_FOR).unwrap_or(chrono::TimeDelta::MAX);
+        let waiting = self.waiting();
+        let mine = waiting.get(&policy).and_then(|own| own.since);
+        waiting
+            .iter()
+            .filter(|(other, _)| **other != policy)
+            .filter(|(_, wait)| wait.at.is_some_and(|at| now - at <= fresh))
+            .filter_map(|(_, wait)| Some((wait.since?, wait.estimate_bytes)))
+            .filter(|(since, _)| mine.is_none_or(|mine| *since < mine))
+            .min_by_key(|(since, _)| *since)
+            .map(|(_, estimate)| estimate)
     }
 
     fn waiting(&self) -> std::sync::MutexGuard<'_, BTreeMap<PolicyId, Waiting>> {
@@ -218,8 +246,12 @@ fn note_waiting(
     figures: &MemoryFigures,
 ) {
     let now = Utc::now();
+    let shown_for = chrono::TimeDelta::from_std(WAIT_SHOWN_FOR).unwrap_or(chrono::TimeDelta::MAX);
+    // A wait whose demand went away is never cleared; one refused again long
+    // after is a new wait.
     let since = waiting
         .get(&policy.id)
+        .filter(|earlier| earlier.at.is_some_and(|at| now - at <= shown_for))
         .and_then(|earlier| earlier.since)
         .unwrap_or(now);
     waiting.insert(
@@ -245,6 +277,11 @@ fn note_waiting(
 /// daemon asks again at every pass while the demand is queued, and a wait
 /// whose demand went away is never cleared otherwise.
 pub const WAIT_SHOWN_FOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// How long after its last refusal the longest-waiting profile keeps its
+/// claim on memory ahead of others: a few passes. Its demand gone, the claim
+/// lapses.
+const CLAIM_HELD_FOR: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 
 /// `host set-memory-margin SIZE|off|on`.
 ///
@@ -298,6 +335,16 @@ pub fn set_margin(
         "Applies to the next runner the service starts; nothing running is stopped."
     )
     .map_err(failed)?;
+    if next.enabled
+        && host_fitness::physical_memory_bytes().is_some_and(|total| next.margin_bytes >= total)
+    {
+        writeln!(
+            out,
+            "Warning: the margin is at least this machine's memory, so only one runner at a \
+             time will start (one always starts when nothing else runs)."
+        )
+        .map_err(failed)?;
+    }
     Ok(())
 }
 
@@ -368,11 +415,18 @@ impl MemorySnapshot {
         }
     }
 
-    /// One line per waiting profile: `waiting for memory: …`.
+    /// One line when the setting is unreadable, and one per waiting
+    /// profile: `waiting for memory: …`.
     ///
     /// # Errors
     /// The writer's.
     pub fn write_waiting(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        if let Some(reason) = &self.setting_unreadable {
+            writeln!(
+                out,
+                "  memory setting            unreadable, so the defaults apply: {reason}"
+            )?;
+        }
         for waiting in &self.waiting {
             writeln!(
                 out,
@@ -477,7 +531,7 @@ mod tests {
     #[test]
     fn a_heavy_profile_waits_for_memory_and_says_so_until_admitted() {
         // MacM6: 24 GiB, one Unreal build (11.8 GiB by the coordinator)
-        // running with 2 GiB used so far, 14 GiB free.
+        // running and not sampled yet, 14 GiB free.
         let (dir, _store, policy, memory) = setup(14 * GIB);
         coordinator_says(&memory, &policy, 11_800 << 20);
         let running = [busy(&policy)];
@@ -509,6 +563,69 @@ mod tests {
             .expect("read")
             .expect("written");
         assert!(state.waiting.is_empty(), "the wait is over");
+    }
+
+    #[test]
+    fn the_longest_waiting_profile_is_served_before_a_lighter_one() {
+        let (_dir, store, heavy, memory) = setup(10 * GIB);
+        let light = fixtures::policy()
+            .id(PolicyId::from_u128(0x11))
+            .repository("acme/app")
+            .host(heavy.host_id)
+            .autoscale("home", 4)
+            .active()
+            .build();
+        store.insert_policy(&light).expect("policy");
+        memory.set_coordinator_estimates(MemoryEstimates {
+            estimates: vec![
+                TargetEstimate {
+                    target: target_ref(&heavy.target),
+                    peak_rss_bytes: 8 * GIB,
+                    samples: 5,
+                    own: true,
+                },
+                TargetEstimate {
+                    target: target_ref(&light.target),
+                    peak_rss_bytes: 2 * GIB,
+                    samples: 5,
+                    own: true,
+                },
+            ],
+        });
+        let running = [busy(&light)];
+        // 10 GiB free, 2 GiB reserved by the light build: the heavy one
+        // (9 GiB with the margin) waits.
+        assert!(!MemoryGate::admit(&memory, &heavy, &running).admits());
+        // A second light build would fit (6 GiB available, 3 needed), but
+        // the heavy one claims its 8 GiB first.
+        assert!(!MemoryGate::admit(&memory, &light, &running).admits());
+        // The heavy one is not held back by the light one waiting after it.
+        assert!(MemoryGate::admit(&memory, &heavy, &[]).admits());
+        memory.admitted(&heavy);
+        assert!(MemoryGate::admit(&memory, &light, &running).admits());
+    }
+
+    #[test]
+    fn status_shows_recent_waits_only_and_none_while_off() {
+        let (dir, _store, policy, memory) = setup(GIB);
+        coordinator_says(&memory, &policy, 4 * GIB);
+        let _ = MemoryGate::admit(&memory, &policy, &[busy(&policy)]);
+        let paths = AppPaths::rooted_at(dir.path());
+        let now = Utc::now();
+        assert_eq!(MemorySnapshot::read(&paths, now).waiting.len(), 1);
+        let later = now + chrono::TimeDelta::minutes(6);
+        assert!(MemorySnapshot::read(&paths, later).waiting.is_empty());
+        records::set_settings(
+            &paths,
+            MemorySettings {
+                enabled: false,
+                margin_bytes: GIB,
+            },
+        )
+        .expect("off");
+        let off = MemorySnapshot::read(&paths, now);
+        assert!(!off.enabled);
+        assert!(off.waiting.is_empty());
     }
 
     #[test]

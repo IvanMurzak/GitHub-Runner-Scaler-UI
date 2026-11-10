@@ -548,10 +548,13 @@ From 0.4.53 a host checks its free memory before it starts any runner, its own d
 after each `hello` and whenever the figures change (looked at every 60 seconds), a
 `memory_estimates` message: for each of the host's targets with measured jobs, the heaviest job
 key's expected peak (its p90, or a heavier one of its newest three runs), taken from that host's own
-samples of each job where it has some and from every host's otherwise, with the sample count and
-whether only its own runs spoke. A runner takes any job its labels match, so one figure per target
+samples once it has any for the target (a job measured only on other hosts, such as another OS's
+build, is likely one its labels never take) and from every host's otherwise, with the sample count
+and whether only its own runs spoke. Targets are named once however their case varies, and the
+message is trimmed to fit one frame. A runner takes any job its labels match, so one figure per target
 stands for its heaviest job. A target never measured is left out, and the host falls back to the
-p90 of the peaks it measured itself, then to 1 GiB. A host older than 0.4.53 skips the message as
+p90 of the peaks it measured itself, then to 1 GiB; it also forgets the coordinator's figures when the
+link ends. A host older than 0.4.53 skips the message as
 one it does not know; a coordinator older than 0.4.53 never sends it, and reads a `memory` refusal
 as `other`.
 

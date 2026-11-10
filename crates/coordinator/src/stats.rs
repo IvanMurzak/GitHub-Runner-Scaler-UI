@@ -753,37 +753,31 @@ impl Aggregates {
     }
 
     /// What a runner `host_id` starts for `target` is expected to need: the
-    /// heaviest of the target's job keys by [`Self::expected_peak`]'s rule, each
-    /// from `host_id`'s own samples of it when it has any, else every host's. A
+    /// heaviest of the target's job keys by [`Self::expected_peak`]'s rule. A
     /// runner takes any job its labels match, so the heaviest stands for them
-    /// all. `None` without any sample measuring memory.
+    /// all. Only `host_id`'s own samples count once it has any for the target:
+    /// a job key measured only elsewhere is likely one its labels never take
+    /// (another OS's build), and would hold its memory for nothing. A target it
+    /// never ran falls back to every host's samples. `None` without any sample
+    /// measuring memory.
     #[must_use]
     pub fn target_estimate(&self, host_id: &str, target: &TargetRef) -> Option<TargetEstimate> {
+        let measured = |own_only: bool| {
+            self.by_key.values().map(move |key_samples| {
+                key_samples
+                    .iter()
+                    .filter(|sample| sample.peak_rss_bytes.is_some())
+                    .filter(|sample| target.covers(&sample.repository))
+                    .filter(|sample| !own_only || sample.host_id == host_id)
+                    .collect::<Vec<&JobSample>>()
+            })
+        };
+        let own = measured(true).any(|samples| !samples.is_empty());
         let mut heaviest: Option<u64> = None;
         let mut samples = 0usize;
-        let mut own = true;
-        for key_samples in self.by_key.values() {
-            let measured: Vec<&JobSample> = key_samples
-                .iter()
-                .filter(|sample| sample.peak_rss_bytes.is_some())
-                .filter(|sample| target.covers(&sample.repository))
-                .collect();
-            if measured.is_empty() {
-                continue;
-            }
-            let mine: Vec<&JobSample> = measured
-                .iter()
-                .copied()
-                .filter(|sample| sample.host_id == host_id)
-                .collect();
-            let speaking = if mine.is_empty() {
-                own = false;
-                measured
-            } else {
-                mine
-            };
-            samples += speaking.len();
-            heaviest = heaviest.max(expected_of(speaking));
+        for key_samples in measured(own) {
+            samples += key_samples.len();
+            heaviest = heaviest.max(expected_of(key_samples));
         }
         Some(TargetEstimate {
             target: target.clone(),
@@ -1915,13 +1909,14 @@ mod tests {
         use runner_manager_domain::coordinator_protocol::TargetScope;
         let gib = 1u64 << 30;
         let mut samples = Vec::new();
-        // The light job ran here; the heavy one only elsewhere.
+        // MacM6 ran the smoke and the macOS build; the Windows build ran
+        // only on the Windows host.
         for _ in 0..5 {
             samples.push(sample("octo/app/smoke", "macm6", 10, gib / 4));
-            samples.push(sample("octo/app/smoke", "linux", 10, 3 * gib));
-            samples.push(sample("octo/app/build", "linux", 10, 12 * gib));
+            samples.push(sample("octo/app/build-macos", "macm6", 10, 6 * gib));
+            samples.push(sample("octo/app/build-windows", "win", 10, 12 * gib));
         }
-        let mut other = sample("other/repo/x", "macm6", 10, 40 * gib);
+        let mut other = sample("other/repo/x", "win", 10, 40 * gib);
         other.repository = "other/repo".into();
         samples.push(other);
         let aggregates = Aggregates::from_samples(samples, 30);
@@ -1929,16 +1924,21 @@ mod tests {
             scope: TargetScope::Repo,
             name: "Octo/App".into(),
         };
-        let estimate = aggregates
+        let mac = aggregates
             .target_estimate("macm6", &repo)
             .expect("measured");
-        assert_eq!(estimate.peak_rss_bytes, 12 * gib, "the heaviest job counts");
-        assert_eq!(estimate.samples, 10, "own smoke runs, every build run");
-        assert!(!estimate.own, "the build was measured elsewhere only");
-        let smoke_only = aggregates
+        assert_eq!(mac.peak_rss_bytes, 6 * gib, "its own heaviest job");
+        assert_eq!(mac.samples, 10);
+        assert!(mac.own);
+        let win = aggregates.target_estimate("win", &repo).expect("measured");
+        assert_eq!(win.peak_rss_bytes, 12 * gib);
+        // A host that never ran the target: every host's runs, the heaviest.
+        let new = aggregates
             .target_estimate("linux", &repo)
             .expect("measured");
-        assert!(smoke_only.own);
+        assert_eq!(new.peak_rss_bytes, 12 * gib);
+        assert_eq!(new.samples, 15);
+        assert!(!new.own);
         // An organization covers every repository of its owner.
         let org = TargetRef {
             scope: TargetScope::Org,

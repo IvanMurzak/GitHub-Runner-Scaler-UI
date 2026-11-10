@@ -288,9 +288,10 @@ impl Default for MemorySettings {
     }
 }
 
-/// `1GiB`, `512MiB`, `2G`, `1.5GB`, `800M` or a bare number of bytes, as
-/// bytes. Units are binary whatever they are spelled (`G` = `GB` = `GiB`):
-/// memory is counted in powers of two.
+/// `1GiB`, `512MiB`, `2G`, `1.5GB`, `800M` or `0`, as bytes. Units are binary
+/// whatever they are spelled (`G` = `GB` = `GiB`): memory is counted in powers
+/// of two. A bare number other than `0` is refused: `2` is far more likely to
+/// mean 2 GiB than 2 bytes.
 ///
 /// # Errors
 /// Anything else, or a value that does not fit in `u64`.
@@ -304,8 +305,17 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
     if number.is_empty() {
         return Err(invalid());
     }
-    let shift = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 0,
+    let unit = unit.trim().to_ascii_lowercase();
+    if unit.is_empty() && number.trim_start_matches(['0', '.']).is_empty() {
+        return Ok(0);
+    }
+    let shift = match unit.as_str() {
+        "" => {
+            return Err(format!(
+                "`{text}` needs a unit: write `{text}GiB` or `{text}MiB`"
+            ));
+        }
+        "b" => 0,
         "k" | "kb" | "kib" => 10,
         "m" | "mb" | "mib" => 20,
         "g" | "gb" | "gib" => 30,
@@ -517,8 +527,9 @@ mod tests {
             gib(crowded)
         );
         assert!(admitted <= TOTAL, "with admission: {}", gib(admitted));
-        assert!(slower > fast, "the price: jobs wait for memory");
-        assert!(slower < 3 * fast, "but every job ran: {slower} ticks");
+        // The figures the 0.4.53 CHANGELOG quotes.
+        assert_eq!((gib(crowded).as_str(), fast), ("32.0 GiB", 10));
+        assert_eq!((gib(admitted).as_str(), slower), ("17.4 GiB", 16));
     }
 
     #[test]
@@ -527,8 +538,12 @@ mod tests {
         assert_eq!(parse_size("1G"), Ok(GIB));
         assert_eq!(parse_size("1.5gb"), Ok(GIB + GIB / 2));
         assert_eq!(parse_size("512MiB"), Ok(512 << 20));
-        assert_eq!(parse_size("2048"), Ok(2048));
+        assert_eq!(parse_size("1 GiB"), Ok(GIB));
+        assert_eq!(parse_size(".5G"), Ok(GIB / 2));
+        assert_eq!(parse_size("2048B"), Ok(2048));
         assert_eq!(parse_size(" 0 "), Ok(0));
+        assert!(parse_size("2").is_err(), "a bare number needs a unit");
+        assert!(parse_size("2048").is_err());
         assert!(parse_size("lots").is_err());
         assert!(parse_size("1 parsec").is_err());
         assert!(parse_size("GiB").is_err());

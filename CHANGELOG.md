@@ -18,21 +18,24 @@ the version being prepared rather than the version in `Cargo.toml`.
   it, only when free memory less what its running attempts may still grow into (each holds its
   estimate less what it uses now, until it ends) holds the runner's estimate plus a margin. The
   estimate is per profile, for the heaviest job its labels can take: the coordinator's figure for
-  the target, else the p90 of the last 20 peaks this host measured for the profile, else 1 GiB.
+  the target (from this host's own runs once it has any), else the p90 of the last 20 job peaks
+  this host measured for the profile (or a heavier one of the newest three), else 1 GiB.
   A refused start is deferred, not failed: the job stays queued, the next pass asks again,
-  `status` shows `waiting for memory: … needs X GiB, Y GiB free less Z GiB reserved` (and
+  `status` shows `waiting for memory: … needs X GiB (… estimate + … margin), Y GiB free less Z GiB reserved for running jobs` (and
   `memory` in `status --json`), and the log says `memory_deferred` with `free_bytes`,
   `reserved_bytes`, `estimate_bytes`, `estimate_source` and `margin_bytes`. With nothing running
   a runner always starts, however large (`memory_admitted_alone`). In a simulation of MacM6 with
   that queue the busiest moment went from 32.0 GiB to 17.4 GiB, the queue taking 16 ticks instead
   of 10. See [Keep heavy jobs from crowding one machine](README.md#keep-heavy-jobs-from-crowding-one-machine).
 - **`runner-manager host set-memory-margin SIZE|off|on`**: the free memory kept beyond the
-  estimate (default `1GiB`, in `config/memory.toml`), or admission off. On by default; `host show`
+  estimate (default `1GiB`, in `config/memory.toml`; a size needs a unit), or admission off. On by default; `host show`
   prints the setting and the free memory now. A running service applies a change to its next start.
 - **Coordinator: `memory_estimates` for each host's targets** (additive, version-4 links): after
   each `hello` and whenever they change, the heaviest job's expected peak per target, from that
-  host's own runs where it has them. A host older than 0.4.53 skips the message; with an older
+  host's own runs once it has any (another OS's build measured elsewhere does not count). A host older than 0.4.53 skips the message; with an older
   coordinator the host estimates from its own measurements.
+- A heavy profile waiting for memory is served before lighter profiles that began waiting after
+  it, so steady light work cannot keep it waiting for ever.
 - **Launch refusal `memory`.** A coordinator launch the host's memory cannot hold (counting the
   launches it accepted whose runners are not up yet) is refused with reason `memory`, and the
   coordinator places the job elsewhere; it keeps the host a candidate as for a capacity refusal.

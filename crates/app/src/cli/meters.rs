@@ -232,8 +232,8 @@ impl AttemptMeters {
     }
 
     /// Keeps, for its profile, the peak of every metered attempt that ended
-    /// (is not in `live`) after running a job: an idle exit says nothing of the
-    /// jobs, and one that never reached the journal's end is asked again.
+    /// (is not in `live`, and concluded in the journal) after running a job:
+    /// an idle exit says nothing of the jobs. `live` must be complete.
     fn bank_ended(&self, store: &dyn Store, live: &HashSet<AttemptId>) {
         let ended: Vec<(AttemptId, PolicyId, u64)> = self
             .lock()
@@ -246,16 +246,20 @@ impl AttemptMeters {
         }
         let mut kept = false;
         for (attempt, policy, peak) in ended {
-            let outcome = match store.attempt(attempt) {
-                Ok(Some(found)) => found.outcome().cloned(),
+            let ran_a_job = match store.attempt(attempt) {
+                // `CompletedJob` is the runner finishing its job, whatever the
+                // job's own result (an out-of-memory build included). `Failed`
+                // is the runner failing, mostly before any job: its peak would
+                // drag the estimate down.
+                Ok(Some(found)) => match found.outcome() {
+                    Some(outcome) => matches!(outcome, AttemptOutcome::CompletedJob),
+                    // Not concluded yet: asked again at the next look.
+                    None => continue,
+                },
                 // Gone from the journal (cleaned): nothing says how it ended.
-                Ok(None) => None,
+                Ok(None) => false,
                 Err(_) => continue,
             };
-            let ran_a_job = matches!(
-                outcome,
-                Some(AttemptOutcome::CompletedJob | AttemptOutcome::Failed { .. })
-            );
             if ran_a_job && peak > 0 {
                 let mut peaks = self.peaks();
                 let kept_for = peaks.policies.entry(policy.to_string()).or_default();
@@ -286,11 +290,17 @@ impl AttemptMeters {
     /// Returns the targets of the attempts whose runner process is newly
     /// seen gone. Blocking: SQLite and the process table.
     pub fn sample_once(&self, store: &dyn Store, host: HostId) -> Vec<ScaleTarget> {
-        let policies = store.policies().unwrap_or_default();
+        // A read that failed leaves `live` short: nothing is concluded from it.
+        let mut complete = true;
+        let policies = store.policies().unwrap_or_else(|_| {
+            complete = false;
+            Vec::new()
+        });
         let mut live = HashSet::new();
         let mut roots: Vec<(AttemptId, u32, &ScaleTarget, PolicyId)> = Vec::new();
         for policy in policies.iter().filter(|policy| policy.is_owned_by(host)) {
             let Ok(attempts) = store.active_attempts_for_policy(policy.id) else {
+                complete = false;
                 continue;
             };
             for attempt in attempts {
@@ -331,7 +341,9 @@ impl AttemptMeters {
             self.record_for(attempt, Some(policy), now, *usage);
         }
         drop(seen);
-        self.bank_ended(store, &live);
+        if complete {
+            self.bank_ended(store, &live);
+        }
         self.forget_stale(&live, now);
         exited
     }
@@ -437,31 +449,51 @@ mod tests {
             .active()
             .build();
         store.insert_policy(&policy).expect("policy");
-        let ended = |outcome: AttemptOutcome| {
+        let ended = |state: AttemptState, outcome: AttemptOutcome| {
             let attempt = fixtures::attempt()
                 .id(AttemptId::new_random())
                 .policy_id(policy.id)
-                .state(AttemptState::Finished)
+                .state(state)
                 .outcome(outcome)
                 .build();
             store.record_attempt(&attempt).expect("recorded");
             attempt.id
         };
-        let job = ended(AttemptOutcome::CompletedJob);
-        let idle = ended(AttemptOutcome::ExitedIdleWithoutWork);
+        let job = ended(AttemptState::Finished, AttemptOutcome::CompletedJob);
+        let idle = ended(
+            AttemptState::Finished,
+            AttemptOutcome::ExitedIdleWithoutWork,
+        );
+        let failed = ended(
+            AttemptState::Failed,
+            AttemptOutcome::failed(
+                runner_manager_domain::attempt::FailureReason::ProcessExitedUnexpectedly,
+            ),
+        );
+        // Still running, but missing from a `live` set (as a failed read would
+        // leave it): not concluded, so not banked yet.
+        let running = fixtures::attempt()
+            .id(AttemptId::new_random())
+            .policy_id(policy.id)
+            .state(AttemptState::Busy)
+            .github_runner_id(1)
+            .build();
+        store.record_attempt(&running).expect("recorded");
 
         let file = dir.path().join("memory-peaks.toml");
         let meters = AttemptMeters::with_peaks_file(file.clone());
         let now = Instant::now();
         meters.record_for(job, Some(policy.id), now, tree(6 << 30, 0));
         meters.record_for(idle, Some(policy.id), now, tree(1 << 20, 0));
+        meters.record_for(failed, Some(policy.id), now, tree(2 << 20, 0));
+        meters.record_for(running.id, Some(policy.id), now, tree(3 << 30, 0));
         assert_eq!(meters.current_rss(job), Some(6 << 30));
 
         meters.bank_ended(&store, &HashSet::new());
         assert_eq!(
             meters.peaks_of(policy.id),
             vec![6 << 30],
-            "the idle exit says nothing"
+            "an idle exit and a runner failure say nothing of the jobs"
         );
         // Reported once whether banked before or after.
         assert!(meters.take(job).is_some());
@@ -471,11 +503,26 @@ mod tests {
             None,
             "gone once banked and reported"
         );
-        // Banked once, and kept across a restart.
+
+        // The running one was left for later, and is banked once it ends.
+        let finished = fixtures::attempt()
+            .id(running.id)
+            .policy_id(policy.id)
+            .state(AttemptState::Finished)
+            .outcome(AttemptOutcome::CompletedJob)
+            .build();
+        store.record_attempt(&finished).expect("recorded");
+        meters.bank_ended(&store, &HashSet::new());
         meters.bank_ended(&store, &HashSet::new());
         assert_eq!(
+            meters.peaks_of(policy.id),
+            vec![6 << 30, 3 << 30],
+            "banked once"
+        );
+        // Kept across a restart.
+        assert_eq!(
             AttemptMeters::with_peaks_file(file).peaks_of(policy.id),
-            vec![6 << 30]
+            vec![6 << 30, 3 << 30]
         );
     }
 

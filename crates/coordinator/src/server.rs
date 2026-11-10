@@ -54,6 +54,10 @@ const TOUCH_EVERY: Duration = Duration::from_secs(60);
 /// they changed.
 const ESTIMATES_EVERY: Duration = Duration::from_secs(60);
 
+/// The most a `memory_estimates` frame may take, with room to spare under
+/// [`MAX_MESSAGE_BYTES`].
+const ESTIMATES_BYTES: usize = MAX_MESSAGE_BYTES - 1024;
+
 /// The server's settings.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -806,15 +810,32 @@ async fn serve_host(
 /// statistics. Targets never measured are left out.
 #[must_use]
 pub fn memory_estimates(state: &AppState, host_id: &str, targets: &[TargetRef]) -> MemoryEstimates {
-    state
+    let mut unique: Vec<&TargetRef> = Vec::new();
+    for target in targets {
+        if !unique.iter().any(|seen| seen.same_as(target)) {
+            unique.push(target);
+        }
+    }
+    let mut estimates = state
         .statistics
         .with_aggregates(|aggregates| MemoryEstimates {
-            estimates: targets
-                .iter()
+            estimates: unique
+                .into_iter()
                 .filter_map(|target| aggregates.target_estimate(host_id, target))
                 .take(MAX_MEMORY_ESTIMATES)
                 .collect(),
-        })
+        });
+    // Within one frame, or the host's transport refuses it and the link
+    // reconnects into the same message. Targets dropped from the end fall
+    // back to the host's own measurements.
+    while ServerMessage::MemoryEstimates(estimates.clone())
+        .encode()
+        .len()
+        > ESTIMATES_BYTES
+    {
+        estimates.estimates.pop();
+    }
+    estimates
 }
 
 /// Sends the host its memory estimates unless they are what it was last sent;
@@ -883,6 +904,68 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_estimates_fit_one_frame_and_name_each_target_once() {
+        use crate::store::JobSample;
+        use runner_manager_domain::coordinator_protocol::TargetScope;
+        let mut store = Store::open_in_memory().expect("store");
+        let name = |index: usize| format!("acme/{}{index}", "r".repeat(130));
+        for index in 0..MAX_MEMORY_ESTIMATES {
+            store
+                .record_sample(
+                    &JobSample {
+                        job_key: format!("{}/build", name(index)),
+                        repository: name(index),
+                        host_id: "h".into(),
+                        finished_at: Utc::now(),
+                        duration_secs: Some(1),
+                        queue_wait_secs: None,
+                        peak_rss_bytes: Some(1 << 30),
+                        cpu_avg_millicores: None,
+                        cpu_peak_millicores: None,
+                    },
+                    30,
+                    Utc::now() - chrono::TimeDelta::days(1),
+                )
+                .expect("sample");
+        }
+        let state = AppState::new(
+            Config::new("http://127.0.0.1".into(), SecretString::from("s")),
+            store,
+        );
+        let mut targets: Vec<TargetRef> = (0..MAX_MEMORY_ESTIMATES)
+            .map(|index| TargetRef {
+                scope: TargetScope::Repo,
+                name: name(index),
+            })
+            .collect();
+        targets.insert(
+            1,
+            TargetRef {
+                scope: TargetScope::Repo,
+                name: name(0).to_uppercase(),
+            },
+        );
+        let estimates = memory_estimates(&state, "h", &targets);
+        let frame = ServerMessage::MemoryEstimates(estimates.clone()).encode();
+        assert!(frame.len() <= ESTIMATES_BYTES, "{}", frame.len());
+        assert!(
+            estimates.estimates.len() > 100,
+            "{}",
+            estimates.estimates.len()
+        );
+        let first = &estimates.estimates[0].target;
+        assert_eq!(
+            estimates
+                .estimates
+                .iter()
+                .filter(|estimate| estimate.target.same_as(first))
+                .count(),
+            1,
+            "a target named twice is estimated once"
+        );
+    }
 
     #[test]
     fn attempts_are_limited_per_address_per_minute() {

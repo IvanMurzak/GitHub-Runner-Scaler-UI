@@ -1110,6 +1110,12 @@ async fn link(ports: LinkPorts, meters: &AttemptMeters) {
         // The coordinator forgets a disconnected host's launches and places
         // their jobs elsewhere; starting them here as well would double up.
         ports.launches.clear();
+        // Its memory estimates speak for a link that is gone (and maybe for a
+        // coordinator this host left): its own measurements stand in until
+        // the next session sends them again.
+        ports.memory.set_coordinator_estimates(
+            runner_manager_domain::coordinator_protocol::MemoryEstimates::default(),
+        );
         // Only the first failure after a session changes anything; repeated
         // failed reconnects must not wake every target loop.
         ports.coordination.send_if_modified(|view| {
