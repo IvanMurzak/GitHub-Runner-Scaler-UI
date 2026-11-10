@@ -73,6 +73,9 @@ const SURFACE: [(&str, &[&str]); 11] = [
             // Owner decision 2026-11-10: check what native Linux jobs ask of
             // Docker through their proxy; record before refusing.
             "docker-policy",
+            // Owner decision 2026-11-10: host directories no runner or job may
+            // reach, enforced by systemd on Linux.
+            "protect-path",
             // Owner decision 2026-10-10: an account whose earlier install was
             // replaced by another installation's service archives its unused
             // configuration instead of following remedies meant for the service.
@@ -122,7 +125,8 @@ const SURFACE: [(&str, &[&str]); 11] = [
 
 /// Profile and provider leaves added by the runner-sandbox architecture, and
 /// the host runner environment (`runner.env`), and the dependency caches.
-const NESTED_SURFACE: [(&str, &[&str]); 8] = [
+const NESTED_SURFACE: [(&str, &[&str]); 9] = [
+    ("host protect-path", &["add", "remove", "list"]),
     (
         "host docker-cleanup",
         &["show", "set-mode", "report", "sweep"],

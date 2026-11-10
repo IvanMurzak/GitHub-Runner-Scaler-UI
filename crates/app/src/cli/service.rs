@@ -334,10 +334,21 @@ fn install_from(
     } else {
         None
     };
+    // Unreadable settings fail the install rather than register a service
+    // that silently lets jobs into a path the operator protected.
+    let protected =
+        runner_manager_platform::service::ProtectedPaths::load(context.paths().config_dir())
+            .map_err(|error| {
+                CliError::new(
+                    Failure::LocalState,
+                    format!("cannot read the protected paths: {error}"),
+                )
+            })?;
     let request = InstallRequest::new(mode)
         .for_binary(&service_binary)
         .copied_from(source)
-        .with_arguments(service_arguments);
+        .with_arguments(service_arguments)
+        .protecting(protected.paths);
     // The swap above is undone on every failure below it. See `OwnedCopy`: a
     // refused install that left the new copy in place is what put a running
     // daemon on a binary nobody registered.

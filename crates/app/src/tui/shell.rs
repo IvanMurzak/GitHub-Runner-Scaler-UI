@@ -6043,6 +6043,7 @@ fn foreign_service(unreadable: bool) -> runner_manager_platform::service::Foreig
         log_file: local_directories.log_file(),
         starts_on_demand: false,
         definition_path: None,
+        protected_paths: Vec::new(),
         installed_at: chrono::DateTime::from_timestamp(1_791_143_815, 0).expect("a time"),
         installed_by_version: "0.4.30".into(),
         directories: local_directories,

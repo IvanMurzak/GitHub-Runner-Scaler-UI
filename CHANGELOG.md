@@ -31,6 +31,10 @@ the version being prepared rather than the version in `Cargo.toml`.
   `host docker-policy report` summarises them and `host docker-policy
   set-mode --mode enforce` refuses them. `host docker-policy allow-path`
   admits a host directory every job may mount.
+- `host protect-path add|remove|list`: host directories no runner or job may
+  reach on Linux. The systemd unit lists them in `InaccessiblePaths=`, applied
+  at the next `service install --start-at boot`, and the Docker policy treats
+  a container mount of one as a `protected_path` violation.
 
 ## 0.4.56
 

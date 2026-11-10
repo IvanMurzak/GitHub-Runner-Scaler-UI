@@ -179,9 +179,20 @@ impl DockerCleanup {
             .chain(&config.allow)
             .filter_map(|path| policy::resolve(path))
             .collect();
+        let protected = self
+            .policy_config
+            .parent()
+            .map(runner_manager_platform::service::ProtectedPaths::load)
+            .transpose()?
+            .unwrap_or_default()
+            .paths
+            .iter()
+            .filter_map(|path| policy::resolve(path))
+            .collect();
         Ok(Some(policy::Context {
             mode: config.mode,
             allowed,
+            protected,
             log: self.policy_log.clone(),
         }))
     }

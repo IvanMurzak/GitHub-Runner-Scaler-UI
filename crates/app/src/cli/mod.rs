@@ -55,6 +55,7 @@ pub mod meters;
 pub mod policy;
 pub mod polling;
 pub mod profile;
+pub mod protect_path;
 pub mod service;
 pub mod status;
 pub mod ui;
@@ -906,6 +907,9 @@ pub enum HostCommand {
     /// What native Linux jobs may ask of Docker; audit by default.
     #[command(subcommand)]
     DockerPolicy(HostDockerPolicyCommand),
+    /// Host directories no runner or job may reach (Linux).
+    #[command(subcommand)]
+    ProtectPath(HostProtectPathCommand),
     /// Move this account's configuration aside when no service runs against it.
     ///
     /// For an account whose earlier install was replaced by another
@@ -942,6 +946,22 @@ pub enum HostDockerPolicyCommand {
     DisallowPath(DockerPolicyPathArgs),
     /// Summarise recorded violations by repository and rule.
     Report(DockerPolicyReportArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HostProtectPathCommand {
+    /// Hide a host directory from the service, its runners and their jobs.
+    Add(ProtectPathArgs),
+    /// Stop hiding a directory added with `add`.
+    Remove(ProtectPathArgs),
+    /// List the protected directories and whether the service enforces them.
+    List,
+}
+
+#[derive(Debug, Args)]
+pub struct ProtectPathArgs {
+    /// An absolute host path.
+    pub path: String,
 }
 
 #[derive(Debug, Args)]
