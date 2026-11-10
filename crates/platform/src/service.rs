@@ -5167,7 +5167,11 @@ impl ServiceOperations {
 
     #[cfg(target_os = "linux")]
     fn adopt_boot_installation_on_linux(&self, mode: StartMode) -> Result<bool, ServiceError> {
-        if mode != StartMode::Boot || !crate::host_fitness::is_elevated() {
+        if mode != StartMode::Boot {
+            return Ok(false);
+        }
+        self.refuse_overridden_account()?;
+        if !crate::host_fitness::is_elevated() {
             return Ok(false);
         }
         let Some((StartMode::Boot, found)) = self.find_registration()? else {
@@ -5201,6 +5205,36 @@ impl ServiceOperations {
             }
         }
         Ok(true)
+    }
+
+    /// Refuses a Linux boot install over a unit an administrator's drop-in made
+    /// run as another account.
+    ///
+    /// A drop-in outlives the unit file `service install` rewrites, so the new
+    /// unit would run as that account too, and that account cannot open the
+    /// system tree `root` owns. Said before anything is stopped or copied.
+    #[cfg(target_os = "linux")]
+    fn refuse_overridden_account(&self) -> Result<(), ServiceError> {
+        let Some((StartMode::Boot, found)) = self.find_registration()? else {
+            return Ok(());
+        };
+        match found.account.as_deref() {
+            Some(account) if account != ServiceAccount::Root.as_str() => {
+                Err(ServiceError::Control {
+                    operation: "install",
+                    name: self.identity.name().to_string(),
+                    manager: "systemd",
+                    detail: format!(
+                        "a drop-in under {SYSTEMD_SYSTEM_DIR}/{}.d/ makes it run as {account}, and \
+                         a boot service must run as root to use {}. Remove `User=` and `Group=` \
+                         from that drop-in, run `sudo systemctl daemon-reload`, and install again",
+                        self.identity.systemd_unit(),
+                        crate::paths::SYSTEM_DATA_ROOT,
+                    ),
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Refuses `operation` when the machine's registration is another
@@ -8348,11 +8382,12 @@ mod sys {
 
             let name = plan.identity().name().to_string();
             if self.mode == StartMode::Boot {
-                let refusals = plan
-                    .directories()
-                    .all()
+                // The credential store's directory as well as the four: the
+                // service rewrites the credential there when GitHub rotates it.
+                let refusals = super::permitted_paths(DefinitionKind::SystemdUnit, plan)
                     .iter()
                     .filter_map(|path| {
+                        let path = std::path::Path::new(path);
                         let owner = std::fs::metadata(path).ok().map(|metadata| metadata.uid());
                         super::boot_directory_refusal(path, owner)
                     })
@@ -8363,7 +8398,9 @@ mod sys {
                         &name,
                         format!(
                             "{}. Run `sudo runner-manager service install --start-at boot` \
-                             without --data-dir, which uses {} and {}",
+                             without --data-dir, which uses {} and {}; a directory there that \
+                             root does not own is handed back with `sudo chown -R root:root \
+                             <directory>`",
                             refusals.join("; "),
                             crate::paths::SYSTEM_DATA_ROOT,
                             crate::paths::SYSTEM_LOGS_DIR,
@@ -9716,6 +9753,23 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_boot_install_refuses_a_unit_a_drop_in_runs_as_another_account() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations.install(&host.request(StartMode::Boot)).unwrap();
+        host.controls.edit("runner-manager", |registration| {
+            registration.account = Some("ivan".to_string());
+        });
+        let refused = operations
+            .install(&host.request(StartMode::Boot))
+            .expect_err("a unit running as ivan cannot use root's tree");
+        let message = refused.to_string();
+        assert!(message.contains("run as ivan"), "{message}");
+        assert!(message.contains("Remove `User=`"), "{message}");
     }
 
     #[test]
