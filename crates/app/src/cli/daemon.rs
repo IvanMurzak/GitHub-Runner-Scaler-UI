@@ -470,8 +470,8 @@ async fn run_generation(
                                         target_paths.state_dir(),
                                     ),
                                 )
-                                .with_runner_account(
-                                    runner_manager_platform::runner_account::RunnerAccount::for_this_daemon(),
+                                .with_runner_pool(
+                                    runner_manager_platform::runner_account::RunnerPool::for_this_daemon(),
                                 ),
                         ),
                         clock: Arc::clone(&clock),

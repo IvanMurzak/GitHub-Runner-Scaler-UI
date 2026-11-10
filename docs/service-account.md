@@ -280,44 +280,57 @@ unreadable `$HOME/.gitconfig` as fatal and an absent one as nothing.
 capability bounding set as a set: a capability missing from the list above is a
 shortfall, any other is an excess.
 
-### Jobs run as `rm-runner`, with no capabilities
+### Each runner runs as an account of its own, with no capabilities
 
 A boot service's daemon runs as `root`, because only `root` can read the
 machine-scoped credential. Its jobs do not. `service install --start-at boot`
-creates a system account, `rm-runner`, with no password, no login shell and no
-home directory, and the daemon starts every runner as it:
+creates the group `rm-runner` and 32 system accounts in it, `rm-runner-1` to
+`rm-runner-32`, with no password, no login shell and no home directory. The
+daemon starts every runner as one of them, never as one another runner on the
+host is using:
 
-- the runner's attempt directory is handed to `rm-runner` (`0700`), and so are
-  the dependency-cache directories it is given. The runner root,
-  `/var/lib/runner-manager/runtime`, is `root:rm-runner 0750`: no other local
-  account can enter it, and no job can rename another job's attempt.
-  **Every runner on the host shares `rm-runner`**, so a job can still read and
-  change another job's attempt that runs at the same time, including that
-  runner's credentials. That was as true when every job ran as `root`; a
-  separate account per concurrent runner would close it, and is not done yet;
-- moving from `root` to `rm-runner` clears every capability the daemon holds,
+- the runner's attempt directory is handed to its account (`0700`). The runner
+  root, `/var/lib/runner-manager/runtime`, is `root:rm-runner 0750`: no account
+  outside the pool can enter it, no job can rename another job's attempt, and
+  **no job can read another job's attempt** — its checkout, its artifacts, or
+  its runner's credentials. A job also cannot read another job's
+  `/proc/<pid>/environ`, where secrets passed as environment variables live, nor
+  signal its processes. It can still see that they exist and read their command
+  lines, as any account can;
+- dependency caches are the exception, shared on purpose: each cache directory
+  belongs to the `rm-runner` group, is set-group-ID and carries a default ACL,
+  so what one runner's job writes there the next one can use and update. Sharing
+  a cache is sharing trust: a job can leave in it what another repository's job
+  then runs. Repositories you trust differently should not share a cache; see
+  `repo cache set-namespace`;
+- moving from `root` to a pool account clears every capability the daemon holds,
   and `NoNewPrivileges=yes` stops a set-user-ID or file-capability binary from
   granting one back. A job runs with none, and as an ordinary account it can
   change the owner of the files it extracts only to itself, which is what
   `tar`, npm and `node-gyp` running as `root` expected and could not do;
 - the daemon signals a runner through a recorded process identity only while
-  that process is still `rm-runner`'s, and never writes its records through a
-  link, since a job owns the directory they are in;
-- Docker is reached through the per-attempt proxy, whose socket is handed to
-  `rm-runner`. **Access to a Docker engine is access to `root`**: a job that can
-  start a container can mount the host into it. On a host whose jobs use
-  Docker, `rm-runner` protects the host's files from an ordinary job, not from
-  one that sets out to escape through Docker;
+  that process belongs to the account that owns the attempt, and never writes
+  its records through a link, since the job owns the directory they are in;
+- Docker is reached through the per-attempt proxy, whose socket is handed to the
+  attempt's account. **Access to a Docker engine is access to `root`**: a job
+  that can start a container can mount the host into it, other jobs' attempts
+  included. On a host whose jobs use Docker, separate accounts protect jobs from
+  each other only against an ordinary job, not against one that sets out to
+  escape through Docker;
 - the Git checkout cache is not offered to these runners. Preparing and
   capturing it runs `git` in the daemon over a checkout the job wrote, and
   repository configuration such as `core.fsmonitor` names a command.
 
-If `rm-runner` is removed, the service starts no runner, rather than run jobs as
-`root` with its capabilities, and says to re-run `service install`. A boot
-unit registered by an earlier release keeps no capability at all, so until it is
-re-registered its jobs keep running as a capability-less `root`, as before. A login
-service, and `sudo runner-manager daemon run` in a terminal, keep their runners
-in their own account as before.
+With all 32 accounts busy, a launch fails rather than put two runners on one
+account; a host configured for more concurrent runners than that runs at most
+32. If the accounts are removed, the service starts no runner, rather than run
+jobs as `root` with its capabilities, and says to re-run `service install`. A
+host upgraded from 0.4.56, which ran every runner as the single account
+`rm-runner`, keeps sharing it until `service install` creates the pool. A boot
+unit registered before 0.4.56 keeps no capability at all, so until it is
+re-registered its jobs keep running as a capability-less `root`. A login service,
+and `sudo runner-manager daemon run` in a terminal, keep their runners in their
+own account as before.
 
 `service install --start-at boot` refuses directories a boot unit could not use
 — one another account owns, or one under a home tree — and says to drop
@@ -341,8 +354,8 @@ restrictions:
   privilege inside it;
 - an action that installs tooling into `/usr` or `/opt` fails.
 
-A boot service's runners run as `rm-runner`, which has no home directory, so
-each runner gets its own `HOME` at `<attempt>/home` instead. Actions
+A boot service's runners run as pool accounts, which have no home directory,
+so each runner gets its own `HOME` at `<attempt>/home` instead. Actions
 that install into `~` (`setup-bun`'s `~/.bun`, `docker login`'s
 `~/.docker`) work there, and what they leave goes with the attempt. A login
 service keeps the operator's own `HOME`.
