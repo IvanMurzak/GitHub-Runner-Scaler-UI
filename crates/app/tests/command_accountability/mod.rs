@@ -509,7 +509,7 @@ pub const MANIFEST: &[Classification] = &[
     },
     Classification {
         leaf: "host isolation prepare",
-        coverage: Coverage::Excluded,
+        coverage: Coverage::Dedicated,
         evidence: &[at(
             "crates/agent/src/oci.rs",
             "a_rootful_engine_needs_rootful_podman_and_room_for_every_runner",
