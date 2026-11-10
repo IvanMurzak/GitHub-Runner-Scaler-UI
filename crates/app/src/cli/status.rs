@@ -140,6 +140,9 @@ pub struct StatusDocument {
     /// The optional coordinator: whether this host joined one, and the
     /// service's link to it as the daemon last reported it.
     pub coordinator: super::coordinator::CoordinatorSnapshot,
+    /// Memory admission (0.4.53): its setting, and the profiles whose
+    /// runners wait for memory, as the service last recorded.
+    pub memory: super::memory::MemorySnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -665,6 +668,7 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
             })
             .collect(),
         doctor,
+        memory: super::memory::MemorySnapshot::read(&service.paths, context.clock().now()),
     })
 }
 
@@ -731,6 +735,15 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
         "  service start mode        {}",
         document.host.service_start_mode
     )?;
+    writeln!(
+        out,
+        "  memory admission          {}",
+        super::memory::describe(runner_manager_domain::memory::MemorySettings {
+            enabled: document.memory.enabled,
+            margin_bytes: document.memory.margin_bytes,
+        })
+    )?;
+    document.memory.write_waiting(out)?;
     if let Some(root) = &document.product.service_installed_from {
         writeln!(
             out,
@@ -1073,6 +1086,23 @@ mod tests {
                 namespaces: Some(2),
                 measured_at: Some(chrono::DateTime::from_timestamp(1_787_270_000, 0).unwrap()),
             },
+            memory: super::super::memory::MemorySnapshot {
+                enabled: true,
+                margin_bytes: 1 << 30,
+                setting_unreadable: None,
+                waiting: vec![runner_manager_platform::memory_admission::Waiting {
+                    policy_id: "00000000-0000-0000-0000-000000000003".to_string(),
+                    target: "acme/unreal".to_string(),
+                    profile: "default".to_string(),
+                    since: Some(chrono::DateTime::from_timestamp(1_787_270_000, 0).unwrap()),
+                    at: Some(chrono::DateTime::from_timestamp(1_787_270_300, 0).unwrap()),
+                    free_bytes: 14 << 30,
+                    reserved_bytes: 10 << 30,
+                    estimate_bytes: 12 << 30,
+                    estimate_source: "coordinator".to_string(),
+                    margin_bytes: 1 << 30,
+                }],
+            },
         }
     }
 
@@ -1100,6 +1130,24 @@ mod tests {
     /// the whole schema, rather than in a consumer's `jq` some weeks later.
     /// Adding a field is a compatible change and updates this list.
     #[test]
+    fn a_profile_waiting_for_memory_is_one_line_with_its_figures() {
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document()).expect("writing to a Vec");
+        let text = String::from_utf8(buffer).expect("utf-8");
+        assert!(
+            text.contains("memory admission          on, margin 1.0 GiB"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "waiting for memory: acme/unreal (default) needs 13.0 GiB (12.0 GiB coordinator \
+                 estimate + 1.0 GiB margin), 14.0 GiB free less 10.0 GiB reserved for running jobs"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn the_documented_schema_is_the_one_that_is_emitted() {
         let emitted = emitted();
 
@@ -1114,10 +1162,30 @@ mod tests {
                 "generated_at",
                 "github_contacted",
                 "host",
+                "memory",
                 "policies",
                 "polling",
                 "product",
                 "schema_version",
+            ]
+        );
+        assert_eq!(
+            keys(&emitted, "/memory"),
+            ["enabled", "margin_bytes", "setting_unreadable", "waiting"]
+        );
+        assert_eq!(
+            keys(&emitted, "/memory/waiting/0"),
+            [
+                "at",
+                "estimate_bytes",
+                "estimate_source",
+                "free_bytes",
+                "margin_bytes",
+                "policy_id",
+                "profile",
+                "reserved_bytes",
+                "since",
+                "target",
             ]
         );
         assert_eq!(

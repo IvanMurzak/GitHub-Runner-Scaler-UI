@@ -1266,9 +1266,14 @@ impl Placement {
                         "a host refused a launch; trying the next"
                     );
                     // Its slots are taken: a job too big for the rest waits for it.
+                    // So is one whose memory is spoken for by running jobs.
                     still_able = matches!(
                         ack.reason,
-                        Some(RefusalReason::MaxCapacity | RefusalReason::HostCapacity)
+                        Some(
+                            RefusalReason::MaxCapacity
+                                | RefusalReason::HostCapacity
+                                | RefusalReason::Memory
+                        )
                     );
                     last_failure = Some(Unplaced::Refused(
                         ack.reason.unwrap_or(RefusalReason::Other),
@@ -1643,6 +1648,8 @@ mod tests {
         Refuse,
         /// Refuse for a reason other than its slots.
         Disabled,
+        /// Refuse: its memory is spoken for by running jobs (0.4.53).
+        Memory,
         Silent,
     }
 
@@ -1736,6 +1743,10 @@ mod tests {
                         Answer::Disabled => placement.acknowledged(
                             id,
                             LaunchAck::refused(&launch.lease_id, RefusalReason::Disabled),
+                        ),
+                        Answer::Memory => placement.acknowledged(
+                            id,
+                            LaunchAck::refused(&launch.lease_id, RefusalReason::Memory),
                         ),
                         Answer::Silent => {}
                     }
@@ -2989,7 +3000,12 @@ mod tests {
     /// would; one whose slots are taken does, as with a heartbeat that says so.
     #[tokio::test]
     async fn a_heavy_job_goes_elsewhere_only_when_the_big_host_cannot_take_it() {
-        for (how, accepted) in [(Answer::Disabled, 1), (Answer::Refuse, 0)] {
+        // A memory refusal is a busy host too: its running jobs will end.
+        for (how, accepted) in [
+            (Answer::Disabled, 1),
+            (Answer::Refuse, 0),
+            (Answer::Memory, 0),
+        ] {
             let (registry, placement) = light_and_mem();
             let big = connect_sized(
                 &registry,

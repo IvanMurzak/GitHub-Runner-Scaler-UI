@@ -63,7 +63,9 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::coordinator::{LinkView, same_target, target_ref};
+use super::memory::HostMemory;
 use super::meters::AttemptMeters;
+use runner_manager_domain::memory::MemoryVerdict;
 
 /// Lease ids remembered so a repeat is refused.
 const SEEN_MEMORY: usize = 1024;
@@ -326,6 +328,9 @@ pub struct Launches {
     host: Host,
     view: watch::Receiver<LinkView>,
     book: Mutex<Book>,
+    /// The host's memory admission: a launch it would refuse to start is
+    /// refused here, so the coordinator places the job elsewhere at once.
+    memory: Option<Arc<HostMemory>>,
 }
 
 impl Launches {
@@ -336,7 +341,15 @@ impl Launches {
             host,
             view,
             book: Mutex::new(Book::default()),
+            memory: None,
         }
+    }
+
+    /// Refuses a launch the host's memory cannot hold (`memory`).
+    #[must_use]
+    pub fn with_memory(mut self, memory: Arc<HostMemory>) -> Self {
+        self.memory = Some(memory);
+        self
     }
 
     fn book(&self) -> std::sync::MutexGuard<'_, Book> {
@@ -537,6 +550,37 @@ impl Launches {
                 | LimitingFactor::NotReconciling
                 | LimitingFactor::ForeignHost => return refuse(RefusalReason::Disabled),
                 LimitingFactor::Demand | LimitingFactor::MinCapacity => {}
+            }
+        }
+        // Memory, as the pass will judge it, with every accepted launch still
+        // without a runner holding its estimate: they are coming. Not when a
+        // runner already up serves this launch: nothing new starts.
+        if let Some(memory) = self
+            .memory
+            .as_ref()
+            .filter(|_| with.to_start > without.to_start)
+        {
+            let pending: Vec<u64> = {
+                let book = self.book();
+                book.open
+                    .values()
+                    .filter(|open| open.attempt.is_none())
+                    .filter_map(|open| policies.iter().find(|p| p.id == open.policy))
+                    .map(|owner| memory.estimate(owner).bytes)
+                    .collect()
+            };
+            if let MemoryVerdict::Defer(figures) = memory.verdict(policy, &attempts, &pending) {
+                tracing::info!(
+                    lease = %launch.lease_id,
+                    policy_id = %policy.id,
+                    free_bytes = figures.free,
+                    reserved_bytes = figures.reserved,
+                    estimate_bytes = figures.estimate.bytes,
+                    estimate_source = figures.estimate.source.as_str(),
+                    margin_bytes = figures.margin,
+                    "a launch was refused: the host lacks the memory for it"
+                );
+                return refuse(RefusalReason::Memory);
             }
         }
         let ttl = Duration::from_secs(u64::from(launch.ttl_secs));
@@ -1781,6 +1825,46 @@ mod tests {
                 )
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_launch_the_hosts_memory_cannot_hold_is_refused_for_memory() {
+        use runner_manager_domain::coordinator_protocol::{MemoryEstimates, TargetEstimate};
+        let gib = 1u64 << 30;
+        let dir = tempfile::tempdir().expect("dir");
+        let (store, policy, plain) = setup(LAUNCH_VERSION);
+        let memory = Arc::new(
+            HostMemory::new(
+                runner_manager_platform::paths::AppPaths::rooted_at(dir.path()),
+                Arc::clone(&store) as Arc<dyn Store>,
+            )
+            .with_free_memory(move || Some(5 * gib)),
+        );
+        memory.set_coordinator_estimates(MemoryEstimates {
+            estimates: vec![TargetEstimate {
+                target: target_ref(&policy.target),
+                peak_rss_bytes: 3 * gib,
+                samples: 4,
+                own: true,
+            }],
+        });
+        let launches = Launches::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            plain.current_host(),
+            directed_view(&policy, LAUNCH_VERSION, true),
+        )
+        .with_memory(memory);
+        assert!(
+            launches
+                .decide(&launch(&policy, "a"), false, false)
+                .accepted
+        );
+        // The first launch's runner is not up yet: its 3 GiB are spoken for.
+        let refused = launches.decide(&launch(&policy, "b"), false, false);
+        assert_eq!(refused.reason, Some(RefusalReason::Memory));
+        // Without admission the profile's two slots take both.
+        assert!(plain.decide(&launch(&policy, "a"), false, false).accepted);
+        assert!(plain.decide(&launch(&policy, "b"), false, false).accepted);
     }
 
     #[test]

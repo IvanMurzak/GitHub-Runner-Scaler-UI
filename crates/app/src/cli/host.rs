@@ -603,6 +603,7 @@ pub fn dispatch(
         }
         HostCommand::SetCapacity(args) => set_capacity(context, args, out),
         HostCommand::SetPollInterval(args) => super::polling::set_poll_interval(context, args, out),
+        HostCommand::SetMemoryMargin(args) => super::memory::set_margin(context, args, out),
         HostCommand::SetRuntimeRoot(args) => runtime_root(context, Some(&args.path), styling, out),
         HostCommand::ResetRuntimeRoot => runtime_root(context, None, styling, out),
         HostCommand::Show => show(context, out),
@@ -1145,6 +1146,12 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     )
     .map_err(failed)?;
     writeln!(out, "  service start mode        {start_mode}").map_err(failed)?;
+    writeln!(
+        out,
+        "  memory admission          {}",
+        super::memory::describe_setting(context)
+    )
+    .map_err(failed)?;
 
     // -- where disposable runner attempts are created ---------------------
     //

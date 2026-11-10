@@ -1190,3 +1190,75 @@ async fn statistics_over_the_link_require_an_authenticated_version_four_host() {
         .await;
     assert_eq!(closed_with(&mut socket).await, Some(CLOSE_UNAUTHORIZED));
 }
+
+/// From 0.4.53: a version-4 host is told, after its `hello`, what its targets'
+/// jobs are expected to need, for its own memory admission. An older link
+/// (version 3) is never sent the message.
+#[tokio::test]
+async fn a_version_four_host_is_told_its_targets_memory_estimates() {
+    use runner_manager_coordinator::store::JobSample;
+    use runner_manager_domain::coordinator_protocol::{MemoryEstimates, TargetRef};
+    let mut store = Store::open_in_memory().expect("store");
+    for (index, rss) in [6u64 << 30, 11 << 30, 12 << 30].into_iter().enumerate() {
+        store
+            .record_sample(
+                &JobSample {
+                    job_key: format!("octo/app/build-{index}"),
+                    repository: "octo/app".into(),
+                    host_id: "elsewhere".into(),
+                    finished_at: Utc::now(),
+                    duration_secs: Some(60),
+                    queue_wait_secs: None,
+                    peak_rss_bytes: Some(rss),
+                    cpu_avg_millicores: None,
+                    cpu_peak_millicores: None,
+                },
+                30,
+                Utc::now() - chrono::TimeDelta::days(1),
+            )
+            .expect("sample");
+    }
+    let coordinator = start_with(store).await;
+    let (host_id, key) = enrolled(&coordinator, "macm6", 41).await;
+    let mut socket = coordinator.connect(&host_id, &key).await;
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerMessage::Welcome { .. }
+    ));
+    send(&mut socket, &hello(PROTOCOL_VERSION, &host_id)).await;
+    let mut estimates = None;
+    for _ in 0..2 {
+        if let ServerMessage::MemoryEstimates(found) = next(&mut socket).await {
+            estimates = Some(found);
+        }
+    }
+    let Some(MemoryEstimates { estimates }) = estimates else {
+        panic!("no memory estimates after the hello");
+    };
+    assert_eq!(estimates.len(), 1);
+    assert_eq!(
+        estimates[0].target,
+        TargetRef {
+            scope: TargetScope::Org,
+            name: "octo".into()
+        }
+    );
+    assert_eq!(estimates[0].peak_rss_bytes, 12 << 30, "the heaviest job");
+    assert_eq!(estimates[0].samples, 3);
+    assert!(!estimates[0].own);
+    drop(socket);
+
+    // A version-3 link: a `hello_ack` and nothing else.
+    let mut socket = coordinator.connect_at(3, &host_id, &key).await;
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerMessage::Welcome { .. }
+    ));
+    send(&mut socket, &hello(3, &host_id)).await;
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerMessage::HelloAck(_)
+    ));
+    let more = tokio::time::timeout(Duration::from_millis(300), socket.next()).await;
+    assert!(more.is_err(), "nothing more for a version-3 host: {more:?}");
+}

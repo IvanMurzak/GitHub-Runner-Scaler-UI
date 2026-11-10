@@ -120,6 +120,7 @@ use runner_manager_domain::attempt::{
     AttemptOutcome, AttemptState, FailureReason, IsolationProviderFailure, RunnerAttempt,
 };
 use runner_manager_domain::capacity::{Allocation, HostAllocator, LimitingFactor};
+use runner_manager_domain::memory::{MemoryFigures, MemoryVerdict};
 use runner_manager_domain::model::{
     AttemptId, Clock, Host, IdlePollInterval, Org, OwnerRepo, PolicyId, RefreshInterval,
     ScaleTarget, Timestamp,
@@ -1928,6 +1929,16 @@ pub enum LifecycleEvent {
     /// The allocation lock was not free, so `count` runners this policy was
     /// granted were not created this pass.
     AllocationDeferred { policy: PolicyId, count: u16 },
+    /// The host lacks the memory for one more runner of this policy: free
+    /// memory less what its running attempts may still grow into is under
+    /// the estimate plus the margin. Not `started`: the demand stays queued
+    /// and a later pass tries again. `started`: nothing runs that could free
+    /// memory, so the runner was started anyway.
+    MemoryShort {
+        policy: PolicyId,
+        figures: MemoryFigures,
+        started: bool,
+    },
     /// The host's attempt set could not be read at all.
     ///
     /// Distinct from an empty set on purpose, and the whole reason
@@ -1971,6 +1982,8 @@ impl LifecycleEvent {
             Self::RunnerStarted { .. } => "runner_started",
             Self::RunnerStartFailed { .. } => "runner_start_failed",
             Self::AllocationDeferred { .. } => "allocation_deferred",
+            Self::MemoryShort { started: false, .. } => "memory_deferred",
+            Self::MemoryShort { started: true, .. } => "memory_admitted_alone",
             Self::AttemptsUnreadable { .. } => "attempts_unreadable",
             Self::HostCapacityUnreadable { .. } => "host_capacity_unreadable",
             Self::AttemptCleaned { .. } => "attempt_cleaned",
@@ -1992,6 +2005,7 @@ impl LifecycleEvent {
             | Self::RunnerStarted { policy, .. }
             | Self::RunnerStartFailed { policy, .. }
             | Self::AllocationDeferred { policy, .. }
+            | Self::MemoryShort { policy, .. }
             | Self::AttemptCleaned { policy, .. }
             | Self::AttemptCleanFailed { policy, .. }
             | Self::ScaleDownRefused { policy, .. } => Some(*policy),
@@ -2064,6 +2078,20 @@ impl fmt::Display for LifecycleEvent {
                 f,
                 "policy {policy}: the allocation lock was held; {count} granted runners \
                  were not created"
+            ),
+            Self::MemoryShort {
+                policy,
+                figures,
+                started: false,
+            } => write!(f, "policy {policy}: waiting for memory: {figures}"),
+            Self::MemoryShort {
+                policy,
+                figures,
+                started: true,
+            } => write!(
+                f,
+                "policy {policy}: started although the host lacks the memory, because \
+                 nothing else runs here: {figures}"
             ),
             Self::AttemptsUnreadable { reason } => write!(
                 f,
@@ -2249,6 +2277,27 @@ impl EventSink for TracingEvents {
                     policy_id = %policy,
                     reason = "allocation_lock_unavailable",
                     count
+                );
+            }
+            LifecycleEvent::MemoryShort {
+                policy,
+                figures,
+                started,
+            } => {
+                let reason = if started {
+                    "larger_than_free_memory_nothing_else_running"
+                } else {
+                    "insufficient_memory"
+                };
+                tracing::warn!(
+                    event = name,
+                    policy_id = %policy,
+                    reason,
+                    free_bytes = figures.free,
+                    reserved_bytes = figures.reserved,
+                    estimate_bytes = figures.estimate.bytes,
+                    estimate_source = figures.estimate.source.as_str(),
+                    margin_bytes = figures.margin,
                 );
             }
             LifecycleEvent::AttemptsUnreadable { reason } => {
@@ -2439,6 +2488,30 @@ struct Reserved {
     _hold: LaunchHold,
 }
 
+/// Whether the host has the memory for one more runner: asked under the
+/// allocation lock before every start, after every ceiling granted it, so a
+/// directed launch and a host's own demand meet the same check. See
+/// [`runner_manager_domain::memory`].
+pub trait MemoryGate: fmt::Debug + Send + Sync {
+    /// Whether one more runner of `policy` may start, given every attempt on
+    /// the host (those this pass reserved included).
+    fn admit(&self, policy: &ScalePolicy, attempts: &[RunnerAttempt]) -> MemoryVerdict;
+
+    /// `policy` was granted a runner and memory did not stop it: a waiting
+    /// state recorded for it is over.
+    fn admitted(&self, _policy: &ScalePolicy) {}
+}
+
+/// No memory admission: every start the ceilings grant goes ahead.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoMemoryGate;
+
+impl MemoryGate for NoMemoryGate {
+    fn admit(&self, _policy: &ScalePolicy, _attempts: &[RunnerAttempt]) -> MemoryVerdict {
+        MemoryVerdict::Unchecked
+    }
+}
+
 /// Every policy's demand is its own reading: no coordinator places runners.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OwnDemand;
@@ -2516,6 +2589,9 @@ pub struct ReconcileReport {
     /// unstarted -- a number that agreed with neither its own name nor its
     /// documentation.
     pub deferred: u16,
+    /// Runners this pass was granted but did not start because the host
+    /// lacked the memory for them. Their demand stays queued.
+    pub memory_deferred: u16,
     /// Times the host's attempt set could not be read this pass.
     ///
     /// Non-zero means the pass decided less than it looks like it decided: a
@@ -2736,6 +2812,7 @@ pub struct Reconciler {
     /// What serves this target's launches beside its passes, when something
     /// does: see [`Self::with_launch_side`].
     launch_side: Option<Arc<tokio::sync::Notify>>,
+    memory: Arc<dyn MemoryGate>,
 }
 
 impl Reconciler {
@@ -2761,7 +2838,15 @@ impl Reconciler {
             clean_backoff: CleanBackoff::default(),
             director: Arc::new(OwnDemand),
             launch_side: None,
+            memory: Arc::new(NoMemoryGate),
         }
+    }
+
+    /// Checks every start against the host's memory. See [`MemoryGate`].
+    #[must_use]
+    pub fn with_memory_gate(mut self, memory: Arc<dyn MemoryGate>) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Leaves this reconciler's directed launches to whatever `signal` wakes
@@ -3242,6 +3327,18 @@ impl Reconciler {
         demand: u32,
         reserved: &[Reserved],
     ) -> Result<Allocation, AllocationFailure> {
+        self.allocate_over(policy, demand, reserved)
+            .await
+            .map(|(allocation, _)| allocation)
+    }
+
+    /// [`Self::allocate_only`], and the attempt set it was decided over.
+    async fn allocate_over(
+        &self,
+        policy: &ScalePolicy,
+        demand: u32,
+        reserved: &[Reserved],
+    ) -> Result<(Allocation, Vec<RunnerAttempt>), AllocationFailure> {
         // Read again under the shared launch lock, not just at each target's
         // poll boundary: another target must not use an old, higher ceiling.
         let mut host = self.host.clone();
@@ -3255,7 +3352,8 @@ impl Reconciler {
             .await
             .map_err(AllocationFailure::Attempts)?;
         let mut allocator = HostAllocator::from_attempts(&host, &attempts);
-        Ok(allocator.allocate(policy, demand))
+        let allocation = allocator.allocate(policy, demand);
+        Ok((allocation, attempts))
     }
 
     /// Flow 2.4-2.6: start runners for one policy, one lock hold per runtime.
@@ -3347,8 +3445,8 @@ impl Reconciler {
             // whole sequence rather than on the decision alone -- reading the
             // headroom outside the lock is the shape in which two policies both
             // find room for the last slot.
-            let allocation = match self.allocate_only(policy, demand, reserved).await {
-                Ok(allocation) => allocation,
+            let (allocation, attempts) = match self.allocate_over(policy, demand, reserved).await {
+                Ok(decided) => decided,
                 Err(failure) => {
                     drop(guard);
                     self.report_allocation_failure(report, &failure);
@@ -3370,6 +3468,35 @@ impl Reconciler {
             if allocation.starts_nothing() || budget == 0 {
                 drop(guard);
                 break;
+            }
+
+            // Memory, last: every ceiling granted this runner. Read under the
+            // hold with the set the grant was decided over, so a runner this
+            // pass reserved a moment ago holds its estimate here already.
+            match self.memory.admit(policy, &attempts) {
+                MemoryVerdict::Defer(figures) => {
+                    drop(guard);
+                    report.memory_deferred = report.memory_deferred.saturating_add(budget);
+                    self.events.emit(LifecycleEvent::MemoryShort {
+                        policy: policy.id,
+                        figures,
+                        started: false,
+                    });
+                    // A directed launch waits like one that could not start:
+                    // past `START_LIMIT` it is dropped, and the coordinator
+                    // places its job on another host.
+                    self.director.start_failed(policy, None);
+                    break;
+                }
+                MemoryVerdict::AdmitAlone(figures) => {
+                    self.events.emit(LifecycleEvent::MemoryShort {
+                        policy: policy.id,
+                        figures,
+                        started: true,
+                    });
+                    self.memory.admitted(policy);
+                }
+                MemoryVerdict::Admit(_) | MemoryVerdict::Unchecked => self.memory.admitted(policy),
             }
 
             let created = self
@@ -5123,6 +5250,150 @@ mod tests {
         );
         assert_eq!(report.started, 2, "and two runners were actually started");
         assert_eq!(harness.launcher.live_count(), 2);
+    }
+
+    // =======================================================================
+    // Memory admission
+    // =======================================================================
+
+    /// The domain rule over a fixed free-memory reading: every attempt on the
+    /// host is estimated at `estimate` and none has been sampled yet.
+    #[derive(Debug)]
+    struct FixedMemory {
+        free: u64,
+        estimate: u64,
+        admitted: std::sync::atomic::AtomicU32,
+    }
+
+    impl MemoryGate for FixedMemory {
+        fn admit(&self, _policy: &ScalePolicy, attempts: &[RunnerAttempt]) -> MemoryVerdict {
+            let running: Vec<runner_manager_domain::memory::Running> = attempts
+                .iter()
+                .filter(|attempt| attempt.counts_against_capacity())
+                .map(|_| runner_manager_domain::memory::Running {
+                    estimate: self.estimate,
+                    current_rss: None,
+                })
+                .collect();
+            runner_manager_domain::memory::admit(
+                Some(self.free),
+                &running,
+                runner_manager_domain::memory::Estimate::choose(None, Some(self.estimate)),
+                GIB,
+            )
+        }
+
+        fn admitted(&self, _policy: &ScalePolicy) {
+            self.admitted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    fn with_memory(harness: Harness, free: u64, estimate: u64) -> (Harness, Arc<FixedMemory>) {
+        let gate = Arc::new(FixedMemory {
+            free,
+            estimate,
+            admitted: std::sync::atomic::AtomicU32::new(0),
+        });
+        let Harness {
+            launcher,
+            demand,
+            events,
+            clock,
+            reconciler,
+        } = harness;
+        let reconciler = reconciler.with_memory_gate(Arc::clone(&gate) as Arc<dyn MemoryGate>);
+        (
+            Harness {
+                launcher,
+                demand,
+                events,
+                clock,
+                reconciler,
+            },
+            gate,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_start_the_memory_cannot_hold_is_deferred_and_the_demand_kept() {
+        // 10 GiB free, 4 GiB per runner, a 1 GiB margin: the first fits whole,
+        // the second fits beside the first's 4 GiB still to come, the third
+        // does not. Every ceiling would have granted five.
+        let (mut harness, gate) = with_memory(Harness::simple(8, 5, "acme/app"), 10 * GIB, 4 * GIB);
+        let report = harness
+            .reconciler
+            .reconcile(&[policy(1, "acme/app", 5)])
+            .await;
+
+        assert_eq!(
+            report.allocations[0].to_start, 5,
+            "the ceilings granted five"
+        );
+        assert_eq!(report.started, 2);
+        assert_eq!(report.memory_deferred, 3, "deferred, not failed");
+        assert_eq!(report.failures, 0);
+        assert_eq!(gate.admitted.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let deferred: Vec<MemoryFigures> = harness
+            .events
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                LifecycleEvent::MemoryShort {
+                    figures,
+                    started: false,
+                    ..
+                } => Some(figures),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].free, 10 * GIB);
+        assert_eq!(deferred[0].reserved, 8 * GIB);
+        assert_eq!(deferred[0].needed(), 5 * GIB);
+
+        // The demand is still queued: the next pass asks again, and is
+        // refused again while nothing has ended.
+        let again = harness
+            .reconciler
+            .reconcile(&[policy(1, "acme/app", 5)])
+            .await;
+        assert_eq!(again.started, 0);
+        assert!(again.memory_deferred > 0);
+        assert_eq!(harness.launcher.live_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_runner_bigger_than_the_free_memory_starts_when_nothing_else_runs() {
+        let (mut harness, _) = with_memory(Harness::simple(8, 2, "acme/app"), GIB, 4 * GIB);
+        let report = harness
+            .reconciler
+            .reconcile(&[policy(1, "acme/app", 5)])
+            .await;
+
+        assert_eq!(report.started, 1, "no starvation, but only one");
+        assert_eq!(report.memory_deferred, 1);
+        let names: Vec<&str> = harness
+            .events
+            .events()
+            .iter()
+            .map(LifecycleEvent::name)
+            .filter(|name| name.starts_with("memory_"))
+            .collect();
+        assert_eq!(names, ["memory_admitted_alone", "memory_deferred"]);
+    }
+
+    #[tokio::test]
+    async fn without_a_memory_gate_every_granted_runner_starts() {
+        let mut harness = Harness::simple(8, 5, "acme/app");
+        let report = harness
+            .reconciler
+            .reconcile(&[policy(1, "acme/app", 5)])
+            .await;
+        assert_eq!(report.started, 5);
+        assert_eq!(report.memory_deferred, 0);
     }
 
     // =======================================================================

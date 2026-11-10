@@ -11,8 +11,12 @@
 //! tree, its average CPU over the attempt and its busiest interval.
 //!
 //! An isolated attempt (a container, a VM, a WSL distribution) has no host
-//! process to look at and reports no usage. Nothing here is a figure the
-//! host acts on; the coordinator uses it to estimate how heavy a job is.
+//! process to look at and reports no usage. The coordinator uses the figures
+//! to estimate how heavy a job is; from 0.4.53 the host's memory admission
+//! uses them too (`super::memory`): what each running attempt uses now, and,
+//! once an attempt that ran a job ends, its peak, kept per profile in
+//! `state/memory-peaks.toml`. Sampling then also runs while admission is on
+//! without a coordinator.
 //!
 //! The same look notices a live attempt whose runner process is gone and
 //! nudges its target loop, so the next pass concludes it and frees its slot
@@ -23,9 +27,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use runner_manager_domain::attempt::AttemptOutcome;
 use runner_manager_domain::coordinator_protocol::AttemptUsage;
-use runner_manager_domain::model::{AttemptId, HostId, ScaleTarget};
+use runner_manager_domain::memory::LOCAL_PEAKS_KEPT;
+use runner_manager_domain::model::{AttemptId, HostId, PolicyId, ScaleTarget};
 use runner_manager_domain::store::Store;
+use runner_manager_platform::memory_admission::{Peaks, load_peaks, save_peaks};
 use runner_manager_platform::resource_usage::{TreeUsage, sample_trees};
 use tokio::time::Instant;
 
@@ -50,11 +57,20 @@ struct Meter {
     /// its time out of the total, and new work after that must still count.
     used_cpu: Duration,
     peak_rss: u64,
+    /// The tree's memory at the last look.
+    last_rss: u64,
     peak_millicores: u32,
     samples: u32,
     /// When its runner process was first seen gone, for the log line that says
     /// how long its slot took to free.
     gone_at: Option<Instant>,
+    /// The profile it ran for, when a pass sampled it (not a bare `record`).
+    policy: Option<PolicyId>,
+    /// Its usage went into an attempt report.
+    reported: bool,
+    /// It ended, and its peak was kept for its profile (or judged not worth
+    /// keeping: an idle exit).
+    banked: bool,
 }
 
 /// CPU time over wall time, in thousandths of a CPU.
@@ -84,6 +100,9 @@ impl Meter {
 #[derive(Debug, Default)]
 pub struct AttemptMeters {
     meters: Mutex<HashMap<AttemptId, Meter>>,
+    /// Each profile's newest peaks, and where they are kept.
+    peaks: Mutex<Peaks>,
+    peaks_file: Option<std::path::PathBuf>,
     /// Live attempts whose runner process was seen gone, and when that was
     /// last announced: again only after [`ANNOUNCE_AGAIN`], so an attempt a
     /// pass cannot conclude yet (GitHub unreachable) does not pull every poll
@@ -98,8 +117,58 @@ impl AttemptMeters {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// One sample of `attempt`'s tree, taken at `at`.
+    /// Meters whose ended attempts' peaks are kept in `file`, and those kept
+    /// there before.
+    #[must_use]
+    pub fn with_peaks_file(file: std::path::PathBuf) -> Self {
+        Self {
+            peaks: Mutex::new(load_peaks(&file)),
+            peaks_file: Some(file),
+            ..Self::default()
+        }
+    }
+
+    fn peaks(&self) -> std::sync::MutexGuard<'_, Peaks> {
+        self.peaks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `policy`'s newest measured peaks, oldest first.
+    #[must_use]
+    pub fn peaks_of(&self, policy: PolicyId) -> Vec<u64> {
+        self.peaks()
+            .policies
+            .get(&policy.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Sets `policy`'s measured peaks.
+    #[cfg(test)]
+    pub fn set_peaks(&self, policy: PolicyId, peaks: Vec<u64>) {
+        self.peaks().policies.insert(policy.to_string(), peaks);
+    }
+
+    /// What `attempt`'s tree used at the last look, when it was sampled.
+    #[must_use]
+    pub fn current_rss(&self, attempt: AttemptId) -> Option<u64> {
+        self.lock().get(&attempt).map(|meter| meter.last_rss)
+    }
+
+    /// One sample of `attempt`'s tree, taken at `at`, for no profile.
+    #[cfg(test)]
     pub fn record(&self, attempt: AttemptId, at: Instant, usage: TreeUsage) {
+        self.record_for(attempt, None, at, usage);
+    }
+
+    fn record_for(
+        &self,
+        attempt: AttemptId,
+        policy: Option<PolicyId>,
+        at: Instant,
+        usage: TreeUsage,
+    ) {
         let mut meters = self.lock();
         let meter = meters.entry(attempt).or_insert(Meter {
             first_at: at,
@@ -107,9 +176,13 @@ impl AttemptMeters {
             last_cpu: usage.cpu_time,
             used_cpu: Duration::ZERO,
             peak_rss: 0,
+            last_rss: 0,
             peak_millicores: 0,
             samples: 0,
             gone_at: None,
+            policy,
+            reported: false,
+            banked: false,
         });
         // A descendant that exited took its CPU time out of the total: only
         // increases count, from wherever the total now stands.
@@ -121,6 +194,7 @@ impl AttemptMeters {
         meter.last_at = at;
         meter.last_cpu = usage.cpu_time;
         meter.peak_rss = meter.peak_rss.max(usage.rss_bytes);
+        meter.last_rss = usage.rss_bytes;
         meter.samples = meter.samples.saturating_add(1);
         meter.gone_at = None;
     }
@@ -132,9 +206,20 @@ impl AttemptMeters {
         Some(now.saturating_duration_since(gone_at))
     }
 
-    /// What `attempt` used, once: the meter is gone afterwards.
+    /// What `attempt` used, once. The meter stays until its peak is kept for
+    /// its profile.
     pub fn take(&self, attempt: AttemptId) -> Option<AttemptUsage> {
-        self.lock().remove(&attempt).map(|meter| meter.usage())
+        let mut meters = self.lock();
+        let meter = meters.get_mut(&attempt)?;
+        if meter.reported {
+            return None;
+        }
+        meter.reported = true;
+        let usage = meter.usage();
+        if meter.banked || meter.policy.is_none() {
+            meters.remove(&attempt);
+        }
+        Some(usage)
     }
 
     /// Forgets meters not sampled for a long while and not in `live`: an
@@ -146,15 +231,76 @@ impl AttemptMeters {
         });
     }
 
+    /// Keeps, for its profile, the peak of every metered attempt that ended
+    /// (is not in `live`, and concluded in the journal) after running a job:
+    /// an idle exit says nothing of the jobs. `live` must be complete.
+    fn bank_ended(&self, store: &dyn Store, live: &HashSet<AttemptId>) {
+        let ended: Vec<(AttemptId, PolicyId, u64)> = self
+            .lock()
+            .iter()
+            .filter(|(attempt, meter)| !meter.banked && !live.contains(attempt))
+            .filter_map(|(attempt, meter)| Some((*attempt, meter.policy?, meter.peak_rss)))
+            .collect();
+        if ended.is_empty() {
+            return;
+        }
+        let mut kept = false;
+        for (attempt, policy, peak) in ended {
+            let ran_a_job = match store.attempt(attempt) {
+                // `CompletedJob` is the runner finishing its job, whatever the
+                // job's own result (an out-of-memory build included). `Failed`
+                // is the runner failing, mostly before any job: its peak would
+                // drag the estimate down.
+                Ok(Some(found)) => match found.outcome() {
+                    Some(outcome) => matches!(outcome, AttemptOutcome::CompletedJob),
+                    // Not concluded yet: asked again at the next look.
+                    None => continue,
+                },
+                // Gone from the journal (cleaned): nothing says how it ended.
+                Ok(None) => false,
+                Err(_) => continue,
+            };
+            if ran_a_job && peak > 0 {
+                let mut peaks = self.peaks();
+                let kept_for = peaks.policies.entry(policy.to_string()).or_default();
+                kept_for.push(peak);
+                if kept_for.len() > LOCAL_PEAKS_KEPT {
+                    let surplus = kept_for.len() - LOCAL_PEAKS_KEPT;
+                    kept_for.drain(..surplus);
+                }
+                kept = true;
+            }
+            let mut meters = self.lock();
+            if let Some(meter) = meters.get_mut(&attempt) {
+                meter.banked = true;
+                if meter.reported {
+                    meters.remove(&attempt);
+                }
+            }
+        }
+        if kept && let Some(file) = &self.peaks_file {
+            let peaks = self.peaks().clone();
+            if let Err(error) = save_peaks(file, &peaks) {
+                tracing::warn!(%error, "the measured memory peaks could not be kept");
+            }
+        }
+    }
+
     /// One pass: samples every live native attempt of `host`'s own policies.
     /// Returns the targets of the attempts whose runner process is newly
     /// seen gone. Blocking: SQLite and the process table.
     pub fn sample_once(&self, store: &dyn Store, host: HostId) -> Vec<ScaleTarget> {
-        let policies = store.policies().unwrap_or_default();
+        // A read that failed leaves `live` short: nothing is concluded from it.
+        let mut complete = true;
+        let policies = store.policies().unwrap_or_else(|_| {
+            complete = false;
+            Vec::new()
+        });
         let mut live = HashSet::new();
-        let mut roots: Vec<(AttemptId, u32, &ScaleTarget)> = Vec::new();
+        let mut roots: Vec<(AttemptId, u32, &ScaleTarget, PolicyId)> = Vec::new();
         for policy in policies.iter().filter(|policy| policy.is_owned_by(host)) {
             let Ok(attempts) = store.active_attempts_for_policy(policy.id) else {
+                complete = false;
                 continue;
             };
             for attempt in attempts {
@@ -162,12 +308,12 @@ impl AttemptMeters {
                 roots.extend(
                     attempt
                         .process_id()
-                        .map(|pid| (attempt.id, pid, &policy.target)),
+                        .map(|pid| (attempt.id, pid, &policy.target, policy.id)),
                 );
             }
         }
         // One look at the process table for every attempt.
-        let pids: Vec<u32> = roots.iter().map(|(_, pid, _)| *pid).collect();
+        let pids: Vec<u32> = roots.iter().map(|(_, pid, _, _)| *pid).collect();
         let trees = sample_trees(&pids);
         let now = Instant::now();
         let mut exited = Vec::new();
@@ -176,7 +322,7 @@ impl AttemptMeters {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         seen.retain(|attempt, _| live.contains(attempt));
-        for (attempt, pid, target) in roots {
+        for (attempt, pid, target, policy) in roots {
             let Some(usage) = trees.get(&pid) else {
                 if let Some(meter) = self.lock().get_mut(&attempt) {
                     meter.gone_at.get_or_insert(now);
@@ -192,29 +338,32 @@ impl AttemptMeters {
                 continue;
             };
             seen.remove(&attempt);
-            self.record(attempt, now, *usage);
+            self.record_for(attempt, Some(policy), now, *usage);
         }
         drop(seen);
+        if complete {
+            self.bank_ended(store, &live);
+        }
         self.forget_stale(&live, now);
         exited
     }
 }
 
-/// Samples this host's attempts every [`SAMPLE_EVERY`] while `joined` says
-/// it has joined a coordinator, and hands `exited` the targets whose runner
-/// process just went away. Never returns.
+/// Samples this host's attempts every [`SAMPLE_EVERY`] while `wanted` says
+/// so (it has joined a coordinator, or memory admission is on), and hands
+/// `exited` the targets whose runner process just went away. Never returns.
 pub async fn sample_attempts(
     meters: Arc<AttemptMeters>,
     store: Arc<dyn Store>,
     host: HostId,
-    joined: impl Fn() -> bool + Send,
+    wanted: impl Fn() -> bool + Send,
     exited: impl Fn(&ScaleTarget) + Send,
 ) {
     let mut ticks = tokio::time::interval(SAMPLE_EVERY);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
-        if !joined() {
+        if !wanted() {
             continue;
         }
         let (meters, store) = (Arc::clone(&meters), Arc::clone(&store));
@@ -281,6 +430,100 @@ mod tests {
 
         assert_eq!(announced, vec![policy.target.clone()]);
         assert!(meters.since_seen_gone(attempt.id, Instant::now()).is_some());
+    }
+
+    #[test]
+    fn an_ended_attempt_that_ran_a_job_keeps_its_peak_for_its_profile() {
+        use runner_manager_domain::attempt::AttemptState;
+        use runner_manager_domain::store::SqliteStore;
+        use runner_manager_testkit::fixtures;
+
+        let dir = tempfile::tempdir().expect("a directory");
+        let store = SqliteStore::open(dir.path().join("journal.db")).expect("store");
+        let host = fixtures::host().build();
+        store.put_host(&host).expect("host");
+        let policy = fixtures::policy()
+            .repository("acme/repo")
+            .host(host.id)
+            .autoscale("home", 2)
+            .active()
+            .build();
+        store.insert_policy(&policy).expect("policy");
+        let ended = |state: AttemptState, outcome: AttemptOutcome| {
+            let attempt = fixtures::attempt()
+                .id(AttemptId::new_random())
+                .policy_id(policy.id)
+                .state(state)
+                .outcome(outcome)
+                .build();
+            store.record_attempt(&attempt).expect("recorded");
+            attempt.id
+        };
+        let job = ended(AttemptState::Finished, AttemptOutcome::CompletedJob);
+        let idle = ended(
+            AttemptState::Finished,
+            AttemptOutcome::ExitedIdleWithoutWork,
+        );
+        let failed = ended(
+            AttemptState::Failed,
+            AttemptOutcome::failed(
+                runner_manager_domain::attempt::FailureReason::ProcessExitedUnexpectedly,
+            ),
+        );
+        // Still running, but missing from a `live` set (as a failed read would
+        // leave it): not concluded, so not banked yet.
+        let running = fixtures::attempt()
+            .id(AttemptId::new_random())
+            .policy_id(policy.id)
+            .state(AttemptState::Busy)
+            .github_runner_id(1)
+            .build();
+        store.record_attempt(&running).expect("recorded");
+
+        let file = dir.path().join("memory-peaks.toml");
+        let meters = AttemptMeters::with_peaks_file(file.clone());
+        let now = Instant::now();
+        meters.record_for(job, Some(policy.id), now, tree(6 << 30, 0));
+        meters.record_for(idle, Some(policy.id), now, tree(1 << 20, 0));
+        meters.record_for(failed, Some(policy.id), now, tree(2 << 20, 0));
+        meters.record_for(running.id, Some(policy.id), now, tree(3 << 30, 0));
+        assert_eq!(meters.current_rss(job), Some(6 << 30));
+
+        meters.bank_ended(&store, &HashSet::new());
+        assert_eq!(
+            meters.peaks_of(policy.id),
+            vec![6 << 30],
+            "an idle exit and a runner failure say nothing of the jobs"
+        );
+        // Reported once whether banked before or after.
+        assert!(meters.take(job).is_some());
+        assert_eq!(meters.take(job), None);
+        assert_eq!(
+            meters.current_rss(job),
+            None,
+            "gone once banked and reported"
+        );
+
+        // The running one was left for later, and is banked once it ends.
+        let finished = fixtures::attempt()
+            .id(running.id)
+            .policy_id(policy.id)
+            .state(AttemptState::Finished)
+            .outcome(AttemptOutcome::CompletedJob)
+            .build();
+        store.record_attempt(&finished).expect("recorded");
+        meters.bank_ended(&store, &HashSet::new());
+        meters.bank_ended(&store, &HashSet::new());
+        assert_eq!(
+            meters.peaks_of(policy.id),
+            vec![6 << 30, 3 << 30],
+            "banked once"
+        );
+        // Kept across a restart.
+        assert_eq!(
+            AttemptMeters::with_peaks_file(file).peaks_of(policy.id),
+            vec![6 << 30, 3 << 30]
+        );
     }
 
     fn tree(rss: u64, cpu_ms: u64) -> TreeUsage {

@@ -53,7 +53,7 @@ use chrono::{DateTime, Utc};
 use runner_manager_domain::coordinator_protocol::{
     AttemptFinished, AttemptOutcomeKind, ConnectedHostStats, HostJobStats, HostScore, HostStats,
     JobStats, MAX_MESSAGE_BYTES, OpenLease, PendingQueue, PlacementDecision, ServerMessage,
-    StatsReport, is_managed_runner_name, printable,
+    StatsReport, TargetEstimate, TargetRef, is_managed_runner_name, printable,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
@@ -595,17 +595,7 @@ impl Correlator {
 // Aggregates
 // ---------------------------------------------------------------------------
 
-/// The nearest-rank percentile `p` (0-100) of `values`.
-#[must_use]
-pub fn percentile<T: Copy + Ord>(values: &[T], p: u32) -> Option<T> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    let rank = (sorted.len() * p.min(100) as usize).div_ceil(100).max(1);
-    sorted.get(rank - 1).copied()
-}
+pub use runner_manager_domain::memory::percentile;
 
 /// The percentile `p` of one optional field over `samples`.
 fn field_percentile<T: Copy + Ord>(
@@ -759,15 +749,42 @@ impl Aggregates {
     /// out-of-memory killer finds.
     #[must_use]
     pub fn expected_peak(&self, key: &str) -> Option<u64> {
-        let mut samples = self.speaking_for(key);
-        let p90 = field_percentile(&samples, |sample| sample.peak_rss_bytes, 90)?;
-        samples.sort_unstable_by_key(|sample| std::cmp::Reverse(sample.finished_at));
-        samples
-            .iter()
-            .filter_map(|sample| sample.peak_rss_bytes)
-            .take(RECENT_SAMPLES)
-            .chain([p90])
-            .max()
+        expected_of(self.speaking_for(key))
+    }
+
+    /// What a runner `host_id` starts for `target` is expected to need: the
+    /// heaviest of the target's job keys by [`Self::expected_peak`]'s rule. A
+    /// runner takes any job its labels match, so the heaviest stands for them
+    /// all. Only `host_id`'s own samples count once it has any for the target:
+    /// a job key measured only elsewhere is likely one its labels never take
+    /// (another OS's build), and would hold its memory for nothing. A target it
+    /// never ran falls back to every host's samples. `None` without any sample
+    /// measuring memory.
+    #[must_use]
+    pub fn target_estimate(&self, host_id: &str, target: &TargetRef) -> Option<TargetEstimate> {
+        let measured = |own_only: bool| {
+            self.by_key.values().map(move |key_samples| {
+                key_samples
+                    .iter()
+                    .filter(|sample| sample.peak_rss_bytes.is_some())
+                    .filter(|sample| target.covers(&sample.repository))
+                    .filter(|sample| !own_only || sample.host_id == host_id)
+                    .collect::<Vec<&JobSample>>()
+            })
+        };
+        let own = measured(true).any(|samples| !samples.is_empty());
+        let mut heaviest: Option<u64> = None;
+        let mut samples = 0usize;
+        for key_samples in measured(own) {
+            samples += key_samples.len();
+            heaviest = heaviest.max(expected_of(key_samples));
+        }
+        Some(TargetEstimate {
+            target: target.clone(),
+            peak_rss_bytes: heaviest?,
+            samples: u32::try_from(samples).unwrap_or(u32::MAX),
+            own,
+        })
     }
 
     /// What placement weighs `key` by. See [`Self::speaking_for`].
@@ -802,6 +819,19 @@ impl Aggregates {
     pub fn host_ratios(&self, key: &str) -> BTreeMap<String, HostRatio> {
         ratios_of(&self.speaking_for(key))
     }
+}
+
+/// The memory `samples` of one job are expected to need: their p90 peak, or
+/// more if one of the newest [`RECENT_SAMPLES`] needed more.
+fn expected_of(mut samples: Vec<&JobSample>) -> Option<u64> {
+    let p90 = field_percentile(&samples, |sample| sample.peak_rss_bytes, 90)?;
+    samples.sort_unstable_by_key(|sample| std::cmp::Reverse(sample.finished_at));
+    samples
+        .iter()
+        .filter_map(|sample| sample.peak_rss_bytes)
+        .take(RECENT_SAMPLES)
+        .chain([p90])
+        .max()
 }
 
 /// A job's figures from `samples`; `None` without any.
@@ -1872,6 +1902,59 @@ mod tests {
             cpu_avg_millicores: Some(1000),
             cpu_peak_millicores: None,
         }
+    }
+
+    #[test]
+    fn a_targets_estimate_is_its_heaviest_job_from_the_hosts_own_runs_first() {
+        use runner_manager_domain::coordinator_protocol::TargetScope;
+        let gib = 1u64 << 30;
+        let mut samples = Vec::new();
+        // MacM6 ran the smoke and the macOS build; the Windows build ran
+        // only on the Windows host.
+        for _ in 0..5 {
+            samples.push(sample("octo/app/smoke", "macm6", 10, gib / 4));
+            samples.push(sample("octo/app/build-macos", "macm6", 10, 6 * gib));
+            samples.push(sample("octo/app/build-windows", "win", 10, 12 * gib));
+        }
+        let mut other = sample("other/repo/x", "win", 10, 40 * gib);
+        other.repository = "other/repo".into();
+        samples.push(other);
+        let aggregates = Aggregates::from_samples(samples, 30);
+        let repo = TargetRef {
+            scope: TargetScope::Repo,
+            name: "Octo/App".into(),
+        };
+        let mac = aggregates
+            .target_estimate("macm6", &repo)
+            .expect("measured");
+        assert_eq!(mac.peak_rss_bytes, 6 * gib, "its own heaviest job");
+        assert_eq!(mac.samples, 10);
+        assert!(mac.own);
+        let win = aggregates.target_estimate("win", &repo).expect("measured");
+        assert_eq!(win.peak_rss_bytes, 12 * gib);
+        // A host that never ran the target: every host's runs, the heaviest.
+        let new = aggregates
+            .target_estimate("linux", &repo)
+            .expect("measured");
+        assert_eq!(new.peak_rss_bytes, 12 * gib);
+        assert_eq!(new.samples, 15);
+        assert!(!new.own);
+        // An organization covers every repository of its owner.
+        let org = TargetRef {
+            scope: TargetScope::Org,
+            name: "other".into(),
+        };
+        assert_eq!(
+            aggregates
+                .target_estimate("macm6", &org)
+                .map(|e| e.peak_rss_bytes),
+            Some(40 * gib)
+        );
+        let unknown = TargetRef {
+            scope: TargetScope::Repo,
+            name: "nobody/here".into(),
+        };
+        assert_eq!(aggregates.target_estimate("macm6", &unknown), None);
     }
 
     #[test]

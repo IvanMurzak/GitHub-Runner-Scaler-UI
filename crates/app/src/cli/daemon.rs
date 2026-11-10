@@ -23,8 +23,8 @@ use runner_manager_agent::package::{
 };
 use runner_manager_agent::reconcile::{
     AllocationLock, DemandDirector, FileAllocationLock, FitnessGatedLauncher, GatewayDemand,
-    RandomJitter, ReconcileReport, Reconciler, ReconcilerPorts, RepositoryDirectory, TeeEvents,
-    TracingEvents, WslRecoveryAllocationLock,
+    MemoryGate, RandomJitter, ReconcileReport, Reconciler, ReconcilerPorts, RepositoryDirectory,
+    TeeEvents, TracingEvents, WslRecoveryAllocationLock,
 };
 use runner_manager_domain::attempt::{AttemptState, FailureReason, active_count, active_count_for};
 use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget, StartMode};
@@ -153,6 +153,10 @@ async fn run_generation(
             host.clone(),
             coordination.subscribe(),
         ));
+        let memory = Arc::new(super::memory::HostMemory::new(
+            context.paths().clone(),
+            Arc::clone(&store) as Arc<dyn Store>,
+        ));
         let _link = start_coordinator_link(
             context,
             &host,
@@ -162,7 +166,7 @@ async fn run_generation(
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             ),
-            (coordination, launches),
+            (coordination, launches, memory),
         );
         let heartbeat_store = Arc::clone(&store) as Arc<dyn Store>;
         let heartbeat_paths = context.paths().clone();
@@ -363,12 +367,30 @@ async fn run_generation(
     let coordination = super::coordinator::coordination();
     // The coordinator's launches (stage 3): accepted by the link, started by
     // the target loops' passes for their pool profiles.
-    let launches = Arc::new(super::launches::Launches::new(
+    // Memory admission (0.4.53): every start, whoever asked for it, is
+    // checked against the host's free memory.
+    let memory = Arc::new(super::memory::HostMemory::new(
+        context.paths().clone(),
         Arc::clone(&store) as Arc<dyn Store>,
-        host.clone(),
-        coordination.subscribe(),
     ));
+    let launches = Arc::new(
+        super::launches::Launches::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            host.clone(),
+            coordination.subscribe(),
+        )
+        .with_memory(Arc::clone(&memory)),
+    );
     let routes = Arc::new(routes);
+    // What each attempt uses: for the coordinator's statistics and for
+    // memory admission.
+    let _sampling = AbortOnDrop(tokio::spawn(super::coordinator::sample_for(
+        Arc::clone(&memory),
+        Arc::clone(&store) as Arc<dyn Store>,
+        host.id,
+        Arc::clone(&coordination),
+        Arc::clone(&routes),
+    )));
     // ------------------------------------------------------------------
     // ONE LOOP PER TARGET, ADDED AND REMOVED WHILE THE DAEMON RUNS.
     // ------------------------------------------------------------------
@@ -398,6 +420,7 @@ async fn run_generation(
         let launches = Arc::clone(&launches);
         let coordination = Arc::clone(&coordination);
         let routes = Arc::clone(&routes);
+        let memory = Arc::clone(&memory);
         async move {
             let package_target = policies[0].target.clone();
             let catalog = Arc::new(GatewayCatalog::new(
@@ -486,15 +509,18 @@ async fn run_generation(
                 events: Arc::clone(&events),
             };
             let director = Arc::clone(&launches) as Arc<dyn DemandDirector>;
+            let memory = memory as Arc<dyn MemoryGate>;
             Ok(ManagedTarget {
                 policies,
                 store: Arc::clone(&store) as Arc<dyn Store>,
                 launch_side: Some(
                     Reconciler::new(host.clone(), ports.clone())
-                        .with_director(Arc::clone(&director)),
+                        .with_director(Arc::clone(&director))
+                        .with_memory_gate(Arc::clone(&memory)),
                 ),
                 reconciler: Reconciler::new(host.clone(), ports)
                     .with_director(director)
+                    .with_memory_gate(memory)
                     .with_launch_side(Arc::clone(&signals.launch)),
                 cancel,
                 polling: Arc::clone(&polling),
@@ -519,7 +545,11 @@ async fn run_generation(
         Arc::clone(&store) as Arc<dyn Store>,
         Arc::clone(&routes),
         (Arc::clone(&host_unfit), Arc::clone(&draining)),
-        (Arc::clone(&coordination), Arc::clone(&launches)),
+        (
+            Arc::clone(&coordination),
+            Arc::clone(&launches),
+            Arc::clone(&memory),
+        ),
     );
 
     let (shutdown, _) = tokio::sync::watch::channel(false);
@@ -702,9 +732,10 @@ fn start_coordinator_link(
     store: Arc<dyn Store>,
     routes: Arc<super::coordinator::WakeRoutes>,
     (unfit, draining): (Arc<AtomicBool>, Arc<AtomicBool>),
-    (coordination, launches): (
+    (coordination, launches, memory): (
         Arc<super::coordinator::Coordination>,
         Arc<super::launches::Launches>,
+        Arc<super::memory::HostMemory>,
     ),
 ) -> Option<AbortOnDrop> {
     let key_store = match context.secret_store_for(
@@ -735,6 +766,7 @@ fn start_coordinator_link(
             runner_root,
             coordination,
             launches,
+            memory,
         }),
     )))
 }

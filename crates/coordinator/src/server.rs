@@ -25,10 +25,10 @@ use axum::routing::{get, post};
 use chrono::Utc;
 use runner_manager_domain::coordinator_protocol::{
     CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CONNECT_PATH, ENROLL_PATH, EnrollRequest,
-    EnrollResponse, HEALTH_PATH, HostMessage, LAUNCH_VERSION, MAX_MESSAGE_BYTES,
-    MIN_PROTOCOL_VERSION, NONCE_LEN, PROTOCOL_VERSION, STATS_VERSION, ServerMessage,
-    SessionPurpose, WEBHOOK_PATH, WakeReason, decode_public_key, encode_nonce, supported,
-    verify_challenge,
+    EnrollResponse, HEALTH_PATH, HostMessage, LAUNCH_VERSION, MAX_MEMORY_ESTIMATES,
+    MAX_MESSAGE_BYTES, MIN_PROTOCOL_VERSION, MemoryEstimates, NONCE_LEN, PROTOCOL_VERSION,
+    STATS_VERSION, ServerMessage, SessionPurpose, TargetRef, WEBHOOK_PATH, WakeReason,
+    decode_public_key, encode_nonce, supported, verify_challenge,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use tokio::sync::mpsc;
@@ -49,6 +49,14 @@ const MAX_ENROLL_BYTES: usize = 16 * 1024;
 
 /// How often a connected host's `last_seen_at` is rewritten.
 const TOUCH_EVERY: Duration = Duration::from_secs(60);
+
+/// How often a host's memory estimates are worked out again, and sent when
+/// they changed.
+const ESTIMATES_EVERY: Duration = Duration::from_secs(60);
+
+/// The most a `memory_estimates` frame may take, with room to spare under
+/// [`MAX_MESSAGE_BYTES`].
+const ESTIMATES_BYTES: usize = MAX_MESSAGE_BYTES - 1024;
 
 /// The server's settings.
 #[derive(Debug, Clone)]
@@ -672,6 +680,11 @@ async fn serve_host(
     let mut last_touched = Instant::now();
     let mut checks = tokio::time::interval(state.config.heartbeat_interval);
     checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Memory estimates for the host's own admission, from 0.4.53. A host
+    // before it skips the message as one it does not know.
+    let mut targets: Vec<TargetRef> = Vec::new();
+    let mut sent_estimates: Option<MemoryEstimates> = None;
+    let mut estimated_at = Instant::now();
     loop {
         tokio::select! {
             frame = socket.recv() => {
@@ -696,7 +709,16 @@ async fn serve_host(
                             cores = hello.cores,
                             "a host described itself"
                         );
+                        targets = hello.targets.iter().map(|target| target.reference()).collect();
                         state.registry.set_hello(host_id, connection, hello);
+                        if version >= STATS_VERSION {
+                            // Always after a `hello`: the host may have restarted.
+                            sent_estimates = None;
+                            estimated_at = Instant::now();
+                            if !send_estimates(socket, state, host_id, &targets, &mut sent_estimates).await {
+                                return;
+                            }
+                        }
                     }
                     Ok(HostMessage::Heartbeat(mut heartbeat)) => {
                         // Leases the host no longer holds are closed, and
@@ -770,9 +792,73 @@ async fn serve_host(
                     close(socket, 1001, "silent").await;
                     return;
                 }
+                if version >= STATS_VERSION
+                    && !targets.is_empty()
+                    && estimated_at.elapsed() >= ESTIMATES_EVERY
+                {
+                    estimated_at = Instant::now();
+                    if !send_estimates(socket, state, host_id, &targets, &mut sent_estimates).await {
+                        return;
+                    }
+                }
             }
         }
     }
+}
+
+/// What each of `targets` is expected to need on `host_id`, from the job
+/// statistics. Targets never measured are left out.
+#[must_use]
+pub fn memory_estimates(state: &AppState, host_id: &str, targets: &[TargetRef]) -> MemoryEstimates {
+    let mut unique: Vec<&TargetRef> = Vec::new();
+    for target in targets {
+        if !unique.iter().any(|seen| seen.same_as(target)) {
+            unique.push(target);
+        }
+    }
+    let mut estimates = state
+        .statistics
+        .with_aggregates(|aggregates| MemoryEstimates {
+            estimates: unique
+                .into_iter()
+                .filter_map(|target| aggregates.target_estimate(host_id, target))
+                .take(MAX_MEMORY_ESTIMATES)
+                .collect(),
+        });
+    // Within one frame, or the host's transport refuses it and the link
+    // reconnects into the same message. Targets dropped from the end fall
+    // back to the host's own measurements.
+    while ServerMessage::MemoryEstimates(estimates.clone())
+        .encode()
+        .len()
+        > ESTIMATES_BYTES
+    {
+        estimates.estimates.pop();
+    }
+    estimates
+}
+
+/// Sends the host its memory estimates unless they are what it was last sent;
+/// `false` when the connection is gone.
+async fn send_estimates(
+    socket: &mut WebSocket,
+    state: &AppState,
+    host_id: &str,
+    targets: &[TargetRef],
+    sent: &mut Option<MemoryEstimates>,
+) -> bool {
+    let estimates = memory_estimates(state, host_id, targets);
+    // Nothing known and nothing said yet: nothing to say.
+    if sent
+        .as_ref()
+        .map_or(estimates.estimates.is_empty(), |sent| *sent == estimates)
+    {
+        return true;
+    }
+    tracing::debug!(%host_id, targets = estimates.estimates.len(), "memory estimates sent");
+    let delivered = send(socket, &ServerMessage::MemoryEstimates(estimates.clone())).await;
+    *sent = Some(estimates);
+    delivered
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +904,68 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_estimates_fit_one_frame_and_name_each_target_once() {
+        use crate::store::JobSample;
+        use runner_manager_domain::coordinator_protocol::TargetScope;
+        let mut store = Store::open_in_memory().expect("store");
+        let name = |index: usize| format!("acme/{}{index}", "r".repeat(130));
+        for index in 0..MAX_MEMORY_ESTIMATES {
+            store
+                .record_sample(
+                    &JobSample {
+                        job_key: format!("{}/build", name(index)),
+                        repository: name(index),
+                        host_id: "h".into(),
+                        finished_at: Utc::now(),
+                        duration_secs: Some(1),
+                        queue_wait_secs: None,
+                        peak_rss_bytes: Some(1 << 30),
+                        cpu_avg_millicores: None,
+                        cpu_peak_millicores: None,
+                    },
+                    30,
+                    Utc::now() - chrono::TimeDelta::days(1),
+                )
+                .expect("sample");
+        }
+        let state = AppState::new(
+            Config::new("http://127.0.0.1".into(), SecretString::from("s")),
+            store,
+        );
+        let mut targets: Vec<TargetRef> = (0..MAX_MEMORY_ESTIMATES)
+            .map(|index| TargetRef {
+                scope: TargetScope::Repo,
+                name: name(index),
+            })
+            .collect();
+        targets.insert(
+            1,
+            TargetRef {
+                scope: TargetScope::Repo,
+                name: name(0).to_uppercase(),
+            },
+        );
+        let estimates = memory_estimates(&state, "h", &targets);
+        let frame = ServerMessage::MemoryEstimates(estimates.clone()).encode();
+        assert!(frame.len() <= ESTIMATES_BYTES, "{}", frame.len());
+        assert!(
+            estimates.estimates.len() > 100,
+            "{}",
+            estimates.estimates.len()
+        );
+        let first = &estimates.estimates[0].target;
+        assert_eq!(
+            estimates
+                .estimates
+                .iter()
+                .filter(|estimate| estimate.target.same_as(first))
+                .count(),
+            1,
+            "a target named twice is estimated once"
+        );
+    }
 
     #[test]
     fn attempts_are_limited_per_address_per_minute() {

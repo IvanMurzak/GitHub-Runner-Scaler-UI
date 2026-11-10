@@ -180,6 +180,7 @@ const RUNNER_ENV_COMMANDS: &str = "crates/app/tests/runner_env_commands.rs";
 const HOST_DOCTOR_COMMANDS: &str = "crates/app/tests/host_doctor_commands.rs";
 const DEPENDENCY_CACHE_COMMANDS: &str = "crates/app/tests/dependency_cache_commands.rs";
 const POLL_INTERVAL_COMMANDS: &str = "crates/app/tests/poll_interval_commands.rs";
+const MEMORY_ADMISSION_COMMANDS: &str = "crates/app/tests/memory_admission_commands.rs";
 const COORDINATOR_COMMANDS: &str = "crates/app/tests/coordinator_commands.rs";
 
 pub const LOCAL_CHAIN_EVIDENCE: &[Evidence] = &[
@@ -473,6 +474,29 @@ pub const MANIFEST: &[Classification] = &[
                      Dedicated real-process tests drive both flags against polling.toml and the \
                      host row under --data-dir, read them back through status and host show, \
                      and pin every refusal and that it writes nothing.",
+        }),
+    },
+    Classification {
+        leaf: "host set-memory-margin",
+        coverage: Coverage::Dedicated,
+        evidence: &[
+            at(
+                MEMORY_ADMISSION_COMMANDS,
+                "host_set_memory_margin_round_trips_through_memory_toml_status_and_host_show",
+            ),
+            at(
+                MEMORY_ADMISSION_COMMANDS,
+                "host_set_memory_margin_refuses_what_is_not_a_size_and_writes_nothing",
+            ),
+        ],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::HostConfiguration,
+            reason: "The margin changes only whether the daemon admits a runner by this \
+                     machine's free memory, which the generated oracle does not model: no \
+                     policy, attempt, root or credential. Dedicated real-process tests drive \
+                     sizes, off and on against memory.toml under --data-dir, read them back \
+                     through status and host show, and pin the refusal and that it writes \
+                     nothing.",
         }),
     },
     generated("host set-runtime-root"),
