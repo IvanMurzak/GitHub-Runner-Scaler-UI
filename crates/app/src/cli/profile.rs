@@ -207,12 +207,7 @@ pub fn dispatch(
             if policy.enabled()
                 && !policy.execution_policy().is_native()
                 && PlatformExecutionProvider::new(policy.host_id)
-                    .with_isolation_settings(
-                        runner_manager_agent::oci::IsolationSettings::load(
-                            context.paths().config_dir(),
-                        )
-                        .unwrap_or_default(),
-                    )
+                    .with_isolation_settings(super::host::isolation_settings(context)?)
                     .probe(&policy)
                     != ProviderCapability::Ready
             {

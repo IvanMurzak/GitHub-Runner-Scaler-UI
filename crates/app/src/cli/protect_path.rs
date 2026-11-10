@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use runner_manager_platform::service::{InstallRecord, ProtectedPaths, sudo_command};
 
-use super::{CliError, Context, Failure, HostProtectPathCommand, write_failed};
+use super::{CliError, Context, Failure, HostProtectPathCommand, set_member, write_failed};
 
 /// Runs a `host protect-path` subcommand.
 ///
@@ -48,8 +48,7 @@ pub fn dispatch(
             if let Some(why) = ProtectedPaths::refusal(&path, &own) {
                 return Err(CliError::new(Failure::InvalidArgument, why));
             }
-            if !protected.paths.contains(&path) {
-                protected.paths.push(path.clone());
+            if set_member(&mut protected.paths, &path, true) {
                 protected.save(config_dir).map_err(local)?;
             }
             writeln!(out, "No runner or job will reach {}.", path.display()).map_err(failed)?;
@@ -58,9 +57,7 @@ pub fn dispatch(
         HostProtectPathCommand::Remove(args) => {
             supported()?;
             let path = PathBuf::from(&args.path);
-            let before = protected.paths.len();
-            protected.paths.retain(|protected| *protected != path);
-            if protected.paths.len() != before {
+            if set_member(&mut protected.paths, &path, false) {
                 protected.save(config_dir).map_err(local)?;
             }
             writeln!(out, "{} is no longer protected.", path.display()).map_err(failed)?;

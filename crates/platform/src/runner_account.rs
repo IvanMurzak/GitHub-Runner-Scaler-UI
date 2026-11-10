@@ -266,15 +266,30 @@ impl RunnerPool {
             .copied()
     }
 
-    /// The accounts a new attempt may be given: the pool's own, or the legacy
-    /// account while the pool has none.
+    /// The account an attempt runs as. `owner` is the one that already owns
+    /// its directory, kept unless another live attempt holds it (`held`): a
+    /// persistent slot kept since an earlier attempt then moves to a free
+    /// account. Otherwise the first account neither held nor `busy` (which
+    /// is asked only then) is chosen. While the pool has no account of its
+    /// own, every attempt shares the legacy one. `None` when all are taken.
     #[must_use]
-    pub fn assignable(&self) -> Vec<RunnerAccount> {
+    pub fn allocate(
+        &self,
+        owner: Option<RunnerAccount>,
+        held: &std::collections::BTreeSet<u32>,
+        busy: impl FnOnce() -> std::collections::BTreeSet<u32>,
+    ) -> Option<RunnerAccount> {
         if self.accounts.is_empty() {
-            self.legacy.iter().copied().collect()
-        } else {
-            self.accounts.clone()
+            return owner.or(self.legacy);
         }
+        if let Some(owner) = owner.filter(|owner| !held.contains(&owner.uid)) {
+            return Some(owner);
+        }
+        let busy = busy();
+        self.accounts
+            .iter()
+            .copied()
+            .find(|account| !held.contains(&account.uid) && !busy.contains(&account.uid))
     }
 
     /// Shares `path` and everything under it with every account in the pool:
@@ -346,15 +361,19 @@ mod sys {
     }
 
     pub(super) fn share_tree(gid: u32, path: &Path) -> io::Result<()> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        share(gid, path, &metadata)?;
+        share_entry(gid, path, &std::fs::symlink_metadata(path)?)
+    }
+
+    /// Shares `path`, whose `metadata` the caller already has, and what is
+    /// under it that is not shared yet: one `lstat` per entry.
+    fn share_entry(gid: u32, path: &Path, metadata: &std::fs::Metadata) -> io::Result<()> {
+        share(gid, path, metadata)?;
         if metadata.is_dir() {
             for entry in std::fs::read_dir(path)? {
                 let child = entry?.path();
-                let shared = std::fs::symlink_metadata(&child)
-                    .is_ok_and(|metadata| is_shared(gid, &metadata));
-                if !shared {
-                    share_tree(gid, &child)?;
+                let metadata = std::fs::symlink_metadata(&child)?;
+                if !is_shared(gid, &metadata) {
+                    share_entry(gid, &child, &metadata)?;
                 }
             }
         }
@@ -598,12 +617,20 @@ mod tests {
             accounts: vec![first],
             legacy: Some(legacy),
         };
-        assert_eq!(pool.assignable(), [first]);
+        let none = std::collections::BTreeSet::new();
+        let held = std::collections::BTreeSet::from([990]);
+        assert_eq!(pool.allocate(None, &none, Default::default), Some(first));
+        assert_eq!(pool.allocate(None, &held, Default::default), None);
+        assert_eq!(pool.allocate(None, &none, || held.clone()), None);
+        assert_eq!(
+            pool.allocate(Some(first), &none, || held.clone()),
+            Some(first)
+        );
         assert_eq!(pool.account(997), Some(legacy));
         assert_eq!(pool.account(990), Some(first));
         assert_eq!(pool.account(0), None);
         pool.accounts.clear();
-        assert_eq!(pool.assignable(), [legacy]);
+        assert_eq!(pool.allocate(None, &held, Default::default), Some(legacy));
     }
 
     #[cfg(unix)]

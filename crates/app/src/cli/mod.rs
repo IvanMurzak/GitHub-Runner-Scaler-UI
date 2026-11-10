@@ -464,6 +464,22 @@ pub const NO_OPERATOR_REMEDY: &str = "there is no command here that fixes this";
 /// three commands, and nothing in the shape of the code objected. One binding
 /// per command makes that particular mistake unwritable, and puts the string
 /// next to the function whose name has to agree with it.
+/// Puts `path` into `list` when `present`, or takes it out otherwise.
+/// Returns whether the list changed, so the caller saves only then.
+pub(crate) fn set_member(
+    list: &mut Vec<std::path::PathBuf>,
+    path: &std::path::Path,
+    present: bool,
+) -> bool {
+    let member = list.iter().any(|entry| entry == path);
+    if present && !member {
+        list.push(path.to_path_buf());
+    } else if !present && member {
+        list.retain(|entry| entry != path);
+    }
+    present != member
+}
+
 pub fn write_failed(what: &str) -> impl Fn(io::Error) -> CliError + Copy + '_ {
     move |source| {
         CliError::new(
@@ -941,9 +957,9 @@ pub enum HostDockerPolicyCommand {
     /// Choose off, audit (default: record, never refuse), or enforce.
     SetMode(DockerPolicyModeArgs),
     /// Let every job bind-mount this host directory into its containers.
-    AllowPath(DockerPolicyPathArgs),
+    AllowPath(HostPathArgs),
     /// Stop allowing a host directory added with `allow-path`.
-    DisallowPath(DockerPolicyPathArgs),
+    DisallowPath(HostPathArgs),
     /// Summarise recorded violations by repository and rule.
     Report(DockerPolicyReportArgs),
 }
@@ -951,15 +967,15 @@ pub enum HostDockerPolicyCommand {
 #[derive(Debug, Subcommand)]
 pub enum HostProtectPathCommand {
     /// Hide a host directory from the service, its runners and their jobs.
-    Add(ProtectPathArgs),
+    Add(HostPathArgs),
     /// Stop hiding a directory added with `add`.
-    Remove(ProtectPathArgs),
+    Remove(HostPathArgs),
     /// List the protected directories and whether the service enforces them.
     List,
 }
 
 #[derive(Debug, Args)]
-pub struct ProtectPathArgs {
+pub struct HostPathArgs {
     /// An absolute host path.
     pub path: String,
 }
@@ -968,12 +984,6 @@ pub struct ProtectPathArgs {
 pub struct DockerPolicyModeArgs {
     #[arg(long, value_parser = ["off", "audit", "enforce"])]
     pub mode: String,
-}
-
-#[derive(Debug, Args)]
-pub struct DockerPolicyPathArgs {
-    /// An absolute host path.
-    pub path: String,
 }
 
 #[derive(Debug, Args)]

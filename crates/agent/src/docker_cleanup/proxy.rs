@@ -344,6 +344,12 @@ pub fn serve(path: &Path) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     journal.proxy = Some(ProcessIdentity::of_current_process().map_err(invalid)?);
     write_json(path, &journal)?;
+    let session = Arc::new(Session {
+        attempt: journal.attempt,
+        repository: journal.repository.clone(),
+        policy: journal.policy.clone(),
+        owned: Mutex::new(std::collections::HashSet::new()),
+    });
     let shared = Arc::new(Mutex::new(journal));
     write_json(&directory.join("ready"), &true)?;
     let stop = directory.join("stop");
@@ -385,10 +391,11 @@ pub fn serve(path: &Path) -> io::Result<()> {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let journal = Arc::clone(&shared);
+                let session = Arc::clone(&session);
                 let path = path.to_path_buf();
                 let engine = engine.clone();
                 std::thread::spawn(move || {
-                    if handle(&mut stream, &journal, &path, &engine).is_err() {
+                    if handle(&mut stream, &journal, &session, &path, &engine).is_err() {
                         let _ = reply(
                             &mut stream,
                             503,
@@ -405,9 +412,60 @@ pub fn serve(path: &Path) -> io::Result<()> {
     }
 }
 
+/// What every request of one proxy shares, fixed when it starts.
+struct Session {
+    attempt: AttemptId,
+    repository: String,
+    policy: Option<policy::Context>,
+    /// Container and exec ids already known to be this job's own. Only full
+    /// engine ids are kept: a name can be reused by another job's container.
+    owned: Mutex<std::collections::HashSet<String>>,
+}
+
+impl Session {
+    fn knows(&self, id: &str) -> bool {
+        self.owned.lock().is_ok_and(|owned| owned.contains(id))
+    }
+
+    fn remember(&self, id: &str) {
+        if id.len() == 64
+            && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && let Ok(mut owned) = self.owned.lock()
+        {
+            owned.insert(id.to_owned());
+        }
+    }
+
+    /// Whether the container `id` (already encoded for a path) was created by
+    /// this job. One the engine does not know is left for the engine to answer.
+    fn owns(&self, engine: &UnixEngine, id: &str) -> io::Result<bool> {
+        if self.knows(id) {
+            return Ok(true);
+        }
+        let reply = engine.request("GET", &format!("/containers/{id}/json"), None)?;
+        if reply.status == 404 {
+            return Ok(true);
+        }
+        let owned = reply
+            .body
+            .pointer("/Config/Labels")
+            .and_then(|labels| labels.get(policy::JOB_LABEL))
+            .and_then(Value::as_str)
+            == Some(self.attempt.to_string().as_str());
+        if owned {
+            self.remember(id);
+            if let Some(full) = reply.body.get("Id").and_then(Value::as_str) {
+                self.remember(full);
+            }
+        }
+        Ok(owned)
+    }
+}
+
 fn handle(
     stream: &mut UnixStream,
     shared: &Mutex<Journal>,
+    session: &Session,
     path: &Path,
     engine: &UnixEngine,
 ) -> io::Result<()> {
@@ -426,27 +484,20 @@ fn handle(
     let exec_create = method == "POST"
         && matches!(policy::target(api), policy::Target::Container(_))
         && api.ends_with("/exec");
-    let (checked, attempt, repository) = {
-        let journal = shared
-            .lock()
-            .map_err(|_| invalid("Docker journal lock poisoned"))?;
-        (
-            journal
-                .policy
-                .clone()
-                .filter(|policy| policy.mode != policy::Mode::Off),
-            journal.attempt,
-            journal.repository.clone(),
-        )
-    };
+    let checked = session.policy.as_ref();
+    let attempt = session.attempt;
     let mut violations = Vec::new();
-    if checked.is_some() {
+    // With the policy off only protected paths are checked, and those only
+    // ever arrive in a creation body.
+    if let Some(policy) = checked
+        && policy.mode != policy::Mode::Off
+    {
         violations.extend(policy::check_endpoint(method, api, query));
-        foreign_target(engine, api, attempt, &mut violations)?;
+        foreign_target(engine, session, api, &mut violations)?;
     }
     if !create && !exec_create {
-        if let Some(policy) = &checked
-            && settle(stream, policy, attempt, &repository, &violations)?
+        if let Some(policy) = checked
+            && settle(stream, policy, session, &violations)?
         {
             return Ok(());
         }
@@ -459,17 +510,19 @@ fn handle(
         stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
     }
     let mut body: Value = serde_json::from_slice(&head.body(stream)?).map_err(invalid)?;
-    if let Some(policy) = &checked {
+    if let Some(policy) = checked {
         let allowed = |path: &Path| policy.access(path);
         match api {
             "/containers/create" => {
                 violations.extend(policy::check_container_create(&body, &allowed));
-                for other in policy::referenced_containers(&body) {
-                    if !owned_container(engine, &percent_encode(&other), attempt)? {
-                        violations.push(policy::Violation {
-                            rule: "foreign_container".into(),
-                            detail: format!("joins or borrows from container {other}"),
-                        });
+                if policy.mode != policy::Mode::Off {
+                    for other in policy::referenced_containers(&body) {
+                        if !session.owns(engine, &percent_encode(&other))? {
+                            violations.push(policy::Violation::new(
+                                "foreign_container",
+                                format!("joins or borrows from container {other}"),
+                            ));
+                        }
                     }
                 }
             }
@@ -477,7 +530,7 @@ fn handle(
             "/networks/create" => violations.extend(policy::check_network_create(&body)),
             _ => violations.extend(policy::check_exec_create(&body)),
         }
-        if settle(stream, policy, attempt, &repository, &violations)? {
+        if settle(stream, policy, session, &violations)? {
             return Ok(());
         }
     }
@@ -486,6 +539,11 @@ fn handle(
     }
     if exec_create {
         let response = engine.request(method, parts[1], Some(&body))?;
+        // Created in one of the job's own containers, or the policy would
+        // have refused it: its later start and inspect need no lookup.
+        if let Some(id) = response.body.get("Id").and_then(Value::as_str) {
+            session.remember(id);
+        }
         return reply(stream, response.status, &response.body);
     }
     let intent = {
@@ -512,6 +570,9 @@ fn handle(
         let mut journal = shared
             .lock()
             .map_err(|_| invalid("Docker journal lock poisoned"))?;
+        if intent.kind == Kind::Container {
+            session.remember(id);
+        }
         capture_created(&mut journal, &intent, id, engine)?;
         journal
             .intents
@@ -524,26 +585,29 @@ fn handle(
     reply(stream, response.status, &response.body)
 }
 
-/// Records `violations` and, in [`policy::Mode::Enforce`], refuses the request.
-/// Returns whether it was refused.
+/// Records `violations` and refuses the request when one of them refuses it
+/// (see [`policy::Context::refuses`]). Returns whether it was refused.
 fn settle(
     stream: &mut UnixStream,
     policy: &policy::Context,
-    attempt: AttemptId,
-    repository: &str,
+    session: &Session,
     violations: &[policy::Violation],
 ) -> io::Result<bool> {
+    let violations = violations
+        .iter()
+        .filter(|violation| policy.records(violation))
+        .collect::<Vec<_>>();
     if violations.is_empty() {
         return Ok(false);
     }
-    let refused = policy.mode == policy::Mode::Enforce;
+    let refused = violations.iter().any(|violation| policy.refuses(violation));
     let at = chrono::Utc::now().to_rfc3339();
     let records = violations
         .iter()
         .map(|violation| policy::Record {
             at: at.clone(),
-            attempt: attempt.to_string(),
-            repository: repository.to_owned(),
+            attempt: session.attempt.to_string(),
+            repository: session.repository.clone(),
             rule: violation.rule.clone(),
             detail: violation.detail.clone(),
             refused,
@@ -573,12 +637,13 @@ fn settle(
 /// one, that this job did not create.
 fn foreign_target(
     engine: &UnixEngine,
+    session: &Session,
     api: &str,
-    attempt: AttemptId,
     violations: &mut Vec<policy::Violation>,
 ) -> io::Result<()> {
     let container = match policy::target(api) {
         policy::Target::Container(id) => Some(id.to_owned()),
+        policy::Target::Exec(id) if session.knows(id) => None,
         policy::Target::Exec(id) => engine
             .request("GET", &format!("/exec/{id}/json"), None)?
             .body
@@ -588,29 +653,14 @@ fn foreign_target(
         policy::Target::None => None,
     };
     if let Some(container) = container
-        && !owned_container(engine, &container, attempt)?
+        && !session.owns(engine, &container)?
     {
-        violations.push(policy::Violation {
-            rule: "foreign_container".into(),
-            detail: format!("{api} acts on a container this job did not create"),
-        });
+        violations.push(policy::Violation::new(
+            "foreign_container",
+            format!("{api} acts on a container this job did not create"),
+        ));
     }
     Ok(())
-}
-
-/// Whether the container `id` (already encoded for a path) was created by this
-/// job. One the engine does not know is left for the engine to answer.
-fn owned_container(engine: &UnixEngine, id: &str, attempt: AttemptId) -> io::Result<bool> {
-    let reply = engine.request("GET", &format!("/containers/{id}/json"), None)?;
-    if reply.status == 404 {
-        return Ok(true);
-    }
-    Ok(reply
-        .body
-        .pointer("/Config/Labels")
-        .and_then(|labels| labels.get(policy::JOB_LABEL))
-        .and_then(Value::as_str)
-        == Some(attempt.to_string().as_str()))
 }
 
 /// Labels a container this job creates as its own, replacing any value the

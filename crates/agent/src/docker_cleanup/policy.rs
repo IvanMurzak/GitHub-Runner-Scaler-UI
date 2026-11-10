@@ -7,6 +7,10 @@
 //! each one is recorded and still forwarded; in [`Mode::Enforce`] it is
 //! refused with the rule it broke.
 //!
+//! A mount of a path the operator protected (`host protect-path`) is refused
+//! in every mode, `off` included: the operator asked for that path to be out
+//! of every job's reach, and the engine runs outside the service's sandbox.
+//!
 //! The rules are about the host and about other jobs, never about what a job
 //! does inside its own containers:
 //!
@@ -66,6 +70,17 @@ impl Mode {
     }
 }
 
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        [Self::Off, Self::Audit, Self::Enforce]
+            .into_iter()
+            .find(|mode| mode.as_str() == text)
+            .ok_or_else(|| format!("expected off, audit or enforce, not {text}"))
+    }
+}
+
 /// The operator's settings.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,11 +99,7 @@ impl Config {
     ///
     /// When the file cannot be read or does not parse.
     pub fn load(path: &Path) -> io::Result<Self> {
-        match fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(super::invalid),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error),
-        }
+        runner_manager_platform::settings_file::load(path)
     }
 
     /// Writes the settings to `path`.
@@ -97,7 +108,7 @@ impl Config {
     ///
     /// When the file cannot be written.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        super::write_json(path, self)
+        runner_manager_platform::settings_file::save(path, self)
     }
 }
 
@@ -127,7 +138,27 @@ pub enum Access {
 }
 
 impl Context {
+    /// Whether `violation` is recorded: every one unless the policy is off,
+    /// and a protected path's always.
+    #[must_use]
+    pub fn records(&self, violation: &Violation) -> bool {
+        self.mode != Mode::Off || violation.rule == PROTECTED_PATH
+    }
+
+    /// Whether `violation` refuses its request: every one in
+    /// [`Mode::Enforce`], and a protected path's in every mode.
+    #[must_use]
+    pub fn refuses(&self, violation: &Violation) -> bool {
+        self.mode == Mode::Enforce || violation.rule == PROTECTED_PATH
+    }
+
     /// Whether a container may bind-mount `source`.
+    ///
+    /// A path with `..` is refused outright. Otherwise the longest existing
+    /// prefix is resolved through every link on the host, so that a link the
+    /// job left in its own directory cannot point a mount anywhere else, and
+    /// the rest is appended as written: Docker creates a missing bind source
+    /// as a directory.
     #[must_use]
     pub fn access(&self, source: &Path) -> Access {
         let Some(resolved) = (source.is_absolute()
@@ -152,6 +183,9 @@ impl Context {
     }
 }
 
+/// The rule a mount of a protected path breaks.
+const PROTECTED_PATH: &str = "protected_path";
+
 /// A rule a request broke.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Violation {
@@ -160,7 +194,7 @@ pub struct Violation {
 }
 
 impl Violation {
-    fn new(rule: &str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(rule: &str, detail: impl Into<String>) -> Self {
         let mut detail = detail.into();
         if detail.len() > 300 {
             let mut end = 300;
@@ -496,38 +530,19 @@ fn check_host_path(
             "engine_socket",
             format!("{} is the Docker engine itself", source.display()),
         ));
-    } else if allowed(source) == Access::Protected {
-        violations.push(Violation::new(
-            "protected_path",
+        return;
+    }
+    match allowed(source) {
+        Access::Allowed => {}
+        Access::Protected => violations.push(Violation::new(
+            PROTECTED_PATH,
             format!("{} is a protected host path", source.display()),
-        ));
-    } else if allowed(source) == Access::Outside {
-        violations.push(Violation::new(
+        )),
+        Access::Outside => violations.push(Violation::new(
             "host_path",
             format!("{} is outside the job's own directories", source.display()),
-        ));
+        )),
     }
-}
-
-/// Whether `source` lies inside one of `roots`, as the host will resolve it.
-///
-/// A path with `..` is refused outright. Otherwise the longest existing prefix
-/// is resolved through every link on the host, so that a link the job left in
-/// its own directory cannot point a mount anywhere else, and the rest is
-/// appended as written: Docker creates a missing bind source as a directory.
-#[must_use]
-pub fn inside(source: &Path, roots: &[PathBuf]) -> bool {
-    if !source.is_absolute()
-        || source
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return false;
-    }
-    let Some(resolved) = resolve(source) else {
-        return false;
-    };
-    roots.iter().any(|root| resolved.starts_with(root))
 }
 
 /// `path` with its longest existing prefix resolved through links.
@@ -690,13 +705,19 @@ mod tests {
         let attempt = root.path().join("attempt");
         fs::create_dir_all(attempt.join("_work")).unwrap();
         std::os::unix::fs::symlink(outside.path(), attempt.join("escape")).unwrap();
-        let roots = [fs::canonicalize(&attempt).unwrap()];
-        assert!(inside(&attempt.join("_work"), &roots));
-        assert!(inside(&attempt.join("_work/not/yet/created"), &roots));
-        assert!(!inside(&attempt.join("escape"), &roots));
-        assert!(!inside(&attempt.join("escape/inner"), &roots));
-        assert!(!inside(&attempt.join("_work/../../etc"), &roots));
-        assert!(!inside(Path::new("relative"), &roots));
+        let context = Context {
+            mode: Mode::Enforce,
+            allowed: vec![fs::canonicalize(&attempt).unwrap()],
+            protected: vec![],
+            log: root.path().join("log"),
+        };
+        let inside = |path: &Path| context.access(path) == Access::Allowed;
+        assert!(inside(&attempt.join("_work")));
+        assert!(inside(&attempt.join("_work/not/yet/created")));
+        assert!(!inside(&attempt.join("escape")));
+        assert!(!inside(&attempt.join("escape/inner")));
+        assert!(!inside(&attempt.join("_work/../../etc")));
+        assert!(!inside(Path::new("relative")));
     }
 
     #[cfg(unix)]
@@ -726,6 +747,27 @@ mod tests {
             rules(&check_container_create(&body, &|path| context.access(path))),
             ["protected_path"]
         );
+    }
+
+    #[test]
+    fn a_protected_path_is_refused_in_every_mode_and_the_rest_only_when_enforced() {
+        let protected = Violation::new(PROTECTED_PATH, "/srv/keys");
+        let privileged = Violation::new("privileged", "a privileged container");
+        for (mode, recorded, refused) in [
+            (Mode::Off, false, false),
+            (Mode::Audit, true, false),
+            (Mode::Enforce, true, true),
+        ] {
+            let context = Context {
+                mode,
+                allowed: vec![],
+                protected: vec![],
+                log: PathBuf::from("log"),
+            };
+            assert!(context.records(&protected) && context.refuses(&protected));
+            assert_eq!(context.records(&privileged), recorded, "{mode:?}");
+            assert_eq!(context.refuses(&privileged), refused, "{mode:?}");
+        }
     }
 
     #[test]

@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-use runner_manager_agent::docker_cleanup::policy::{self, Config, Mode};
+use runner_manager_agent::docker_cleanup::policy::{self, Config};
 use runner_manager_agent::docker_cleanup::{self, DockerCleanup};
 
-use super::{CliError, Context, Failure, HostDockerPolicyCommand, write_failed};
+use super::{CliError, Context, Failure, HostDockerPolicyCommand, set_member, write_failed};
 
 /// Runs a `host docker-policy` subcommand.
 ///
@@ -20,7 +20,8 @@ pub fn dispatch(
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let failed = write_failed("the Docker policy");
-    let config_path = context.paths().config_dir().join(policy::CONFIG_FILE);
+    let config_dir = context.paths().config_dir();
+    let config_path = config_dir.join(policy::CONFIG_FILE);
     let log = context
         .paths()
         .state_dir()
@@ -32,10 +33,9 @@ pub fn dispatch(
     let mut config = Config::load(&config_path).map_err(local)?;
     match command {
         HostDockerPolicyCommand::Show => {
-            let accounting = docker_cleanup::Config::load(
-                &context.paths().config_dir().join("docker-cleanup.json"),
-            )
-            .map_err(local)?;
+            let accounting =
+                docker_cleanup::Config::load(&config_dir.join(docker_cleanup::CONFIG_FILE))
+                    .map_err(local)?;
             writeln!(out, "Docker policy: {}", config.mode.as_str()).map_err(failed)?;
             writeln!(out, "  settings                  {}", config_path.display())
                 .map_err(failed)?;
@@ -69,17 +69,10 @@ pub fn dispatch(
             }
         }
         HostDockerPolicyCommand::SetMode(args) => {
-            config.mode = match args.mode.as_str() {
-                "off" => Mode::Off,
-                "audit" => Mode::Audit,
-                "enforce" => Mode::Enforce,
-                _ => {
-                    return Err(CliError::new(
-                        Failure::InvalidArgument,
-                        "expected off, audit or enforce",
-                    ));
-                }
-            };
+            config.mode = args
+                .mode
+                .parse()
+                .map_err(|error: String| CliError::new(Failure::InvalidArgument, error))?;
             config.save(&config_path).map_err(local)?;
             writeln!(
                 out,
@@ -90,8 +83,7 @@ pub fn dispatch(
         }
         HostDockerPolicyCommand::AllowPath(args) => {
             let path = absolute(&args.path)?;
-            if !config.allow.contains(&path) {
-                config.allow.push(path.clone());
+            if set_member(&mut config.allow, &path, true) {
                 config.save(&config_path).map_err(local)?;
             }
             writeln!(
@@ -103,9 +95,7 @@ pub fn dispatch(
         }
         HostDockerPolicyCommand::DisallowPath(args) => {
             let path = absolute(&args.path)?;
-            let before = config.allow.len();
-            config.allow.retain(|allowed| *allowed != path);
-            if config.allow.len() != before {
+            if set_member(&mut config.allow, &path, false) {
                 config.save(&config_path).map_err(local)?;
             }
             writeln!(

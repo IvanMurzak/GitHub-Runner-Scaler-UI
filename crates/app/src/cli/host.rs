@@ -954,9 +954,17 @@ fn oci_capability(settings: runner_manager_agent::oci::IsolationSettings) -> Iso
     })
 }
 
+/// [`isolation_capabilities_with`] under `context`'s settings, probed once
+/// per process: the terminal UI shows it on every settings screen, and a
+/// probe runs Podman twice.
 #[must_use]
-pub fn isolation_capabilities() -> Vec<IsolationCapability> {
-    isolation_capabilities_with(runner_manager_agent::oci::IsolationSettings::default())
+pub fn isolation_capabilities(context: &Context) -> Vec<IsolationCapability> {
+    static PROBED: std::sync::OnceLock<Vec<IsolationCapability>> = std::sync::OnceLock::new();
+    PROBED
+        .get_or_init(|| {
+            isolation_capabilities_with(isolation_settings(context).unwrap_or_default())
+        })
+        .clone()
 }
 
 /// [`isolation_capabilities`] under the operator's `settings`.
@@ -982,7 +990,7 @@ pub fn isolation_capabilities_with(
     ]
 }
 
-fn isolation_settings(
+pub(crate) fn isolation_settings(
     context: &Context,
 ) -> Result<runner_manager_agent::oci::IsolationSettings, CliError> {
     runner_manager_agent::oci::IsolationSettings::load(context.paths().config_dir()).map_err(
@@ -1043,8 +1051,7 @@ fn isolation_prepare(context: &Context, out: &mut dyn Write) -> Result<(), CliEr
     let version = run("podman", &["--version"])?;
     writeln!(out, "Podman: {version}").map_err(failed)?;
     for file in ["/etc/subuid", "/etc/subgid"] {
-        let text = std::fs::read_to_string(file).unwrap_or_default();
-        if text.lines().any(|line| line.starts_with("containers:")) {
+        if runner_manager_agent::oci::containers_range(std::path::Path::new(file)) > 0 {
             writeln!(out, "{file}: the containers account already has a range").map_err(failed)?;
         } else {
             use std::io::Write as _;
@@ -1053,6 +1060,7 @@ fn isolation_prepare(context: &Context, out: &mut dyn Write) -> Result<(), CliEr
                 .create(true)
                 .open(file)
                 .map_err(|error| CliError::new(Failure::LocalState, format!("{file}: {error}")))?;
+            let text = std::fs::read_to_string(file).unwrap_or_default();
             let separator = if text.is_empty() || text.ends_with('\n') {
                 ""
             } else {
@@ -1065,14 +1073,11 @@ fn isolation_prepare(context: &Context, out: &mut dyn Write) -> Result<(), CliEr
     }
     run("systemctl", &["enable", "--now", "podman.socket"])?;
     writeln!(out, "podman.socket: enabled and listening").map_err(failed)?;
-    let provider = {
-        let mut provider = runner_manager_agent::oci::OciProcesses::new(
-            runner_manager_domain::model::HostId::from_u128(0),
-        );
-        provider.apply(isolation_settings(context)?);
-        provider
-    };
-    writeln!(out, "Isolated execution: {:?}", provider.host_capability()).map_err(failed)?;
+    let capability = oci_capability(isolation_settings(context)?);
+    writeln!(out, "Isolated execution: {:?}", capability.state).map_err(failed)?;
+    if let Some(remedy) = capability.remedy {
+        writeln!(out, "  next: {remedy}").map_err(failed)?;
+    }
     Ok(())
 }
 

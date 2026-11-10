@@ -393,7 +393,7 @@ impl PolicySettings {
             cache_policy: policy.cache_policy,
             active_runners,
             execution_policy: policy.execution_policy().clone(),
-            provider_diagnostics: cli::host::isolation_capabilities(),
+            provider_diagnostics: cli::host::isolation_capabilities(context),
             workspace,
         })
     }

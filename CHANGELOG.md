@@ -33,8 +33,8 @@ the version being prepared rather than the version in `Cargo.toml`.
   admits a host directory every job may mount.
 - `host protect-path add|remove|list`: host directories no runner or job may
   reach on Linux. The systemd unit lists them in `InaccessiblePaths=`, applied
-  at the next `service install --start-at boot`, and the Docker policy treats
-  a container mount of one as a `protected_path` violation.
+  at the next `service install --start-at boot`, and the Docker proxy refuses
+  a container mount of one in every policy mode, `audit` and `off` included.
 - Isolated execution works under a Linux boot service: the daemon reaches the
   system's rootful Podman service through its socket, and every isolated job
   runs in a container with its own user namespace (`--userns=auto`) and its

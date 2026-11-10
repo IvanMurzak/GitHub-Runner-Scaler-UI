@@ -354,9 +354,10 @@ protect-path list` says whether the registered service enforces the current
 list, and `review_least_privilege` reports a unit that has dropped one.
 
 The Docker engine runs outside the unit, so a container could still mount a
-protected path; the Docker policy (above) records such a mount as
-`protected_path` even inside an allowed directory, and refuses it in `enforce`
-mode.
+protected path. The Docker proxy refuses such a mount, even inside an allowed
+directory, in every policy mode (`off` and `audit` included), and records it as
+`protected_path`. That holds while Docker accounting runs the proxy: with
+`host docker-cleanup set-mode --mode off` jobs reach the engine directly.
 
 The command refuses `/`, the system directories every job needs (`/usr`,
 `/etc`, `/var`, `/tmp` and the like; protect a directory inside one instead),
