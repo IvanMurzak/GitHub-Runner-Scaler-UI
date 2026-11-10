@@ -251,10 +251,10 @@ pub fn install(
     let context = if StartMode::from(args.start_at) == StartMode::Boot
         && context.data_root.is_none()
         && runner_manager_platform::host_fitness::is_elevated()
-        && *context.paths() != runner_manager_platform::paths::AppPaths::system()
     {
-        // A boot service always runs against the system tree. Moved before
-        // anything opens it, so the earlier tree's data lands in an empty one.
+        // A boot service always runs against the system tree. An earlier
+        // tree's data is moved in before this command opens the database there,
+        // on a retry as much as on the first attempt.
         system = context.in_system_tree()?;
         operations(&system)
             .adopt_boot_installation(StartMode::Boot)

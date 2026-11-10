@@ -1798,6 +1798,28 @@ fn systemd_hardening(mode: StartMode) -> Vec<&'static str> {
 #[cfg(any(test, all(unix, not(target_os = "macos"))))]
 const SYSTEMD_HOME_ROOTS: [&str; 3] = ["/home", "/root", "/run/user"];
 
+/// Renames a non-empty directory at `path` to `<name>.before-move-<stamp>`
+/// beside it, leaving nothing at `path`.
+#[cfg(any(all(test, unix), target_os = "linux"))]
+fn set_aside(path: &Path, stamp: &str) -> std::io::Result<()> {
+    let occupied = match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if occupied {
+        let name = path.file_name().map_or_else(
+            || std::borrow::Cow::Borrowed("directory"),
+            |name| name.to_string_lossy(),
+        );
+        std::fs::rename(
+            path,
+            path.with_file_name(format!("{name}.before-move-{stamp}")),
+        )?;
+    }
+    Ok(())
+}
+
 /// Copies the tree at `from` into `to`, except a top-level entry named `skip`.
 /// Directories are created `0700`, files keep their mode, and symbolic links
 /// are copied as links rather than followed.
@@ -5183,25 +5205,29 @@ impl ServiceOperations {
         self.controls
             .control(StartMode::Boot)?
             .stop(&self.identity)?;
-        let empty = std::fs::read_dir(self.paths.config_dir())
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(false);
-        if empty {
+        // No service was ever installed against this tree, so whatever is in it
+        // is what an interrupted attempt or a stray command left: set aside,
+        // never deleted, in favour of the data the running service used. A
+        // tree with its own install record keeps it.
+        if matches!(InstallRecord::read(&self.paths), Ok(None)) {
+            let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
             for (from, to, skip) in [
                 (&old.config, self.paths.config_dir(), None),
                 // `service install` copies the binary in again.
                 (&old.state, self.paths.state_dir(), Some("bin")),
             ] {
-                copy_tree(from, to, skip).map_err(|error| ServiceError::Control {
-                    operation: "move the data of",
-                    name: self.identity.name().to_string(),
-                    manager: "systemd",
-                    detail: format!(
-                        "cannot copy {} to {}: {error}",
-                        from.display(),
-                        to.display()
-                    ),
-                })?;
+                set_aside(to, &stamp)
+                    .and_then(|()| copy_tree(from, to, skip))
+                    .map_err(|error| ServiceError::Control {
+                        operation: "move the data of",
+                        name: self.identity.name().to_string(),
+                        manager: "systemd",
+                        detail: format!(
+                            "cannot copy {} to {}: {error}",
+                            from.display(),
+                            to.display()
+                        ),
+                    })?;
             }
         }
         Ok(true)
@@ -9884,6 +9910,19 @@ mod tests {
             Path::new("journal")
         );
         assert!(!target.join("bin").exists());
+
+        // An occupied target is set aside whole, not merged into or deleted.
+        std::fs::write(target.join("stale.sqlite3-wal"), b"stale").unwrap();
+        set_aside(&target, "20261110T000000Z").unwrap();
+        assert!(!target.exists());
+        let aside = to.path().join("state.before-move-20261110T000000Z");
+        assert_eq!(
+            std::fs::read(aside.join("stale.sqlite3-wal")).unwrap(),
+            b"stale"
+        );
+        copy_tree(from.path(), &target, Some("bin")).unwrap();
+        assert!(!target.join("stale.sqlite3-wal").exists());
+        set_aside(&to.path().join("absent"), "x").unwrap();
     }
 
     #[test]
