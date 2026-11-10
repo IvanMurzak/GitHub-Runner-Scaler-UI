@@ -38,20 +38,23 @@ fn the_policy_defaults_to_audit_and_its_settings_round_trip() {
         root.path(),
         &["host", "docker-policy", "set-mode", "--mode", "enforce"],
     );
+    // Absolute on every platform the CLI builds for.
+    let datasets = root.path().join("datasets");
+    let datasets = datasets.to_str().unwrap();
     ok(
         root.path(),
-        &["host", "docker-policy", "allow-path", "/srv/datasets"],
+        &["host", "docker-policy", "allow-path", datasets],
     );
     let shown = ok(root.path(), &["host", "docker-policy", "show"]);
     assert!(shown.starts_with("Docker policy: enforce"), "{shown}");
-    assert!(shown.contains("/srv/datasets"), "{shown}");
+    assert!(shown.contains(datasets), "{shown}");
 
     ok(
         root.path(),
-        &["host", "docker-policy", "disallow-path", "/srv/datasets"],
+        &["host", "docker-policy", "disallow-path", datasets],
     );
     let shown = ok(root.path(), &["host", "docker-policy", "show"]);
-    assert!(!shown.contains("/srv/datasets"), "{shown}");
+    assert!(!shown.contains(datasets), "{shown}");
 
     assert!(
         !manager(
