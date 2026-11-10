@@ -51,13 +51,13 @@ pub fn launch(
         }
         fs::set_permissions(listen_directory, fs::Permissions::from_mode(0o700))?;
         account.give(listen_directory)?;
-        journal.listen = Some(listen_directory.join("s"));
-        journal.listen_owner = Some((account.uid, account.gid));
+        journal.listen = Some(Listen {
+            socket: listen_directory.join("s"),
+            uid: account.uid,
+            gid: account.gid,
+        });
     }
-    let endpoint = journal
-        .listen
-        .clone()
-        .unwrap_or_else(|| directory.join("s"));
+    let endpoint = journal.socket(&directory);
     write_json(&path, &journal)?;
     let binary = cleanup
         .companion
@@ -300,10 +300,7 @@ pub fn serve(path: &Path) -> io::Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| invalid("missing proxy directory"))?;
-    let socket = journal
-        .listen
-        .clone()
-        .unwrap_or_else(|| directory.join("s"));
+    let socket = journal.socket(directory);
     if socket.as_os_str().as_encoded_bytes().len() >= 108 {
         return Err(invalid("Docker proxy path too long"));
     }
@@ -330,8 +327,8 @@ pub fn serve(path: &Path) -> io::Result<()> {
     journal.engine = actual_engine.into();
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    if let Some((uid, gid)) = journal.listen_owner {
-        std::os::unix::fs::lchown(&socket, Some(uid), Some(gid))?;
+    if let Some(listen) = &journal.listen {
+        std::os::unix::fs::lchown(&socket, Some(listen.uid), Some(listen.gid))?;
     }
     listener.set_nonblocking(true)?;
     journal.proxy = Some(ProcessIdentity::of_current_process().map_err(invalid)?);

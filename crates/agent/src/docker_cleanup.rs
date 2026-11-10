@@ -240,13 +240,18 @@ pub struct Journal {
     pub resources: Vec<Resource>,
     #[serde(default)]
     pub last_reported_secs: Option<u64>,
-    /// Where the proxy listens, when not `s` beside this journal.
+    /// Where the proxy listens and who its socket is handed to, when the
+    /// runner runs as another account; otherwise `s` beside this journal.
     #[serde(default)]
-    pub listen: Option<PathBuf>,
-    /// The uid and gid its socket is handed to, when the runner runs as
-    /// another account.
-    #[serde(default)]
-    pub listen_owner: Option<(u32, u32)>,
+    pub listen: Option<Listen>,
+}
+
+/// A proxy socket outside `state/`, for a runner running as another account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listen {
+    pub socket: PathBuf,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 impl Journal {
@@ -269,8 +274,15 @@ impl Journal {
             resources: Vec::new(),
             last_reported_secs: None,
             listen: None,
-            listen_owner: None,
         }
+    }
+
+    /// The socket the proxy for this journal, kept in `directory`, listens on.
+    #[must_use]
+    pub fn socket(&self, directory: &Path) -> PathBuf {
+        self.listen
+            .as_ref()
+            .map_or_else(|| directory.join("s"), |listen| listen.socket.clone())
     }
 
     pub fn load(path: &Path) -> io::Result<Self> {

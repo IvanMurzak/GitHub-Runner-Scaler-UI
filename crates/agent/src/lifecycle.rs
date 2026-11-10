@@ -165,6 +165,30 @@ fn hand_over(
     spec: &SpawnSpec,
     cache_names: &[&str],
 ) -> std::io::Result<()> {
+    hand_over_attempt(account, runtime)?;
+    for name in cache_names {
+        let Some(value) = spec.configured_env(name) else {
+            continue;
+        };
+        let path = Path::new(value);
+        if !path.is_absolute() {
+            continue;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() && !account.owns(&metadata) => {
+                account.give_tree(path)?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Hands the attempt directory at `runtime` to `account`, and lets the
+/// account's group into the runner root above it.
+fn hand_over_attempt(account: RunnerAccount, runtime: &Path) -> std::io::Result<()> {
     account.give_tree(runtime)?;
     #[cfg(unix)]
     {
@@ -187,24 +211,32 @@ fn hand_over(
             }
         }
     }
-    for name in cache_names {
-        let Some(value) = spec.configured_env(name) else {
-            continue;
-        };
-        let path = Path::new(value);
-        if !path.is_absolute() {
-            continue;
-        }
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() && !account.owns(&metadata) => {
-                account.give_tree(path)?;
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+    Ok(())
+}
+
+/// Who a native runner runs as.
+#[derive(Debug, Clone, Default)]
+enum RunnerIdentity {
+    /// As the daemon itself.
+    #[default]
+    Daemon,
+    /// As this account, which owns the runner's attempt and caches.
+    Account(RunnerAccount),
+    /// As nobody: a confined `root` without the account starts no runner, and
+    /// this says why.
+    Missing(String),
+}
+
+impl RunnerIdentity {
+    /// The account to start a runner as, `None` for the daemon's own, or why
+    /// no runner may start.
+    fn account(&self) -> Result<Option<RunnerAccount>, FailureReason> {
+        match self {
+            Self::Daemon => Ok(None),
+            Self::Account(account) => Ok(Some(*account)),
+            Self::Missing(why) => Err(FailureReason::Other(why.clone())),
         }
     }
-    Ok(())
 }
 
 /// Retry bounds for failures that can resolve without operator action.
@@ -2589,11 +2621,8 @@ pub struct NativeProcesses {
     /// Persistent dependency caches. `None` gives runners none.
     dependency_caches: Option<DependencyCaches>,
     docker_cleanup: Option<crate::docker_cleanup::DockerCleanup>,
-    /// The account runners run as when it is not the daemon's own: a Linux
-    /// boot service's. See [`runner_manager_platform::runner_account`].
-    runner_account: Option<RunnerAccount>,
-    /// Why no runner may start at all: a confined `root` without the account.
-    runner_account_missing: Option<String>,
+    /// Who runners run as. See [`runner_manager_platform::runner_account`].
+    runner: RunnerIdentity,
     #[cfg(test)]
     post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
     #[cfg(test)]
@@ -2650,22 +2679,21 @@ impl PlatformExecutionProvider {
     /// directory and its caches. `None` keeps runners in the daemon's account.
     #[must_use]
     pub fn with_runner_account(mut self, account: Result<Option<RunnerAccount>, String>) -> Self {
-        let account = match account {
-            Ok(account) => account,
+        self.native.runner = match account {
+            Ok(None) => RunnerIdentity::Daemon,
+            Ok(Some(account)) => {
+                self.native.dependency_caches = self
+                    .native
+                    .dependency_caches
+                    .take()
+                    .map(DependencyCaches::without_git);
+                RunnerIdentity::Account(account)
+            }
             Err(why) => {
                 tracing::error!(reason = "runner_account_missing", "{why}");
-                self.native.runner_account_missing = Some(why);
-                None
+                RunnerIdentity::Missing(why)
             }
         };
-        if account.is_some() {
-            self.native.dependency_caches = self
-                .native
-                .dependency_caches
-                .take()
-                .map(DependencyCaches::without_git);
-        }
-        self.native.runner_account = account;
         self
     }
 
@@ -2890,11 +2918,10 @@ impl NativeProcesses {
         config: &EncodedJitConfig,
         cache_target: Option<&runner_manager_domain::model::ScaleTarget>,
     ) -> Result<u32, ProcessStartFailure> {
-        if let Some(why) = &self.runner_account_missing {
-            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
-                why.clone(),
-            )));
-        }
+        let account = self
+            .runner
+            .account()
+            .map_err(ProcessStartFailure::before_spawn)?;
         let handoff = RestrictiveHandoff::create(
             attempt.runtime_path(),
             SecretString::from(config.expose().to_owned()),
@@ -2939,7 +2966,7 @@ impl NativeProcesses {
         };
         #[cfg(not(test))]
         let spec = runner_listener_spec(program, attempt.runtime_path(), caches, &host_env);
-        let spec = match self.runner_account {
+        let spec = match account {
             Some(account) => {
                 hand_over(account, attempt.runtime_path(), &spec, &cache_names).map_err(|_| {
                     ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed)
@@ -2950,9 +2977,8 @@ impl NativeProcesses {
         };
         let (spec, docker_proxy) = if let Some(cleanup) = &self.docker_cleanup {
             let repository = cache_target.map(ToString::to_string).unwrap_or_default();
-            let listen = self
-                .runner_account
-                .map(|account| (attempt.runtime_path().join(DOCKER_SOCKET_DIR), account));
+            let listen =
+                account.map(|account| (attempt.runtime_path().join(DOCKER_SOCKET_DIR), account));
             match cleanup.launch_environment(attempt.id, &repository, &host_env, listen) {
                 Ok(Some(endpoint)) => (
                     spec.env("DOCKER_HOST", endpoint),
@@ -3232,7 +3258,7 @@ impl NativeProcesses {
     /// started, and is treated as gone. A process that has exited passes, and
     /// the identity's own start-time check then reports it gone.
     fn runs_as_runner(&self, identity: &ProcessIdentity) -> bool {
-        let Some(account) = self.runner_account else {
+        let RunnerIdentity::Account(account) = self.runner else {
             return true;
         };
         #[cfg(unix)]
@@ -3289,6 +3315,14 @@ impl ProcessSupervisor for NativeProcesses {
             ));
         }
         self.host_env()?;
+        // The materialized attempt is handed to the runner's account here, off
+        // the async thread and before the JIT registration: it is the one walk
+        // over the whole package copy, and the launch repeats only the cheap
+        // part of it for what it creates afterwards.
+        if let Some(account) = self.runner.account()? {
+            hand_over_attempt(account, attempt.runtime_path())
+                .map_err(|_| FailureReason::ProcessStartFailed)?;
+        }
         // Asked here, before the JIT registration, for the reason `host_env`
         // is: a broken file must cost no registration.
         let cache_target = match &self.dependency_caches {

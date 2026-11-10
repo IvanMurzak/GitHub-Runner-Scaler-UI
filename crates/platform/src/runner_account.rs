@@ -35,20 +35,13 @@ pub struct RunnerAccount {
 }
 
 impl RunnerAccount {
-    /// The account runners launched by this process run as, or `None` when
+    /// The account runners launched by this process run as: `Ok(None)` when
     /// they run as this process does.
     ///
     /// `Some` only for `root` on Linux with [`RUNNER_ACCOUNT`] present, which
     /// is what `service install --start-at boot` sets up. A login service, a
     /// foreground daemon and every other platform keep their runners in their
     /// own account, as before.
-    #[must_use]
-    pub fn for_this_daemon() -> Option<Self> {
-        Self::required_for_this_daemon().ok().flatten()
-    }
-
-    /// [`Self::for_this_daemon`], refusing where running runners as this
-    /// process would hand them its capabilities.
     ///
     /// A boot unit's daemon is `root` with a narrowed capability bounding set
     /// that still holds `CAP_DAC_OVERRIDE` and the rest of
@@ -60,7 +53,7 @@ impl RunnerAccount {
     /// # Errors
     ///
     /// Why no runner may start: the account is missing under a confined `root`.
-    pub fn required_for_this_daemon() -> Result<Option<Self>, String> {
+    pub fn for_this_daemon() -> Result<Option<Self>, String> {
         #[cfg(target_os = "linux")]
         {
             if !crate::host_fitness::is_elevated() {
@@ -150,8 +143,10 @@ impl RunnerAccount {
     ///
     /// Links are handed over themselves and never followed, so a link a
     /// previous job left pointing outside the tree cannot carry the change
-    /// anywhere else. Entries already owned by the account are left alone,
-    /// which keeps a second call over a large tree cheap.
+    /// anywhere else. Below `path`, a directory the account already owns is
+    /// not entered: only the account writes inside one, so nothing there needs
+    /// handing over, and a retained `_work` or an already handed package is
+    /// not walked again.
     ///
     /// # Errors
     ///
@@ -163,7 +158,12 @@ impl RunnerAccount {
         }
         if metadata.is_dir() {
             for entry in std::fs::read_dir(path)? {
-                self.give_tree(&entry?.path())?;
+                let child = entry?.path();
+                let owned_directory = std::fs::symlink_metadata(&child)
+                    .is_ok_and(|metadata| metadata.is_dir() && self.owns(&metadata));
+                if !owned_directory {
+                    self.give_tree(&child)?;
+                }
             }
         }
         Ok(())
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn no_account_is_used_unless_this_is_root_on_linux() {
         if !(cfg!(target_os = "linux") && crate::host_fitness::is_elevated()) {
-            assert_eq!(RunnerAccount::for_this_daemon(), None);
+            assert_eq!(RunnerAccount::for_this_daemon(), Ok(None));
         }
     }
 }

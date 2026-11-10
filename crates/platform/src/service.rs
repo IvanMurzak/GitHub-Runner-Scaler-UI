@@ -1801,8 +1801,16 @@ const SYSTEMD_HARDENING: [&str; 12] = [
 /// None reaches a job. Moving from `root` to another uid clears the permitted
 /// and effective sets, the ambient set is empty, and `NoNewPrivileges=yes`
 /// stops a set-user-ID or file-capability binary from granting any back.
-pub const BOOT_CAPABILITIES: &str =
-    "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID";
+pub const BOOT_CAPABILITIES: &str = boot_capabilities!();
+
+/// The one spelling of [`BOOT_CAPABILITIES`], so that the directive the unit
+/// carries and the list the review checks it against cannot drift apart.
+macro_rules! boot_capabilities {
+    () => {
+        "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID"
+    };
+}
+use boot_capabilities;
 
 /// The hardening directives a unit started in `mode` carries.
 ///
@@ -1815,19 +1823,16 @@ pub const BOOT_CAPABILITIES: &str =
 fn systemd_hardening(mode: StartMode) -> Vec<&'static str> {
     let mut directives = SYSTEMD_HARDENING.to_vec();
     if mode == StartMode::Boot {
-        for directive in &mut directives {
-            if *directive == "CapabilityBoundingSet=" {
-                *directive = BOOT_CAPABILITY_BOUNDING_SET;
-            }
+        if let Some(directive) = directives
+            .iter_mut()
+            .find(|directive| **directive == "CapabilityBoundingSet=")
+        {
+            *directive = concat!("CapabilityBoundingSet=", boot_capabilities!());
         }
         directives.push("ProtectHome=tmpfs");
     }
     directives
 }
-
-/// [`BOOT_CAPABILITIES`] as the directive that sets them.
-const BOOT_CAPABILITY_BOUNDING_SET: &str =
-    "CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID";
 
 /// The trees `ProtectHome=` hides, which a boot unit's directories must
 /// therefore lie outside.

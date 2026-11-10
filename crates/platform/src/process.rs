@@ -618,12 +618,6 @@ impl SpawnSpec {
         self
     }
 
-    /// The account [`Self::run_as`] named, if any.
-    #[must_use]
-    pub const fn account(&self) -> Option<crate::runner_account::RunnerAccount> {
-        self.account
-    }
-
     /// Whether [`Self::expect_normal_scheduling`] was asked for.
     #[doc(hidden)]
     #[must_use]

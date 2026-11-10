@@ -471,7 +471,7 @@ async fn run_generation(
                                     ),
                                 )
                                 .with_runner_account(
-                                    runner_manager_platform::runner_account::RunnerAccount::required_for_this_daemon(),
+                                    runner_manager_platform::runner_account::RunnerAccount::for_this_daemon(),
                                 ),
                         ),
                         clock: Arc::clone(&clock),
