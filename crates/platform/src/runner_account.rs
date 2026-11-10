@@ -386,6 +386,7 @@ mod sys {
 
     /// The default ACL `user::rwx group::rwx other::---`, in the kernel's
     /// `system.posix_acl_default` encoding.
+    #[cfg(any(test, target_os = "linux"))]
     pub(super) fn default_acl() -> Vec<u8> {
         const VERSION: u32 = 2;
         const UNDEFINED: u32 = u32::MAX;
