@@ -129,6 +129,9 @@ pub struct AppState {
     pub remote: crate::remote::RemoteCommands,
     deliveries: Mutex<DeliveryLog>,
     limiter: RateLimiter,
+    /// CLI sign-ins started, per client address: apart from enrollment's, so
+    /// neither can starve the other.
+    cli_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -158,6 +161,7 @@ impl AppState {
             dashboard,
             remote: crate::remote::RemoteCommands::default(),
             limiter: RateLimiter::new(config.attempts_per_minute),
+            cli_limiter: RateLimiter::new(config.attempts_per_minute),
             config,
             store,
             placement: Arc::new(
@@ -190,6 +194,13 @@ impl AppState {
         self.store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the client at `peer` may start another CLI sign-in this
+    /// minute.
+    pub(crate) fn allow_cli_sign_in(&self, peer: SocketAddr, headers: &HeaderMap) -> bool {
+        self.cli_limiter
+            .allow(self.client_address(peer, headers), Instant::now())
     }
 
     fn client_address(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {

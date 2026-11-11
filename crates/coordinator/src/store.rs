@@ -16,7 +16,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// The prefix every invite code carries, so one is recognisable in a paste.
 pub const INVITE_PREFIX: &str = "rmc_";
@@ -245,6 +245,16 @@ impl Store {
                 );
                 PRAGMA user_version = 7;",
             )?;
+        }
+        if version < 8 {
+            // 0.4.61: a session is a browser's (`web`) or the CLI's (`cli`),
+            // and neither is accepted where the other is expected.
+            if !has_column(&connection, "dashboard_sessions", "kind")? {
+                connection.execute_batch(
+                    "ALTER TABLE dashboard_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'web';",
+                )?;
+            }
+            connection.pragma_update(None, "user_version", 8)?;
         }
         Ok(Self { connection })
     }
@@ -730,6 +740,24 @@ pub struct DashboardSession {
     pub avatar_url: Option<String>,
 }
 
+/// Who holds a session: a browser, by its cookie, or the `runner-manager`
+/// CLI, by a bearer token. A token is looked up only as its own kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    Web,
+    Cli,
+}
+
+impl SessionKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Web => "web",
+            Self::Cli => "cli",
+        }
+    }
+}
+
 impl Store {
     /// Records one minute's samples and drops every one older than `oldest`
     /// (Unix seconds).
@@ -812,6 +840,7 @@ impl Store {
         &self,
         token_hash: &str,
         session: &DashboardSession,
+        kind: SessionKind,
         now: i64,
         expires_at: i64,
     ) -> Result<(), StoreError> {
@@ -820,34 +849,37 @@ impl Store {
             params![now],
         )?;
         self.connection.execute(
-            "INSERT INTO dashboard_sessions (token_hash, login, avatar_url, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO dashboard_sessions
+                (token_hash, login, avatar_url, created_at, expires_at, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 token_hash,
                 session.login,
                 session.avatar_url,
                 now,
-                expires_at
+                expires_at,
+                kind.as_str()
             ],
         )?;
         Ok(())
     }
 
-    /// The live session whose cookie hashes to `token_hash`.
+    /// The live session of `kind` whose token hashes to `token_hash`.
     ///
     /// # Errors
     /// SQLite's.
     pub fn session(
         &self,
         token_hash: &str,
+        kind: SessionKind,
         now: i64,
     ) -> Result<Option<DashboardSession>, StoreError> {
         Ok(self
             .connection
             .query_row(
                 "SELECT login, avatar_url FROM dashboard_sessions
-                 WHERE token_hash = ?1 AND expires_at > ?2",
-                params![token_hash, now],
+                 WHERE token_hash = ?1 AND expires_at > ?2 AND kind = ?3",
+                params![token_hash, now, kind.as_str()],
                 |row| {
                     Ok(DashboardSession {
                         login: row.get(0)?,
@@ -1283,5 +1315,44 @@ mod tests {
             Err(StoreError::InvalidTtl)
         ));
         assert_eq!(sanitize_hostname("a b\u{1b}[31m"), "ab31m");
+    }
+
+    #[test]
+    fn sessions_from_before_kinds_are_web_sessions_and_kinds_do_not_mix() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("coordinator.db");
+        {
+            let store = Store::open(&path).expect("current");
+            store
+                .connection
+                .execute_batch(
+                    "ALTER TABLE dashboard_sessions DROP COLUMN kind;
+                     INSERT INTO dashboard_sessions VALUES ('h','me',NULL,1,4102444800);
+                     PRAGMA user_version = 7;",
+                )
+                .expect("a schema-7 database");
+        }
+        let store = Store::open(&path).expect("upgraded");
+        let me = DashboardSession {
+            login: "me".into(),
+            avatar_url: None,
+        };
+        assert_eq!(
+            store.session("h", SessionKind::Web, 2).expect("read"),
+            Some(me.clone())
+        );
+        assert_eq!(store.session("h", SessionKind::Cli, 2).expect("read"), None);
+        store
+            .create_session("c", &me, SessionKind::Cli, 2, 100)
+            .expect("created");
+        assert_eq!(
+            store.session("c", SessionKind::Cli, 3).expect("read"),
+            Some(me)
+        );
+        assert_eq!(store.session("c", SessionKind::Web, 3).expect("read"), None);
+        assert_eq!(
+            store.session("c", SessionKind::Cli, 100).expect("read"),
+            None
+        );
     }
 }
