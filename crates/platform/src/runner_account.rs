@@ -659,4 +659,67 @@ mod tests {
             "a link's target is never touched"
         );
     }
+
+    /// Whether `path`'s filesystem keeps a default ACL; a test of what the
+    /// ACL does has nothing to show on one that does not.
+    #[cfg(target_os = "linux")]
+    fn keeps_default_acl(path: &Path) -> bool {
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `name` and the attribute name are NUL-terminated; a zero
+        // size only asks for the length.
+        let size = unsafe {
+            libc::getxattr(
+                name.as_ptr(),
+                c"system.posix_acl_default".as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        size > 0
+    }
+
+    /// A `container:` job's steps run as an account of the image, which is in
+    /// no group of this host: to the host it is "other". The runner mounts the
+    /// slot's tool cache at `/__t`, so a toolchain a job installed there as the
+    /// container's root must stay readable and executable for "other", or the
+    /// next step that runs it as the image's user fails with
+    /// `env: 'node': Permission denied` (AI-Game-Dev-App, 2026-11-11).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn what_a_job_creates_in_a_shared_cache_stays_readable_by_every_account() {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("tool-cache");
+        std::fs::create_dir(&root).unwrap();
+        let pool = RunnerPool {
+            gid: std::fs::metadata(&root).unwrap().gid(),
+            accounts: Vec::new(),
+            legacy: None,
+        };
+        pool.share_tree(&root).unwrap();
+        if !keeps_default_acl(&root) {
+            eprintln!("skipped: {} keeps no default ACL", root.display());
+            return;
+        }
+
+        // What `@actions/tool-cache` does: `mkdir -p` the version's folder
+        // (mode 0777) and create the binary with its archive mode, 0755.
+        let bin = root.join("node/24.22.2/x64/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o755)
+                .open(bin.join("node"))
+                .unwrap(),
+        );
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
+        for path in [root.join("node"), root.join("node/24.22.2"), bin.clone()] {
+            assert_eq!(mode(&path), 0o2775, "{}", path.display());
+        }
+        assert_eq!(mode(&bin.join("node")), 0o755);
+    }
 }
