@@ -62,6 +62,7 @@ pub mod service;
 pub mod status;
 pub mod ui;
 pub mod update;
+pub mod versions;
 pub mod workspace;
 pub mod wsl;
 mod wsl_watchdog;

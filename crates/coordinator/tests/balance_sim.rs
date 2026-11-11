@@ -813,6 +813,7 @@ impl Sim {
             free_ram_bytes: Some(spec.ram.saturating_sub(self.used_ram(host, self.now()))),
             unfit: false,
             draining: false,
+            versions: None,
             open_leases: Some(
                 self.runners
                     .iter()

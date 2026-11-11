@@ -7,6 +7,33 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.64
+
+### Added
+
+- The dashboard shows each machine's runner-manager builds: the one its
+  service runs and the installed app it upgrades from (npm, Homebrew, the
+  release archive, `cargo install`), with a note when a newer release is
+  out or the service is waiting for its jobs to restart into a newer app.
+  A WSL distribution is marked WSL, and a Windows machine lists the version
+  it last installed in each WSL distribution it manages. Hosts report this
+  in their heartbeat from this version on.
+- **Update** in a machine's panel updates its runner-manager through the
+  coordinator, on a host that allowed changes there (`coordinator
+  remote-changes allow`). The host answers at once and does what its daily
+  automatic update does: it installs the newest published release through
+  the channel that installed the app, checked against the release's
+  `SHA256SUMS`, and the service restarts into it once its running jobs
+  finish. The panel shows how it went. The coordinator names no version and
+  no source. `runner-manager --host remote:NAME update` does the same.
+
+### Fixed
+
+- A service whose recorded source is a checkout's `target/release` path
+  holding a release binary (what `update --force` leaves there) was never
+  updated by the daily automatic update. It now is, like a release archive;
+  a build of the checkout (`X.Y.Z+git.<sha>`) is still left alone.
+
 ## 0.4.63
 
 ### Fixed

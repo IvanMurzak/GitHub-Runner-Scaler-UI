@@ -11,15 +11,18 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use std::sync::Mutex;
+
 use runner_manager_domain::coordinator_protocol::{
-    CommandResult, MAX_COMMAND_OUTPUT_BYTES, RunCommand,
+    CommandResult, MAX_COMMAND_OUTPUT_BYTES, RunCommand, UpdateProgress,
 };
+use runner_manager_platform::lock::{HostLock, LockError, LockKind};
 use runner_manager_platform::paths::AppPaths;
 use serde::{Deserialize, Serialize};
 
 use super::{
     Cli, CliError, Command, Context, CoordinatorRemoteChangesArgs, Failure, HostCommand,
-    RemoteChangesChoice, RepoCommand, RepoProfileCommand, Styling, write_failed,
+    RemoteChangesChoice, RepoCommand, RepoProfileCommand, Styling, UpdateArgs, write_failed,
 };
 
 /// The operator's choice, in the configuration directory.
@@ -85,7 +88,7 @@ pub fn remote_changes(
         "{}",
         if allow {
             "A person signed in to the coordinator may now change this host's repositories, labels, \
-             limits and workspaces. Every change is recorded in remote-commands.jsonl here and on \
+             limits and workspaces, and update its runner-manager. Every change is recorded in remote-commands.jsonl here and on \
              the coordinator. `runner-manager coordinator remote-changes deny` takes it back."
         } else {
             "The coordinator may only read this host's settings now."
@@ -107,7 +110,8 @@ pub enum Access {
 }
 
 /// What a command parsed from the coordinator does, or `None` for one this
-/// host never runs remotely: anything that signs in, installs, updates,
+/// host never runs remotely: anything that signs in, installs, updates (a
+/// plain `update` is started by [`start_update`] instead),
 /// touches another host, or is not about repositories and capacity.
 ///
 /// Every flag of an allowed command comes with it, so the commands here are
@@ -144,6 +148,111 @@ pub fn access(cli: &Cli) -> Option<Access> {
             ),
         ) => Some(Access::Change),
         _ => None,
+    }
+}
+
+/// Whether `cli` is a plain `runner-manager update`: the one update the
+/// coordinator may start. It is not run as typed, which would update the
+/// service's private copy: [`start_update`] updates the binary the service was
+/// installed from, as the daily check does, and the service then restarts
+/// into it once its jobs finish.
+fn is_update(cli: &Cli) -> bool {
+    cli.host == super::HostSelector::Local
+        && matches!(
+            &cli.command,
+            Command::Update(UpdateArgs {
+                check: false,
+                force: false
+            })
+        )
+}
+
+/// The last update the coordinator started, while this service runs.
+static UPDATE: Mutex<Option<UpdateProgress>> = Mutex::new(None);
+
+fn set_update(state: &str, message: String) {
+    *UPDATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(UpdateProgress {
+        state: state.to_owned(),
+        at: chrono::Utc::now().timestamp(),
+        message,
+    });
+}
+
+/// The last update the coordinator started, for the heartbeat.
+#[must_use]
+pub fn update_progress() -> Option<UpdateProgress> {
+    UPDATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Starts updating this host and answers at once: a package manager can take
+/// longer than the coordinator waits for an answer. The heartbeat carries how
+/// it went ([`update_progress`]).
+fn start_update(context: &Context, request_id: &str) -> CommandResult {
+    let lock = match HostLock::try_acquire(context.paths(), LockKind::Update) {
+        Ok(lock) => lock,
+        Err(LockError::Held { .. }) => {
+            return CommandResult::refused(
+                request_id,
+                Failure::Conflict.code(),
+                "an update is already running on this host",
+            );
+        }
+        Err(error) => {
+            return CommandResult::refused(
+                request_id,
+                Failure::LocalState.code(),
+                &error.to_string(),
+            );
+        }
+    };
+    set_update("running", "Looking for the newest release.".to_owned());
+    let context = context.clone();
+    std::thread::spawn(move || {
+        let _lock = lock;
+        let outcome = super::update::perform(
+            &context,
+            &UpdateArgs {
+                check: false,
+                force: false,
+            },
+            &mut Vec::new(),
+            super::update::Caller::Coordinator,
+        );
+        match outcome {
+            Ok(()) => {
+                let installed = super::update::Installation::of_service(context.paths())
+                    .ok()
+                    .flatten()
+                    .and_then(|(_, version)| version);
+                let message = match installed {
+                    Some(version) if version != env!("RUNNER_MANAGER_BUILD_VERSION") => format!(
+                        "{version} is installed; the service restarts into it once its jobs finish."
+                    ),
+                    _ => "No newer release was installed: this is the newest one.".to_owned(),
+                };
+                tracing::info!("the update the coordinator started ended");
+                set_update("done", message);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the update the coordinator started failed");
+                set_update("failed", error.to_string());
+            }
+        }
+    });
+    CommandResult {
+        request_id: request_id.to_owned(),
+        exit_code: 0,
+        stdout: "Updating runner-manager on this host. The service restarts into the new \
+                 version once its running jobs finish; the dashboard shows how it goes.\n"
+            .to_owned(),
+        stderr: String::new(),
+        truncated: false,
+        access: None,
     }
 }
 
@@ -193,11 +302,16 @@ pub fn execute(context: &Context, command: &RunCommand) -> CommandResult {
                 return result;
             }
         };
-        let Some(access) = access(&cli) else {
+        let update = is_update(&cli);
+        let Some(access) = (if update {
+            Some(Access::Change)
+        } else {
+            access(&cli)
+        }) else {
             return refused(
                 Failure::InvalidArgument,
                 "this host does not run that command for the coordinator; only reading and \
-                 changing repositories, labels, limits and workspaces",
+                 changing repositories, labels, limits and workspaces, and `update`",
             );
         };
         let judged = |mut result: CommandResult| {
@@ -216,6 +330,9 @@ pub fn execute(context: &Context, command: &RunCommand) -> CommandResult {
                 "this host does not take changes through the coordinator; its operator can allow \
                  them there with `runner-manager coordinator remote-changes allow`",
             ));
+        }
+        if update {
+            return judged(start_update(context, &command.request_id));
         }
         let result = |exit_code: u8, stdout: String, stderr: String| {
             let (stdout, stderr, truncated) = bounded(stdout, stderr);
@@ -375,6 +492,56 @@ mod tests {
         ] {
             assert_eq!(access(&parsed(refused)), None, "{refused:?}");
         }
+    }
+
+    #[test]
+    fn only_a_plain_update_is_started_for_the_coordinator() {
+        assert!(is_update(&parsed(&["update"])));
+        for other in [
+            &["update", "--check"][..],
+            &["update", "--force"],
+            &["--host", "wsl:Ubuntu", "update"],
+        ] {
+            assert!(!is_update(&parsed(other)), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn an_update_needs_changes_allowed_and_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = Context::resolve(Some(dir.path()), &mut Vec::new()).unwrap();
+        let command = RunCommand {
+            request_id: "r1".into(),
+            argv: vec!["update".into()],
+            by: "someone".into(),
+        };
+        let refused = execute(&context, &command);
+        assert_eq!(refused.exit_code, Failure::Conflict.code());
+        assert_eq!(refused.access.as_deref(), Some("change"));
+        assert!(
+            refused.stderr.contains("remote-changes allow"),
+            "{refused:?}"
+        );
+        assert_eq!(update_progress(), None, "nothing started");
+        let record =
+            std::fs::read_to_string(context.paths().state_dir().join(RECORD_FILE)).unwrap();
+        assert!(record.contains(r#""argv":["update"]"#), "{record}");
+
+        // Allowed, but another update holds the lock: refused, nothing started.
+        remote_changes(
+            &context,
+            &CoordinatorRemoteChangesArgs {
+                choice: RemoteChangesChoice::Allow,
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let held = HostLock::try_acquire(context.paths(), LockKind::Update).unwrap();
+        let busy = execute(&context, &command);
+        assert_eq!(busy.exit_code, Failure::Conflict.code());
+        assert!(busy.stderr.contains("already running"), "{busy:?}");
+        drop(held);
+        assert_eq!(update_progress(), None);
     }
 
     #[test]

@@ -1444,6 +1444,74 @@ async fn a_command_posted_over_http_is_relayed_to_the_host_and_its_result_return
 }
 
 #[tokio::test]
+async fn a_hosts_versions_reach_the_overview_from_its_heartbeat() {
+    use runner_manager_domain::coordinator_protocol::{
+        COMMAND_VERSION, Heartbeat, HostVersions, ManagedWsl, UpdateProgress,
+    };
+
+    let (coordinator, token) = start_with_a_cli_session().await;
+    let (host_id, key) = enrolled(&coordinator, "ivanpc", 53).await;
+    let mut socket = linked(&coordinator, COMMAND_VERSION, &host_id, &key).await;
+    let overview = || async {
+        let overview: serde_json::Value = reqwest::Client::new()
+            .get(format!("{}/api/overview", coordinator.base))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("sent")
+            .json()
+            .await
+            .expect("json");
+        overview["hosts"][0]["versions"].clone()
+    };
+    assert!(overview().await.is_null(), "no heartbeat yet");
+    socket
+        .send(Message::Text(
+            HostMessage::Heartbeat(Heartbeat {
+                versions: Some(HostVersions {
+                    service: "0.4.63".into(),
+                    app: Some("0.4.64".into()),
+                    app_source: Some("npm".into()),
+                    updatable: true,
+                    update: Some(UpdateProgress {
+                        state: "done".into(),
+                        at: 1,
+                        message: "0.4.64 is installed".into(),
+                    }),
+                    wsl: vec![ManagedWsl {
+                        distribution: "Ubuntu".into(),
+                        installed_version: "0.4.63".into(),
+                    }],
+                    wsl_guest: false,
+                }),
+                ..Heartbeat::default()
+            })
+            .encode()
+            .into(),
+        ))
+        .await
+        .expect("heartbeat");
+    let versions = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let versions = overview().await;
+            if !versions.is_null() {
+                break versions;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the heartbeat's versions reach the overview");
+    assert_eq!(versions["service"], "0.4.63");
+    assert_eq!(versions["app"], "0.4.64");
+    assert_eq!(versions["app_source"], "npm");
+    assert_eq!(versions["updatable"], true);
+    assert_eq!(versions["update"]["state"], "done");
+    assert_eq!(versions["wsl"][0]["distribution"], "Ubuntu");
+    assert_eq!(versions["wsl_guest"], false);
+}
+
+#[tokio::test]
 async fn a_host_older_than_commands_is_refused_with_a_conflict() {
     let (coordinator, token) = start_with_a_cli_session().await;
     let (host_id, key) = enrolled(&coordinator, "old-box", 52).await;

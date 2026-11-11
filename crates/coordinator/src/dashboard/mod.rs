@@ -434,6 +434,8 @@ struct HostView {
     manageable: bool,
     /// Its operator allowed changes through the coordinator.
     remote_changes: bool,
+    /// Its runner-manager builds, from its last heartbeat (0.4.64).
+    versions: Option<runner_manager_domain::coordinator_protocol::HostVersions>,
 }
 
 /// A job with the host its runner belongs to, when its host said.
@@ -500,6 +502,9 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
                 connected_since: link.map(|host| host.since.timestamp()),
                 manageable: state.registry.takes_commands(&record.id) == Some(true),
                 remote_changes: hello.is_some_and(|hello| hello.remote_changes),
+                versions: link
+                    .and_then(|host| host.heartbeat.as_ref())
+                    .and_then(|heartbeat| heartbeat.versions.clone()),
             }
         })
         .collect();

@@ -272,6 +272,96 @@ pub struct Heartbeat {
     /// an older host, or when it cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
+    /// From 0.4.64: the runner-manager builds on this host. `None` from an
+    /// older host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub versions: Option<HostVersions>,
+}
+
+/// The runner-manager builds on a host, as its service reports them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostVersions {
+    /// The build the service runs: the daemon sending the heartbeat.
+    pub service: String,
+    /// The installed binary the service was installed from, and upgrades
+    /// itself from when it changes (what `runner-manager` on the machine's
+    /// command line usually is). `None` when the service was not installed,
+    /// or its binary does not answer `--version`.
+    pub app: Option<String>,
+    /// How that binary was installed: `release archive`, `npm`, `Homebrew`,
+    /// `cargo install` or `a build in a checkout`.
+    pub app_source: Option<String>,
+    /// Whether the coordinator can update this host: changes through the
+    /// coordinator are allowed and its binary was installed in a way the
+    /// service can update.
+    pub updatable: bool,
+    /// The last update started through the coordinator, while this service
+    /// runs.
+    pub update: Option<UpdateProgress>,
+    /// Windows: the WSL distributions this machine manages, each a host of
+    /// its own on the coordinator.
+    pub wsl: Vec<ManagedWsl>,
+    /// Linux: this host runs inside a WSL distribution a Windows machine
+    /// manages.
+    pub wsl_guest: bool,
+}
+
+/// The most WSL distributions a heartbeat names.
+pub const MAX_MANAGED_WSL: usize = 16;
+/// The longest update message a heartbeat carries, in bytes.
+pub const MAX_UPDATE_MESSAGE: usize = 512;
+
+impl HostVersions {
+    /// Within [`MAX_MANAGED_WSL`] and [`MAX_UPDATE_MESSAGE`], and every
+    /// version short: a host's own figures, cut to what a heartbeat carries.
+    #[must_use]
+    pub fn bounded(mut self) -> Self {
+        let cut = |text: &mut String, limit: usize| {
+            if text.len() > limit {
+                let mut end = limit;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+        };
+        cut(&mut self.service, 64);
+        for text in [&mut self.app, &mut self.app_source].into_iter().flatten() {
+            cut(text, 64);
+        }
+        if let Some(update) = &mut self.update {
+            cut(&mut update.message, MAX_UPDATE_MESSAGE);
+        }
+        self.wsl.truncate(MAX_MANAGED_WSL);
+        for wsl in &mut self.wsl {
+            cut(&mut wsl.distribution, 64);
+            cut(&mut wsl.installed_version, 64);
+        }
+        self
+    }
+}
+
+/// An update started through the coordinator.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateProgress {
+    /// `running`, `done` or `failed`.
+    pub state: String,
+    /// Unix seconds: when it started, or ended.
+    pub at: i64,
+    /// What it did, or why it failed.
+    pub message: String,
+}
+
+/// A WSL distribution a Windows machine manages.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManagedWsl {
+    /// As `wsl --list` spells it.
+    pub distribution: String,
+    /// The runner-manager this machine last installed in it.
+    pub installed_version: String,
 }
 
 /// The most lease ids a heartbeat names.
@@ -1485,6 +1575,7 @@ mod tests {
                 draining: true,
                 open_leases: Some(vec!["l1".into()]),
                 disk_free_bytes: Some(20 << 30),
+                versions: None,
             }),
         ];
         let attempts = [
@@ -1831,6 +1922,62 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn a_heartbeat_carries_the_hosts_versions_and_an_older_one_none() {
+        let older = r#"{"type":"heartbeat","free_slots":1}"#;
+        let Ok(HostMessage::Heartbeat(beat)) = HostMessage::decode(older) else {
+            panic!("an older heartbeat decodes");
+        };
+        assert_eq!(beat.versions, None);
+        let versions = HostVersions {
+            service: "0.4.64".into(),
+            app: Some("0.4.64".into()),
+            app_source: Some("npm".into()),
+            updatable: true,
+            update: None,
+            wsl: vec![ManagedWsl {
+                distribution: "Ubuntu".into(),
+                installed_version: "0.4.64".into(),
+            }],
+            wsl_guest: false,
+        };
+        let sent = HostMessage::Heartbeat(Heartbeat {
+            versions: Some(versions.clone()),
+            ..Heartbeat::default()
+        });
+        assert_eq!(HostMessage::decode(&sent.encode()), Ok(sent));
+        // Unknown fields from a newer host are ignored.
+        let newer = r#"{"type":"heartbeat","versions":{"service":"9.0.0","later":1}}"#;
+        let Ok(HostMessage::Heartbeat(beat)) = HostMessage::decode(newer) else {
+            panic!("a newer heartbeat decodes");
+        };
+        assert_eq!(
+            beat.versions.map(|versions| versions.service).as_deref(),
+            Some("9.0.0")
+        );
+    }
+
+    #[test]
+    fn a_hosts_versions_are_cut_to_what_a_heartbeat_carries() {
+        let versions = HostVersions {
+            service: "é".repeat(100),
+            update: Some(UpdateProgress {
+                state: "failed".into(),
+                at: 0,
+                message: "x".repeat(MAX_UPDATE_MESSAGE * 2),
+            }),
+            wsl: vec![ManagedWsl::default(); MAX_MANAGED_WSL + 3],
+            ..HostVersions::default()
+        }
+        .bounded();
+        assert_eq!(versions.service.len(), 64);
+        assert_eq!(
+            versions.update.map(|update| update.message.len()),
+            Some(MAX_UPDATE_MESSAGE)
+        );
+        assert_eq!(versions.wsl.len(), MAX_MANAGED_WSL);
     }
 
     #[test]
