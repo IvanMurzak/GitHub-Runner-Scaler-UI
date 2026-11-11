@@ -254,9 +254,8 @@ button { font: inherit; color: inherit; }
 .spark-cap { position: absolute; top: 4px; left: 8px; right: 8px; display: flex; justify-content: space-between; font-size: 10.5px; color: var(--muted); }
 .spark-empty { display: grid; place-items: center; font-size: 12px; color: var(--muted); }
 .host-foot { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12.5px; padding-top: 10px; border-top: 1px solid var(--border); }
-.host-foot b { color: var(--text-2); font-weight: 550; }
+.host-foot b, .host-ver b { color: var(--text-2); font-weight: 550; }
 .host-ver { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; color: var(--muted); font-size: 12.5px; }
-.host-ver b { color: var(--text-2); font-weight: 550; }
 .ver-list { display: grid; gap: 6px; margin: 0; font-size: 13px; }
 .ver-row { display: grid; grid-template-columns: minmax(90px, max-content) 1fr; gap: 12px; }
 .ver-row dt { color: var(--text-2); }

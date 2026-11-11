@@ -913,7 +913,7 @@
     const parent = v && v.wsl_guest ? wslParent(x) : null;
     const u = v && v.update;
     const busy = dw.busy.has('update') || (u && u.state === 'running');
-    const can = !!(x && x.online && x.manageable && v && v.updatable);
+    const can = !!(x && x.online && x.manageable && x.remote_changes && v && v.updatable);
     let hint;
     if (!x || !x.online) hint = 'Shown while the machine is connected.';
     else if (!v) hint = 'This machine runs a runner-manager older than 0.4.64, which does not report its versions or take updates from here. Update it on the machine once.';
@@ -921,7 +921,7 @@
     else if (!v.updatable) hint = `Its app is ${v.app_source || 'not known'}, which the service cannot update. Update it on the machine.`;
     else hint = 'Update installs the newest release the way the app was installed. The service finishes its running jobs first, then restarts into it.';
     const st = v ? versionState(v) : null;
-    const card = h('section', { class: 'card dw-card', 'data-key': 'update', 'data-sig': versionSig(x), 'aria-labelledby': 'dw-h-ver' },
+    return h('section', { class: 'card dw-card', 'data-key': 'update', 'data-sig': versionSig(x), 'aria-labelledby': 'dw-h-ver' },
       h('fieldset', { class: 'fs', disabled: busy || null },
         h('div', { class: 'cap-row' },
           h('div', { class: 'cap-text' },
@@ -940,7 +940,6 @@
         u ? h('p', { class: `ver-progress ${u.state === 'failed' ? 'text-err' : 'muted'}` },
           u.state === 'running' ? 'Update started ' : u.state === 'failed' ? 'Update failed ' : 'Update finished ', ago(u.at), u.message ? ` · ${u.message}` : '') : null),
       resultNote('update'));
-    return card;
   }
 
   // Heartbeats bring the versions and an update's progress: the card follows them.

@@ -110,8 +110,8 @@ pub enum Access {
 }
 
 /// What a command parsed from the coordinator does, or `None` for one this
-/// host never runs remotely: anything that signs in, installs, updates (a
-/// plain `update` is started by [`start_update`] instead),
+/// host never runs remotely: anything that signs in, installs, updates with a
+/// flag,
 /// touches another host, or is not about repositories and capacity.
 ///
 /// Every flag of an allowed command comes with it, so the commands here are
@@ -130,7 +130,11 @@ pub fn access(cli: &Cli) -> Option<Access> {
             RepoCommand::List(_)
             | RepoCommand::Profile(RepoProfileCommand::List(_) | RepoProfileCommand::Show(_)),
         ) => Some(Access::Read),
-        Command::Host(HostCommand::SetCapacity(_))
+        Command::Update(UpdateArgs {
+            check: false,
+            force: false,
+        })
+        | Command::Host(HostCommand::SetCapacity(_))
         | Command::Repo(
             RepoCommand::Add(_)
             | RepoCommand::Remove(_)
@@ -149,22 +153,6 @@ pub fn access(cli: &Cli) -> Option<Access> {
         ) => Some(Access::Change),
         _ => None,
     }
-}
-
-/// Whether `cli` is a plain `runner-manager update`: the one update the
-/// coordinator may start. It is not run as typed, which would update the
-/// service's private copy: [`start_update`] updates the binary the service was
-/// installed from, as the daily check does, and the service then restarts
-/// into it once its jobs finish.
-fn is_update(cli: &Cli) -> bool {
-    cli.host == super::HostSelector::Local
-        && matches!(
-            &cli.command,
-            Command::Update(UpdateArgs {
-                check: false,
-                force: false
-            })
-        )
 }
 
 /// The last update the coordinator started, while this service runs.
@@ -214,29 +202,21 @@ fn start_update(context: &Context, request_id: &str) -> CommandResult {
     let context = context.clone();
     std::thread::spawn(move || {
         let _lock = lock;
+        let mut report = Vec::new();
         let outcome = super::update::perform(
             &context,
             &UpdateArgs {
                 check: false,
                 force: false,
             },
-            &mut Vec::new(),
+            &mut report,
             super::update::Caller::Coordinator,
         );
+        super::versions::invalidate();
         match outcome {
             Ok(()) => {
-                let installed = super::update::Installation::of_service(context.paths())
-                    .ok()
-                    .flatten()
-                    .and_then(|(_, version)| version);
-                let message = match installed {
-                    Some(version) if version != env!("RUNNER_MANAGER_BUILD_VERSION") => format!(
-                        "{version} is installed; the service restarts into it once its jobs finish."
-                    ),
-                    _ => "No newer release was installed: this is the newest one.".to_owned(),
-                };
                 tracing::info!("the update the coordinator started ended");
-                set_update("done", message);
+                set_update("done", outcome_text(&String::from_utf8_lossy(&report)));
             }
             Err(error) => {
                 tracing::warn!(%error, "the update the coordinator started failed");
@@ -254,6 +234,15 @@ fn start_update(context: &Context, request_id: &str) -> CommandResult {
         truncated: false,
         access: None,
     }
+}
+
+/// What an update did, from its report: the lines after the header that says
+/// what was found, on one line.
+fn outcome_text(report: &str) -> String {
+    let outcome = report
+        .split_once("\n\n")
+        .map_or(report, |(_, outcome)| outcome);
+    outcome.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Runs a command the coordinator relayed, as this host's service, and says
@@ -302,12 +291,7 @@ pub fn execute(context: &Context, command: &RunCommand) -> CommandResult {
                 return result;
             }
         };
-        let update = is_update(&cli);
-        let Some(access) = (if update {
-            Some(Access::Change)
-        } else {
-            access(&cli)
-        }) else {
+        let Some(access) = access(&cli) else {
             return refused(
                 Failure::InvalidArgument,
                 "this host does not run that command for the coordinator; only reading and \
@@ -331,7 +315,8 @@ pub fn execute(context: &Context, command: &RunCommand) -> CommandResult {
                  them there with `runner-manager coordinator remote-changes allow`",
             ));
         }
-        if update {
+        // Not run as typed, which would update the service's private copy.
+        if matches!(cli.command, Command::Update(_)) {
             return judged(start_update(context, &command.request_id));
         }
         let result = |exit_code: u8, stdout: String, stderr: String| {
@@ -460,6 +445,7 @@ mod tests {
             Some(Access::Read)
         );
         assert_eq!(access(&parsed(&["host", "show"])), Some(Access::Read));
+        assert_eq!(access(&parsed(&["update"])), Some(Access::Change));
         assert_eq!(
             access(&parsed(&[
                 "repo",
@@ -483,7 +469,9 @@ mod tests {
         for refused in [
             &["auth", "logout"][..],
             &["service", "uninstall"],
-            &["update"],
+            &["update", "--check"],
+            &["update", "--force"],
+            &["--host", "wsl:Ubuntu", "update"],
             &["host", "protect-path", "add", "/srv"],
             &["coordinator", "leave"],
             &["--host", "wsl:Ubuntu", "repo", "list"],
@@ -495,15 +483,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_plain_update_is_started_for_the_coordinator() {
-        assert!(is_update(&parsed(&["update"])));
-        for other in [
-            &["update", "--check"][..],
-            &["update", "--force"],
-            &["--host", "wsl:Ubuntu", "update"],
-        ] {
-            assert!(!is_update(&parsed(other)), "{other:?}");
-        }
+    fn an_updates_outcome_is_what_follows_its_header() {
+        assert_eq!(
+            outcome_text(
+                "runner-manager update\n  installed  0.4.63\n\n0.4.64 is installed.\nThe service\n  restarts.\n"
+            ),
+            "0.4.64 is installed. The service restarts."
+        );
+        assert_eq!(outcome_text("only a line\n"), "only a line");
     }
 
     #[test]

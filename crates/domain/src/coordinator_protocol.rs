@@ -292,9 +292,9 @@ pub struct HostVersions {
     /// How that binary was installed: `release archive`, `npm`, `Homebrew`,
     /// `cargo install` or `a build in a checkout`.
     pub app_source: Option<String>,
-    /// Whether the coordinator can update this host: changes through the
-    /// coordinator are allowed and its binary was installed in a way the
-    /// service can update.
+    /// Whether the service can update that binary through the channel that
+    /// installed it (a build in a checkout it cannot). The coordinator can
+    /// then update the host where its operator allowed changes there.
     pub updatable: bool,
     /// The last update started through the coordinator, while this service
     /// runs.
@@ -309,6 +309,9 @@ pub struct HostVersions {
 
 /// The most WSL distributions a heartbeat names.
 pub const MAX_MANAGED_WSL: usize = 16;
+/// The longest version, source or distribution name a heartbeat carries, in
+/// bytes.
+pub const MAX_VERSION_TEXT: usize = 64;
 /// The longest update message a heartbeat carries, in bytes.
 pub const MAX_UPDATE_MESSAGE: usize = 512;
 
@@ -317,26 +320,18 @@ impl HostVersions {
     /// version short: a host's own figures, cut to what a heartbeat carries.
     #[must_use]
     pub fn bounded(mut self) -> Self {
-        let cut = |text: &mut String, limit: usize| {
-            if text.len() > limit {
-                let mut end = limit;
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                text.truncate(end);
-            }
-        };
-        cut(&mut self.service, 64);
+        let cut = |text: &mut String, limit: usize| text.truncate(text.floor_char_boundary(limit));
+        cut(&mut self.service, MAX_VERSION_TEXT);
         for text in [&mut self.app, &mut self.app_source].into_iter().flatten() {
-            cut(text, 64);
+            cut(text, MAX_VERSION_TEXT);
         }
         if let Some(update) = &mut self.update {
             cut(&mut update.message, MAX_UPDATE_MESSAGE);
         }
         self.wsl.truncate(MAX_MANAGED_WSL);
         for wsl in &mut self.wsl {
-            cut(&mut wsl.distribution, 64);
-            cut(&mut wsl.installed_version, 64);
+            cut(&mut wsl.distribution, MAX_VERSION_TEXT);
+            cut(&mut wsl.installed_version, MAX_VERSION_TEXT);
         }
         self
     }
@@ -1972,7 +1967,7 @@ mod tests {
             ..HostVersions::default()
         }
         .bounded();
-        assert_eq!(versions.service.len(), 64);
+        assert_eq!(versions.service.len(), MAX_VERSION_TEXT);
         assert_eq!(
             versions.update.map(|update| update.message.len()),
             Some(MAX_UPDATE_MESSAGE)

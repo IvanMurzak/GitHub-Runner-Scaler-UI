@@ -1762,13 +1762,13 @@ const UPGRADE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// question needs — and the answer is confirmed by executing the binary anyway
 /// (see [`upgraded_version`]), which is a stronger check than any digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BinaryStamp {
+pub(crate) struct BinaryStamp {
     len: u64,
     modified: Option<std::time::SystemTime>,
 }
 
 impl BinaryStamp {
-    fn of(path: &std::path::Path) -> Option<Self> {
+    pub(crate) fn of(path: &std::path::Path) -> Option<Self> {
         let meta = std::fs::metadata(path).ok()?;
         Some(Self {
             len: meta.len(),

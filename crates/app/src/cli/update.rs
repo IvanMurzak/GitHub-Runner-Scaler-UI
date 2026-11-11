@@ -456,10 +456,10 @@ impl Installation {
     /// [`Failure::LocalState`] when the record cannot be read.
     pub(crate) fn of_service(
         paths: &runner_manager_platform::paths::AppPaths,
-    ) -> Result<Option<(Self, Option<String>)>, CliError> {
+    ) -> Result<Option<Self>, CliError> {
         Ok(service_source(paths)?.map(|path| {
             let version = force::executable_version(&path);
-            (Self::of_source(paths, path, version.as_deref()), version)
+            Self::of_source(paths, path, version.as_deref())
         }))
     }
 
@@ -812,7 +812,7 @@ pub(super) fn perform(
     let mut installation = Installation::detect(context)?;
     if caller != Caller::Operator
         && matches!(installation.channel, Channel::ServiceCopy)
-        && let Some((source, _)) = Installation::of_service(context.paths())?
+        && let Some(source) = Installation::of_service(context.paths())?
     {
         installation = source;
     }
