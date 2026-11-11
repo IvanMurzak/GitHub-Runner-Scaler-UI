@@ -11,10 +11,13 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 ### Fixed
 
-- A WSL host first set up by an older build no longer fails to start after
-  `runner-manager wsl install` rewrites its systemd unit
-  (`226/NAMESPACE`, "Failed to set up mount namespacing"): the directories
-  the unit lets the service write are created before the unit is replaced.
+- A WSL host first set up before 0.4.57 starts again after
+  `runner-manager wsl install` rewrites its systemd unit. Its directories are
+  under `/root`, which the unit's `ProtectHome=tmpfs` hid, and systemd failed
+  the unit before it started (`226/NAMESPACE`, "Failed to set up mount
+  namespacing"). A boot unit now binds directories under `/root`, `/home` or
+  `/run/user` back with `BindPaths=`, and the WSL update creates any that are
+  missing before it replaces the unit.
 
 ## 0.4.58
 

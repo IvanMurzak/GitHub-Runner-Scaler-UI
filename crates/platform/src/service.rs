@@ -1764,10 +1764,26 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    out.push_str(&format!(
-        "ReadWritePaths={}\n",
-        quoted(&permitted_paths(DefinitionKind::SystemdUnit, plan))
-    ));
+    let permitted = permitted_paths(DefinitionKind::SystemdUnit, plan);
+    out.push_str(&format!("ReadWritePaths={}\n", quoted(&permitted)));
+    // `ProtectHome=tmpfs` mounts an empty tmpfs over the home trees, and only
+    // `BindPaths=` brings a directory back into it: `ReadWritePaths=` alone
+    // names one that is not there, and the unit fails before it starts
+    // (`226/NAMESPACE`). A boot unit installed now keeps its directories
+    // outside them; one an older build installed under `/root` (a WSL host
+    // set up before 0.4.57) keeps working this way.
+    let under_home: Vec<String> = permitted
+        .iter()
+        .filter(|path| {
+            SYSTEMD_HOME_ROOTS
+                .iter()
+                .any(|root| Path::new(path.as_str()).starts_with(root))
+        })
+        .cloned()
+        .collect();
+    if plan.start_mode() == StartMode::Boot && !under_home.is_empty() {
+        out.push_str(&format!("BindPaths={}\n", quoted(&under_home)));
+    }
     if !plan.protected_paths().is_empty() {
         out.push_str(&format!(
             "InaccessiblePaths={}\n",
@@ -1963,8 +1979,7 @@ impl ProtectedPaths {
 }
 
 /// The trees `ProtectHome=` hides, which a boot unit's directories must
-/// therefore lie outside.
-#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+/// therefore lie outside, or be bound back into ([`systemd_unit`]).
 const SYSTEMD_HOME_ROOTS: [&str; 3] = ["/home", "/root", "/run/user"];
 
 /// Renames a non-empty directory at `path` to `<name>.before-move-<stamp>`
@@ -10123,6 +10138,31 @@ mod tests {
         };
         list.save(directory.path()).unwrap();
         assert_eq!(ProtectedPaths::load(directory.path()).unwrap(), list);
+    }
+
+    #[test]
+    fn a_boot_unit_with_directories_under_root_binds_them_back_into_its_tmpfs_home() {
+        let legacy = InstallPlan::unchecked(
+            ServiceIdentity::product(),
+            StartMode::Boot,
+            "/root/.local/state/runner-manager/bin/runner-manager",
+            ServiceDirectories {
+                config: PathBuf::from("/root/.config/runner-manager"),
+                state: PathBuf::from("/root/.local/state/runner-manager"),
+                runtime: PathBuf::from("/root/.local/share/runner-manager/runtime"),
+                logs: PathBuf::from("/root/.local/share/runner-manager/logs"),
+            },
+        )
+        .with_secret_guard("/var/lib/runner-manager/secrets/user-access-token");
+        let unit = systemd_unit(&legacy);
+        let directives = ini_directives(&unit, "Service");
+        assert_eq!(directives["ProtectHome"], "tmpfs");
+        assert_eq!(
+            directives["BindPaths"],
+            "/root/.config/runner-manager /root/.local/state/runner-manager \
+             /root/.local/share/runner-manager/runtime /root/.local/share/runner-manager/logs",
+            "only the directories under a home tree, never the secrets outside it"
+        );
     }
 
     #[test]
