@@ -1766,23 +1766,19 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
     };
     let permitted = permitted_paths(DefinitionKind::SystemdUnit, plan);
     out.push_str(&format!("ReadWritePaths={}\n", quoted(&permitted)));
-    // `ProtectHome=tmpfs` mounts an empty tmpfs over the home trees, and only
-    // `BindPaths=` brings a directory back into it: `ReadWritePaths=` alone
-    // names one that is not there, and the unit fails before it starts
-    // (`226/NAMESPACE`). A boot unit installed now keeps its directories
-    // outside them; one an older build installed under `/root` (a WSL host
+    // `ProtectHome=tmpfs` hides the home trees, and only `BindPaths=` brings
+    // a directory back (see `DefinitionDrift::writable`). New boot units keep
+    // theirs outside them; one an older build put under `/root` (a WSL host
     // set up before 0.4.57) keeps working this way.
-    let under_home: Vec<String> = permitted
-        .iter()
-        .filter(|path| {
-            SYSTEMD_HOME_ROOTS
-                .iter()
-                .any(|root| Path::new(path.as_str()).starts_with(root))
-        })
-        .cloned()
-        .collect();
-    if plan.start_mode() == StartMode::Boot && !under_home.is_empty() {
-        out.push_str(&format!("BindPaths={}\n", quoted(&under_home)));
+    if plan.start_mode() == StartMode::Boot {
+        let under_home: Vec<String> = permitted
+            .iter()
+            .filter(|path| home_root_of(Path::new(path.as_str())).is_some())
+            .cloned()
+            .collect();
+        if !under_home.is_empty() {
+            out.push_str(&format!("BindPaths={}\n", quoted(&under_home)));
+        }
     }
     if !plan.protected_paths().is_empty() {
         out.push_str(&format!(
@@ -1982,6 +1978,14 @@ impl ProtectedPaths {
 /// therefore lie outside, or be bound back into ([`systemd_unit`]).
 const SYSTEMD_HOME_ROOTS: [&str; 3] = ["/home", "/root", "/run/user"];
 
+/// The home tree `path` lies under, which `ProtectHome=` hides.
+fn home_root_of(path: &Path) -> Option<&'static str> {
+    SYSTEMD_HOME_ROOTS
+        .iter()
+        .copied()
+        .find(|root| path.starts_with(root))
+}
+
 /// Renames a non-empty directory at `path` to `<name>.before-move-<stamp>`
 /// beside it, leaving nothing at `path`.
 #[cfg(any(all(test, unix), target_os = "linux"))]
@@ -2042,10 +2046,7 @@ fn copy_tree(from: &Path, to: &Path, skip: Option<&str>) -> std::io::Result<()> 
 /// one its `ProtectHome=` hides.
 #[cfg(any(test, all(unix, not(target_os = "macos"))))]
 fn boot_directory_refusal(path: &Path, owner: Option<u32>) -> Option<String> {
-    if let Some(root) = SYSTEMD_HOME_ROOTS
-        .iter()
-        .find(|root| path.starts_with(root))
-    {
+    if let Some(root) = home_root_of(path) {
         return Some(format!(
             "{} is under {root}, which a boot service cannot see",
             path.display()
@@ -4014,29 +4015,36 @@ pub struct DefinitionDrift {
     /// Which manager reads the definition.
     pub manager: DefinitionKind,
     /// The directories the rendered definition lets the service write. A
-    /// systemd unit fails before its first instruction (`226/NAMESPACE`)
-    /// when one is missing, so whoever writes `rendered` creates them first:
-    /// a host installed by an older build may never have made one, and
-    /// `ProtectHome=tmpfs` mounts only those that exist.
+    /// systemd unit fails before its first instruction (`226/NAMESPACE`) when
+    /// one it lists is missing, or is under a home tree its
+    /// `ProtectHome=tmpfs` hides without a `BindPaths=` for it. So whoever
+    /// writes `rendered` creates them first: a host an older build installed
+    /// may never have made one.
     pub writable: Vec<PathBuf>,
 }
 
 impl DefinitionDrift {
-    /// Creates every missing directory in [`Self::writable`], `0700`.
+    /// Creates every missing directory in [`Self::writable`]: the directory
+    /// itself `0700`, its parents (`~/.local` and its like, not this
+    /// program's to tighten) as the umask says.
     ///
     /// # Errors
     ///
     /// The first directory that could not be created.
     pub fn create_writable(&self) -> std::io::Result<()> {
+        let mut leaf = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut leaf, 0o700);
         for directory in &self.writable {
-            if directory.is_dir() {
-                continue;
+            if let Some(parent) = directory.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            builder.create(directory)?;
+            match leaf.create(directory) {
+                Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                    return Err(error);
+                }
+                _ => {}
+            }
         }
         Ok(())
     }

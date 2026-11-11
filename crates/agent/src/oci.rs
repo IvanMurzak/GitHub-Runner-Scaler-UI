@@ -1065,7 +1065,7 @@ mod tests {
     /// this process never holds the file open for writing: a sibling test
     /// that forks meanwhile would carry that descriptor into its child until
     /// it execs, and running the script then fails with `ETXTBSY`.
-    fn write_script(path: &std::path::Path, script: &str) {
+    fn write_script(path: &Path, script: &str) {
         use std::io::Write as _;
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "sh"])
@@ -1272,8 +1272,7 @@ mod tests {
         let bin = runtime.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let listener = bin.join("Runner.Listener");
-        std::fs::write(&listener, "#!/bin/sh\nsleep 10\n").unwrap();
-        std::fs::set_permissions(&listener, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_script(&listener, "#!/bin/sh\nsleep 10\n");
         let policy = fixtures::policy()
             .repository("octo/repo")
             .autoscale("home", 1)
@@ -1328,16 +1327,14 @@ mod tests {
         // proves the provider's stdin-to-bootstrap handoff, then removes it
         // before the long-lived child exists so the sentinel is not retained
         // in the process environment or writable layer.
-        std::fs::write(
+        write_script(
             &listener,
             "#!/bin/sh\n\
              test -n \"${ACTIONS_RUNNER_INPUT_JITCONFIG:-}\" || exit 70\n\
              unset ACTIONS_RUNNER_INPUT_JITCONFIG\n\
              : > /tmp/runner-manager-jit-received\n\
              exec sleep 600\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&listener, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
     }
 
     fn build_conflicting_package(runtime: &Path, version: &str) -> PathBuf {
