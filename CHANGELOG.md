@@ -7,6 +7,20 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.63
+
+### Fixed
+
+- A Mac reported less free memory than it had, to the coordinator and to
+  its own memory admission: free plus inactive pages counted inactive app
+  memory, which only compression frees, and left out the active file
+  cache, which macOS drops on demand. Reading 8.3 GB of files on a 24 GiB
+  Mac mini made it report 1.6 GB less free while what it could hand out
+  grew by 2 GB. A Mac now reports free, file-backed and purgeable pages:
+  what Activity Monitor does not count as used. Like Linux's
+  `MemAvailable` it counts the file cache, but holds none of it back; the
+  admission and placement margins are that reserve.
+
 ## 0.4.62
 
 ### Fixed

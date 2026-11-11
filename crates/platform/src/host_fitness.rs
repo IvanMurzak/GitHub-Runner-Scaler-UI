@@ -109,9 +109,9 @@ pub fn physical_memory_bytes() -> Option<u64> {
 }
 
 /// Physical memory available to new work right now, in bytes: Windows'
-/// available physical memory, Linux's `MemAvailable`, macOS's free plus
-/// inactive pages (`host_statistics64`, what `vm_stat` prints). Advisory: a
-/// coordinator heartbeat.
+/// available physical memory, Linux's `MemAvailable`, macOS's free,
+/// file-backed and purgeable pages (`host_statistics64`, what `vm_stat`
+/// prints). Advisory: a coordinator heartbeat.
 #[must_use]
 pub fn available_memory_bytes() -> Option<u64> {
     sys::available_memory_bytes()
@@ -227,11 +227,34 @@ fn meminfo_field(text: &str, field: &str) -> Option<u64> {
     kib.checked_mul(1024)
 }
 
-/// Free plus inactive pages in bytes: memory macOS hands to new work without
-/// paging anything out (the `available` figure `psutil` reports).
+/// The page counts `host_statistics64` reports on macOS that available
+/// memory is made of.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn available_pages_bytes(free: u64, inactive: u64, page: u64) -> Option<u64> {
-    free.checked_add(inactive)?.checked_mul(page)
+#[derive(Clone, Copy)]
+struct VmPages {
+    free: u64,
+    speculative: u64,
+    external: u64,
+    purgeable: u64,
+}
+
+/// Memory macOS hands to new work without compressing or swapping anything,
+/// in bytes: free pages, the file cache (file-backed pages, active ones too)
+/// and purgeable pages. It is what Activity Monitor does not count as used.
+/// Like Linux's `MemAvailable` it counts the file cache, but it holds none of
+/// it back (pages still to be written, files in use): the admission and
+/// placement margins are that reserve. Not `psutil`'s free plus inactive:
+/// that counts inactive app memory, which only compression frees, and leaves
+/// out the active file cache.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn available_pages_bytes(pages: VmPages, page: u64) -> Option<u64> {
+    // The speculative pages are in both the free and the file-backed counts.
+    pages
+        .free
+        .saturating_sub(pages.speculative)
+        .checked_add(pages.external)?
+        .checked_add(pages.purgeable)?
+        .checked_mul(page)
 }
 
 /// The Windows system directory, from the kernel rather than from the
@@ -1261,16 +1284,13 @@ mod sys {
         }
         // SAFETY: `sysconf` reads a constant.
         let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        let (free, speculative, inactive) = (
-            stats.free_count,
-            stats.speculative_count,
-            stats.inactive_count,
-        );
-        // The kernel's free count includes the speculative pages, which
-        // `vm_stat` prints apart; free here is what it calls free.
         super::available_pages_bytes(
-            u64::from(free).saturating_sub(u64::from(speculative)),
-            u64::from(inactive),
+            super::VmPages {
+                free: u64::from(stats.free_count),
+                speculative: u64::from(stats.speculative_count),
+                external: u64::from(stats.external_page_count),
+                purgeable: u64::from(stats.purgeable_count),
+            },
             page,
         )
     }
@@ -1478,7 +1498,34 @@ mod tests {
         assert_eq!(busy_share((0, 0), (250, 1000)), Some(75));
         assert_eq!(busy_share((250, 1000), (250, 1000)), None);
         assert_eq!(busy_share((10, 20), (5, 40)), None, "went back");
-        assert_eq!(available_pages_bytes(10, 5, 16_384), Some(15 * 16_384));
+    }
+
+    /// Reading files moves free pages into the file cache, which macOS drops
+    /// on demand: it must not lower available memory.
+    #[test]
+    fn file_cache_a_job_reads_in_stays_available_on_macos() {
+        // The Mac mini's `vm_stat` before the read, in 16 KiB pages.
+        let before = VmPages {
+            free: 231_617 + 35_446,
+            speculative: 35_446,
+            external: 361_612,
+            purgeable: 15_016,
+        };
+        let read = 100_000;
+        let after = VmPages {
+            free: before.free - read,
+            external: before.external + read,
+            ..before
+        };
+        let page = 16_384;
+        assert_eq!(
+            available_pages_bytes(after, page),
+            available_pages_bytes(before, page)
+        );
+        assert_eq!(
+            available_pages_bytes(before, page),
+            Some((231_617 + 361_612 + 15_016) * page)
+        );
     }
 
     /// Linux reports what new work can have, page cache included: the WSL

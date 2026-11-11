@@ -476,7 +476,7 @@ and labels), not a single job:
    filtered. Each launch reserves the queue's next heaviest job, so one heavy job among light
    ones counts once; the host must still hold the heaviest job, since a runner can take any of
    them. "Free memory" is what the OS says new work can have: Linux's `MemAvailable`, Windows'
-   available physical memory, macOS's free plus inactive pages. Only the jobs' own samples filter: a job never measured counts for the estimate and the ranking,
+   available physical memory, macOS's free, file-backed and purgeable pages. Only the jobs' own samples filter: a job never measured counts for the estimate and the ranking,
    not the filter, so another job's heavy samples never keep it waiting, though it may land on a host
    too small for what it turns out to need. It reserves at most `COORDINATOR_DEFAULT_JOB_RAM`. Nor is anything filtered when the
    demand plus the margin is more than the total memory of every host that serves the queue, a host
