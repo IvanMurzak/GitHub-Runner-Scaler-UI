@@ -99,8 +99,10 @@
   }
   const repoShort = (r) => (r ? String(r).split('/').pop() : '—');
   const humanize = (v) => (v ? String(v).replace(/_/g, ' ') : '—');
-  const jobUrl = (j) => `https://github.com/${j.repository}/actions/runs/${j.run_id}/job/${j.id}`;
-  const repoUrl = (r) => `https://github.com/${r}`;
+  // GitHub's web address as the coordinator is configured (GitHub Enterprise Server too).
+  const githubWeb = () => (state.ov && state.ov.github_web) || 'https://github.com';
+  const jobUrl = (j) => `${githubWeb()}/${j.repository}/actions/runs/${j.run_id}/job/${j.id}`;
+  const repoUrl = (r) => `${githubWeb()}/${r}`;
   const repoLink = (r, cls) => h('a', { class: cls, href: repoUrl(r), target: '_blank', rel: 'noopener', title: r, text: repoShort(r) });
 
   // Live-updating text: elements carry data-since (elapsed) or data-ago (relative).
@@ -294,7 +296,7 @@
     const sm = ov.summary || {};
     const pct = isNum(sm.slots_busy) && sm.slots_total > 0 ? (sm.slots_busy / sm.slots_total) * 100 : null;
     const oldest = (ov.queue || [])[0];
-    const runHosts = new Set((ov.running || []).map((j) => j.host_id)).size;
+    const runHosts = new Set((ov.running || []).map((j) => j.host_id).filter(Boolean)).size;
     $('#kpis').replaceChildren(
       kpi('Machines online', h('span', { class: 'num' }, fmtInt(sm.hosts_online), h('small', { text: ` / ${fmtInt(sm.hosts_total)}` }))),
       kpi('Runner slots busy', h('span', { class: 'num' }, fmtInt(sm.slots_busy), h('small', { text: ` / ${fmtInt(sm.slots_total)}` })),
@@ -302,7 +304,7 @@
       kpi('Jobs queued', h('span', { class: 'num' }, fmtInt(sm.jobs_queued)),
         oldest ? h('span', {}, 'oldest ', since(oldest.queued_at)) : 'nothing waiting'),
       kpi('Jobs running', h('span', { class: 'num' }, fmtInt(sm.jobs_running)),
-        runHosts ? `on ${runHosts} machine${runHosts === 1 ? '' : 's'}` : 'all idle'),
+        runHosts ? `on ${runHosts} machine${runHosts === 1 ? '' : 's'}` : sm.jobs_running ? null : 'all idle'),
       kpi('Queue wait p50', h('span', { class: 'num', text: fmtDur(sm.p50_queue_wait_secs) }),
         h('span', {}, 'p90 ', h('b', { class: 'num', text: fmtDur(sm.p90_queue_wait_secs) }))),
     );

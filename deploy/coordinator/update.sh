@@ -347,7 +347,9 @@ move_to() {
         restore_backup "$backup_name" &&
         docker compose up -d &&
         reload_caddy_if_changed "$caddy_before" &&
-        wait_healthy "$from"; then
+        wait_healthy "$known"; then
+        # Not `$from`: with no version recorded, compose runs `:latest`, which
+        # is likely the very $target that failed, and an empty want accepts it.
         log "rolled back to $shown"
         write_status rolled_back "$shown" "$target" "$latest" "$(date +%s)" \
             "$target did not become healthy; rolled back to $shown and restored database backup $backup_name"

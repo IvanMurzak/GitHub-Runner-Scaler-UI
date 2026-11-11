@@ -111,7 +111,11 @@ impl Activity {
         let unix = |at: Option<chrono::DateTime<chrono::Utc>>| at.map(|at| at.timestamp());
         let mut inner = self.lock();
         match event.action.as_str() {
-            action @ ("queued" | "waiting" | "in_progress") => {
+            // GitHub does not order its deliveries: a `queued` or
+            // `in_progress` after the job's `completed` does not bring it back.
+            action @ ("queued" | "waiting" | "in_progress")
+                if !inner.recent.iter().any(|done| done.id == job.id) =>
+            {
                 let entry = inner.jobs.entry(job.id).or_insert_with(|| ActiveJob {
                     id: job.id,
                     run_id: job.run_id,
@@ -132,6 +136,7 @@ impl Activity {
             }
             "completed" => {
                 inner.jobs.remove(&job.id);
+                inner.recent.retain(|done| done.id != job.id);
                 // A job cancelled before any runner took it never ran.
                 let ran = job.runner_name.is_some();
                 let seconds = |secs: Option<u64>| secs.and_then(|secs| i64::try_from(secs).ok());
@@ -299,6 +304,20 @@ mod tests {
         assert_eq!(snapshot.recent[0].duration_secs, Some(60));
         assert_eq!(snapshot.recent[0].queued_secs, Some(5));
         assert_eq!(activity.counts(now), (0, 0));
+        // A late `in_progress` or a repeated `completed` changes nothing.
+        feed(
+            &activity,
+            &event("in_progress", 1, &["self-hosted", "linux"], Some("rm-a")),
+            now,
+        );
+        feed(
+            &activity,
+            &event("completed", 1, &["self-hosted", "linux"], Some("rm-a")),
+            now,
+        );
+        let snapshot = activity.snapshot(now);
+        assert!(snapshot.running.is_empty());
+        assert_eq!(snapshot.recent.len(), 1);
     }
 
     #[test]

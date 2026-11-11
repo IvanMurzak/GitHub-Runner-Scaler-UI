@@ -738,16 +738,25 @@ impl Store {
         Ok(())
     }
 
-    /// Every sample taken at or after `since` (Unix seconds), oldest first.
+    /// The samples taken at or after `since` (Unix seconds), averaged per
+    /// `step` seconds from `since` and per host, oldest first; each row's
+    /// `at` is its step's start.
     ///
     /// # Errors
     /// SQLite's.
-    pub fn metrics(&self, since: i64) -> Result<Vec<MetricSample>, StoreError> {
+    pub fn metrics(&self, since: i64, step: i64) -> Result<Vec<MetricSample>, StoreError> {
+        // Averaged into steps here, so a week of minutes per host never leaves
+        // SQLite: one row per step and host.
         let mut statement = self.connection.prepare(
-            "SELECT at, host_id, cpu, ram_used, ram_total, busy, slots, disk_free, queued, running
-             FROM metric_samples WHERE at >= ?1 ORDER BY at",
+            "SELECT ?1 + ((at - ?1) / ?2) * ?2 AS step_at, host_id,
+                CAST(AVG(cpu) AS INTEGER), CAST(AVG(ram_used) AS INTEGER),
+                CAST(AVG(ram_total) AS INTEGER), CAST(AVG(busy) AS INTEGER),
+                CAST(AVG(slots) AS INTEGER), CAST(AVG(disk_free) AS INTEGER),
+                CAST(AVG(queued) AS INTEGER), CAST(AVG(running) AS INTEGER)
+             FROM metric_samples WHERE at >= ?1
+             GROUP BY step_at, host_id ORDER BY step_at",
         )?;
-        let rows = statement.query_map(params![since], |row| {
+        let rows = statement.query_map(params![since, step.max(1)], |row| {
             Ok(MetricSample {
                 at: row.get(0)?,
                 host_id: row.get(1)?,
@@ -852,9 +861,14 @@ impl Store {
                 .map(|(hash, _)| hash)
                 .collect()
         };
+        let transaction = self.connection.unchecked_transaction()?;
         for hash in &refused {
-            self.delete_session(hash)?;
+            transaction.execute(
+                "DELETE FROM dashboard_sessions WHERE token_hash = ?1",
+                params![hash],
+            )?;
         }
+        transaction.commit()?;
         Ok(refused.len())
     }
 }

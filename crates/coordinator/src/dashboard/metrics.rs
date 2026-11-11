@@ -45,6 +45,14 @@ impl Range {
         }
     }
 
+    /// The first step's start for a chart ending at `now`, and the step.
+    #[must_use]
+    pub const fn window(self, now: i64) -> (i64, i64) {
+        let (span, step) = self.span_and_step();
+        let end = now - now.rem_euclid(step);
+        (end - span + step, step)
+    }
+
     /// Its length and one step, in seconds: at most 360 points.
     #[must_use]
     pub const fn span_and_step(self) -> (i64, i64) {
@@ -129,12 +137,11 @@ pub fn series(
     now: i64,
     names: &BTreeMap<String, String>,
 ) -> Series {
-    let (span, step) = range.span_and_step();
-    let end = now - now.rem_euclid(step);
-    let start = end - span + step;
+    let (span, _) = range.span_and_step();
+    let (start, step) = range.window(now);
     let points = usize::try_from(span / step).unwrap_or(0);
     let index = |at: i64| -> Option<usize> {
-        (at >= start && at < end + step)
+        (at >= start)
             .then(|| usize::try_from((at - start) / step).ok())
             .flatten()
             .filter(|&index| index < points)
@@ -217,5 +224,27 @@ mod tests {
         assert!(!host.cpu.contains(&Some(99)), "outside the range");
         assert_eq!(Range::parse("7d"), Some(Range::Week));
         assert_eq!(Range::parse("2h"), None);
+    }
+
+    #[test]
+    fn the_store_averages_a_week_into_the_charts_steps() {
+        let mut store = crate::store::Store::open_in_memory().expect("store");
+        let now = 10_000 * 3600;
+        let (start, step) = Range::Week.window(now);
+        let samples: Vec<MetricSample> = (0..90)
+            .map(|minute| MetricSample {
+                at: start + minute * 60,
+                host_id: "h1".into(),
+                cpu: Some(u32::try_from(minute / 30).unwrap() * 10),
+                ..MetricSample::default()
+            })
+            .collect();
+        store.record_metrics(&samples, 0).expect("recorded");
+        let rows = store.metrics(start, step).expect("read");
+        assert_eq!(rows.len(), 3, "one row per half-hour step");
+        assert_eq!(rows[1].at, start + step);
+        let series = series(&rows, Range::Week, now, &BTreeMap::new());
+        assert_eq!(&series.hosts[0].cpu[..3], &[Some(0), Some(10), Some(20)]);
+        assert_eq!(series.hosts[0].cpu[3], None);
     }
 }

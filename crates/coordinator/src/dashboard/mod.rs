@@ -476,6 +476,7 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
         "version": env!("CARGO_PKG_VERSION"),
         "generated_at": now,
         "started_at": dashboard.started_at,
+        "github_web": dashboard.auth.web_base,
         "update": update_status(dashboard),
         "summary": summary,
         "hosts": hosts,
@@ -500,11 +501,11 @@ async fn metrics_route(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let now = Utc::now().timestamp();
-    let (span, _) = range.span_and_step();
+    let (start, step) = range.window(now);
     let (samples, names) = {
         let store = state.store();
         (
-            store.metrics(now - span).unwrap_or_default(),
+            store.metrics(start, step).unwrap_or_default(),
             host_names(&store.hosts().unwrap_or_default()),
         )
     };
