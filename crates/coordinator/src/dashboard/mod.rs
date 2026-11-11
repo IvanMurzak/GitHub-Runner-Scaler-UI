@@ -498,13 +498,8 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
                 last_seen_at: record.last_seen_at.map(|at| at.timestamp()),
                 enrolled_at: record.enrolled_at.timestamp(),
                 connected_since: link.map(|host| host.since.timestamp()),
-                manageable: state
-                    .registry
-                    .protocol_version(&record.id)
-                    .is_some_and(|version| {
-                        version >= runner_manager_domain::coordinator_protocol::COMMAND_VERSION
-                    }),
-                remote_changes: state.registry.remote_changes(&record.id),
+                manageable: state.registry.takes_commands(&record.id) == Some(true),
+                remote_changes: hello.is_some_and(|hello| hello.remote_changes),
             }
         })
         .collect();
@@ -656,12 +651,16 @@ struct CommandBody {
     argv: Vec<String>,
 }
 
-/// Runs a command on a host for the signed-in person, and records it.
+/// Runs a command on a host for the signed-in person, and records it when
+/// `recorded`: the dashboard's own read of a machine, on every opening and
+/// after every change, is not, or it would push the changes out of the
+/// record (the host keeps no reads either).
 async fn run_on_host(
     state: &AppState,
     host_id: &str,
     argv: Vec<String>,
     login: &str,
+    recorded: bool,
 ) -> Result<runner_manager_domain::coordinator_protocol::CommandResult, crate::remote::RemoteError>
 {
     let outcome = state
@@ -674,6 +673,9 @@ async fn run_on_host(
             crate::remote::COMMAND_TIMEOUT,
         )
         .await;
+    if !recorded {
+        return outcome;
+    }
     let record = crate::store::RemoteCommandRecord {
         at: Utc::now().timestamp(),
         login: login.to_owned(),
@@ -730,7 +732,7 @@ async fn host_command(
     if credential == Credential::Cookie && !same_origin(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match run_on_host(&state, &host_id, body.argv, &session.login).await {
+    match run_on_host(&state, &host_id, body.argv, &session.login, true).await {
         Ok(result) => json(&result),
         Err(error) => remote_failure(error),
     }
@@ -742,7 +744,7 @@ async fn host_config(
     axum::extract::Path(host_id): axum::extract::Path<String>,
 ) -> Response {
     let argv = ["repo", "list", "--json"].map(String::from).to_vec();
-    match run_on_host(&state, &host_id, argv, &session.login).await {
+    match run_on_host(&state, &host_id, argv, &session.login, false).await {
         Ok(result) if result.exit_code == 0 => {
             let Ok(config) = serde_json::from_str::<serde_json::Value>(&result.stdout) else {
                 return error_json(

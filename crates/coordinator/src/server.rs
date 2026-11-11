@@ -203,7 +203,7 @@ impl AppState {
             .allow(self.client_address(peer, headers), Instant::now())
     }
 
-    fn client_address(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    pub(crate) fn client_address(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
         if self.config.trust_forwarded_for
             && let Some(forwarded) = headers
                 .get_all("x-forwarded-for")
@@ -678,6 +678,7 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         receiver,
     )
     .await;
+    state.remote.connection_gone(&host_id, connection);
     if state.registry.unregister(&host_id, connection) {
         state.placement.host_gone(&host_id);
     }
@@ -808,7 +809,7 @@ async fn serve_host(
                         }
                     }
                     Ok(HostMessage::CommandResult(result)) if version >= COMMAND_VERSION => {
-                        state.remote.complete(result);
+                        state.remote.complete(host_id, result);
                     }
                     Ok(HostMessage::AttemptFinished(finished)) if version >= LAUNCH_VERSION => {
                         state.placement.attempt_finished(host_id, &finished);

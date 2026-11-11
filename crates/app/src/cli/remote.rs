@@ -173,8 +173,23 @@ pub fn execute(context: &Context, command: &RunCommand) -> CommandResult {
             Ok(cli) => cli,
             Err(error) => {
                 let mut result = refused(Failure::InvalidArgument, "");
-                result.exit_code = 2;
-                result.stderr = error.render().to_string();
+                let rendered = error.render().to_string();
+                // `--help` and `--version` are answers, as on a terminal.
+                if matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) {
+                    result.exit_code = 0;
+                    result.stderr = String::new();
+                    result.stdout = rendered;
+                } else {
+                    result.exit_code = 2;
+                    result.stderr = rendered;
+                }
+                let (stdout, stderr, truncated) = bounded(result.stdout, result.stderr);
+                result.stdout = stdout;
+                result.stderr = stderr;
+                result.truncated = truncated;
                 return result;
             }
         };
@@ -255,21 +270,38 @@ fn names_another_tree(argv: &[String]) -> bool {
         .any(|argument| argument == "--data-dir" || argument.starts_with("--data-dir="))
 }
 
-/// `stdout` and `stderr` cut to [`MAX_COMMAND_OUTPUT_BYTES`] together,
-/// stderr first: it says why a command failed.
+/// The bytes `character` takes inside a JSON string, as `serde_json`
+/// writes it: a quote, a backslash or a control character is escaped.
+fn encoded_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        control if u32::from(control) < 0x20 => 6,
+        other => other.len_utf8(),
+    }
+}
+
+/// The JSON-encoded size of `text`, without its quotes.
+fn encoded_size(text: &str) -> usize {
+    text.chars().map(encoded_len).sum()
+}
+
+/// `stdout` and `stderr` cut to [`MAX_COMMAND_OUTPUT_BYTES`] together, as
+/// they are sent (JSON-escaped), stderr first: it says why a command failed.
+/// Measured escaped, so that the frame stays under the coordinator's limit
+/// whatever the output holds.
 fn bounded(stdout: String, stderr: String) -> (String, String, bool) {
     let cut = |text: String, limit: usize| -> (String, bool) {
-        if text.len() <= limit {
-            return (text, false);
+        let mut size = 0;
+        for (index, character) in text.char_indices() {
+            size += encoded_len(character);
+            if size > limit {
+                return (text[..index].to_owned(), true);
+            }
         }
-        let mut end = limit;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        (text[..end].to_owned(), true)
+        (text, false)
     };
     let (stderr, cut_err) = cut(stderr, MAX_COMMAND_OUTPUT_BYTES);
-    let (stdout, cut_out) = cut(stdout, MAX_COMMAND_OUTPUT_BYTES - stderr.len());
+    let (stdout, cut_out) = cut(stdout, MAX_COMMAND_OUTPUT_BYTES - encoded_size(&stderr));
     (stdout, stderr, cut_err || cut_out)
 }
 
@@ -351,7 +383,14 @@ mod tests {
             bounded("o".repeat(MAX_COMMAND_OUTPUT_BYTES), "error: why\n".into());
         assert!(truncated);
         assert_eq!(stderr, "error: why\n");
-        assert_eq!(stdout.len() + stderr.len(), MAX_COMMAND_OUTPUT_BYTES);
+        assert_eq!(
+            encoded_size(&stdout) + encoded_size(&stderr),
+            MAX_COMMAND_OUTPUT_BYTES
+        );
+        // Escaped output counts as it is sent.
+        let (quotes, _, truncated) = bounded("\"".repeat(MAX_COMMAND_OUTPUT_BYTES), String::new());
+        assert!(truncated);
+        assert_eq!(quotes.len(), MAX_COMMAND_OUTPUT_BYTES / 2);
         assert_eq!(
             bounded("a".into(), String::new()),
             ("a".into(), String::new(), false)

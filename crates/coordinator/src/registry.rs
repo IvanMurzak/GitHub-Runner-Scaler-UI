@@ -287,8 +287,6 @@ impl Registry {
         false
     }
 
-    /// Queues `message` for `host_id`'s connection; `false` when it is not
-    /// connected or its queue is full.
     /// Whether `host_id`'s operator allowed changes through the coordinator,
     /// by its last `hello`.
     #[must_use]
@@ -303,17 +301,22 @@ impl Registry {
     /// `None` when it is not connected.
     #[must_use]
     pub fn takes_commands(&self, host_id: &str) -> Option<bool> {
-        self.protocol_version(host_id)
-            .map(|version| version >= runner_manager_domain::coordinator_protocol::COMMAND_VERSION)
+        self.link(host_id).map(|(_, version)| {
+            version >= runner_manager_domain::coordinator_protocol::COMMAND_VERSION
+        })
     }
 
-    /// The protocol version `host_id`'s connection negotiated, when it is
-    /// connected.
+    /// The token and negotiated protocol version of `host_id`'s connection,
+    /// when it is connected.
     #[must_use]
-    pub fn protocol_version(&self, host_id: &str) -> Option<u32> {
-        self.lock().get(host_id).map(|connected| connected.version)
+    pub fn link(&self, host_id: &str) -> Option<(u64, u32)> {
+        self.lock()
+            .get(host_id)
+            .map(|connected| (connected.connection, connected.version))
     }
 
+    /// Queues `message` for `host_id`'s connection; `false` when it is not
+    /// connected or its queue is full.
     pub fn send(&self, host_id: &str, message: ServerMessage) -> bool {
         self.lock()
             .get(host_id)

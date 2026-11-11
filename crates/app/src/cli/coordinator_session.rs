@@ -400,6 +400,9 @@ pub fn logout(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     let failed = write_failed("the sign-out");
     let data_root = context.data_root.as_deref();
     let Some(session) = load_session(data_root)? else {
+        // A stored session this build cannot read (a newer schema, a damaged
+        // entry) is removed too: it signs nobody in, and would otherwise stay.
+        let _ = session_store(data_root).map(|store| store.delete());
         writeln!(out, "this account is not signed in to a coordinator").map_err(failed)?;
         return Ok(());
     };

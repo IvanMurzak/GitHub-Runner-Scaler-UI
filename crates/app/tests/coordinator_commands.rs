@@ -471,10 +471,11 @@ impl Coordinator {
             },
         );
         let state = Arc::clone(&self.state);
+        let host_id = id.clone();
         std::thread::spawn(move || {
             while let Some(message) = receiver.blocking_recv() {
                 if let Outbound::Send(ServerMessage::RunCommand(command)) = message {
-                    state.remote.complete(answer(&command));
+                    state.remote.complete(&host_id, answer(&command));
                 }
             }
         });

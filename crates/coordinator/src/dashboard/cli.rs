@@ -41,6 +41,10 @@ pub const CLI_SESSION_SECS: i64 = 90 * 24 * 60 * 60;
 /// The most sign-ins waiting at once.
 pub const MAX_PENDING: usize = 256;
 
+/// The most sign-ins one client address may have waiting at once, so a few
+/// addresses cannot fill [`MAX_PENDING`] for everyone.
+pub const MAX_PENDING_PER_ADDRESS: usize = 8;
+
 /// Consonants only: no `0`/`O` or `1`/`I`/`L` to confuse, and no vowels to
 /// spell words with.
 const ALPHABET: &[u8] = b"BCDFGHJKMNPQRSTVWXZ";
@@ -58,6 +62,7 @@ enum Decision {
 #[derive(Debug)]
 struct Pending {
     user_code: String,
+    address: std::net::IpAddr,
     started: Instant,
     decision: Decision,
 }
@@ -94,11 +99,19 @@ impl CliSignIns {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Starts a sign-in, or `None` when [`MAX_PENDING`] are already waiting.
-    pub fn start(&self, now: Instant) -> Option<Started> {
+    /// Starts a sign-in for a client at `address`, or `None` when
+    /// [`MAX_PENDING`] are already waiting, or [`MAX_PENDING_PER_ADDRESS`]
+    /// of that address's.
+    pub fn start(&self, now: Instant, address: std::net::IpAddr) -> Option<Started> {
         let mut pending = self.lock();
         pending.retain(|_, sign_in| now.duration_since(sign_in.started) < LIFETIME);
-        if pending.len() >= MAX_PENDING {
+        if pending.len() >= MAX_PENDING
+            || pending
+                .values()
+                .filter(|sign_in| sign_in.address == address)
+                .count()
+                >= MAX_PENDING_PER_ADDRESS
+        {
             return None;
         }
         let user_code = loop {
@@ -112,6 +125,7 @@ impl CliSignIns {
             auth::token_hash(&device_code),
             Pending {
                 user_code: user_code.clone(),
+                address,
                 started: now,
                 decision: Decision::Waiting,
             },
@@ -233,7 +247,8 @@ pub(super) async fn start(
     if !state.allow_cli_sign_in(peer, &headers) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    let Some(started) = dashboard(&state).cli.start(Instant::now()) else {
+    let address = state.client_address(peer, &headers);
+    let Some(started) = dashboard(&state).cli.start(Instant::now(), address) else {
         return status_json(StatusCode::SERVICE_UNAVAILABLE, "busy");
     };
     json(&serde_json::json!({
@@ -498,6 +513,10 @@ fn escape(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn here() -> std::net::IpAddr {
+        std::net::IpAddr::from([127, 0, 0, 1])
+    }
+
     fn me() -> DashboardSession {
         DashboardSession {
             login: "me".into(),
@@ -540,7 +559,7 @@ mod tests {
     fn a_sign_in_is_answered_once_and_expires() {
         let sign_ins = CliSignIns::default();
         let now = Instant::now();
-        let started = sign_ins.start(now).expect("room");
+        let started = sign_ins.start(now, here()).expect("room");
         assert_eq!(started.device_code.len(), 64);
         assert_eq!(sign_ins.poll(&started.device_code, now), Poll::Waiting);
         assert!(sign_ins.is_waiting(&started.user_code, now));
@@ -559,11 +578,11 @@ mod tests {
             "handed out once"
         );
 
-        let denied = sign_ins.start(now).expect("room");
+        let denied = sign_ins.start(now, here()).expect("room");
         assert!(sign_ins.decide(&denied.user_code, None, now));
         assert_eq!(sign_ins.poll(&denied.device_code, now), Poll::Denied);
 
-        let late = sign_ins.start(now).expect("room");
+        let late = sign_ins.start(now, here()).expect("room");
         let later = now + LIFETIME;
         assert!(!sign_ins.is_waiting(&late.user_code, later));
         assert!(!sign_ins.decide(&late.user_code, Some(me()), later));
@@ -575,12 +594,18 @@ mod tests {
     fn the_waiting_sign_ins_are_bounded() {
         let sign_ins = CliSignIns::default();
         let now = Instant::now();
-        for _ in 0..MAX_PENDING {
-            assert!(sign_ins.start(now).is_some());
+        for _ in 0..MAX_PENDING_PER_ADDRESS {
+            assert!(sign_ins.start(now, here()).is_some());
         }
-        assert!(sign_ins.start(now).is_none(), "full");
+        assert!(sign_ins.start(now, here()).is_none(), "one address's share");
+        let sign_ins = CliSignIns::default();
+        for index in 0..MAX_PENDING {
+            let address = std::net::IpAddr::from([10, 0, (index / 250) as u8, (index % 250) as u8]);
+            assert!(sign_ins.start(now, address).is_some());
+        }
+        assert!(sign_ins.start(now, here()).is_none(), "full");
         assert!(
-            sign_ins.start(now + LIFETIME).is_some(),
+            sign_ins.start(now + LIFETIME, here()).is_some(),
             "the expired ones make room"
         );
     }

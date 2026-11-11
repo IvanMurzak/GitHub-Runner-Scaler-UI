@@ -53,14 +53,23 @@ impl RemoteError {
     }
 }
 
-/// The commands sent and not yet answered.
+/// A command sent and not yet answered: the connection it went out on, and
+/// who waits for its result.
+#[derive(Debug)]
+struct Pending {
+    host_id: String,
+    connection: u64,
+    sender: oneshot::Sender<CommandResult>,
+}
+
+/// The commands sent and not yet answered, by request id.
 #[derive(Debug, Default)]
 pub struct RemoteCommands {
-    pending: Mutex<HashMap<String, oneshot::Sender<CommandResult>>>,
+    pending: Mutex<HashMap<String, Pending>>,
 }
 
 impl RemoteCommands {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, oneshot::Sender<CommandResult>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Pending>> {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -78,10 +87,11 @@ impl RemoteCommands {
         by: &str,
         timeout: Duration,
     ) -> Result<CommandResult, RemoteError> {
-        match registry.takes_commands(host_id) {
-            None => return Err(RemoteError::Offline),
-            Some(false) => return Err(RemoteError::TooOld),
-            Some(true) => {}
+        let Some((connection, version)) = registry.link(host_id) else {
+            return Err(RemoteError::Offline);
+        };
+        if version < runner_manager_domain::coordinator_protocol::COMMAND_VERSION {
+            return Err(RemoteError::TooOld);
         }
         let command = RunCommand {
             request_id: hex::encode(rand::random::<[u8; 16]>()),
@@ -93,7 +103,14 @@ impl RemoteCommands {
         }
         let (sender, receiver) = oneshot::channel();
         let id = command.request_id.clone();
-        self.lock().insert(id.clone(), sender);
+        self.lock().insert(
+            id.clone(),
+            Pending {
+                host_id: host_id.to_owned(),
+                connection,
+                sender,
+            },
+        );
         if !registry.send(host_id, ServerMessage::RunCommand(command)) {
             self.lock().remove(&id);
             return Err(RemoteError::Offline);
@@ -102,17 +119,30 @@ impl RemoteCommands {
         self.lock().remove(&id);
         match outcome {
             Ok(Ok(result)) => Ok(result),
-            // The host went away: its connection's sender was dropped.
+            // The host went away: `connection_gone` dropped the sender.
             Ok(Err(_)) => Err(RemoteError::Offline),
             Err(_) => Err(RemoteError::Timeout),
         }
     }
 
-    /// A host answered. A result nobody waits for (it timed out) is dropped.
-    pub fn complete(&self, result: CommandResult) {
-        if let Some(sender) = self.lock().remove(&result.request_id) {
-            let _ = sender.send(result);
+    /// `host_id` answered. A result nobody waits for (it timed out), or one
+    /// for a command sent to another host, is dropped.
+    pub fn complete(&self, host_id: &str, result: CommandResult) {
+        let mut pending = self.lock();
+        if pending
+            .get(&result.request_id)
+            .is_some_and(|waiting| waiting.host_id == host_id)
+            && let Some(waiting) = pending.remove(&result.request_id)
+        {
+            let _ = waiting.sender.send(result);
         }
+    }
+
+    /// `host_id`'s `connection` ended: the commands sent on it will never be
+    /// answered, and their callers learn so at once instead of timing out.
+    pub fn connection_gone(&self, host_id: &str, connection: u64) {
+        self.lock()
+            .retain(|_, waiting| waiting.host_id != host_id || waiting.connection != connection);
     }
 }
 
@@ -137,13 +167,16 @@ mod tests {
             Err(RemoteError::Offline)
         );
         // An answer nobody waits for changes nothing.
-        remote.complete(CommandResult {
-            request_id: "x".into(),
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-            truncated: false,
-            access: None,
-        });
+        remote.complete(
+            "nobody",
+            CommandResult {
+                request_id: "x".into(),
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+                access: None,
+            },
+        );
     }
 }
