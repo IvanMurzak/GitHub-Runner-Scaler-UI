@@ -120,11 +120,38 @@
         <div id="recent"></div>
       </section>
 
+      <section id="audit-section" class="section card" aria-labelledby="h-audit" hidden>
+        <div class="section-head">
+          <h2 id="h-audit">Remote commands</h2>
+          <span id="audit-count" class="count num"></span>
+          <div id="audit-filter" class="seg seg-sm" role="group" aria-label="Show commands"></div>
+          <button id="audit-toggle" class="link-btn" type="button" aria-controls="audit" aria-expanded="true">Hide</button>
+        </div>
+        <div id="audit"></div>
+      </section>
+
       <section id="pools-section" class="section" aria-labelledby="h-pools" hidden>
         <div class="section-head"><h2 id="h-pools">Pools &amp; leases</h2></div>
         <div id="pools" class="pools"></div>
       </section>
     </main>
+
+    <dialog id="drawer" class="drawer" aria-labelledby="dw-title">
+      <header class="dw-head">
+        <div class="dw-title-row">
+          <span id="dw-dot" class="host-dot" aria-hidden="true"></span>
+          <div class="dw-id">
+            <h2 id="dw-title">Machine</h2>
+            <p id="dw-sub" class="host-sub"></p>
+          </div>
+          <button id="dw-close" class="icon-btn" type="button" aria-label="Close machine panel" title="Close (Esc)">
+            <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M5.5 5.5l9 9M14.5 5.5l-9 9"/></svg>
+          </button>
+        </div>
+        <div id="dw-access" hidden></div>
+      </header>
+      <div id="dw-body" class="dw-body" tabindex="-1"></div>
+    </dialog>
 
     <footer class="foot">
       <span id="uptime"></span>
