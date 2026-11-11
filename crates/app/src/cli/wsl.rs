@@ -285,6 +285,14 @@ pub fn dispatch_wsl_host(
                 .map_err(write_failed("this configuration"))?;
             Ok(())
         }
+        WslHostCommand::MoveToSystemTree => {
+            require_linux()?;
+            let said = move_to_system_tree(context)?;
+            if !said.is_empty() {
+                writeln!(out, "{said}").map_err(write_failed("this move"))?;
+            }
+            Ok(())
+        }
         WslHostCommand::ConvergeService => {
             require_linux()?;
             let message = if converge_service_definition(context)? {
@@ -655,6 +663,151 @@ fn converge_service_definition(context: &Context) -> Result<bool, CliError> {
         "rewrote a systemd unit an older build installed"
     );
     Ok(true)
+}
+
+/// The drop-in `wsl-host configure-recovery` writes, which names a Windows
+/// path, never the service's own tree.
+const RECOVERY_DROP_IN: &str = "20-wsl-recovery.conf";
+
+/// Moves a boot service an older build installed under `/root` (a WSL host
+/// set up before 0.4.57) to the system tree every root service uses since:
+/// `service install --start-at boot` copies its configuration and database to
+/// `/var/lib/runner-manager`, keeps the old tree, and writes the unit against
+/// the new one. Returns what it did, or why not, for the operator; empty when
+/// there was nothing to move.
+///
+/// Only an idle host is moved. A runner started from the old tree keeps
+/// running when the service stops, in a directory the moved service cannot
+/// see, so with one running the move waits for the next `wsl install`. A
+/// drop-in of the operator's that names the old tree would point the moved
+/// service at a hidden directory, so that, too, stops the move and is named.
+fn move_to_system_tree(context: &Context) -> Result<String, CliError> {
+    use runner_manager_platform::paths::AppPaths;
+    use runner_manager_platform::service::SYSTEMD_SYSTEM_DIR;
+
+    let local = |what: &str, source: &dyn std::fmt::Display| {
+        CliError::new(Failure::LocalState, format!("cannot {what}: {source}"))
+    };
+    let Some(record) = InstallRecord::read(context.paths())
+        .map_err(|source| local("read the install record", &source))?
+    else {
+        return Ok(String::new());
+    };
+    let old = record.directories.clone();
+    let system = AppPaths::system();
+    if record.start_mode != StartMode::Boot || old.config.as_path() == system.config_dir() {
+        return Ok(String::new());
+    }
+    let unit = super::service::identity().systemd_unit();
+    let drop_ins = Path::new(SYSTEMD_SYSTEM_DIR).join(format!("{unit}.d"));
+    let old_trees = [&old.config, &old.state, &old.runtime, &old.logs];
+    if let Some(drop_in) = drop_in_naming(&drop_ins, &old_trees) {
+        return Ok(format!(
+            "This host's data stays under {} for now: {} names that tree, and the moved service \
+             could not see it. Change or remove that drop-in, run `sudo systemctl daemon-reload`, \
+             and run `runner-manager wsl install` again to move it to {}.",
+            old.config.display(),
+            drop_in.display(),
+            runner_manager_platform::paths::SYSTEM_DATA_ROOT,
+        ));
+    }
+    let postponed = |running: usize| {
+        format!(
+            "This host's data stays under {} for now: {running} runner process(es) still run \
+             from {}. It moves to {} at the next `runner-manager wsl install` that finds the host \
+             idle.",
+            old.config.display(),
+            old.runtime.display(),
+            runner_manager_platform::paths::SYSTEM_DATA_ROOT,
+        )
+    };
+    let running = runner_processes_under(Path::new("/proc"), &old.runtime);
+    if running > 0 {
+        return Ok(postponed(running));
+    }
+    systemctl_ok(&["stop", &unit], "stop the service before moving its data")?;
+    // A runner may have started between the look and the stop.
+    let running = runner_processes_under(Path::new("/proc"), &old.runtime);
+    if running > 0 {
+        systemctl_ok(&["start", &unit], "start the service again")?;
+        return Ok(postponed(running));
+    }
+    let executable =
+        std::env::current_exe().map_err(|source| local("find this executable", &source))?;
+    let installed = std::process::Command::new(&executable)
+        .args(["service", "install", "--start-at", "boot"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|source| local("run service install", &source))?;
+    if !installed.status.success() {
+        // The old unit is untouched unless the install got as far as
+        // rewriting it, and either way the old tree is still there.
+        let _ = systemctl_ok(&["start", &unit], "start the service again");
+        return Err(CliError::new(
+            Failure::WslProvisioning,
+            format!(
+                "moving this host to {} failed, and its service was started again as it was: {}",
+                runner_manager_platform::paths::SYSTEM_DATA_ROOT,
+                String::from_utf8_lossy(&installed.stderr).trim()
+            ),
+        ));
+    }
+    systemctl_ok(&["daemon-reload"], "reload systemd after the move")?;
+    systemctl_ok(&["start", &unit], "start the moved service")?;
+    Ok(format!(
+        "This host's data moved from {} to {}; the old tree is kept, and the service now runs \
+         from the system tree.",
+        old.config.display(),
+        runner_manager_platform::paths::SYSTEM_DATA_ROOT,
+    ))
+}
+
+/// The first drop-in in `directory`, other than [`RECOVERY_DROP_IN`], whose
+/// text names one of `trees`.
+fn drop_in_naming(directory: &Path, trees: &[&std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    let mut entries: Vec<_> = std::fs::read_dir(directory)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "conf")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name != RECOVERY_DROP_IN)
+        })
+        .collect();
+    entries.sort();
+    entries.into_iter().find(|path| {
+        std::fs::read_to_string(path).is_ok_and(|text| {
+            trees
+                .iter()
+                .any(|tree| text.contains(tree.to_string_lossy().as_ref()))
+        })
+    })
+}
+
+/// How many processes under `proc` (`/proc`) run a program, or in a working
+/// directory, inside `runtime`: the runners an attempt there started.
+fn runner_processes_under(proc: &Path, runtime: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(proc) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .filter(|entry| {
+            ["exe", "cwd"].iter().any(|link| {
+                std::fs::read_link(entry.path().join(link))
+                    .is_ok_and(|target| target.starts_with(runtime))
+            })
+        })
+        .count()
 }
 
 /// Reload systemd and restart an active service onto what changed.
@@ -2884,6 +3037,20 @@ impl Provisioner<'_> {
         if matches!(active.as_deref(), Some("active"))
             || matches!(enabled.as_deref(), Some("enabled"))
         {
+            // A host an older build set up under /root moves to the system
+            // tree first, when it is idle; the unit that writes is current.
+            let moved = invoker
+                .exec_ok(
+                    "move the Linux service to the system tree",
+                    self.linux(distribution)
+                        .args(["wsl-host", "move-to-system-tree"])
+                        .with_timeout(SERVICE_TIMEOUT),
+                )
+                .map_err(|source| self.stage_failure(Stage::Service, &source))?;
+            let said = moved.stdout_text();
+            if !said.is_empty() {
+                writeln!(out, "{said}").map_err(failed)?;
+            }
             // Adoption keeps the registration, and with it whatever unit an
             // older build wrote. The new binary rewrites an outdated one and
             // restarts the service onto it; a current unit is left alone.
@@ -4256,6 +4423,65 @@ fn wait_for_a_stop_signal() -> Result<HoldStop, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_to_the_system_tree_waits_for_runners_and_an_operator_drop_in_naming_the_old_tree() {
+        let root = tempfile::tempdir().expect("dir");
+        let runtime = root.path().join("root/.local/share/runner-manager/runtime");
+        let elsewhere = root.path().join("usr/bin");
+        std::fs::create_dir_all(runtime.join("attempt/bin")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let proc = root.path().join("proc");
+        for (pid, exe, cwd) in [
+            (
+                "100",
+                runtime.join("attempt/bin/Runner.Listener"),
+                runtime.join("attempt"),
+            ),
+            ("200", elsewhere.join("sshd"), elsewhere.clone()),
+            (
+                "self",
+                runtime.join("attempt/bin/Runner.Listener"),
+                runtime.clone(),
+            ),
+        ] {
+            let process = proc.join(pid);
+            std::fs::create_dir_all(&process).unwrap();
+            std::os::unix::fs::symlink(exe, process.join("exe")).unwrap();
+            std::os::unix::fs::symlink(cwd, process.join("cwd")).unwrap();
+        }
+        assert_eq!(
+            runner_processes_under(&proc, &runtime),
+            1,
+            "only numbered processes running from the old runtime count"
+        );
+        assert_eq!(runner_processes_under(&proc, &elsewhere.join("none")), 0);
+
+        let drop_ins = root.path().join("runner-manager.service.d");
+        std::fs::create_dir_all(&drop_ins).unwrap();
+        std::fs::write(
+            drop_ins.join(RECOVERY_DROP_IN),
+            "[Service]\nReadWritePaths=/mnt/c/x\n",
+        )
+        .unwrap();
+        let config = root.path().join("root/.config/runner-manager");
+        let trees = [&config, &runtime];
+        assert_eq!(drop_in_naming(&drop_ins, &trees), None);
+        std::fs::write(
+            drop_ins.join("10-actions-tar.conf"),
+            format!(
+                "[Service]\nEnvironment=\"TMPDIR={}/tmp\"\n",
+                runtime.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            drop_in_naming(&drop_ins, &trees),
+            Some(drop_ins.join("10-actions-tar.conf"))
+        );
+        assert_eq!(drop_in_naming(&root.path().join("absent"), &trees), None);
+    }
 
     use std::sync::{Arc, Mutex};
 

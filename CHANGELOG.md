@@ -7,6 +7,25 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.60
+
+### Changed
+
+- `runner-manager wsl install` moves a distribution first set up before
+  0.4.57 from `/root` to `/var/lib/runner-manager`, the tree every root
+  service uses, once it finds the host idle: the same move
+  `service install --start-at boot` makes, keeping the old tree. Its jobs then
+  run under their own `rm-runner-N` accounts. Runners still running postpone
+  the move to a later run, and an operator's drop-in that names the old tree
+  stops it with that file named.
+
+### Fixed
+
+- `deploy/coordinator/install-updater.sh` hands `.git` back to the account
+  the update timer runs as when a command once run with sudo left part of it
+  to root, which made every update fail at `git fetch`. `update.sh` says so
+  when a fetch fails.
+
 ## 0.4.59
 
 ### Fixed

@@ -287,7 +287,9 @@ move_to() {
         return
     }
     git fetch --quiet --tags origin || {
-        refuse "git fetch failed"
+        # Most often part of .git belongs to root, from a git command once
+        # run with sudo; install-updater.sh hands it back.
+        refuse "git fetch failed; if part of .git is not $(id -un)'s, run sudo ./install-updater.sh"
         return
     }
     git rev-parse --verify --quiet "refs/tags/$tag^{commit}" >/dev/null || {
