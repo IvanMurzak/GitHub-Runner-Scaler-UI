@@ -122,7 +122,16 @@ const SURFACE: [(&str, &[&str]); 11] = [
     // host joins with a one-time code and can leave at any time.
     (
         "coordinator",
-        &["join", "status", "leave", "stats", "remote-changes"],
+        &[
+            "join",
+            "status",
+            "leave",
+            "stats",
+            "remote-changes",
+            "login",
+            "logout",
+            "hosts",
+        ],
     ),
 ];
 
@@ -403,7 +412,12 @@ fn the_host_selector_is_global_and_takes_only_the_two_documented_spellings() {
     );
 
     let temporary = tempfile::tempdir().expect("a temporary directory");
-    for accepted in ["local", "wsl:Ubuntu", "wsl:Debian GNU/Linux 12"] {
+    for accepted in [
+        "local",
+        "wsl:Ubuntu",
+        "wsl:Debian GNU/Linux 12",
+        "remote:ivan-ms-a2",
+    ] {
         let outcome = run({
             let mut command = runner_manager(temporary.path());
             command.args(["--host", accepted, "repo", "list", "--help"]);

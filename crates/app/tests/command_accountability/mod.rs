@@ -340,6 +340,42 @@ pub const MANIFEST: &[Classification] = &[
         }),
     },
     Classification {
+        leaf: "coordinator login",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            COORDINATOR_COMMANDS,
+            "coordinator_login_signs_this_account_in_through_a_browser_and_logout_forgets_it",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::CoordinatorServer,
+            reason: "Signs a person in at a coordinator and keeps the session in this account's own secret store, which the policy chain oracle does not model; the dedicated test approves the code as a browser would and checks the stored session.",
+        }),
+    },
+    Classification {
+        leaf: "coordinator logout",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            COORDINATOR_COMMANDS,
+            "coordinator_login_signs_this_account_in_through_a_browser_and_logout_forgets_it",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::CoordinatorServer,
+            reason: "Ends a coordinator session there and here, which the policy chain oracle does not model; the dedicated test checks the store is emptied and the coordinator refuses the token after.",
+        }),
+    },
+    Classification {
+        leaf: "coordinator hosts",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            COORDINATOR_COMMANDS,
+            "the_signed_in_account_lists_hosts_and_runs_commands_on_them_remotely",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::CoordinatorServer,
+            reason: "Lists a coordinator's hosts over a signed-in session, which the policy chain oracle does not model; the dedicated test checks the text and the versioned JSON for online, offline and too-old hosts.",
+        }),
+    },
+    Classification {
         leaf: "coordinator stats",
         coverage: Coverage::Dedicated,
         evidence: &[at(

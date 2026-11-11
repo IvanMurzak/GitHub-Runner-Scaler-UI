@@ -426,6 +426,9 @@ runner-manager coordinator status [--json]                     # Show the coordi
 runner-manager coordinator leave                               # Forget the coordinator and its key
 runner-manager coordinator stats [--json]                      # Show the coordinator's job statistics and placements
 runner-manager coordinator remote-changes allow|deny|status    # Let people signed in to the coordinator change this host
+runner-manager coordinator login [--url URL]                   # Sign in to a coordinator with GitHub, to manage its hosts from here
+runner-manager coordinator logout                              # Sign out of the coordinator and forget its session
+runner-manager coordinator hosts [--json]                      # List the coordinator's hosts: online, manageable, remote changes
 ```
 
 Host capacity changes take effect on the next allocation without restarting the
@@ -731,6 +734,11 @@ on a host that can hold the heaviest job queued for that pool, preferring a warm
 to spare and a host that has run those jobs fast. `runner-manager coordinator stats [--json]`
 shows the heaviest jobs, the samples per host and the last placements with every host's score;
 with no statistics yet, placement is the warm-workspace / free-memory order it always was.
+
+With its web dashboard configured, a person on its allowlist can also manage hosts from any
+machine: `runner-manager coordinator login`, then `runner-manager --host remote:NAME repo list`.
+A host answers reads always and changes only after its own operator ran
+`runner-manager coordinator remote-changes allow` there ([remote management](docs/coordinator.md#remote-management)).
 
 Deployment, the GitHub App (webhook and sweep), shared pools, statistics and administration: [`docs/coordinator.md`](docs/coordinator.md).
 

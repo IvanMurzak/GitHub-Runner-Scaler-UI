@@ -111,7 +111,7 @@ pub enum Access {
 /// touches another host, or is not about repositories and capacity.
 #[must_use]
 pub fn access(cli: &Cli) -> Option<Access> {
-    if cli.data_dir.is_some() || cli.host.distribution().is_some() {
+    if cli.data_dir.is_some() || cli.host != super::HostSelector::Local {
         return None;
     }
     match &cli.command {
@@ -304,6 +304,7 @@ mod tests {
             &["host", "protect-path", "add", "/srv"],
             &["coordinator", "leave"],
             &["--host", "wsl:Ubuntu", "repo", "list"],
+            &["--host", "remote:other", "repo", "list"],
             &["--data-dir", "/tmp/x", "repo", "list"],
         ] {
             assert_eq!(access(&parsed(refused)), None, "{refused:?}");

@@ -139,6 +139,7 @@ pub const FALLBACK_AFTER: Duration = Duration::from_secs(30);
 pub fn dispatch(
     context: &Context,
     command: &CoordinatorCommand,
+    styling: super::Styling,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
@@ -149,6 +150,11 @@ pub fn dispatch(
         CoordinatorCommand::RemoteChanges(args) => {
             super::remote::remote_changes(context, args, out)
         }
+        CoordinatorCommand::Login(args) => {
+            super::coordinator_session::login(context, args, styling, out)
+        }
+        CoordinatorCommand::Logout => super::coordinator_session::logout(context, out),
+        CoordinatorCommand::Hosts(args) => super::coordinator_session::hosts(context, args, out),
     }
 }
 

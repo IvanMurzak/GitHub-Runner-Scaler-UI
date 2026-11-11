@@ -762,6 +762,102 @@ database (schema 6, from 0.4.58). The job lists are built from the `workflow_job
 kept in memory, so after a restart they fill again as jobs move. Without a proxy in front, forward
 `/`, `/assets/*`, `/auth/*` and `/api/*` as well as the four endpoints in [Deploy](#deploy).
 
+## Remote management
+
+A person signed in to the coordinator can read, and where allowed change, the repositories and
+limits of a host that joined it, from the dashboard or from `runner-manager` on any machine. It
+needs the [web dashboard](#web-dashboard) configured, and hosts and coordinator at 0.4.61 or later
+(protocol version 5).
+
+### What a host allows
+
+The coordinator only relays `runner-manager` arguments; the host parses them and decides. It runs
+nothing outside this list, and never anything that signs in, installs, updates, removes the
+service, or addresses another host (`--host`, `--data-dir`):
+
+| Kind | Commands | Answered |
+| --- | --- | --- |
+| Read | `status`, `host show`, `repo list [--json]`, `repo profile list`, `repo profile show` | always |
+| Change | `host set-capacity`; `repo add`, `remove`, `set-capacity`, `set-scale`, `add-label`, `remove-label`, `set-workspace`; `repo profile add`, `remove`, `set-capacity`, `set-scale`, `add-label`, `remove-label`, `set-workspace` | only after `runner-manager coordinator remote-changes allow` **on that host** |
+
+Changes are off until the host's own operator turns them on there:
+
+```bash
+runner-manager coordinator remote-changes allow    # on the host; `deny` takes it back
+runner-manager coordinator remote-changes status
+```
+
+The host runs a command as its service would, in its own data directories, and answers with the
+command's exit code and output (up to 48 KiB). The running service tells the coordinator within a
+minute when the choice changes; the dashboard and `coordinator hosts` show it.
+
+### Sign in the CLI
+
+```bash
+runner-manager coordinator login                     # the coordinator this host joined
+runner-manager coordinator login --url https://runners.example.com
+```
+
+`login` prints a link and a code (and opens a browser on a desktop). Open the link in a browser
+signed in to the dashboard (or sign in there; you come back to it), check that the page shows the
+same code, and approve. The person is checked against the same `COORDINATOR_DASHBOARD_USERS`
+list as the dashboard; the machine's enrollment key plays no part. The CLI is then handed a
+session token for 90 days, kept in the user-scoped secret store of whoever ran `login` (a `0600`
+file under `~/.local/share/runner-manager/secrets` on Linux, DPAPI on Windows, the login keychain
+on macOS), never in the service's. `runner-manager coordinator logout` ends it on both sides. A
+login taken off the list is refused at its next request, as in the browser.
+
+### Run a command on a host
+
+```bash
+runner-manager coordinator hosts                     # name, online, manageable, remote changes
+runner-manager --host remote:ivan-ms-a2 repo list
+runner-manager --host remote:ivan-ms-a2 repo set-capacity octo/app --max-capacity 4
+runner-manager --host remote:ivan-ms-a2 status
+```
+
+`NAME` is the host's name at the coordinator (or its id). The output and the exit code are the
+host's own, its refusal included. Before anything is sent, `--host remote:` says when this account
+is not signed in, names the hosts when `NAME` is not one, and says when the host is offline or too
+old to take commands; the coordinator waits up to a minute for an answer.
+
+### HTTP
+
+| Method and path | Who | Answer |
+| --- | --- | --- |
+| `POST /auth/cli/start` | anyone, rate-limited per address | `{"device_code", "user_code": "BCDF-GHJK", "verification_url", "interval_secs": 3, "expires_in_secs": 600}` |
+| `GET /auth/cli?code=` | a browser | the approval page (Approve / Deny) |
+| `POST /auth/cli/approve` | a browser's session cookie, this origin | form `code`, `decision=approve\|deny` |
+| `POST /auth/cli/poll` | the CLI, `{"device_code"}` | `428 {"status":"pending"}`, `403 denied`, `410 expired`, or once `200 {"token", "login"}` |
+| `POST /auth/cli/logout` | `Authorization: Bearer` | `204` |
+| `GET /api/overview` | a session | hosts with `online`, `manageable`, `remote_changes` |
+| `POST /api/hosts/{id}/command` | a session; a cookie also needs this origin | `{"argv": [...]}` to `{"request_id", "exit_code", "stdout", "stderr", "truncated"}`; `503` offline, `409` too old, `504` no answer |
+| `GET /api/hosts/{id}/config` | a session | the host's `repo list --json` and `remote_changes` |
+| `GET /api/audit` | a session | the last 100 remote commands |
+
+Every `/api/*` route takes the browser's cookie or the CLI's `Authorization: Bearer <token>`. A
+token is only accepted as a bearer token and a cookie only as a cookie; a bearer request needs no
+`Origin` (a browser never sends the header on its own), and a token cannot approve another
+sign-in. Pending sign-ins are kept in memory for 10 minutes (a restart forgets them), the device
+code by its hash only; sessions are kept by their SHA-256 (schema 8 marks each `web` or `cli`).
+
+### The audit trail
+
+Both sides record every command: the coordinator in its database (`remote_commands`: when, who,
+which host, the arguments, how it ended, the newest 1000; `GET /api/audit` and the dashboard show
+them), and the host in `state/remote-commands.jsonl` beside its other state (when, by whom, the
+arguments, the exit code; moved to `.jsonl.1` at 1 MiB). The coordinator's log carries the host and
+the outcome only, never the arguments.
+
+### Security model
+
+A person on the allowlist, or anyone holding their session, can read every host's repositories
+and limits, and change those of hosts that allowed changes. So can anyone who controls the
+coordinator itself: a compromised coordinator can change, within the list above, any host that
+ran `remote-changes allow`. It can never change a host that did not, and no host runs anything
+outside the list, whoever asks: no shell, no sign-in, no update, no service removal. A host that
+does not want to be managed at all keeps changes off (the default), or leaves the coordinator.
+
 ## Updates
 
 Each release publishes the coordinator's two images to GHCR, built from `deploy/coordinator/Dockerfile`
@@ -876,7 +972,10 @@ rolls back. To go back past a database upgrade, restore a backup from before it 
   1 MiB body limit, repeated `X-GitHub-Delivery` ids ignored), `/connect` (signed challenge, for
   the link and for a `stats` query session alike),
   `/enroll` (one-time code), `/healthz`. Connection and enrollment attempts are rate-limited
-  per client address.
+  per client address, and so are CLI sign-ins (`/auth/cli/start`).
+- [Remote management](#remote-management): commands reach a host only for a signed-in person on
+  the allowlist, from the list a host allows, and changes only on a host whose operator allowed
+  them there.
 - The admin commands run on the coordinator's own machine against its database; there is no
   remote admin endpoint. An enrolled host may only read `stats` over its signed link.
 - Logs carry identifiers, counts and fixed words: never the secret, a code, a key, a signature,

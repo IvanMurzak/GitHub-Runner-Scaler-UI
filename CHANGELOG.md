@@ -7,6 +7,38 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.61
+
+### Added
+
+- Remote management through the coordinator (protocol version 5). A person
+  signed in to the coordinator's dashboard can read a host's repositories,
+  profiles and limits, and change them on a host whose operator allowed it
+  there with `runner-manager coordinator remote-changes allow`. Reads are
+  always answered; changes are off until allowed. A host runs only
+  repository and capacity commands, never one that signs in, installs,
+  updates or removes the service. Every command is recorded on both sides:
+  in the coordinator's database (`GET /api/audit`) and in the host's
+  `state/remote-commands.jsonl`.
+- `runner-manager coordinator login [--url URL]` signs the CLI in to a
+  coordinator with GitHub: it prints a link and a code, the person approves
+  the code in a browser signed in to the dashboard (the same
+  `COORDINATOR_DASHBOARD_USERS` list), and the session (90 days) is kept in
+  that account's own secret store, never the service's.
+  `runner-manager coordinator logout` ends it on both sides, and
+  `runner-manager coordinator hosts [--json]` lists the hosts with whether
+  each is online, takes commands, and allows changes.
+- `--host remote:NAME` runs a command on the host the coordinator knows as
+  NAME, as in `runner-manager --host remote:ivan-ms-a2 repo set-capacity
+  octo/app --max-capacity 4`, with that host's own output and exit code.
+- `runner-manager repo list --json`: one versioned document of the host's
+  capacity and every repository policy with its profile, labels, limit and
+  workspace.
+- The coordinator serves `/auth/cli/*` for the CLI sign-in and accepts a CLI
+  session as `Authorization: Bearer` on `/api/*`. Its database moves to
+  schema 8 (schema 7 adds the command record; 8 marks each session as a
+  browser's or the CLI's).
+
 ## 0.4.60
 
 ### Changed
