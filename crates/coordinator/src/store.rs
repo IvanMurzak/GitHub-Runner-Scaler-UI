@@ -16,7 +16,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The prefix every invite code carries, so one is recognisable in a paste.
 pub const INVITE_PREFIX: &str = "rmc_";
@@ -202,6 +202,34 @@ impl Store {
         if version < 5 {
             rekey_samples(&connection)?;
             connection.pragma_update(None, "user_version", 5)?;
+        }
+        if version < 6 {
+            // 0.4.58: the web dashboard's history (one row a minute per host,
+            // and one with `host_id` empty for the whole fleet) and its
+            // sign-in sessions, kept by the hash of their cookie only.
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS metric_samples (
+                    at INTEGER NOT NULL,
+                    host_id TEXT NOT NULL,
+                    cpu INTEGER,
+                    ram_used INTEGER,
+                    ram_total INTEGER,
+                    busy INTEGER,
+                    slots INTEGER,
+                    disk_free INTEGER,
+                    queued INTEGER,
+                    running INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS metric_samples_by_time ON metric_samples (at);
+                CREATE TABLE IF NOT EXISTS dashboard_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    login TEXT NOT NULL,
+                    avatar_url TEXT,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                PRAGMA user_version = 6;",
+            )?;
         }
         Ok(Self { connection })
     }
@@ -647,6 +675,202 @@ fn name_taken(connection: &Connection, name: &str) -> Result<bool, StoreError> {
         params![name],
         |row| row.get(0),
     )?)
+}
+
+/// One minute of one host's load, or of the whole fleet (`host_id` empty).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetricSample {
+    /// Unix seconds.
+    pub at: i64,
+    pub host_id: String,
+    pub cpu: Option<u32>,
+    pub ram_used: Option<u64>,
+    pub ram_total: Option<u64>,
+    pub busy: Option<u32>,
+    pub slots: Option<u32>,
+    pub disk_free: Option<u64>,
+    pub queued: Option<u32>,
+    pub running: Option<u32>,
+}
+
+/// A signed-in dashboard session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DashboardSession {
+    pub login: String,
+    pub avatar_url: Option<String>,
+}
+
+impl Store {
+    /// Records one minute's samples and drops every one older than `oldest`
+    /// (Unix seconds).
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn record_metrics(
+        &mut self,
+        samples: &[MetricSample],
+        oldest: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut insert = transaction.prepare_cached(
+                "INSERT INTO metric_samples (at, host_id, cpu, ram_used, ram_total, busy, slots,
+                    disk_free, queued, running)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for sample in samples {
+                insert.execute(params![
+                    sample.at,
+                    sample.host_id,
+                    sample.cpu,
+                    to_sql(sample.ram_used),
+                    to_sql(sample.ram_total),
+                    sample.busy,
+                    sample.slots,
+                    to_sql(sample.disk_free),
+                    sample.queued,
+                    sample.running
+                ])?;
+            }
+        }
+        transaction.execute("DELETE FROM metric_samples WHERE at < ?1", params![oldest])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// The samples taken at or after `since` (Unix seconds), averaged per
+    /// `step` seconds from `since` and per host, oldest first; each row's
+    /// `at` is its step's start.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn metrics(&self, since: i64, step: i64) -> Result<Vec<MetricSample>, StoreError> {
+        // Averaged into steps here, so a week of minutes per host never leaves
+        // SQLite: one row per step and host.
+        let mut statement = self.connection.prepare(
+            "SELECT ?1 + ((at - ?1) / ?2) * ?2 AS step_at, host_id,
+                CAST(AVG(cpu) AS INTEGER), CAST(AVG(ram_used) AS INTEGER),
+                CAST(AVG(ram_total) AS INTEGER), CAST(AVG(busy) AS INTEGER),
+                CAST(AVG(slots) AS INTEGER), CAST(AVG(disk_free) AS INTEGER),
+                CAST(AVG(queued) AS INTEGER), CAST(AVG(running) AS INTEGER)
+             FROM metric_samples WHERE at >= ?1
+             GROUP BY step_at, host_id ORDER BY step_at",
+        )?;
+        let rows = statement.query_map(params![since, step.max(1)], |row| {
+            Ok(MetricSample {
+                at: row.get(0)?,
+                host_id: row.get(1)?,
+                cpu: row.get(2)?,
+                ram_used: from_sql(row.get(3)?),
+                ram_total: from_sql(row.get(4)?),
+                busy: row.get(5)?,
+                slots: row.get(6)?,
+                disk_free: from_sql(row.get(7)?),
+                queued: row.get(8)?,
+                running: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Keeps a session under the hash of its cookie until `expires_at`
+    /// (Unix seconds), and drops the expired ones.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn create_session(
+        &self,
+        token_hash: &str,
+        session: &DashboardSession,
+        now: i64,
+        expires_at: i64,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM dashboard_sessions WHERE expires_at <= ?1",
+            params![now],
+        )?;
+        self.connection.execute(
+            "INSERT INTO dashboard_sessions (token_hash, login, avatar_url, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                token_hash,
+                session.login,
+                session.avatar_url,
+                now,
+                expires_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The live session whose cookie hashes to `token_hash`.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn session(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<Option<DashboardSession>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT login, avatar_url FROM dashboard_sessions
+                 WHERE token_hash = ?1 AND expires_at > ?2",
+                params![token_hash, now],
+                |row| {
+                    Ok(DashboardSession {
+                        login: row.get(0)?,
+                        avatar_url: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Ends a session.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn delete_session(&self, token_hash: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM dashboard_sessions WHERE token_hash = ?1",
+            params![token_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Ends every session of a login `allowed` refuses.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn delete_sessions_except(
+        &self,
+        allowed: impl Fn(&str) -> bool,
+    ) -> Result<usize, StoreError> {
+        let refused: Vec<String> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT token_hash, login FROM dashboard_sessions")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, login)| !allowed(login))
+                .map(|(hash, _)| hash)
+                .collect()
+        };
+        let transaction = self.connection.unchecked_transaction()?;
+        for hash in &refused {
+            transaction.execute(
+                "DELETE FROM dashboard_sessions WHERE token_hash = ?1",
+                params![hash],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(refused.len())
+    }
 }
 
 const SELECT_HOST: &str =

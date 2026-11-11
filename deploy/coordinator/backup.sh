@@ -2,8 +2,10 @@
 # Daily online backup of the coordinator's SQLite database; docs/coordinator.md
 # ("Back up and restore") says how to use and restore it.
 #
-#   backup.sh once       one copy, then the oldest beyond the last 7 are removed
-#   backup.sh            that, once a day, for ever: an hour after one that failed
+#   backup.sh once          one copy, then the oldest beyond the last 7 are removed
+#   backup.sh restore NAME  the copy NAME (coordinator-<UTC time>.db) in place of
+#                           the database; only while the coordinator is stopped
+#   backup.sh               `once`, once a day, for ever: an hour after one that failed
 #
 # VACUUM INTO reads a consistent snapshot through SQLite's own locking while the
 # coordinator keeps writing, which a plain file copy of a WAL database does not.
@@ -51,10 +53,52 @@ backup_once() {
     echo "backup: wrote $final"
 }
 
-if [ "${1:-}" = "once" ]; then
-    backup_once
-    exit
-fi
+# Stops nothing itself: the coordinator must not be running. The copy is checked
+# beside the database before anything changes, so a refused one leaves the
+# database as it was.
+restore() {
+    name="$1"
+    # A bare file name in the backup directory: no slash can match.
+    case "$name" in
+        coordinator-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.db) ;;
+        *)
+            echo "backup: '$name' is not the name of a backup (coordinator-<UTC time>.db, as in $BACKUP_DIR)" >&2
+            return 2
+            ;;
+    esac
+    if [ ! -s "$BACKUP_DIR/$name" ]; then
+        echo "backup: there is no $BACKUP_DIR/$name" >&2
+        return 1
+    fi
+    staged="$DATABASE.restore"
+    rm -f "$staged"
+    if ! cp "$BACKUP_DIR/$name" "$staged" ||
+        [ "$(sqlite3 "$staged" 'PRAGMA integrity_check' 2>&1)" != "ok" ] ||
+        [ "$(sqlite3 "$staged" 'SELECT count(*) > 0 FROM sqlite_master' 2>&1)" != "1" ]; then
+        rm -f "$staged"
+        echo "backup: $name failed its integrity check; the database is unchanged" >&2
+        return 1
+    fi
+    # The old database's WAL first: applied to the copy, it would damage it.
+    rm -f "$DATABASE-wal" "$DATABASE-shm"
+    mv "$staged" "$DATABASE"
+    echo "backup: restored $DATABASE from $name"
+}
+
+case "${1:-}" in
+    once)
+        backup_once
+        exit
+        ;;
+    restore)
+        if [ $# -ne 2 ]; then
+            echo "usage: backup.sh restore coordinator-<UTC time>.db" >&2
+            exit 2
+        fi
+        restore "$2"
+        exit
+        ;;
+esac
 
 while :; do
     # A restart does not make a copy of its own: seven restarts during a bad

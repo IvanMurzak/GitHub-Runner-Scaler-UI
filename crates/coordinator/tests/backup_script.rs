@@ -151,3 +151,130 @@ fn a_failed_backup_removes_nothing_and_leaves_nothing_that_looks_like_one() {
     assert!(!output.status.success());
     assert_eq!(copies(&backups).len(), 8);
 }
+
+fn run_restore(database: &Path, backups: &Path, name: &str) -> std::process::Output {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/coordinator/backup.sh");
+    Command::new("sh")
+        .arg(script)
+        .arg("restore")
+        .arg(name)
+        .env("COORDINATOR_DB", database)
+        .env("COORDINATOR_BACKUP_DIR", backups)
+        .output()
+        .expect("sh runs")
+}
+
+/// A stopped coordinator's database, with a WAL file left behind, and a good
+/// backup of a different one beside it.
+fn database_and_a_backup(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let database = dir.join("coordinator.db");
+    let backups = dir.join("backups");
+    std::fs::create_dir(&backups).expect("created");
+    Connection::open(&database)
+        .expect("opened")
+        .execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES ('now');")
+        .expect("written");
+    std::fs::write(dir.join("coordinator.db-wal"), "stale").expect("written");
+    Connection::open(backups.join("coordinator-20261109T030000Z.db"))
+        .expect("opened")
+        .execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES ('then');")
+        .expect("written");
+    (database, backups)
+}
+
+fn value(database: &Path) -> String {
+    Connection::open(database)
+        .expect("opened")
+        .query_row("SELECT x FROM t", [], |row| row.get(0))
+        .expect("read")
+}
+
+#[test]
+fn a_good_backup_is_restored_in_place_of_the_database_and_its_wal() {
+    if Command::new("sqlite3").arg("-version").output().is_err() {
+        eprintln!("skipped: no sqlite3 command");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a directory");
+    let (database, backups) = database_and_a_backup(dir.path());
+
+    let output = run_restore(&database, &backups, "coordinator-20261109T030000Z.db");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(!dir.path().join("coordinator.db-wal").exists());
+    assert!(!dir.path().join("coordinator.db.restore").exists());
+    assert_eq!(value(&database), "then");
+    assert!(
+        backups.join("coordinator-20261109T030000Z.db").exists(),
+        "the backup stays"
+    );
+}
+
+#[test]
+fn a_name_that_is_not_a_backup_is_refused_and_the_database_is_untouched() {
+    if Command::new("sqlite3").arg("-version").output().is_err() {
+        eprintln!("skipped: no sqlite3 command");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a directory");
+    let (database, backups) = database_and_a_backup(dir.path());
+    let before = std::fs::read(&database).expect("read");
+
+    for name in [
+        "../backups/coordinator-20261109T030000Z.db",
+        "/etc/passwd",
+        "coordinator.db",
+        "coordinator-20261109T030000Z.db.bak",
+        "coordinator-20261109T030000Z",
+        "",
+    ] {
+        let output = run_restore(&database, &backups, name);
+        assert_eq!(output.status.code(), Some(2), "{name:?}: {output:?}");
+    }
+    // Well formed, but not there.
+    let output = run_restore(&database, &backups, "coordinator-20200101T000000Z.db");
+    assert!(!output.status.success(), "{output:?}");
+
+    assert_eq!(std::fs::read(&database).expect("read"), before);
+    assert!(dir.path().join("coordinator.db-wal").exists());
+    assert_eq!(value(&database), "now");
+}
+
+#[test]
+fn a_corrupt_backup_is_refused_and_the_database_is_untouched() {
+    if Command::new("sqlite3").arg("-version").output().is_err() {
+        eprintln!("skipped: no sqlite3 command");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a directory");
+    let (database, backups) = database_and_a_backup(dir.path());
+    let before = std::fs::read(&database).expect("read");
+    // Not a database at all, and a database with its pages overwritten.
+    std::fs::write(
+        backups.join("coordinator-20261109T040000Z.db"),
+        "not sqlite",
+    )
+    .expect("written");
+    let mut damaged = std::fs::read(backups.join("coordinator-20261109T030000Z.db")).expect("read");
+    let page = 4096.min(damaged.len() / 2);
+    for byte in &mut damaged[page..] {
+        *byte = 0xA5;
+    }
+    std::fs::write(backups.join("coordinator-20261109T050000Z.db"), damaged).expect("written");
+
+    for name in [
+        "coordinator-20261109T040000Z.db",
+        "coordinator-20261109T050000Z.db",
+    ] {
+        let output = run_restore(&database, &backups, name);
+        assert!(!output.status.success(), "{name}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("integrity check"),
+            "{name}: {output:?}"
+        );
+    }
+
+    assert_eq!(std::fs::read(&database).expect("read"), before);
+    assert!(dir.path().join("coordinator.db-wal").exists());
+    assert!(!dir.path().join("coordinator.db.restore").exists());
+}

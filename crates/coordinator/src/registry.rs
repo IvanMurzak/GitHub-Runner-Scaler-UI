@@ -47,6 +47,8 @@ struct Connected {
     heartbeat_at: Instant,
     /// The last `hello_ack` sent, so an unchanged one is not sent again.
     acked: Option<HelloAck>,
+    /// When this connection was registered, by the wall clock.
+    since: chrono::DateTime<chrono::Utc>,
 }
 
 impl Connected {
@@ -235,6 +237,8 @@ pub struct ConnectedHost {
     pub host_id: String,
     pub hello: Option<Hello>,
     pub heartbeat: Option<Heartbeat>,
+    /// When its connection was registered.
+    pub since: chrono::DateTime<chrono::Utc>,
 }
 
 impl Registry {
@@ -258,6 +262,7 @@ impl Registry {
                 heartbeat: None,
                 heartbeat_at: crate::clock::now(),
                 acked: None,
+                since: chrono::Utc::now(),
             },
         );
         if let Some(previous) = previous {
@@ -492,6 +497,7 @@ impl Registry {
                 host_id: host_id.clone(),
                 hello: connected.hello.clone(),
                 heartbeat: connected.heartbeat.clone(),
+                since: connected.since,
             })
             .collect();
         hosts.sort_by(|a, b| a.host_id.cmp(&b.host_id));

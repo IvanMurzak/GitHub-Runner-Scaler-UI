@@ -7,6 +7,11 @@
 #
 # Only Caddy publishes ports. The coordinator is reachable from it alone.
 #
+# The images are the ones each release publishes to GHCR, at the version .env
+# names as COORDINATOR_VERSION (`latest` when unset). `docker compose up -d
+# --build` builds them from this checkout instead; update.sh and its systemd
+# timer keep a deployment on the newest release (docs/coordinator.md, Updates).
+#
 # The reconciliation sweep (a GitHub App id and private key) is added with a
 # docker-compose.override.yml; see docs/coordinator.md.
 
@@ -17,17 +22,23 @@ services:
     build:
       context: ../..
       dockerfile: deploy/coordinator/Dockerfile
-    image: runner-manager-coordinator:local
+    image: ghcr.io/ivanmurzak/runner-manager-coordinator:${COORDINATOR_VERSION:-latest}
     restart: unless-stopped
     environment:
       COORDINATOR_PUBLIC_URL: https://${COORDINATOR_HOST:?set COORDINATOR_HOST in .env}
       # Caddy is the only client, and it appends the real client address.
       COORDINATOR_TRUST_FORWARDED_FOR: "true"
       COORDINATOR_WEBHOOK_SECRET_FILE: /run/secrets/webhook_secret
+      # The web dashboard: off while the client id is empty. Its client
+      # secret comes from docker-compose.override.yml (docs/coordinator.md).
+      COORDINATOR_DASHBOARD_CLIENT_ID: ${COORDINATOR_DASHBOARD_CLIENT_ID:-}
+      COORDINATOR_DASHBOARD_USERS: ${COORDINATOR_DASHBOARD_USERS:-}
     secrets:
       - webhook_secret
     volumes:
       - coordinator-data:/data
+      # update.sh's status.json, read-only, for the dashboard.
+      - ./state:/run/coordinator-update:ro
     expose:
       - "8080"
 
@@ -38,7 +49,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/coordinator/Dockerfile.backup
-    image: runner-manager-coordinator-backup:local
+    image: ghcr.io/ivanmurzak/runner-manager-coordinator-backup:${COORDINATOR_VERSION:-latest}
     restart: unless-stopped
     depends_on:
       - coordinator

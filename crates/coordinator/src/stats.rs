@@ -668,6 +668,21 @@ pub struct Aggregates {
     by_key: BTreeMap<String, Vec<JobSample>>,
 }
 
+impl Aggregates {
+    /// How long jobs waited for a runner, p50 and p90, over every kept
+    /// sample.
+    #[must_use]
+    pub fn queue_wait_percentiles(&self) -> (Option<u64>, Option<u64>) {
+        let waits: Vec<u64> = self
+            .by_key
+            .values()
+            .flatten()
+            .filter_map(|sample| sample.queue_wait_secs)
+            .collect();
+        (percentile(&waits, 50), percentile(&waits, 90))
+    }
+}
+
 /// One job key's figures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobFigures {
@@ -1623,12 +1638,7 @@ pub fn report(
         })
         .collect();
 
-    let waits: Vec<u64> = aggregates
-        .by_key
-        .values()
-        .flatten()
-        .filter_map(|sample| sample.queue_wait_secs)
-        .collect();
+    let (p50_queue_wait_secs, p90_queue_wait_secs) = aggregates.queue_wait_percentiles();
 
     let decisions = store
         .decisions(REPORT_DECISIONS)?
@@ -1645,8 +1655,8 @@ pub fn report(
         launches: counters.launches,
         wakes: counters.wakes,
         samples: counters.samples,
-        p50_queue_wait_secs: percentile(&waits, 50),
-        p90_queue_wait_secs: percentile(&waits, 90),
+        p50_queue_wait_secs,
+        p90_queue_wait_secs,
         jobs,
         hosts,
         decisions,

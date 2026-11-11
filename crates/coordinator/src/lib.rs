@@ -27,6 +27,7 @@ pub(crate) mod clock {
     }
 }
 
+pub mod dashboard;
 pub mod github_app;
 pub mod placement;
 pub mod registry;

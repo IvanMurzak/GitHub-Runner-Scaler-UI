@@ -1,4 +1,5 @@
-//! The HTTP surface: `/webhook`, `/connect`, `/enroll`, `/healthz`.
+//! The HTTP surface: `/webhook`, `/connect`, `/enroll`, `/healthz`, and the
+//! web dashboard ([`crate::dashboard`]).
 //!
 //! TLS is terminated by the reverse proxy in front (Caddy, see
 //! `deploy/coordinator`), so this listens on plain HTTP.
@@ -85,6 +86,11 @@ pub struct Config {
     /// How long an accepted launch counts without its runner taking a job
     /// (`COORDINATOR_LEASE_TTL`).
     pub lease_ttl: Duration,
+    /// The web dashboard's GitHub sign-in; `None`, no dashboard.
+    pub dashboard: Option<crate::dashboard::auth::AuthConfig>,
+    /// Where the updater leaves its status for the dashboard
+    /// (`COORDINATOR_UPDATE_STATUS`).
+    pub update_status: std::path::PathBuf,
 }
 
 impl Config {
@@ -101,6 +107,8 @@ impl Config {
             stats: StatsConfig::default(),
             placement_tick: crate::placement::TICK,
             lease_ttl: crate::placement::LEASE_TTL,
+            dashboard: None,
+            update_status: crate::dashboard::UPDATE_STATUS.into(),
         }
     }
 }
@@ -115,6 +123,8 @@ pub struct AppState {
     pub placement: Arc<Placement>,
     /// Stage 4: what jobs used, and the counters `stats` shows.
     pub statistics: Arc<Statistics>,
+    /// The web dashboard, when its sign-in is configured.
+    pub dashboard: Option<crate::dashboard::Dashboard>,
     deliveries: Mutex<DeliveryLog>,
     limiter: RateLimiter,
 }
@@ -126,7 +136,24 @@ impl AppState {
         let store = Arc::new(Mutex::new(store));
         let statistics = Arc::new(Statistics::load(Arc::clone(&store), config.stats));
         let lease_ttl = config.lease_ttl;
+        let dashboard = config.dashboard.clone().map(|auth| {
+            // The sessions of a login taken off the allowlist, which every
+            // request refuses anyway, are not kept either.
+            if let Ok(removed) = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .delete_sessions_except(|login| auth.allows(login))
+                && removed > 0
+            {
+                tracing::info!(
+                    removed,
+                    "dashboard sessions of logins no longer allowed were ended"
+                );
+            }
+            crate::dashboard::Dashboard::new(auth, config.update_status.clone())
+        });
         Arc::new(Self {
+            dashboard,
             limiter: RateLimiter::new(config.attempts_per_minute),
             config,
             store,
@@ -156,7 +183,7 @@ impl AppState {
         Ok(record)
     }
 
-    fn store(&self) -> std::sync::MutexGuard<'_, Store> {
+    pub(crate) fn store(&self) -> std::sync::MutexGuard<'_, Store> {
         self.store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -180,6 +207,10 @@ impl AppState {
 
 /// The router, for [`serve`] and for tests.
 pub fn router(state: Arc<AppState>) -> Router {
+    let dashboard = state
+        .dashboard
+        .is_some()
+        .then(|| crate::dashboard::routes(&state));
     Router::new()
         .route(
             WEBHOOK_PATH,
@@ -191,6 +222,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(CONNECT_PATH, get(connect))
         .route(HEALTH_PATH, get(|| async { "ok" }))
+        .merge(dashboard.unwrap_or_default())
         .with_state(state)
 }
 
@@ -228,8 +260,9 @@ fn collect_wakes(state: &AppState) {
         .count_wakes(state.registry.take_wakes_sent());
 }
 
-/// Adds the launch and wake counts to the database every minute, and saves
-/// placement's live state for the admin CLI.
+/// Adds the launch and wake counts to the database every minute, saves
+/// placement's live state for the admin CLI, and the dashboard's minute of
+/// history.
 async fn flush_counters(state: Arc<AppState>) {
     let mut ticks = tokio::time::interval(Duration::from_secs(60));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -238,6 +271,7 @@ async fn flush_counters(state: Arc<AppState>) {
         collect_wakes(&state);
         state.statistics.flush();
         state.statistics.save_live(&live_state(&state));
+        crate::dashboard::record_minute(&state);
     }
 }
 
@@ -331,6 +365,16 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             let Ok(job) = serde_json::from_slice::<WorkflowJobEvent>(&body) else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
+            let times = JobTimes::parse(
+                job.workflow_job.created_at.as_deref(),
+                job.workflow_job.started_at.as_deref(),
+                job.workflow_job.completed_at.as_deref(),
+            );
+            if let Some(dashboard) = &state.dashboard {
+                dashboard
+                    .activity
+                    .job_event(&job, &times, Utc::now().timestamp());
+            }
             let action = action_name(&job.action);
             let required = required_labels(&job.workflow_job.labels);
             let repository = &job.repository.full_name;
@@ -409,11 +453,7 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                             .conclusion
                             .as_deref()
                             .is_some_and(|conclusion| conclusion != "success"),
-                        ..JobTimes::parse(
-                            job.workflow_job.created_at.as_deref(),
-                            job.workflow_job.started_at.as_deref(),
-                            job.workflow_job.completed_at.as_deref(),
-                        )
+                        ..times
                     };
                     state.statistics.job_identified(runner, identity, times);
                 }
@@ -749,6 +789,9 @@ async fn serve_host(
                     }
                     Ok(HostMessage::AttemptStarted(started)) if version >= LAUNCH_VERSION => {
                         state.placement.attempt_started(host_id, &started);
+                        if let Some(dashboard) = &state.dashboard {
+                            dashboard.activity.runner_started(host_id, &started.runner_name);
+                        }
                     }
                     Ok(HostMessage::AttemptFinished(finished)) if version >= LAUNCH_VERSION => {
                         state.placement.attempt_finished(host_id, &finished);
