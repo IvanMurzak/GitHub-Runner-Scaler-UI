@@ -1703,6 +1703,7 @@ mod tests {
                         warm: false,
                     }],
                 }],
+                remote_changes: false,
             },
         );
         registry.set_heartbeat(
@@ -2362,6 +2363,7 @@ mod tests {
                         warm: false,
                     }],
                 }],
+                remote_changes: false,
             },
         );
         let beat = |free| Heartbeat {
@@ -3074,6 +3076,7 @@ mod tests {
                         warm: false,
                     }],
                 }],
+                remote_changes: false,
             },
         );
         registry.set_heartbeat(
@@ -3191,6 +3194,7 @@ mod tests {
                         warm: false,
                     }],
                 }],
+                remote_changes: false,
             },
         );
         registry.set_heartbeat(

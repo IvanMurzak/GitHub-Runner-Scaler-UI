@@ -137,6 +137,10 @@ pub enum SecretItem {
     /// The Ed25519 private key this host proves itself to a coordinator with
     /// (`coordinator join`).
     CoordinatorKey,
+    /// A person's session at a coordinator, for `--host remote:NAME`
+    /// (`coordinator login`). Kept in the user-scoped store of whoever signed
+    /// in, never the service's.
+    CoordinatorCliSession,
 }
 
 impl SecretItem {
@@ -146,6 +150,7 @@ impl SecretItem {
         match self {
             Self::GithubCredential => ITEM,
             Self::CoordinatorKey => "coordinator-host-key",
+            Self::CoordinatorCliSession => "coordinator-cli-session",
         }
     }
 }

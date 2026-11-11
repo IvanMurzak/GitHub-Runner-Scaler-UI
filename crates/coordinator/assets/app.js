@@ -48,6 +48,9 @@
     timers: {},
     showAllRecent: false,
     hostColors: new Map(),
+    audit: null, auditErr: null, auditSig: '', showAllAudit: false,
+    auditOpen: loadFlag('rm.audit.open', true),
+    auditAll: loadFlag('rm.audit.all', false),
   };
   const serverNow = () => nowSec() + state.skew;
 
@@ -56,6 +59,11 @@
     return '6h';
   }
   function saveRange(r) { try { localStorage.setItem('rm.range', r); } catch (_) { /* ignore */ } }
+  function loadFlag(k, dflt) {
+    try { const v = localStorage.getItem(k); if (v === '1' || v === '0') return v === '1'; } catch (_) { /* storage unavailable */ }
+    return dflt;
+  }
+  function saveFlag(k, v) { try { localStorage.setItem(k, v ? '1' : '0'); } catch (_) { /* ignore */ } }
 
   // ------------------------------------------------------------- formatting
   function fmtDur(secs) {
@@ -129,6 +137,8 @@
     $('#signout').addEventListener('click', signOut);
     $('#recent-toggle').addEventListener('click', () => { state.showAllRecent = !state.showAllRecent; if (state.ov) renderRecent(state.ov); });
     buildRangeSwitch();
+    buildAuditControls();
+    setupDrawer();
     document.addEventListener('visibilitychange', onVisibility);
     document.addEventListener('pointerdown', (e) => { if (!e.target.closest('.plot')) hideAllTips(); });
     try {
@@ -144,6 +154,7 @@
 
   function showLogin(netMsg) {
     stopTimers();
+    if (dw.id) closeDrawer(true);
     $('#boot').hidden = true; $('#app').hidden = true; $('#login').hidden = false;
     document.title = 'Sign in · Runner Manager';
     const params = new URLSearchParams(location.search);
@@ -158,7 +169,7 @@
 
   function showApp() {
     $('#boot').hidden = true; $('#login').hidden = true; $('#app').hidden = false;
-    if (location.search) history.replaceState(null, '', '/');
+    if (location.search) history.replaceState(null, '', `/${location.hash}`);
     const u = state.session || {};
     const who = $('#who');
     who.replaceChildren();
@@ -168,6 +179,8 @@
     ]);
     who.title = u.login ? `Signed in as ${u.login}` : '';
     startTimers();
+    const id = hashHost();
+    if (id) openDrawer(id, false);
   }
 
   async function signOut() {
@@ -182,10 +195,11 @@
     stopTimers();
     loadOverview();
     loadMetrics();
+    loadAudit();
     state.timers.tick = setInterval(tick, 1000);
   }
   function stopTimers() {
-    clearTimeout(state.timers.ov); clearTimeout(state.timers.m); clearInterval(state.timers.tick);
+    clearTimeout(state.timers.ov); clearTimeout(state.timers.m); clearTimeout(state.timers.audit); clearInterval(state.timers.tick);
     state.timers = {};
   }
   const polling = () => !document.hidden && !$('#app').hidden;
@@ -276,6 +290,7 @@
     renderRecent(ov);
     renderPools(ov);
     renderLive();
+    syncDrawer();
   }
 
   function meterBar(pct, extra) {
@@ -365,11 +380,14 @@
       h('header', { class: 'host-head' },
         hostDot(x.id),
         h('div', { class: 'host-id' },
-          h('h3', { class: 'host-name', text: x.name || x.hostname || x.id, title: x.hostname || null }),
+          h('h3', { class: 'host-name', title: x.hostname || null },
+            h('a', { class: 'host-open', href: `#host=${encodeURIComponent(x.id)}`, 'data-host': x.id, text: x.name || x.hostname || x.id })),
           h('p', { class: 'host-sub' },
             h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' }),
             [x.arch, isNum(x.cores) ? `${x.cores} cores` : null].filter(Boolean).join(' · '))),
-        h('span', { class: `status status-${st.key}` }, h('i', { 'aria-hidden': 'true' }), st.label)),
+        h('div', { class: 'host-badges' },
+          h('span', { class: `status status-${st.key}` }, h('i', { 'aria-hidden': 'true' }), st.label),
+          accessChip(x, !!x.remote_changes))),
       h('div', { class: 'host-meters' },
         meterRow('CPU', x.cpu_load_percent, fmtPct(x.cpu_load_percent)),
         meterRow('Memory', used != null && total ? (used / total) * 100 : null, `${fmtBytes(used)} / ${fmtBytes(total)}`),
@@ -385,8 +403,12 @@
     const hosts = ov.hosts || [];  // online first, then by name
     const on = hosts.filter((x) => x.online).length;
     $('#machines-count').textContent = hosts.length ? `${on} of ${hosts.length} online` : '';
+    // Cards are rebuilt on every poll: keep keyboard focus on the same card.
+    const f = document.activeElement;
+    const keep = f && f.classList && f.classList.contains('host-open') ? f.dataset.host : null;
     $('#hosts').replaceChildren(...(hosts.length ? hosts.map(hostCard)
       : [empty('No machines enrolled yet', 'Machines appear here once their runner-manager agent connects.')]));
+    if (keep) { const el = $(`.host-open[data-host="${CSS.escape(keep)}"]`); if (el) el.focus({ preventScroll: true }); }
   }
 
   // ---------------------------------------------------------------- tables
@@ -756,6 +778,754 @@
         loadMetrics();
       },
     })));
+  }
+
+  // ======================================================== remote commands
+  // The coordinator relays `runner-manager` argv to a machine; the machine
+  // decides what it runs. Nothing here is updated before the machine confirms:
+  // every change is followed by a fresh read of its configuration.
+  const AUDIT_MS = 15000;
+  const MANAGE_MIN = '0.4.61';
+  const ALLOW_CMD = 'runner-manager coordinator remote-changes allow';
+  const OS_TOKEN = { linux: 'linux', windows: 'win', macos: 'osx' };
+  const ARCH_TOKEN = { x64: 'x64', x86_64: 'x64', amd64: 'x64', arm64: 'arm64', aarch64: 'arm64', arm: 'arm' };
+  const POLICY_STATE = { active: 'ok', pending: 'dim', draining: 'warn', disabled: 'dim', repair_required: 'err', authentication_failed: 'err' };
+  const ERR_HINT = {
+    0: 'The coordinator could not be reached.',
+    400: 'The coordinator did not accept this command.',
+    403: 'The coordinator refused a change from this page.',
+    409: `This machine runs a runner-manager older than ${MANAGE_MIN}, which cannot take commands from the coordinator. Update it there, then try again.`,
+    502: 'The machine could not carry out the request.',
+    503: 'This machine is offline. Try again once it reconnects.',
+    504: 'The machine did not answer in time.',
+  };
+  // Reads the panel itself makes; the activity log hides them unless asked.
+  // The host says what each command was; one it refused unjudged counts as a change attempt.
+  const isRead = (c) => c.access === 'read';
+
+  const shq = (a) => (/^[A-Za-z0-9_\-.,/:=@%+]+$/.test(String(a)) ? String(a) : `'${String(a).replace(/'/g, `'\\''`)}'`);
+  const cmdLine = (argv) => ['runner-manager', ...(argv || []).map(shq)].join(' ');
+  const isDefault = (p) => !p.profile || p.profile === 'default';
+  const policyKey = (p) => `${p.repository}#${p.profile || 'default'}`;
+  // A named profile is changed through `repo profile <verb> --profile NAME`.
+  const repoArgv = (p, verb, ...rest) => (isDefault(p)
+    ? ['repo', verb, p.repository, ...rest]
+    : ['repo', 'profile', verb, p.repository, '--profile', p.profile, ...rest]);
+  const hostById = (id) => ((state.ov && state.ov.hosts) || []).find((x) => x.id === id) || null;
+  const trimEnd = (t) => String(t || '').replace(/\s+$/, '');
+  const capWord = (w) => (w ? w[0].toUpperCase() + w.slice(1) : w);
+
+  function icon(d, size, extra) {
+    return s('svg', { viewBox: '0 0 20 20', width: size || 14, height: size || 14, 'aria-hidden': 'true', class: extra || null },
+      s('path', { fill: 'none', stroke: 'currentColor', 'stroke-width': 1.7, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', d }));
+  }
+  const xIcon = (n) => icon('M5.5 5.5l9 9M14.5 5.5l-9 9', n);
+  const plusIcon = () => icon('M10 4.5v11M4.5 10h11', 14);
+  const lockIcon = () => icon('M6 9V7a4 4 0 0 1 8 0v2M5.5 9h9a1 1 0 0 1 1 1v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1V10a1 1 0 0 1 1-1z', 11);
+  const extIcon = () => icon('M8 5H5.5A1.5 1.5 0 0 0 4 6.5v8A1.5 1.5 0 0 0 5.5 16h8a1.5 1.5 0 0 0 1.5-1.5V12M11 4h5v5M16 4l-7 7', 12, 'ext');
+  const copyIcon = () => icon('M7.5 7.5V5A1.5 1.5 0 0 1 9 3.5h6A1.5 1.5 0 0 1 16.5 5v6a1.5 1.5 0 0 1-1.5 1.5h-2.5M5 7.5h6A1.5 1.5 0 0 1 12.5 9v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 15V9A1.5 1.5 0 0 1 5 7.5z', 14);
+
+  // fetch, with the error body kept: these endpoints explain their failures.
+  async function call(path, opts = {}) {
+    let res;
+    try {
+      res = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...opts, headers: { Accept: 'application/json', ...(opts.headers || {}) } });
+    } catch (_) {
+      return { ok: false, status: 0, hint: ERR_HINT[0], error: '' };
+    }
+    if (res.status === 401) { showLogin(); return { ok: false, status: 401, hint: 'Your session ended.', error: '' }; }
+    let body = null;
+    try { body = await res.json(); } catch (_) { /* empty or not JSON */ }
+    if (res.ok) return { ok: true, status: res.status, body };
+    return { ok: false, status: res.status, hint: ERR_HINT[res.status] || null, error: (body && body.error) || `HTTP ${res.status}` };
+  }
+
+  function invalid(input, msg) {
+    input.setCustomValidity(msg);
+    input.reportValidity();
+    input.addEventListener('input', () => input.setCustomValidity(''), { once: true });
+  }
+
+  function accessChip(x, rc) {
+    if (!x) return null;
+    if (!x.manageable) return x.online ? h('span', { class: 'access access-old', title: `runner-manager on this machine is older than ${MANAGE_MIN}`, text: 'Update needed' }) : null;
+    return rc
+      ? h('span', { class: 'access access-managed', title: 'Changes through the coordinator are allowed', text: 'Managed' })
+      : h('span', { class: 'access access-ro', title: 'Its operator has not allowed changes through the coordinator' }, lockIcon(), 'Read-only');
+  }
+
+  // ------------------------------------------------------------ audit log
+  function buildAuditControls() {
+    $('#audit-filter').replaceChildren(...[['changes', 'Changes'], ['all', 'All']].map(([v, t]) => h('button', {
+      type: 'button', class: 'seg-btn', 'data-v': v, text: t, 'aria-pressed': String((v === 'all') === state.auditAll),
+      onclick: () => { state.auditAll = v === 'all'; saveFlag('rm.audit.all', state.auditAll); renderAudit(true); },
+    })));
+    $('#audit-toggle').addEventListener('click', () => {
+      state.auditOpen = !state.auditOpen; saveFlag('rm.audit.open', state.auditOpen);
+      renderAudit(true);
+      if (state.auditOpen) loadAudit(); else clearTimeout(state.timers.audit);
+    });
+  }
+
+  async function loadAudit() {
+    clearTimeout(state.timers.audit);
+    const r = await call('/api/audit');
+    if (r.status === 401) return;
+    if (r.ok) { state.audit = Array.isArray(r.body && r.body.commands) ? r.body.commands : []; state.auditErr = null; }
+    else state.auditErr = r.status === 404 ? 'gone' : (r.hint || r.error);
+    renderAudit();
+    if (polling() && state.auditOpen) state.timers.audit = setTimeout(loadAudit, AUDIT_MS);
+  }
+
+  function outcomeBadge(o) {
+    const m = /^exit (\d+)$/.exec(o || '');
+    if (m) {
+      return m[1] === '0'
+        ? h('span', { class: 'badge badge-ok' }, h('span', { 'aria-hidden': 'true', text: '✓' }), 'ok')
+        : h('span', { class: 'badge badge-err' }, h('span', { 'aria-hidden': 'true', text: '✕' }), `exit ${m[1]}`);
+    }
+    const [kind, label] = { offline: ['warn', 'offline'], too_old: ['warn', 'too old'], timeout: ['err', 'timed out'], malformed: ['err', 'malformed'] }[o] || ['dim', humanize(o || 'unknown')];
+    return h('span', { class: `badge badge-${kind}`, text: label });
+  }
+  // Each argument is one unit, so a line breaks between arguments, never inside `--flag`.
+  const cmdCode = (argv) => h('code', { class: 'cmd' }, h('span', { class: 'cmd-tok cmd-pfx', text: 'runner-manager' }),
+    (argv || []).map((x) => [' ', h('span', { class: 'cmd-tok', text: shq(x) })]));
+
+  function renderAudit(force) {
+    const sec = $('#audit-section');
+    if (state.auditErr === 'gone') { sec.hidden = true; return; }
+    if (!state.audit && !state.auditErr) return;  // first load still on its way
+    sec.hidden = false;
+    const all = state.audit || [];
+    const list = state.auditAll ? all : all.filter((c) => !isRead(c));
+    const sig = JSON.stringify([all, state.auditAll, state.auditOpen, state.showAllAudit, state.auditErr]);
+    if (!force && sig === state.auditSig) return;
+    state.auditSig = sig;
+    sec.classList.toggle('is-collapsed', !state.auditOpen);
+    $('#audit-count').textContent = list.length ? String(list.length) : '';
+    const tog = $('#audit-toggle');
+    tog.textContent = state.auditOpen ? 'Hide' : 'Show';
+    tog.setAttribute('aria-expanded', String(state.auditOpen));
+    $('#audit-filter').hidden = !state.auditOpen;
+    $$('.seg-btn', $('#audit-filter')).forEach((b) => b.setAttribute('aria-pressed', String((b.dataset.v === 'all') === state.auditAll)));
+    const box = $('#audit');
+    box.hidden = !state.auditOpen;
+    if (!state.auditOpen) return;
+    const LIMIT = 15;
+    const shown = state.showAllAudit ? list : list.slice(0, LIMIT);
+    const reads = all.length - list.length;
+    box.replaceChildren(...[
+      state.auditErr ? h('p', { class: 'notice notice-warn', role: 'status', text: `The log could not be refreshed. ${state.auditErr}` }) : null,
+      shown.length
+        ? table('Commands run on machines through the coordinator', [['Result'], ['Command'], ['Machine'], ['By'], ['When', 'c-num']], shown.map((c) => h('tr', {},
+          td('Result', 'c-result', outcomeBadge(c.outcome)),
+          td('Command', 'c-cmd', cmdCode(c.argv)),
+          td('Machine', 'c-machine', machine(c.host_id, c.host_name || hostName(c.host_id, c.host_id))),
+          td('By', 'c-who', h('span', { text: c.login || '—' })),
+          td('When', 'c-num c-when', ago(c.at, 'muted')))))
+        : empty(all.length ? 'No changes yet' : 'No remote commands yet',
+          reads ? `${reads} read${reads === 1 ? '' : 's'} hidden. Choose All to see them.` : 'Changes made from a machine’s panel are recorded here.'),
+      list.length > LIMIT ? h('div', { class: 'tbl-more' }, h('button', {
+        type: 'button', class: 'link-btn', 'aria-expanded': String(state.showAllAudit), text: state.showAllAudit ? 'Show fewer' : `Show all ${list.length}`,
+        onclick: () => { state.showAllAudit = !state.showAllAudit; renderAudit(true); },
+      })) : null,
+    ].filter(Boolean));
+  }
+
+  // --------------------------------------------------------- machine panel
+  const dw = {
+    id: null, gen: 0, pushed: false, sig: '',
+    cfg: null, rc: null, loading: false, error: null, cfgSeq: 0,
+    results: new Map(), busy: new Set(), add: null, confirm: null,
+  };
+
+  function hashHost() {
+    const m = /^#host=(.+)$/.exec(location.hash);
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]); } catch (_) { return null; }
+  }
+
+  function setupDrawer() {
+    const dlg = $('#drawer');
+    $('#dw-close').addEventListener('click', () => closeDrawer());
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); closeDrawer(); });
+    dlg.addEventListener('close', () => { if (dw.id) closeDrawer(); });
+    dlg.addEventListener('click', (e) => { if (e.target === dlg) closeDrawer(); });
+    dlg.addEventListener('keydown', trapTab);
+    window.addEventListener('hashchange', () => {
+      const id = hashHost();
+      if (id) { if (!$('#app').hidden) openDrawer(id, true); } else if (dw.id) closeDrawer(true);
+    });
+    // The card's name is a link (Enter); Space opens it too, as on a button.
+    $('#hosts').addEventListener('keydown', (e) => {
+      if (e.key === ' ' && e.target.classList && e.target.classList.contains('host-open')) { e.preventDefault(); e.target.click(); }
+    });
+  }
+
+  function trapTab(e) {
+    if (e.key !== 'Tab') return;
+    const dlg = $('#drawer');
+    const f = $$('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])', dlg)
+      .filter((el) => !el.disabled && !el.closest('fieldset:disabled') && (el.checkVisibility ? el.checkVisibility({ visibilityProperty: true }) : el.getClientRects().length));
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && (document.activeElement === first || !dlg.contains(document.activeElement))) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && (document.activeElement === last || !dlg.contains(document.activeElement))) { e.preventDefault(); first.focus(); }
+  }
+
+  function openDrawer(id, pushed) {
+    const dlg = $('#drawer');
+    if (dlg.open && dw.id === id) return;
+    if (!dlg.open) dw.pushed = !!pushed;
+    dw.id = id; dw.gen++;
+    Object.assign(dw, { sig: '', cfg: null, rc: null, loading: false, error: null, add: null, confirm: null });
+    dw.results.clear(); dw.busy.clear();
+    renderDrawerHead();
+    const x = hostById(id);
+    if (!state.ov || (x && x.manageable)) loadConfig(); else renderDrawerBody();
+    if (!dlg.open) { dlg.showModal(); document.documentElement.classList.add('has-drawer'); }
+    $('#dw-body').scrollTop = 0;
+    $('#dw-close').focus();
+  }
+
+  function closeDrawer(fromHash) {
+    if (!dw.id) return;
+    if (!fromHash) {
+      // Opened by a click: step back so Back does not reopen it.
+      if (dw.pushed) { history.back(); return; }
+      history.replaceState(null, '', location.pathname + location.search);
+    }
+    const id = dw.id;
+    dw.id = null; dw.gen++;
+    const dlg = $('#drawer');
+    if (dlg.open) dlg.close();
+    document.documentElement.classList.remove('has-drawer');
+    const link = $(`.host-open[data-host="${CSS.escape(id)}"]`);
+    if (link) link.focus();
+  }
+
+  // Overview polls refresh the header; the body is only rebuilt when the
+  // machine's reachability or permission actually changed.
+  function syncDrawer() {
+    if (!dw.id) return;
+    const before = dw.sig;
+    renderDrawerHead();
+    if (dw.sig === before) return;
+    const x = hostById(dw.id);
+    if (x && x.manageable && !dw.loading && !dw.busy.size && (!dw.cfg || dw.rc !== !!x.remote_changes)) loadConfig({ quiet: !!dw.cfg });
+    else if (!dw.cfg && !dw.loading) renderDrawerBody();
+  }
+
+  function renderDrawerHead() {
+    if (!dw.id) return;
+    const x = hostById(dw.id);
+    const doc = dw.cfg && dw.cfg.config;
+    const name = (x && (x.name || x.hostname)) || (doc && doc.host && doc.host.name) || 'Machine';
+    const rc = dw.rc != null ? dw.rc : !!(x && x.remote_changes);
+    const sig = JSON.stringify([name, !!state.ov, x && [x.hostname, x.os, x.arch, x.online, x.unfit, x.draining, !!x.manageable, !!x.remote_changes], dw.rc]);
+    if (sig === dw.sig) return;
+    dw.sig = sig;
+    $('#dw-title').textContent = name;
+    $('#dw-dot').style.setProperty('--c', hostColor(dw.id));
+    const sub = $('#dw-sub');
+    if (x) {
+      const st = hostStatus(x);
+      const os = String(x.os || '').toLowerCase();
+      const extra = [x.hostname && x.hostname !== name ? x.hostname : null, x.arch, isNum(x.cores) ? `${x.cores} cores` : null].filter(Boolean).join(' · ');
+      sub.replaceChildren(...[
+        h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' }),
+        h('span', { class: `status status-${st.key}` }, h('i', { 'aria-hidden': 'true' }), st.label),
+        x.online ? accessChip(x, rc) : null,
+        extra ? h('span', { text: extra }) : null,
+      ].filter(Boolean));
+    } else sub.replaceChildren();
+    const box = $('#dw-access');
+    const note = accessNotice(x, rc);
+    box.replaceChildren(...(note ? [note] : []));
+    box.hidden = !note;
+  }
+
+  function accessNotice(x, rc) {
+    const note = (kind, title, text) => h('div', { class: `access-note${kind ? ` is-${kind}` : ''}` }, h('strong', { text: title }), h('p', { text }));
+    if (!x) return state.ov ? note('', 'Unknown machine', 'The coordinator has no machine with this id. It may have been removed.') : null;
+    if (!x.online) return note('', 'Offline', 'This machine is not connected. Its repositories can be read and changed once it reconnects.');
+    if (!x.manageable) return note('warn', 'Update needed', `This machine runs a runner-manager older than ${MANAGE_MIN}, which cannot take commands from the coordinator. Update it on the machine to see and change its repositories here.`);
+    if (rc) return null;
+    const linux = String(x.os || '').toLowerCase() === 'linux';
+    return h('div', { class: 'access-note' },
+      h('strong', {}, lockIcon(), 'Read-only'),
+      h('p', { text: 'This machine’s operator has not allowed changes through the coordinator. To allow them, run this on the machine:' }),
+      codeRow(ALLOW_CMD),
+      linux ? h('p', { class: 'access-sub', text: 'Installed as a boot service? Run it with sudo:' }) : null,
+      linux ? codeRow(`sudo ${ALLOW_CMD}`) : null);
+  }
+
+  function codeRow(text) {
+    const code = h('code', { text });
+    const label = h('span', { text: 'Copy' });
+    const btn = h('button', { type: 'button', class: 'btn-sm copy-btn', 'aria-label': `Copy ${text}` }, copyIcon(), label);
+    btn.addEventListener('click', async () => {
+      let ok = false;
+      try { await navigator.clipboard.writeText(text); ok = true; } catch (_) {
+        const r = document.createRange(); r.selectNodeContents(code);
+        const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+        try { ok = document.execCommand('copy'); } catch (__) { ok = false; }
+      }
+      label.textContent = ok ? 'Copied' : 'Selected';
+      btn.classList.toggle('is-done', ok);
+      setTimeout(() => { label.textContent = 'Copy'; btn.classList.remove('is-done'); }, 1800);
+    });
+    return h('div', { class: 'code-row' }, code, btn);
+  }
+
+  async function loadConfig(opts = {}) {
+    if (!dw.id) return;
+    const id = dw.id, gen = dw.gen, seq = ++dw.cfgSeq;
+    dw.loading = true;
+    if (!opts.quiet) { dw.error = null; if (!dw.cfg) renderDrawerBody(); }
+    const r = await call(`/api/hosts/${encodeURIComponent(id)}/config`);
+    if (gen !== dw.gen || seq !== dw.cfgSeq) return;
+    dw.loading = false;
+    if (r.ok && r.body && r.body.config && typeof r.body.config === 'object') {
+      dw.cfg = r.body; dw.rc = r.body.remote_changes === true; dw.error = null;
+    } else if (r.status !== 401) {
+      dw.error = r.ok ? { hint: 'The machine’s answer was not understood.', error: '' } : r;
+    }
+    renderDrawerHead();
+    if (opts.render !== false) renderDrawerBody();
+  }
+
+  function renderDrawerBody() {
+    if (!dw.id) return;
+    const x = hostById(dw.id);
+    let view;
+    if (dw.cfg) view = configView(x);
+    else if (dw.loading) view = skeleton();
+    else if (dw.error) view = errorPanel(dw.error);
+    else view = unavailablePanel(x);
+    $('#dw-body').replaceChildren(view);
+  }
+
+  function skeleton() {
+    const line = (w) => h('span', { class: `sk ${w}` });
+    const card = (...ws) => h('div', { class: 'card sk-card' }, ws.map(line));
+    return h('div', { class: 'dw-stack', 'aria-busy': 'true' },
+      h('p', { class: 'sr-only', role: 'status', text: 'Reading this machine’s repositories…' }),
+      card('w30', 'w60'),
+      h('div', { class: 'dw-section' }, h('span', { class: 'sk w20 sk-head' }),
+        h('div', { class: 'repos' }, card('w50', 'w70', 'w40', 'w60'), card('w40', 'w60', 'w30'), card('w50', 'w70', 'w40'))));
+  }
+
+  function errorPanel(err) {
+    return h('div', { class: 'card dw-msg', role: 'alert' },
+      h('p', { class: 'dw-msg-title', text: 'Could not read this machine’s repositories' }),
+      err.hint ? h('p', { class: 'dw-msg-text', text: err.hint }) : null,
+      err.error ? h('pre', { class: 'result-pre', text: err.error }) : null,
+      h('div', {}, h('button', { type: 'button', class: 'btn-sm', 'data-fk': 'retry', text: 'Retry', onclick: () => loadConfig() })));
+  }
+
+  function unavailablePanel(x) {
+    // The header already says why; this only says what is missing.
+    const [title, text] = !x ? ['Machine not found', 'Check the link, or open a machine from the Machines list.']
+      : ['No repositories to show', 'They are read from the machine itself.'];
+    return h('div', { class: 'card dw-msg dw-msg-center' },
+      h('span', { class: 'empty-icon', 'aria-hidden': 'true' }),
+      h('p', { class: 'dw-msg-title', text: title }),
+      h('p', { class: 'dw-msg-text', text }),
+      x ? h('div', {}, h('button', { type: 'button', class: 'btn-sm', 'data-fk': 'retry', text: 'Try anyway', onclick: () => loadConfig() })) : null);
+  }
+
+  function configView(x) {
+    const doc = dw.cfg.config || {};
+    const can = dw.rc === true;
+    const pols = (Array.isArray(doc.policies) ? doc.policies : []).filter((p) => p && p.repository);
+    const groups = [];
+    for (const p of pols) {
+      let g = groups.find((y) => y.repo === p.repository);
+      if (!g) groups.push(g = { repo: p.repository, items: [] });
+      g.items.push(p);
+    }
+    const known = new Set(pols.map(policyKey));
+    // Results whose control is gone: a removed policy, or the add form once it closed.
+    const orphans = [...dw.results.keys()].filter((k) => (k === 'add' ? !dw.add : k !== 'host' && !known.has(k)));
+    return h('div', { class: 'dw-stack' },
+      dw.error ? h('div', { class: 'result result-err', role: 'alert' },
+        h('span', { class: 'result-icon', 'aria-hidden': 'true', text: '!' }),
+        h('p', { class: 'result-msg', text: `Showing the last answer: the machine could not be read again. ${dw.error.hint || ''}` }),
+        h('button', { type: 'button', class: 'btn-sm', 'data-fk': 'retry', text: 'Retry', onclick: () => loadConfig() }),
+        dw.error.error ? h('pre', { class: 'result-pre', text: dw.error.error }) : null) : null,
+      doc.schema_version !== 1 ? h('p', { class: 'notice notice-warn', text: `This machine describes its settings in format ${doc.schema_version}; this page reads format 1, so some details may be missing.` }) : null,
+      machineCard(doc.host, can, x),
+      h('section', { class: 'dw-section', 'aria-labelledby': 'dw-h-repos' },
+        h('div', { class: 'section-head' },
+          h('h3', { id: 'dw-h-repos', text: 'Repositories' }),
+          h('span', { class: 'count num', text: groups.length ? String(groups.length) : '' }),
+          can && !dw.add ? h('button', { type: 'button', class: 'btn-sm', 'data-fk': 'add-open', onclick: openAdd }, plusIcon(), 'Add repository') : null),
+        h('div', { class: 'repos' },
+          dw.add ? addForm(pols, x) : null,
+          orphans.map(resultNote),
+          groups.length ? groups.map((g) => repoCard(g, can, x))
+            : h('div', { class: 'card' }, empty('No repositories on this machine', can ? 'Add one to start runners for it here.' : 'Repositories added on the machine appear here.')))));
+  }
+
+  function machineCard(host, can, x) {
+    const capv = host && isNum(host.capacity) ? host.capacity : null;
+    const now = x && x.online && isNum(x.busy_slots) ? ` ${x.busy_slots} busy now.` : '';
+    return h('section', { class: 'card dw-card', 'data-key': 'host', 'aria-labelledby': 'dw-h-host' },
+      h('fieldset', { class: 'fs', disabled: dw.busy.has('host') || null },
+        h('div', { class: 'cap-row' },
+          h('div', { class: 'cap-text' },
+            h('h3', { id: 'dw-h-host', class: 'cap-title', text: 'Runner capacity' }),
+            h('p', { class: 'cap-hint', text: host ? `Runners this machine may hold at once, across every repository.${now}` : 'This machine has not recorded its host settings yet.' })),
+          !host ? null : can
+            ? numberForm('host', 'cap', capv, 'runner capacity', (n) => ['host', 'set-capacity', String(n)])
+            : h('span', { class: 'cap-val num', text: capv != null ? String(capv) : '—' }))),
+      resultNote('host'));
+  }
+
+  function repoCard(g, can, x) {
+    const i = g.repo.indexOf('/');
+    const owner = i > 0 ? g.repo.slice(0, i + 1) : '', name = i > 0 ? g.repo.slice(i + 1) : g.repo;
+    return h('article', { class: 'card repo', 'aria-label': g.repo },
+      h('header', { class: 'repo-head' },
+        h('a', { class: 'repo-name', href: repoUrl(g.repo), target: '_blank', rel: 'noopener' },
+          owner ? h('span', { class: 'repo-owner', text: owner }) : null, name, extIcon(), h('span', { class: 'sr-only', text: ' (opens GitHub)' })),
+        g.items.length > 1 ? h('span', { class: 'section-meta', text: `${g.items.length} profiles` }) : null),
+      g.items.map((p) => profileBlock(p, can, x)));
+  }
+
+  function profileBlock(p, can, x) {
+    const key = policyKey(p);
+    const desc = isDefault(p) ? p.repository : `${p.repository}, profile ${p.profile}`;
+    const st = String(p.state || 'unknown');
+    const monitor = p.mode === 'monitor_only';
+    return h('div', { class: 'prof', 'data-key': key, role: 'group', 'aria-label': `Profile ${p.profile || 'default'}` },
+      h('fieldset', { class: 'fs prof-fs', disabled: dw.busy.has(key) || null },
+        h('div', { class: 'prof-head' },
+          h('span', { class: `prof-chip${isDefault(p) ? '' : ' is-named'}`, title: 'Profile' }, h('span', { class: 'chip-tag', text: 'profile' }), p.profile || 'default'),
+          h('span', { class: `badge badge-${POLICY_STATE[st] || 'dim'}`, title: 'State', text: humanize(st) }),
+          h('span', { class: 'spacer' }),
+          enableControl(key, p, can, desc)),
+        h('dl', { class: 'kv' },
+          h('dt', { text: 'Mode' }),
+          h('dd', {}, h('span', { class: 'kv-text', text: `${monitor ? 'Monitor only' : 'Autoscale'} · ${p.execution === 'isolated' ? 'isolated' : 'native'} execution` })),
+          h('dt', { text: 'Max capacity' }),
+          h('dd', {}, can
+            ? [numberForm(key, 'cap', p.max_capacity, `max capacity for ${desc}`, (n) => repoArgv(p, 'set-capacity', '--max-capacity', String(n)), '—'),
+              monitor ? h('p', { class: 'kv-hint', text: 'Setting one turns on autoscaling.' }) : null]
+            : h('span', { class: 'kv-text num', text: isNum(p.max_capacity) ? String(p.max_capacity) : 'Not set' })),
+          h('dt', { text: 'Labels' }),
+          h('dd', {}, labelsBlock(key, p, can, desc)),
+          h('dt', { text: 'Workspace' }),
+          h('dd', {}, workspaceBlock(key, p, can, desc, x))),
+        can ? removeArea(key, p) : null),
+      resultNote(key));
+  }
+
+  function enableControl(key, p, can, desc) {
+    const on = !!p.enabled;
+    if (!can) return h('span', { class: `badge badge-${on ? 'ok' : 'dim'}`, text: on ? 'Enabled' : 'Disabled' });
+    return h('button', {
+      type: 'button', class: 'switch', role: 'switch', 'aria-checked': String(on), 'aria-label': `Scaling for ${desc}`, 'data-fk': `${key}:enabled`,
+      title: on ? 'Disable: start no new runners' : 'Enable: start runners for queued jobs',
+      onclick: (e) => run(key, repoArgv(p, 'set-scale', '--enabled', String(!on)), e.currentTarget),
+    }, h('span', { class: 'switch-text', text: on ? 'Enabled' : 'Disabled' }), h('span', { class: 'switch-track', 'aria-hidden': 'true' }, h('i')));
+  }
+
+  function numberForm(key, field, value, label, toArgv, placeholder) {
+    const base = isNum(value) ? String(value) : '';
+    const input = h('input', {
+      class: 'num-input num', type: 'number', min: 1, max: 65535, step: 1, inputmode: 'numeric', value: base,
+      placeholder: placeholder || '', 'aria-label': label, 'data-fk': `${key}:${field}`,
+    });
+    const save = h('button', { type: 'submit', class: 'btn-sm btn-primary when-dirty', 'data-fk': `${key}:${field}-save`, text: 'Save' });
+    const form = h('form', { class: 'inline-form', novalidate: true });
+    const sync = () => form.classList.toggle('is-dirty', input.value !== base);
+    const bump = (d) => {
+      const n = parseInt(input.value, 10);
+      input.value = String(clamp((isNum(n) ? n : isNum(value) ? value : 0) + d, 1, 65535));
+      input.setCustomValidity('');
+      sync();
+    };
+    input.addEventListener('input', sync);
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const n = Number(input.value);
+      if (input.value === '' || !Number.isInteger(n) || n < 1 || n > 65535) return invalid(input, 'Enter a whole number from 1 to 65535.');
+      if (String(n) === base) return;
+      run(key, toArgv(n), save);
+    });
+    append(form, [h('span', { class: 'stepper' },
+      h('button', { type: 'button', class: 'step-btn', tabindex: -1, 'aria-label': `Decrease ${label}`, onclick: () => bump(-1) }, '−'),
+      input,
+      h('button', { type: 'button', class: 'step-btn', tabindex: -1, 'aria-label': `Increase ${label}`, onclick: () => bump(1) }, '+')), save]);
+    return form;
+  }
+
+  function labelsBlock(key, p, can, desc) {
+    const extra = Array.isArray(p.labels) ? p.labels : [];
+    const chipList = h('span', { class: 'chips' },
+      p.host_label ? h('span', { class: 'chip chip-host', title: 'Host label: derived from this machine, always answered, cannot be removed' }, h('span', { class: 'chip-tag', text: 'host' }), p.host_label) : null,
+      extra.map((l) => (can && p.host_label
+        ? h('span', { class: 'chip chip-x' }, l, h('button', {
+          type: 'button', class: 'chip-del', 'aria-label': `Remove label ${l}`, title: 'Remove label', 'data-fk': `${key}:del:${l}`,
+          onclick: (e) => run(key, repoArgv(p, 'remove-label', '--label', l), e.currentTarget),
+        }, xIcon(12)))
+        : h('span', { class: 'chip', text: l }))),
+      !p.host_label && !extra.length ? h('span', { class: 'kv-text muted', text: 'None while monitor only' }) : null);
+    if (!can || !p.host_label) return chipList;
+    const input = h('input', {
+      class: 'input input-label mono', type: 'text', placeholder: 'new-label', maxlength: 100, autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false',
+      'aria-label': `New label for ${desc}`, 'data-fk': `${key}:label`,
+    });
+    const btn = h('button', { type: 'submit', class: 'btn-sm', 'data-fk': `${key}:label-add` }, plusIcon(), 'Add');
+    const form = h('form', { class: 'inline-form label-form', novalidate: true }, input, btn);
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const v = input.value.trim();
+      if (!v) return input.focus();
+      if (/[\s,]/.test(v)) return invalid(input, 'One label at a time, without spaces or commas.');
+      run(key, repoArgv(p, 'add-label', '--label', v), btn);
+    });
+    return h('div', { class: 'labels-edit' }, chipList, form);
+  }
+
+  function workspaceBlock(key, p, can, desc, x) {
+    const w = p.workspace || {};
+    const kind = w.kind === 'persistent' ? 'persistent' : 'ephemeral';
+    const meta = [w.root_source ? humanize(w.root_source) : null, isNum(w.leases) ? `${w.leases} lease${w.leases === 1 ? '' : 's'}` : null].filter(Boolean).join(' · ');
+    // While editing, a persistent root is already in the path field.
+    const info = h('div', { class: 'ws-info' },
+      can && kind === 'persistent' ? null : h('span', { class: 'mono ws-root', title: w.root || null, text: w.root || '—' }),
+      h('span', { class: 'ws-meta' }, meta, w.cleanup_blocked ? h('span', { class: 'text-err', text: ` · ${w.cleanup_blocked} cleanup blocked` }) : null));
+    if (!can) return h('div', { class: 'ws' }, h('span', { class: 'kv-text', text: capWord(kind) }), info);
+    const win = x && String(x.os || '').toLowerCase() === 'windows';
+    const base = kind === 'persistent' ? (w.root || '') : '';
+    let sel = kind;
+    const path = h('input', {
+      class: 'input mono ws-path', type: 'text', value: base, autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false',
+      placeholder: win ? 'D:\\runner-work\\repo' : '/srv/runner-work/repo', 'aria-label': `Persistent workspace directory for ${desc}`, 'data-fk': `${key}:ws-path`,
+    });
+    const save = h('button', { type: 'submit', class: 'btn-sm btn-primary when-dirty', 'data-fk': `${key}:ws-save`, text: 'Apply' });
+    const form = h('form', { class: 'ws-form', novalidate: true });
+    const seg = h('div', { class: 'seg seg-sm', role: 'group', 'aria-label': `Workspace for ${desc}` },
+      ['ephemeral', 'persistent'].map((k) => h('button', {
+        type: 'button', class: 'seg-btn', 'data-k': k, 'data-fk': `${key}:ws-${k}`, text: capWord(k),
+        onclick: () => { sel = k; sync(); if (k === 'persistent') path.focus(); },
+      })));
+    const pathRow = h('div', { class: 'ws-path-row' }, path);
+    const sync = () => {
+      $$('.seg-btn', seg).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.k === sel)));
+      pathRow.hidden = sel !== 'persistent';
+      form.classList.toggle('is-dirty', sel !== kind || (sel === 'persistent' && path.value.trim() !== base));
+    };
+    path.addEventListener('input', sync);
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const v = path.value.trim();
+      if (sel === 'persistent' && !v) return invalid(path, 'A persistent workspace needs a directory on the machine.');
+      run(key, repoArgv(p, 'set-workspace', '--mode', sel, ...(sel === 'persistent' ? ['--path', v] : [])), save);
+    });
+    append(form, [h('div', { class: 'ws-row' }, seg, save), pathRow, info]);
+    sync();
+    return form;
+  }
+
+  function removeArea(key, p) {
+    const label = isDefault(p) ? 'Remove repository…' : 'Remove profile…';
+    if (dw.confirm !== key) {
+      return h('div', { class: 'prof-foot' }, h('button', {
+        type: 'button', class: 'btn-sm btn-quiet-danger', 'data-fk': `${key}:remove`, text: label,
+        onclick: () => { dw.confirm = key; rerenderBlock(key, `${key}:confirm`); },
+      }));
+    }
+    const input = h('input', {
+      class: 'input mono', type: 'text', placeholder: p.repository, autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false',
+      'aria-label': `Type ${p.repository} to confirm`, 'data-fk': `${key}:confirm`,
+    });
+    const purge = h('input', { type: 'checkbox' });
+    const go = h('button', { type: 'submit', class: 'btn-sm btn-danger', 'data-fk': `${key}:confirm-go`, text: 'Remove', disabled: true });
+    const preview = h('code', { class: 'cmd-preview' });
+    const argv = () => repoArgv(p, 'remove', ...(purge.checked ? ['--purge'] : []));
+    const sync = () => { go.disabled = input.value.trim() !== p.repository; preview.textContent = cmdLine(argv()); };
+    const cancel = () => { dw.confirm = null; rerenderBlock(key, `${key}:remove`); };
+    input.addEventListener('input', sync);
+    purge.addEventListener('change', sync);
+    const form = h('form', { class: 'confirm', novalidate: true, 'aria-label': 'Confirm removal' },
+      h('p', { class: 'confirm-title', text: isDefault(p) ? 'Remove this repository from the machine?' : `Remove profile ${p.profile}?` }),
+      h('p', { class: 'confirm-text' }, 'The machine stops starting runners for ', h('b', { text: p.repository }),
+        isDefault(p) ? '' : [' with profile ', h('b', { text: p.profile })], '. Type the repository name to confirm.'),
+      input,
+      h('label', { class: 'check' }, purge, h('span', {}, 'Also delete its runner package cache and diagnostics (', h('code', { class: 'mono', text: '--purge' }), ')')),
+      preview,
+      h('div', { class: 'form-actions' }, h('button', { type: 'button', class: 'btn-sm', text: 'Cancel', onclick: cancel }), go));
+    form.addEventListener('submit', (e) => { e.preventDefault(); if (!go.disabled) run(key, argv(), go); });
+    form.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancel(); } });
+    sync();
+    return form;
+  }
+
+  function findPolicy(key) {
+    const pols = (dw.cfg && dw.cfg.config && dw.cfg.config.policies) || [];
+    return pols.find((p) => p && policyKey(p) === key) || null;
+  }
+
+  function rerenderBlock(key, fk) {
+    const p = findPolicy(key);
+    const old = $(`[data-key="${CSS.escape(key)}"]`, $('#dw-body'));
+    if (!p || !old) { renderDrawerBody(); refocus(fk); return; }
+    old.replaceWith(profileBlock(p, dw.rc === true, hostById(dw.id)));
+    refocus(fk);
+  }
+
+  const canFocus = (el) => el && !el.disabled && (el.checkVisibility ? el.checkVisibility({ visibilityProperty: true }) : el.getClientRects().length > 0);
+  function refocus(fk, key, preferResult) {
+    const body = $('#dw-body');
+    const res = key ? $(`[data-result="${CSS.escape(key)}"]`, body) : null;
+    const el = fk ? $(`[data-fk="${CSS.escape(fk)}"]`, body) : null;
+    if (preferResult && res) return res.focus();
+    if (canFocus(el)) return el.focus();
+    if (res) return res.focus();
+    body.focus({ preventScroll: true });
+  }
+
+  // ----------------------------------------------------------- add form
+  function guessHostLabel(pols, x) {
+    for (const p of pols) {
+      if (!p.host_label) continue;
+      let l = String(p.host_label);
+      if (!isDefault(p) && l.endsWith(`-${p.profile}`)) l = l.slice(0, -(p.profile.length + 1));
+      const m = /^rm-(.+)-(?:linux|win|osx)-(?:x64|arm64|arm)$/.exec(l);
+      if (m) return m[1];
+    }
+    const slug = String((x && (x.name || x.hostname)) || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+    return slug || 'host';
+  }
+  function derivedLabel(hl, x) {
+    const os = OS_TOKEN[String((x && x.os) || '').toLowerCase()] || 'os';
+    const arch = ARCH_TOKEN[String((x && x.arch) || '').toLowerCase()] || 'arch';
+    return `rm-${hl || '…'}-${os}-${arch}`;
+  }
+
+  function openAdd() {
+    const doc = (dw.cfg && dw.cfg.config) || {};
+    dw.add = { repo: '', hostLabel: guessHostLabel(doc.policies || [], hostById(dw.id)), labels: '', cap: '2', enable: false };
+    dw.results.delete('add');
+    renderDrawerBody();
+    refocus('add:repo');
+  }
+
+  function addForm(pols, x) {
+    const d = dw.add;
+    const field = (id, label, input, hint) => h('div', { class: 'field' },
+      h('label', { class: 'field-label', for: id, text: label }), input, hint ? h('p', { class: 'field-hint' }, hint) : null);
+    const txt = { type: 'text', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' };
+    const repo = h('input', { ...txt, id: 'add-repo', class: 'input mono', value: d.repo, placeholder: 'OWNER/REPO', 'data-fk': 'add:repo' });
+    const hl = h('input', { ...txt, id: 'add-hl', class: 'input mono', value: d.hostLabel, maxlength: 64, 'data-fk': 'add:hl' });
+    const labels = h('input', { ...txt, id: 'add-labels', class: 'input mono', value: d.labels, placeholder: 'self-hosted, gpu', 'data-fk': 'add:labels' });
+    const capIn = h('input', { id: 'add-cap', class: 'input num', type: 'number', min: 1, max: 65535, step: 1, inputmode: 'numeric', value: d.cap, placeholder: 'Monitor only', 'data-fk': 'add:cap' });
+    const enable = h('input', { type: 'checkbox', checked: d.enable || null, 'data-fk': 'add:enable' });
+    const derived = h('code', { class: 'mono' });
+    const preview = h('code', { class: 'cmd-preview' });
+    const submit = h('button', { type: 'submit', class: 'btn-sm btn-primary', 'data-fk': 'add:go' }, 'Add repository');
+    const extra = () => labels.value.split(/[\s,]+/).filter(Boolean);
+    const argv = () => ['repo', 'add', repo.value.trim() || 'OWNER/REPO', '--host-label', hl.value.trim(),
+      ...(capIn.value.trim() ? ['--max-capacity', capIn.value.trim()] : []),
+      ...extra().flatMap((l) => ['--label', l]),
+      ...(enable.checked ? ['--enable'] : [])];
+    const sync = () => {
+      Object.assign(d, { repo: repo.value, hostLabel: hl.value, labels: labels.value, cap: capIn.value, enable: enable.checked });
+      derived.textContent = derivedLabel(hl.value.trim(), x);
+      preview.textContent = cmdLine(argv());
+    };
+    const form = h('form', { class: 'card form', 'data-key': 'add', novalidate: true, 'aria-labelledby': 'add-title' },
+      h('fieldset', { class: 'fs form-fs', disabled: dw.busy.has('add') || null },
+        h('div', { class: 'form-head' },
+          h('h3', { id: 'add-title', class: 'form-title', text: 'Add a repository' }),
+          h('p', { class: 'field-hint', text: 'Creates its policy on this machine. Nothing starts until scaling is enabled.' })),
+        field('add-repo', 'Repository', repo),
+        h('div', { class: 'field-row' },
+          field('add-hl', 'Host label', hl, h('span', {}, 'Runners answer ', derived)),
+          field('add-cap', 'Max capacity', capIn, 'Empty for monitor only.')),
+        field('add-labels', 'Extra labels', labels, 'Optional. Separate with commas or spaces.'),
+        h('label', { class: 'check' }, enable, h('span', {}, 'Enable scaling now')),
+        preview,
+        h('div', { class: 'form-actions' },
+          h('button', { type: 'button', class: 'btn-sm', text: 'Cancel', onclick: () => { dw.add = null; dw.results.delete('add'); renderDrawerBody(); refocus('add-open'); } }),
+          submit)),
+      resultNote('add'));
+    form.addEventListener('input', sync);
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const r = repo.value.trim();
+      if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(r)) return invalid(repo, 'Enter the repository as OWNER/REPO.');
+      if (pols.some((p) => p.repository.toLowerCase() === r.toLowerCase() && isDefault(p))) return invalid(repo, 'This machine already has this repository.');
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(hl.value.trim())) return invalid(hl, 'Letters, digits, - and _ only, up to 64.');
+      const c = capIn.value.trim();
+      if (c && !(/^\d+$/.test(c) && +c >= 1 && +c <= 65535)) return invalid(capIn, 'A whole number from 1 to 65535, or empty for monitor only.');
+      if (!c && extra().length) return invalid(labels, 'Extra labels need a max capacity: a monitor-only policy starts no runner.');
+      run('add', argv(), submit);
+    });
+    sync();
+    return form;
+  }
+
+  // ---------------------------------------------------------- run + result
+  function toResult(r, argv) {
+    if (!r.ok) return { ok: false, title: r.hint || 'The command did not reach the machine.', detail: r.error || null, argv };
+    const b = r.body || {};
+    if (b.exit_code === 0) {
+      const out = trimEnd(b.stdout).split('\n').filter((l) => l.trim());
+      return { ok: true, title: out[0] || 'Done.', detail: out.slice(1).join('\n') || null, argv, truncated: !!b.truncated };
+    }
+    return { ok: false, title: `Not changed · exit ${b.exit_code}`, detail: trimEnd(b.stderr) || trimEnd(b.stdout) || 'The machine gave no reason.', argv, truncated: !!b.truncated };
+  }
+
+  function resultNote(key) {
+    const r = dw.results.get(key);
+    if (!r) return null;
+    const el = h('div', { class: `result result-${r.ok ? 'ok' : 'err'}`, role: r.ok ? 'status' : 'alert', tabindex: -1, 'data-result': key },
+      h('span', { class: 'result-icon', 'aria-hidden': 'true', text: r.ok ? '✓' : '!' }),
+      h('p', { class: 'result-msg', text: r.title }),
+      h('button', {
+        type: 'button', class: 'result-x', 'aria-label': 'Dismiss', title: 'Dismiss',
+        onclick: () => { dw.results.delete(key); el.remove(); $('#dw-body').focus({ preventScroll: true }); },
+      }, xIcon(14)),
+      r.detail ? h('pre', { class: 'result-pre', text: r.detail }) : null,
+      r.truncated ? h('p', { class: 'result-cmd', text: 'The output was cut short.' }) : null,
+      h('p', { class: 'result-cmd', text: `$ ${cmdLine(r.argv)}` }));
+    return el;
+  }
+
+  async function run(key, argv, btn) {
+    if (!dw.id || dw.busy.has(key)) return;
+    const id = dw.id, gen = dw.gen;
+    const fk = btn && btn.dataset.fk;
+    dw.busy.add(key);
+    dw.results.delete(key);
+    const block = $(`[data-key="${CSS.escape(key)}"]`, $('#dw-body'));
+    if (block) {
+      const old = $(':scope > .result', block);
+      if (old) old.remove();
+      const fs = $('fieldset', block);
+      if (fs) fs.disabled = true;
+    }
+    if (btn) btn.setAttribute('aria-busy', 'true');
+    const r = await call(`/api/hosts/${encodeURIComponent(id)}/command`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ argv }),
+    });
+    if (gen !== dw.gen) return;
+    const res = toResult(r, argv);
+    dw.results.set(key, res);
+    if (res.ok && key === 'add') dw.add = null;
+    if (res.ok && dw.confirm === key) dw.confirm = null;
+    if (r.status !== 401) await loadConfig({ quiet: true, render: false });
+    if (gen !== dw.gen) return;
+    dw.busy.delete(key);
+    renderDrawerBody();
+    refocus(fk, key, !res.ok);
+    loadAudit();
+    if (res.ok) loadOverview();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);

@@ -25,8 +25,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
 use runner_manager_domain::coordinator_protocol::{
-    CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CONNECT_PATH, ENROLL_PATH, EnrollRequest,
-    EnrollResponse, HEALTH_PATH, HostMessage, LAUNCH_VERSION, MAX_MEMORY_ESTIMATES,
+    CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, COMMAND_VERSION, CONNECT_PATH, ENROLL_PATH,
+    EnrollRequest, EnrollResponse, HEALTH_PATH, HostMessage, LAUNCH_VERSION, MAX_MEMORY_ESTIMATES,
     MAX_MESSAGE_BYTES, MIN_PROTOCOL_VERSION, MemoryEstimates, NONCE_LEN, PROTOCOL_VERSION,
     STATS_VERSION, ServerMessage, SessionPurpose, TargetRef, WEBHOOK_PATH, WakeReason,
     decode_public_key, encode_nonce, supported, verify_challenge,
@@ -125,8 +125,13 @@ pub struct AppState {
     pub statistics: Arc<Statistics>,
     /// The web dashboard, when its sign-in is configured.
     pub dashboard: Option<crate::dashboard::Dashboard>,
+    /// Commands relayed to hosts and not yet answered.
+    pub remote: crate::remote::RemoteCommands,
     deliveries: Mutex<DeliveryLog>,
     limiter: RateLimiter,
+    /// CLI sign-ins started, per client address: apart from enrollment's, so
+    /// neither can starve the other.
+    cli_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -154,7 +159,9 @@ impl AppState {
         });
         Arc::new(Self {
             dashboard,
+            remote: crate::remote::RemoteCommands::default(),
             limiter: RateLimiter::new(config.attempts_per_minute),
+            cli_limiter: RateLimiter::new(config.attempts_per_minute),
             config,
             store,
             placement: Arc::new(
@@ -189,7 +196,14 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn client_address(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    /// Whether the client at `peer` may start another CLI sign-in this
+    /// minute.
+    pub(crate) fn allow_cli_sign_in(&self, peer: SocketAddr, headers: &HeaderMap) -> bool {
+        self.cli_limiter
+            .allow(self.client_address(peer, headers), Instant::now())
+    }
+
+    pub(crate) fn client_address(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
         if self.config.trust_forwarded_for
             && let Some(forwarded) = headers
                 .get_all("x-forwarded-for")
@@ -664,6 +678,7 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         receiver,
     )
     .await;
+    state.remote.connection_gone(&host_id, connection);
     if state.registry.unregister(&host_id, connection) {
         state.placement.host_gone(&host_id);
     }
@@ -793,6 +808,9 @@ async fn serve_host(
                             dashboard.activity.runner_started(host_id, &started.runner_name);
                         }
                     }
+                    Ok(HostMessage::CommandResult(result)) if version >= COMMAND_VERSION => {
+                        state.remote.complete(host_id, result);
+                    }
                     Ok(HostMessage::AttemptFinished(finished)) if version >= LAUNCH_VERSION => {
                         state.placement.attempt_finished(host_id, &finished);
                         state.statistics.attempt_finished(
@@ -810,7 +828,8 @@ async fn serve_host(
                         | HostMessage::Unknown
                         | HostMessage::LaunchAck(_)
                         | HostMessage::AttemptStarted(_)
-                        | HostMessage::AttemptFinished(_),
+                        | HostMessage::AttemptFinished(_)
+                        | HostMessage::CommandResult(_),
                     )
                     | Err(_) => {}
                 }

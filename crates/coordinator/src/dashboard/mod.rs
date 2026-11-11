@@ -10,6 +10,7 @@
 
 pub mod activity;
 pub mod auth;
+pub mod cli;
 pub mod metrics;
 
 use std::collections::BTreeMap;
@@ -26,7 +27,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::server::AppState;
-use crate::store::{DashboardSession, HostRecord, MetricSample};
+use crate::store::{DashboardSession, HostRecord, MetricSample, SessionKind};
 use activity::Activity;
 use auth::AuthConfig;
 use metrics::Range;
@@ -38,6 +39,8 @@ const ICON_SVG: &str = include_str!("../../assets/icon.svg");
 
 const SESSION_COOKIE: &str = "rm_session";
 const STATE_COOKIE: &str = "rm_oauth_state";
+/// Where the browser goes after GitHub, when not the dashboard.
+const NEXT_COOKIE: &str = "rm_oauth_next";
 
 /// What every dashboard response carries.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
@@ -54,6 +57,8 @@ pub const UPDATE_STATUS: &str = "/run/coordinator-update/status.json";
 pub struct Dashboard {
     pub auth: AuthConfig,
     pub activity: Activity,
+    /// CLI sign-ins waiting for a person to approve them.
+    pub cli: cli::CliSignIns,
     http: reqwest::Client,
     started_at: i64,
     update_status: PathBuf,
@@ -65,6 +70,7 @@ impl Dashboard {
         Self {
             auth,
             activity: Activity::default(),
+            cli: cli::CliSignIns::default(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
@@ -97,6 +103,9 @@ pub fn routes(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
         .route("/api/session", get(session))
         .route("/api/overview", get(overview))
         .route("/api/metrics", get(metrics_route))
+        .route("/api/hosts/{id}/config", get(host_config))
+        .route("/api/hosts/{id}/command", post(host_command))
+        .route("/api/audit", get(audit))
         .route_layer(from_fn_with_state(Arc::clone(state), require_session));
     axum::Router::new()
         .route("/", asset(INDEX_HTML, "text/html; charset=utf-8"))
@@ -109,6 +118,12 @@ pub fn routes(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
         .route("/auth/login", get(login))
         .route("/auth/callback", get(callback))
         .route("/auth/logout", post(logout))
+        .route("/auth/cli", get(cli::page))
+        .route("/auth/cli/start", post(cli::start))
+        .route("/auth/cli/approve", post(cli::approve))
+        .route("/auth/cli/poll", post(cli::poll))
+        .route("/auth/cli/logout", post(cli::logout))
+        .route("/assets/cli.css", get(cli::css))
         .merge(api)
         .layer(map_response(secure_headers))
 }
@@ -119,7 +134,6 @@ async fn secure_headers(mut response: Response) -> Response {
         ("content-security-policy", CSP),
         ("x-content-type-options", "nosniff"),
         ("x-frame-options", "DENY"),
-        ("referrer-policy", "no-referrer"),
         ("cross-origin-opener-policy", "same-origin"),
         (
             "permissions-policy",
@@ -128,6 +142,11 @@ async fn secure_headers(mut response: Response) -> Response {
     ] {
         headers.insert(name, HeaderValue::from_static(value));
     }
+    // `no-referrer` unless a page chose a stricter-than-default one of its
+    // own: the CLI sign-in page's form needs its Origin sent.
+    headers
+        .entry(header::REFERRER_POLICY)
+        .or_insert(HeaderValue::from_static("no-referrer"));
     response
 }
 
@@ -139,16 +158,34 @@ fn dashboard(state: &AppState) -> &Dashboard {
         .expect("dashboard routes are merged only when the dashboard exists")
 }
 
+/// How a request proved its session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Credential {
+    /// A browser's session cookie: a cross-site page can make the browser
+    /// send it, so a change also needs this origin.
+    Cookie,
+    /// The CLI's `Authorization: Bearer` token: never sent by a browser on
+    /// its own, so no origin is asked for.
+    Bearer,
+}
+
 /// Lets an `/api/*` request through only with a live session of an allowed
-/// login, which it hands on as an extension.
+/// login, which it hands on as an extension with its [`Credential`]. A
+/// request with an `Authorization` header is judged by it alone.
 async fn require_session(
     State(state): State<Arc<AppState>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    match signed_in(&state, request.headers()) {
-        Some(session) => {
+    let signed_in = if request.headers().contains_key(header::AUTHORIZATION) {
+        cli_session(&state, request.headers()).map(|session| (session, Credential::Bearer))
+    } else {
+        web_session(&state, request.headers()).map(|session| (session, Credential::Cookie))
+    };
+    match signed_in {
+        Some((session, credential)) => {
             request.extensions_mut().insert(session);
+            request.extensions_mut().insert(credential);
             next.run(request).await
         }
         None => (
@@ -159,12 +196,31 @@ async fn require_session(
     }
 }
 
-/// The signed-in session of a request, if any.
-fn signed_in(state: &AppState, headers: &HeaderMap) -> Option<DashboardSession> {
+/// The bearer token of a request, when it carries one of the right shape.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|token| token.len() == 64)
+}
+
+/// The browser session of a request (its cookie), if any.
+fn web_session(state: &AppState, headers: &HeaderMap) -> Option<DashboardSession> {
     let token = auth::cookie(headers, SESSION_COOKIE).filter(|token| token.len() == 64)?;
+    live_session(state, token, SessionKind::Web)
+}
+
+/// The CLI session of a request (its bearer token), if any.
+fn cli_session(state: &AppState, headers: &HeaderMap) -> Option<DashboardSession> {
+    live_session(state, bearer_token(headers)?, SessionKind::Cli)
+}
+
+fn live_session(state: &AppState, token: &str, kind: SessionKind) -> Option<DashboardSession> {
     let session = state
         .store()
-        .session(&auth::token_hash(token), Utc::now().timestamp())
+        .session(&auth::token_hash(token), kind, Utc::now().timestamp())
         .ok()
         .flatten()?;
     // Taken off the allowlist since: out at once.
@@ -198,18 +254,35 @@ fn redirect(to: &str, cookies: &[String]) -> Response {
     with_cookies(Redirect::to(to).into_response(), cookies)
 }
 
-async fn login(State(state): State<Arc<AppState>>) -> Response {
+#[derive(Debug, Deserialize)]
+struct LoginQuery {
+    /// Where to come back to after GitHub: `/`, or the CLI sign-in page.
+    next: Option<String>,
+}
+
+async fn login(State(state): State<Arc<AppState>>, Query(query): Query<LoginQuery>) -> Response {
     let oauth_state = auth::token();
     let url = auth::authorize_url(&dashboard(&state).auth, &redirect_uri(&state), &oauth_state);
-    redirect(
-        &url,
-        &[auth::set_cookie(
-            STATE_COOKIE,
-            &oauth_state,
-            auth::STATE_SECS,
-            secure_origin(&state),
-        )],
-    )
+    let secure = secure_origin(&state);
+    let mut cookies = vec![auth::set_cookie(
+        STATE_COOKIE,
+        &oauth_state,
+        auth::STATE_SECS,
+        secure,
+    )];
+    match query.next.as_deref() {
+        // Anything else is ignored: the dashboard, as before.
+        Some(next) if cli::valid_next(next) && next != "/" => {
+            cookies.push(auth::set_cookie(
+                NEXT_COOKIE,
+                next,
+                auth::STATE_SECS,
+                secure,
+            ));
+        }
+        _ => cookies.push(auth::set_cookie(NEXT_COOKIE, "", 0, secure)),
+    }
+    redirect(&url, &cookies)
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,6 +299,11 @@ async fn callback(
     let dashboard = dashboard(&state);
     let secure = secure_origin(&state);
     let clear_state = auth::set_cookie(STATE_COOKIE, "", 0, secure);
+    // Checked again: a cookie is the browser's to change.
+    let next = auth::cookie(&headers, NEXT_COOKIE)
+        .filter(|next| cli::valid_next(next))
+        .unwrap_or("/")
+        .to_owned();
     let expected = auth::cookie(&headers, STATE_COOKIE);
     let (Some(code), Some(returned), Some(expected)) = (&query.code, &query.state, expected) else {
         return redirect("/?error=1", &[clear_state]);
@@ -266,6 +344,7 @@ async fn callback(
         .create_session(
             &auth::token_hash(&token),
             &session,
+            SessionKind::Web,
             now,
             now + auth::SESSION_SECS,
         )
@@ -275,9 +354,10 @@ async fn callback(
     }
     tracing::info!("a dashboard session was opened");
     redirect(
-        "/",
+        &next,
         &[
             clear_state,
+            auth::set_cookie(NEXT_COOKIE, "", 0, secure),
             auth::set_cookie(SESSION_COOKIE, &token, auth::SESSION_SECS, secure),
         ],
     )
@@ -285,10 +365,7 @@ async fn callback(
 
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     // A cross-site form cannot sign anyone out.
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok());
-    if origin != Some(state.config.public_origin.trim_end_matches('/')) {
+    if !same_origin(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
     if let Some(token) = auth::cookie(&headers, SESSION_COOKIE) {
@@ -353,6 +430,10 @@ struct HostView {
     last_seen_at: Option<i64>,
     enrolled_at: i64,
     connected_since: Option<i64>,
+    /// Connected and new enough to take commands (protocol version 5).
+    manageable: bool,
+    /// Its operator allowed changes through the coordinator.
+    remote_changes: bool,
 }
 
 /// A job with the host its runner belongs to, when its host said.
@@ -417,6 +498,8 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
                 last_seen_at: record.last_seen_at.map(|at| at.timestamp()),
                 enrolled_at: record.enrolled_at.timestamp(),
                 connected_since: link.map(|host| host.since.timestamp()),
+                manageable: state.registry.takes_commands(&record.id) == Some(true),
+                remote_changes: hello.is_some_and(|hello| hello.remote_changes),
             }
         })
         .collect();
@@ -557,4 +640,145 @@ pub fn record_minute(state: &AppState) {
     {
         tracing::warn!(%error, "the dashboard's minute of history was not saved");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Remote commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct CommandBody {
+    argv: Vec<String>,
+}
+
+/// Runs a command on a host for the signed-in person, and records it when
+/// `recorded`: the dashboard's own read of a machine, on every opening and
+/// after every change, is not, or it would push the changes out of the
+/// record (the host keeps no reads either).
+async fn run_on_host(
+    state: &AppState,
+    host_id: &str,
+    argv: Vec<String>,
+    login: &str,
+    recorded: bool,
+) -> Result<runner_manager_domain::coordinator_protocol::CommandResult, crate::remote::RemoteError>
+{
+    let outcome = state
+        .remote
+        .run(
+            &state.registry,
+            host_id,
+            argv.clone(),
+            login,
+            crate::remote::COMMAND_TIMEOUT,
+        )
+        .await;
+    if !recorded {
+        return outcome;
+    }
+    let record = crate::store::RemoteCommandRecord {
+        at: Utc::now().timestamp(),
+        login: login.to_owned(),
+        host_id: host_id.to_owned(),
+        argv,
+        outcome: match &outcome {
+            Ok(result) => format!("exit {}", result.exit_code),
+            Err(error) => error.code().to_owned(),
+        },
+        access: outcome
+            .as_ref()
+            .ok()
+            .and_then(|result| result.access.clone()),
+    };
+    if let Err(error) = state.store().record_remote_command(&record) {
+        tracing::warn!(%error, "a remote command was not recorded");
+    }
+    // The host and the outcome only: arguments are text off the wire.
+    tracing::info!(host_id, outcome = %record.outcome, "a remote command ran");
+    outcome
+}
+
+fn remote_failure(error: crate::remote::RemoteError) -> Response {
+    error_json(error.status(), &error.to_string())
+}
+
+/// A JSON error answer, never cached.
+fn error_json(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
+}
+
+/// Whether a state-changing request came from this origin: a cross-site page
+/// can send the cookie with a form, never this header.
+fn same_origin(state: &AppState, headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        == Some(state.config.public_origin.trim_end_matches('/'))
+}
+
+async fn host_command(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<DashboardSession>,
+    Extension(credential): Extension<Credential>,
+    axum::extract::Path(host_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CommandBody>,
+) -> Response {
+    if credential == Credential::Cookie && !same_origin(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match run_on_host(&state, &host_id, body.argv, &session.login, true).await {
+        Ok(result) => json(&result),
+        Err(error) => remote_failure(error),
+    }
+}
+
+async fn host_config(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<DashboardSession>,
+    axum::extract::Path(host_id): axum::extract::Path<String>,
+) -> Response {
+    let argv = ["repo", "list", "--json"].map(String::from).to_vec();
+    match run_on_host(&state, &host_id, argv, &session.login, false).await {
+        Ok(result) if result.exit_code == 0 => {
+            let Ok(config) = serde_json::from_str::<serde_json::Value>(&result.stdout) else {
+                return error_json(
+                    StatusCode::BAD_GATEWAY,
+                    "the host's answer was not understood",
+                );
+            };
+            json(&serde_json::json!({
+                "remote_changes": state.registry.remote_changes(&host_id),
+                "config": config,
+            }))
+        }
+        Ok(result) => error_json(StatusCode::BAD_GATEWAY, result.stderr.trim()),
+        Err(error) => remote_failure(error),
+    }
+}
+
+async fn audit(State(state): State<Arc<AppState>>) -> Response {
+    let records = state.store().remote_commands(100).unwrap_or_default();
+    let names = host_names(&state.store().hosts().unwrap_or_default());
+    let records: Vec<_> = records
+        .into_iter()
+        .map(|record| {
+            let host_name = names.get(&record.host_id).cloned();
+            serde_json::json!({
+                "at": record.at,
+                "login": record.login,
+                "host_id": record.host_id,
+                "host_name": host_name,
+                "argv": record.argv,
+                "outcome": record.outcome,
+                "access": record.access,
+            })
+        })
+        .collect();
+    json(&serde_json::json!({ "commands": records }))
 }

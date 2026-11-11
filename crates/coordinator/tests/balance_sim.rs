@@ -748,6 +748,7 @@ impl Sim {
                         }],
                     })
                     .collect(),
+                remote_changes: false,
             },
         );
         let host = &mut self.hosts[index];

@@ -287,6 +287,34 @@ impl Registry {
         false
     }
 
+    /// Whether `host_id`'s operator allowed changes through the coordinator,
+    /// by its last `hello`.
+    #[must_use]
+    pub fn remote_changes(&self, host_id: &str) -> bool {
+        self.lock()
+            .get(host_id)
+            .and_then(|connected| connected.hello.as_ref())
+            .is_some_and(|hello| hello.remote_changes)
+    }
+
+    /// Whether `host_id` takes remote commands (protocol version 5), or
+    /// `None` when it is not connected.
+    #[must_use]
+    pub fn takes_commands(&self, host_id: &str) -> Option<bool> {
+        self.link(host_id).map(|(_, version)| {
+            version >= runner_manager_domain::coordinator_protocol::COMMAND_VERSION
+        })
+    }
+
+    /// The token and negotiated protocol version of `host_id`'s connection,
+    /// when it is connected.
+    #[must_use]
+    pub fn link(&self, host_id: &str) -> Option<(u64, u32)> {
+        self.lock()
+            .get(host_id)
+            .map(|connected| (connected.connection, connected.version))
+    }
+
     /// Queues `message` for `host_id`'s connection; `false` when it is not
     /// connected or its queue is full.
     pub fn send(&self, host_id: &str, message: ServerMessage) -> bool {
@@ -678,6 +706,7 @@ mod tests {
                     warm: false,
                 }],
             }],
+            remote_changes: false,
         }
     }
 

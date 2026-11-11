@@ -44,6 +44,7 @@ pub mod auth;
 pub mod auto_update;
 pub mod cache;
 pub mod coordinator;
+pub mod coordinator_session;
 pub mod daemon;
 pub mod docker_cleanup;
 pub mod docker_policy;
@@ -56,6 +57,7 @@ pub mod policy;
 pub mod polling;
 pub mod profile;
 pub mod protect_path;
+pub mod remote;
 pub mod service;
 pub mod status;
 pub mod ui;
@@ -511,7 +513,7 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", global = true, env = DATA_DIR_VARIABLE)]
     pub data_dir: Option<PathBuf>,
 
-    /// Which host this command is addressed to: `local`, or `wsl:NAME`.
+    /// Which host this command is addressed to: `local`, `wsl:NAME`, or `remote:NAME`.
     ///
     /// `local` is the default and is this machine, exactly as before. With
     /// `wsl:NAME` the command is carried out inside that managed WSL2
@@ -519,7 +521,10 @@ pub struct Cli {
     /// so `--host wsl:Ubuntu repo list` lists the Linux host's policies.
     /// `auth login` is the exception: the sign-in happens here, where the
     /// browser is, and the credential it issues is handed straight to the
-    /// Linux host without being stored on this one.
+    /// Linux host without being stored on this one. With `remote:NAME` the
+    /// command goes through the coordinator (`coordinator login` first) to
+    /// the host it knows as NAME, which runs only repository and capacity
+    /// commands, and changes only when its operator allowed them there.
     #[arg(
         long,
         value_name = "HOST",
@@ -538,6 +543,9 @@ pub const LOCAL_HOST_SELECTOR: &str = "local";
 
 /// The prefix that addresses a managed WSL distribution.
 pub const WSL_HOST_PREFIX: &str = "wsl:";
+
+/// The prefix that addresses a host through the coordinator.
+pub const REMOTE_HOST_PREFIX: &str = "remote:";
 
 /// The long option `--host` is spelled with, as it appears in an argument
 /// vector.
@@ -563,6 +571,9 @@ pub enum HostSelector {
     Local,
     /// The named WSL2 distribution on this machine.
     Wsl(String),
+    /// A host the coordinator this account signed in to knows by this name
+    /// (or id).
+    Remote(String),
 }
 
 impl HostSelector {
@@ -590,9 +601,20 @@ impl HostSelector {
             }
             return Ok(Self::Wsl(name.to_string()));
         }
+        if let Some(name) = raw.strip_prefix(REMOTE_HOST_PREFIX) {
+            if name.is_empty() {
+                return Err(format!(
+                    "`{REMOTE_HOST_PREFIX}` needs the host's name after it, as \
+                     `--host {REMOTE_HOST_PREFIX}build-box`. `runner-manager coordinator hosts` \
+                     names the ones the coordinator has."
+                ));
+            }
+            return Ok(Self::Remote(name.to_string()));
+        }
         Err(format!(
-            "expected `{LOCAL_HOST_SELECTOR}` or `{WSL_HOST_PREFIX}<distribution>`, not \
-             {raw:?}. `runner-manager wsl list` names the distributions this machine has."
+            "expected `{LOCAL_HOST_SELECTOR}`, `{WSL_HOST_PREFIX}<distribution>` or \
+             `{REMOTE_HOST_PREFIX}<host>`, not {raw:?}. `runner-manager wsl list` names the \
+             distributions this machine has."
         ))
     }
 
@@ -600,7 +622,7 @@ impl HostSelector {
     #[must_use]
     pub fn distribution(&self) -> Option<&str> {
         match self {
-            Self::Local => None,
+            Self::Local | Self::Remote(_) => None,
             Self::Wsl(name) => Some(name),
         }
     }
@@ -611,6 +633,7 @@ impl fmt::Display for HostSelector {
         match self {
             Self::Local => f.write_str(LOCAL_HOST_SELECTOR),
             Self::Wsl(name) => write!(f, "{WSL_HOST_PREFIX}{name}"),
+            Self::Remote(name) => write!(f, "{REMOTE_HOST_PREFIX}{name}"),
         }
     }
 }
@@ -678,6 +701,46 @@ pub enum CoordinatorCommand {
     Leave,
     /// Show the coordinator's job statistics and recent placements.
     Stats(CoordinatorStatusArgs),
+    /// Allow or deny changes to this host through the coordinator.
+    ///
+    /// People signed in to the coordinator may then change this host's
+    /// repositories, labels, limits and workspaces. Reads are always answered.
+    RemoteChanges(CoordinatorRemoteChangesArgs),
+    /// Sign in to a coordinator with GitHub, to manage its hosts from here.
+    Login(CoordinatorLoginArgs),
+    /// Sign out of the coordinator and forget its session.
+    Logout,
+    /// List the coordinator's hosts: online, manageable, remote changes.
+    Hosts(CoordinatorHostsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CoordinatorLoginArgs {
+    /// The coordinator's https URL; by default the one this host joined.
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CoordinatorHostsArgs {
+    /// Emit the versioned JSON document instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CoordinatorRemoteChangesArgs {
+    /// `allow`, `deny`, or `status` to show the current choice.
+    #[arg(value_name = "CHOICE", value_enum)]
+    pub choice: RemoteChangesChoice,
+}
+
+/// What `coordinator remote-changes` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RemoteChangesChoice {
+    Allow,
+    Deny,
+    Status,
 }
 
 #[derive(Debug, Args)]
@@ -1354,7 +1417,7 @@ pub enum RepoCommand {
     /// Create a repository-scoped policy in `pending`. Never enables scaling.
     Add(RepoAddArgs),
     /// List repository-scoped policies.
-    List,
+    List(RepoListArgs),
     /// Set a policy's `max_capacity`, promoting monitor-only to autoscale.
     SetCapacity(RepoSetCapacityArgs),
     /// Arm or drain a policy.
@@ -1373,6 +1436,15 @@ pub enum RepoCommand {
     /// Persistent dependency caches for this repository's runners.
     #[command(subcommand)]
     Cache(RepoCacheCommand),
+}
+
+#[derive(Debug, Args, Default)]
+pub struct RepoListArgs {
+    /// One JSON document (`schema_version` 1) instead of the table: the host's
+    /// capacity and every repository policy with its profile, labels, limit
+    /// and workspace.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2297,6 +2369,11 @@ pub fn dispatch() -> ExitCode {
     if let Some(distribution) = cli.host.distribution() {
         return wsl::dispatch_to_selected_host(&cli, distribution, &argv);
     }
+    // The same for a host through the coordinator: nothing of this one is
+    // opened, and the exit code is the remote command's own.
+    if let HostSelector::Remote(name) = &cli.host {
+        return coordinator_session::dispatch_to_remote_host(&cli, name, &argv);
+    }
 
     // The elevated copy `host prepare` starts carries its whole plan on its
     // command line and must touch no local state: as root on macOS a database
@@ -2454,8 +2531,13 @@ fn is_decorated_report(command: &Command) -> bool {
         Command::Wsl(WslCommand::Status(args)) => !args.json,
         Command::Wsl(WslCommand::List | WslCommand::Detach(_)) => true,
         Command::Coordinator(CoordinatorCommand::Status(args)) => !args.json,
-        Command::Coordinator(CoordinatorCommand::Leave) => true,
+        Command::Coordinator(
+            CoordinatorCommand::Leave
+            | CoordinatorCommand::RemoteChanges(_)
+            | CoordinatorCommand::Logout,
+        ) => true,
         Command::Coordinator(CoordinatorCommand::Stats(args)) => !args.json,
+        Command::Coordinator(CoordinatorCommand::Hosts(args)) => !args.json,
         // `host prepare` asks questions and waits for an elevation prompt, and
         // `host doctor --json` is a document; neither may be buffered or
         // decorated.
@@ -2490,7 +2572,7 @@ fn route(
         Command::Service(command) => service::dispatch(context, command, out),
         Command::Update(args) => update::dispatch(context, args, out),
         Command::Wsl(command) => wsl::dispatch(context, command, styling, out),
-        Command::Coordinator(command) => coordinator::dispatch(context, command, out),
+        Command::Coordinator(command) => coordinator::dispatch(context, command, styling, out),
         Command::WslHost(command) => wsl::dispatch_wsl_host(context, command, out),
         // `dispatch` returns the terminal UI's own exit code before reaching
         // here, so that `g1` owns what `tui` exits with.

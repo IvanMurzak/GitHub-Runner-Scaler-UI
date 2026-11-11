@@ -199,6 +199,7 @@ fn hello(version: u32, host_id: &str) -> HostMessage {
                 warm: false,
             }],
         }],
+        remote_changes: false,
     })
 }
 
@@ -974,7 +975,7 @@ async fn query_stats(
 #[tokio::test]
 async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_query() {
     use runner_manager_domain::coordinator_protocol::{
-        AttemptFinished, AttemptOutcomeKind, AttemptUsage, STATS_VERSION,
+        AttemptFinished, AttemptOutcomeKind, AttemptUsage,
     };
 
     let coordinator = start().await;
@@ -984,7 +985,7 @@ async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_quer
     assert!(matches!(
         next(&mut link).await,
         ServerMessage::Welcome {
-            protocol_version: STATS_VERSION,
+            protocol_version: PROTOCOL_VERSION,
             ..
         }
     ));
@@ -1261,4 +1262,201 @@ async fn a_version_four_host_is_told_its_targets_memory_estimates() {
     ));
     let more = tokio::time::timeout(Duration::from_millis(300), socket.next()).await;
     assert!(more.is_err(), "nothing more for a version-3 host: {more:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Remote commands (protocol version 5)
+// ---------------------------------------------------------------------------
+
+/// A coordinator with its dashboard configured (GitHub is never asked here)
+/// and a CLI session for `ivanmurzak`; its bearer token.
+async fn start_with_a_cli_session() -> (Coordinator, String) {
+    use runner_manager_coordinator::dashboard::auth::{self, AuthConfig};
+    use runner_manager_coordinator::store::{DashboardSession, SessionKind};
+    let coordinator = start_configured(Store::open_in_memory().expect("store"), |config| {
+        config.dashboard = Some(AuthConfig {
+            client_id: "Iv1.client".into(),
+            client_secret: SecretString::from("a-client-secret"),
+            allowed_logins: vec!["IvanMurzak".into()],
+            web_base: "http://127.0.0.1:9".into(),
+            api_base: "http://127.0.0.1:9".into(),
+        });
+    })
+    .await;
+    let token = auth::token();
+    let now = Utc::now().timestamp();
+    coordinator
+        .state
+        .store
+        .lock()
+        .expect("store")
+        .create_session(
+            &auth::token_hash(&token),
+            &DashboardSession {
+                login: "ivanmurzak".into(),
+                avatar_url: None,
+            },
+            SessionKind::Cli,
+            now,
+            now + 3600,
+        )
+        .expect("session");
+    (coordinator, token)
+}
+
+async fn command_over_http(
+    coordinator: &Coordinator,
+    token: &str,
+    host_id: &str,
+    argv: &[&str],
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/api/hosts/{host_id}/command", coordinator.base))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "argv": argv }))
+        .send()
+        .await
+        .expect("sent")
+}
+
+/// Connects `host_id` at `version` and sends its hello.
+async fn linked(
+    coordinator: &Coordinator,
+    version: u32,
+    host_id: &str,
+    key: &HostSigningKey,
+) -> Socket {
+    let mut socket = coordinator.connect_at(version, host_id, key).await;
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerMessage::Welcome { .. }
+    ));
+    let mut hello = hello(version, host_id);
+    if let HostMessage::Hello(hello) = &mut hello {
+        hello.remote_changes = true;
+    }
+    socket
+        .send(Message::Text(hello.encode().into()))
+        .await
+        .expect("hello");
+    wait_for_hello(coordinator).await;
+    socket
+}
+
+#[tokio::test]
+async fn a_command_posted_over_http_is_relayed_to_the_host_and_its_result_returned() {
+    use runner_manager_domain::coordinator_protocol::{COMMAND_VERSION, CommandResult};
+
+    let (coordinator, token) = start_with_a_cli_session().await;
+    let (host_id, key) = enrolled(&coordinator, "ivan-ms-a2", 51).await;
+
+    // Enrolled, not connected: 503.
+    let offline = command_over_http(&coordinator, &token, &host_id, &["repo", "list"]).await;
+    assert_eq!(offline.status(), 503);
+
+    let mut socket = linked(&coordinator, COMMAND_VERSION, &host_id, &key).await;
+    let overview: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/api/overview", coordinator.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("sent")
+        .json()
+        .await
+        .expect("json");
+    let listed = &overview["hosts"][0];
+    assert_eq!(listed["name"], "ivan-ms-a2");
+    assert_eq!(listed["online"], true);
+    assert_eq!(listed["manageable"], true);
+    assert_eq!(listed["remote_changes"], true);
+
+    let asked = tokio::spawn({
+        let base = coordinator.base.clone();
+        let token = token.clone();
+        let host_id = host_id.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{base}/api/hosts/{host_id}/command"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "argv": ["repo", "set-capacity", "octo/app", "--max-capacity", "4"]
+                }))
+                .send()
+                .await
+                .expect("sent")
+        }
+    });
+    let command = loop {
+        if let ServerMessage::RunCommand(command) = next(&mut socket).await {
+            break command;
+        }
+    };
+    assert_eq!(
+        command.argv,
+        ["repo", "set-capacity", "octo/app", "--max-capacity", "4"]
+    );
+    assert_eq!(command.by, "ivanmurzak");
+    socket
+        .send(Message::Text(
+            HostMessage::CommandResult(CommandResult {
+                request_id: command.request_id.clone(),
+                exit_code: 0,
+                stdout: "octo/app: max_capacity 4\n".into(),
+                stderr: String::new(),
+                truncated: false,
+                access: Some("change".into()),
+            })
+            .encode()
+            .into(),
+        ))
+        .await
+        .expect("result");
+    let answered = asked.await.expect("joined");
+    assert_eq!(answered.status(), 200);
+    let answered: serde_json::Value = answered.json().await.expect("json");
+    assert_eq!(answered["request_id"], command.request_id.as_str());
+    assert_eq!(answered["exit_code"], 0);
+    assert_eq!(answered["stdout"], "octo/app: max_capacity 4\n");
+    assert_eq!(answered["stderr"], "");
+    assert_eq!(answered["truncated"], false);
+
+    let audit: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/api/audit", coordinator.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("sent")
+        .json()
+        .await
+        .expect("json");
+    let commands = audit["commands"].as_array().expect("commands");
+    assert_eq!(commands.len(), 2, "{audit}");
+    assert_eq!(commands[0]["login"], "ivanmurzak");
+    assert_eq!(commands[0]["host_name"], "ivan-ms-a2");
+    assert_eq!(commands[0]["argv"][1], "set-capacity");
+    assert_eq!(commands[0]["outcome"], "exit 0");
+    assert_eq!(
+        commands[0]["access"], "change",
+        "the host's judgement is kept"
+    );
+    assert_eq!(commands[1]["outcome"], "offline");
+    assert!(commands[1]["access"].is_null(), "no host judged it");
+}
+
+#[tokio::test]
+async fn a_host_older_than_commands_is_refused_with_a_conflict() {
+    let (coordinator, token) = start_with_a_cli_session().await;
+    let (host_id, key) = enrolled(&coordinator, "old-box", 52).await;
+    let _socket = linked(&coordinator, 4, &host_id, &key).await;
+    let refused = command_over_http(&coordinator, &token, &host_id, &["repo", "list"]).await;
+    assert_eq!(refused.status(), 409);
+    let body: serde_json::Value = refused.json().await.expect("json");
+    assert!(
+        body["error"].as_str().expect("error").contains("too old"),
+        "{body}"
+    );
+    let unauthenticated = command_over_http(&coordinator, &"0".repeat(64), &host_id, &["status"])
+        .await
+        .status();
+    assert_eq!(unauthenticated, 401);
 }

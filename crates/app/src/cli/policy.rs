@@ -50,7 +50,8 @@ pub fn dispatch_repo(
             ExecutionPolicy::Native,
             out,
         ),
-        RepoCommand::List => list(context, TargetScope::Repository, out),
+        RepoCommand::List(args) if args.json => list_json(context, out),
+        RepoCommand::List(_) => list(context, TargetScope::Repository, out),
         RepoCommand::SetCapacity(a) => apply_policy_mutation_selected(
             context,
             &ScaleTarget::repository(&a.repository).map_err(invalid)?,
@@ -1111,6 +1112,60 @@ fn write_add_result(
         writeln!(out, "Organization scope uses the narrower Organization -> Self-hosted runners grant and is the safer choice where both scopes work.").map_err(failed)?;
     }
     Ok(())
+}
+
+/// `repo list --json`: the repository policies as one document, for a
+/// script or the coordinator's dashboard. Schema version 1; fields are only
+/// ever added.
+fn list_json(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+    let store = context.store()?;
+    let host = super::host::local_host(&store)?;
+    let host_root = workspace::host_root(context.paths(), host.as_ref());
+    let mut policies = Vec::new();
+    for policy in store.policies().map_err(store_failure)? {
+        if policy.target.scope() != TargetScope::Repository {
+            continue;
+        }
+        let view = workspace::repository_workspace(&store, &host_root, &policy)?;
+        let labels = policy.routing_labels();
+        policies.push(serde_json::json!({
+            "repository": policy.target.to_string(),
+            "profile": policy.profile_name(),
+            "mode": if labels.is_some() { "autoscale" } else { "monitor_only" },
+            "state": policy.state().to_string(),
+            "enabled": policy.enabled(),
+            "max_capacity": policy.max_capacity(),
+            "execution": if policy.execution_policy().is_native() { "native" } else { "isolated" },
+            "host_label": labels.map(|labels| labels.host_label().to_string()),
+            "labels": labels
+                .map(|labels| labels.additional().map(ToString::to_string).collect::<Vec<_>>())
+                .unwrap_or_default(),
+            "workspace": {
+                "kind": view.kind().to_string(),
+                "root": view.effective_root().map_or_else(|| view.host_root.rendered(), str::to_string),
+                "root_source": view.root_source_badge().to_string(),
+                "leases": view.leases.len(),
+                "cleanup_blocked": view.leases.iter().filter(|lease| lease.cleanup_blocked).count(),
+            },
+        }));
+    }
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "host": host.as_ref().map(|host| serde_json::json!({
+            "name": host.display_name.to_string(),
+            "capacity": host.host_capacity(),
+        })),
+        "policies": policies,
+    });
+    writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(&document).map_err(|error| CliError::new(
+            Failure::LocalState,
+            format!("cannot encode the policy list: {error}")
+        ))?
+    )
+    .map_err(write_failed("this policy list"))
 }
 
 fn list(context: &Context, scope: TargetScope, out: &mut dyn Write) -> Result<(), CliError> {

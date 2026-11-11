@@ -16,7 +16,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
 
 /// The prefix every invite code carries, so one is recognisable in a paste.
 pub const INVITE_PREFIX: &str = "rmc_";
@@ -230,6 +230,32 @@ impl Store {
                 );
                 PRAGMA user_version = 6;",
             )?;
+        }
+        if version < 7 {
+            // 0.4.61: every command a person ran on a host through the
+            // coordinator, by whom, and how it ended.
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS remote_commands (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    at INTEGER NOT NULL,
+                    login TEXT NOT NULL,
+                    host_id TEXT NOT NULL,
+                    argv TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    access TEXT
+                );
+                PRAGMA user_version = 7;",
+            )?;
+        }
+        if version < 8 {
+            // 0.4.61: a session is a browser's (`web`) or the CLI's (`cli`),
+            // and neither is accepted where the other is expected.
+            if !has_column(&connection, "dashboard_sessions", "kind")? {
+                connection.execute_batch(
+                    "ALTER TABLE dashboard_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'web';",
+                )?;
+            }
+            connection.pragma_update(None, "user_version", 8)?;
         }
         Ok(Self { connection })
     }
@@ -693,11 +719,47 @@ pub struct MetricSample {
     pub running: Option<u32>,
 }
 
+/// One command a person ran on a host through the coordinator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoteCommandRecord {
+    /// Unix seconds.
+    pub at: i64,
+    pub login: String,
+    pub host_id: String,
+    pub argv: Vec<String>,
+    /// `exit 0`, `exit 3`, `offline`, `timeout`, ...
+    pub outcome: String,
+    /// What the host judged it: `read` or `change`; `None` when it refused
+    /// it unjudged or never answered.
+    pub access: Option<String>,
+}
+
+/// The most remote commands the record keeps.
+const REMOTE_COMMANDS_KEPT: i64 = 1000;
+
 /// A signed-in dashboard session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DashboardSession {
     pub login: String,
     pub avatar_url: Option<String>,
+}
+
+/// Who holds a session: a browser, by its cookie, or the `runner-manager`
+/// CLI, by a bearer token. A token is looked up only as its own kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    Web,
+    Cli,
+}
+
+impl SessionKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Web => "web",
+            Self::Cli => "cli",
+        }
+    }
 }
 
 impl Store {
@@ -782,6 +844,7 @@ impl Store {
         &self,
         token_hash: &str,
         session: &DashboardSession,
+        kind: SessionKind,
         now: i64,
         expires_at: i64,
     ) -> Result<(), StoreError> {
@@ -790,34 +853,37 @@ impl Store {
             params![now],
         )?;
         self.connection.execute(
-            "INSERT INTO dashboard_sessions (token_hash, login, avatar_url, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO dashboard_sessions
+                (token_hash, login, avatar_url, created_at, expires_at, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 token_hash,
                 session.login,
                 session.avatar_url,
                 now,
-                expires_at
+                expires_at,
+                kind.as_str()
             ],
         )?;
         Ok(())
     }
 
-    /// The live session whose cookie hashes to `token_hash`.
+    /// The live session of `kind` whose token hashes to `token_hash`.
     ///
     /// # Errors
     /// SQLite's.
     pub fn session(
         &self,
         token_hash: &str,
+        kind: SessionKind,
         now: i64,
     ) -> Result<Option<DashboardSession>, StoreError> {
         Ok(self
             .connection
             .query_row(
                 "SELECT login, avatar_url FROM dashboard_sessions
-                 WHERE token_hash = ?1 AND expires_at > ?2",
-                params![token_hash, now],
+                 WHERE token_hash = ?1 AND expires_at > ?2 AND kind = ?3",
+                params![token_hash, now, kind.as_str()],
                 |row| {
                     Ok(DashboardSession {
                         login: row.get(0)?,
@@ -826,6 +892,60 @@ impl Store {
                 },
             )
             .optional()?)
+    }
+
+    /// Records a remote command, keeping the newest [`REMOTE_COMMANDS_KEPT`].
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn record_remote_command(
+        &mut self,
+        record: &RemoteCommandRecord,
+    ) -> Result<(), StoreError> {
+        let argv = serde_json::to_string(&record.argv).unwrap_or_else(|_| "[]".into());
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO remote_commands (at, login, host_id, argv, outcome, access)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.at,
+                record.login,
+                record.host_id,
+                argv,
+                record.outcome,
+                record.access
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM remote_commands WHERE id NOT IN (
+                SELECT id FROM remote_commands ORDER BY id DESC LIMIT ?1)",
+            params![REMOTE_COMMANDS_KEPT],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// The newest `limit` remote commands, newest first.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn remote_commands(&self, limit: u32) -> Result<Vec<RemoteCommandRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT at, login, host_id, argv, outcome, access FROM remote_commands
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit], |row| {
+            let argv: String = row.get(3)?;
+            Ok(RemoteCommandRecord {
+                at: row.get(0)?,
+                login: row.get(1)?,
+                host_id: row.get(2)?,
+                argv: serde_json::from_str(&argv).unwrap_or_default(),
+                outcome: row.get(4)?,
+                access: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Ends a session.
@@ -1201,5 +1321,44 @@ mod tests {
             Err(StoreError::InvalidTtl)
         ));
         assert_eq!(sanitize_hostname("a b\u{1b}[31m"), "ab31m");
+    }
+
+    #[test]
+    fn sessions_from_before_kinds_are_web_sessions_and_kinds_do_not_mix() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("coordinator.db");
+        {
+            let store = Store::open(&path).expect("current");
+            store
+                .connection
+                .execute_batch(
+                    "ALTER TABLE dashboard_sessions DROP COLUMN kind;
+                     INSERT INTO dashboard_sessions VALUES ('h','me',NULL,1,4102444800);
+                     PRAGMA user_version = 7;",
+                )
+                .expect("a schema-7 database");
+        }
+        let store = Store::open(&path).expect("upgraded");
+        let me = DashboardSession {
+            login: "me".into(),
+            avatar_url: None,
+        };
+        assert_eq!(
+            store.session("h", SessionKind::Web, 2).expect("read"),
+            Some(me.clone())
+        );
+        assert_eq!(store.session("h", SessionKind::Cli, 2).expect("read"), None);
+        store
+            .create_session("c", &me, SessionKind::Cli, 2, 100)
+            .expect("created");
+        assert_eq!(
+            store.session("c", SessionKind::Cli, 3).expect("read"),
+            Some(me)
+        );
+        assert_eq!(store.session("c", SessionKind::Web, 3).expect("read"), None);
+        assert_eq!(
+            store.session("c", SessionKind::Cli, 100).expect("read"),
+            None
+        );
     }
 }
