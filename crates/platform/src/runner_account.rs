@@ -381,9 +381,16 @@ mod sys {
         else {
             return false;
         };
-        directory.metadata().is_ok_and(|metadata| {
-            metadata.gid() == gid && metadata.mode() & SHARED_DIRECTORY == SHARED_DIRECTORY
-        }) && has_default_acl(&directory.into())
+        let Ok(metadata) = directory.metadata() else {
+            return false;
+        };
+        shared(gid, &directory.into(), metadata.gid(), metadata.mode())
+    }
+
+    /// Whether the open `directory`, of group `group` and mode `mode`, is
+    /// shared with `gid` as this release shares it.
+    fn shared(gid: u32, directory: &std::os::fd::OwnedFd, group: u32, mode: u32) -> bool {
+        group == gid && mode & SHARED_DIRECTORY == SHARED_DIRECTORY && has_default_acl(directory)
     }
 
     /// Shares `path` and what is under it that is not shared yet. A
@@ -399,9 +406,7 @@ mod sys {
             let mode = u32::from(stat.st_mode) & 0o7777;
             if below
                 && let super::walk::Node::Directory { fd, .. } = node
-                && stat.st_gid == gid
-                && mode & SHARED_DIRECTORY == SHARED_DIRECTORY
-                && has_default_acl(fd)
+                && shared(gid, fd, stat.st_gid, mode)
             {
                 return Ok(false);
             }
