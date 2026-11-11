@@ -13,11 +13,15 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 - `runner-manager wsl install` moves a distribution first set up before
   0.4.57 from `/root` to `/var/lib/runner-manager`, the tree every root
-  service uses, once it finds the host idle: the same move
-  `service install --start-at boot` makes, keeping the old tree. Its jobs then
-  run under their own `rm-runner-N` accounts. Runners still running postpone
-  the move to a later run, and an operator's drop-in that names the old tree
-  stops it with that file named.
+  service uses, through the same `service install --start-at boot` move:
+  the old tree is kept, and its jobs then run under their own `rm-runner-N`
+  accounts.
+- That move, from `wsl install` or `sudo runner-manager service install
+  --start-at boot`, now waits for an idle host: with an attempt still active
+  in the old tree's database, or a process still running from its runtime,
+  the service is started again unchanged and the move happens on a later run.
+  An operator's drop-in that names the old tree stops it too, with that file
+  named, since the moved service could not see the directory it points to.
 
 ### Fixed
 

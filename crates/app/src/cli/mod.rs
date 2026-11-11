@@ -767,13 +767,11 @@ pub enum WslHostCommand {
     /// Store the DrvFS recovery directory selected by the Windows provider.
     #[command(hide = true)]
     ConfigureRecovery(WslHostConfigureRecoveryArgs),
-    /// Rewrite a systemd unit an older build installed. Not for people.
+    /// Move a service an older build installed under `/root` to the system
+    /// tree when the host is idle, then rewrite a systemd unit an older build
+    /// installed. Not for people.
     #[command(hide = true)]
     ConvergeService,
-    /// Move a service an older build installed under `/root` to the system
-    /// tree, when the host is idle. Not for people.
-    #[command(hide = true)]
-    MoveToSystemTree,
     /// Register a managed distribution's lifecycle task with the
     /// administrator rights `wsl install` asked for. Not for people.
     #[command(hide = true)]

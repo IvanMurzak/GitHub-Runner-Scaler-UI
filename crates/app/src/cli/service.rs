@@ -229,11 +229,112 @@ fn install_owned_copy(context: &Context, source: &std::path::Path) -> Result<Own
     })
 }
 
+/// [`install`], except that a boot service an older build installed under
+/// another tree, whose move to the system tree had to wait, is not an error:
+/// what was said about it comes back as `Some`, and nothing was changed.
+///
+/// # Errors
+/// As [`install`], apart from that one.
+pub(crate) fn install_or_defer_move(
+    context: &Context,
+    args: &ServiceInstallArgs,
+    out: &mut dyn Write,
+) -> Result<Option<String>, CliError> {
+    match install_with(context, args, out) {
+        Ok(()) => Ok(None),
+        Err(Installed::Deferred(said)) => Ok(Some(said)),
+        Err(Installed::Failed(error)) => Err(error),
+    }
+}
+
 pub fn install(
     context: &Context,
     args: &ServiceInstallArgs,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
+    install_with(context, args, out).map_err(|outcome| match outcome {
+        Installed::Deferred(said) => CliError::with_remedy(
+            Failure::Conflict,
+            said,
+            "sudo runner-manager service install --start-at boot",
+        ),
+        Installed::Failed(error) => error,
+    })
+}
+
+/// Why [`install_with`] did not install.
+enum Installed {
+    /// The move to the system tree had to wait; nothing was changed. Only a
+    /// Linux boot service moves.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Deferred(String),
+    Failed(CliError),
+}
+
+impl From<CliError> for Installed {
+    fn from(error: CliError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// How many processes under `proc` (`/proc`) run a program, or in a working
+/// directory, inside `runtime`: runners an attempt there started.
+#[cfg(any(test, target_os = "linux"))]
+fn runner_processes_under(proc: &std::path::Path, runtime: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(proc) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .filter(|entry| {
+            ["exe", "cwd"].iter().any(|link| {
+                std::fs::read_link(entry.path().join(link))
+                    .is_ok_and(|target| target.starts_with(runtime))
+            })
+        })
+        .count()
+}
+
+/// Whether the host whose tree `context` names is idle, asked once its
+/// service has stopped: no attempt its database still counts as active, and
+/// no process left running from its runtime (one a lost record would hide).
+#[cfg(target_os = "linux")]
+fn idle_for_a_move(context: &Context) -> Result<(), String> {
+    let active = context
+        .store()
+        .map_err(|error| format!("its database could not be read: {error}"))?
+        .attempts()
+        .map_err(|error| format!("its database could not be read: {error}"))?
+        .iter()
+        .filter(|attempt| attempt.state().counts_against_capacity())
+        .count();
+    if active > 0 {
+        return Err(format!(
+            "{active} runner attempt(s) are still active, and the move waits until none is"
+        ));
+    }
+    let running =
+        runner_processes_under(std::path::Path::new("/proc"), context.paths().runtime_dir());
+    if running > 0 {
+        return Err(format!(
+            "{running} process(es) still run from {}, and the move waits until none does",
+            context.paths().runtime_dir().display()
+        ));
+    }
+    Ok(())
+}
+
+fn install_with(
+    context: &Context,
+    args: &ServiceInstallArgs,
+    out: &mut dyn Write,
+) -> Result<(), Installed> {
     let source = std::env::current_exe().map_err(|source| {
         CliError::new(
             Failure::LocalState,
@@ -256,14 +357,20 @@ pub fn install(
         // tree's data is moved in before this command opens the database there,
         // on a retry as much as on the first attempt.
         system = context.in_system_tree()?;
-        operations(&system)
-            .adopt_boot_installation(StartMode::Boot)
-            .map_err(service_failure)?;
+        match operations(&system)
+            .adopt_boot_installation(StartMode::Boot, &|| idle_for_a_move(context))
+        {
+            Ok(_) => {}
+            Err(deferred @ ServiceError::MoveDeferred { .. }) => {
+                return Err(Installed::Deferred(deferred.to_string()));
+            }
+            Err(error) => return Err(service_failure(error).into()),
+        }
         &system
     } else {
         context
     };
-    install_from(context, args, out, &source)
+    Ok(install_from(context, args, out, &source)?)
 }
 
 fn install_from(
@@ -736,6 +843,41 @@ fn service_failure(source: ServiceError) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_counts_only_numbered_processes_running_from_the_old_runtime() {
+        let root = tempfile::tempdir().expect("dir");
+        let runtime = root.path().join("root/.local/share/runner-manager/runtime");
+        let elsewhere = root.path().join("usr/bin");
+        std::fs::create_dir_all(runtime.join("attempt/bin")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let proc = root.path().join("proc");
+        for (pid, exe, cwd) in [
+            (
+                "100",
+                runtime.join("attempt/bin/Runner.Listener"),
+                runtime.join("attempt"),
+            ),
+            ("200", elsewhere.join("sshd"), elsewhere.clone()),
+            (
+                "self",
+                runtime.join("attempt/bin/Runner.Listener"),
+                runtime.clone(),
+            ),
+        ] {
+            let process = proc.join(pid);
+            std::fs::create_dir_all(&process).unwrap();
+            std::os::unix::fs::symlink(exe, process.join("exe")).unwrap();
+            std::os::unix::fs::symlink(cwd, process.join("cwd")).unwrap();
+        }
+        assert_eq!(runner_processes_under(&proc, &runtime), 1);
+        assert_eq!(runner_processes_under(&proc, &elsewhere.join("none")), 0);
+        assert_eq!(
+            runner_processes_under(&root.path().join("absent"), &runtime),
+            0
+        );
+    }
     use clap::Parser as _;
     use std::path::Path;
     use std::sync::Arc;
