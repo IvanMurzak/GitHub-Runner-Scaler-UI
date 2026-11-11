@@ -707,6 +707,166 @@ docker compose up -d
 A copy from an older version is upgraded when the coordinator opens it. One from a newer version is refused
 (`written by a newer coordinator`): see the rollback notes under [Poll modes](#poll-modes).
 
+## Web dashboard
+
+The coordinator can serve a dashboard at its public address (`https://runners.example.com/`):
+the machines with their CPU, memory, disk and runner slots, the jobs queued and running on
+self-hosted runners, the last jobs to finish, pool queues and leases, and a week of history as
+charts (jobs queued and running, CPU, busy slots and memory per machine). It works on a phone as
+well as a desktop, and follows the system's light or dark theme.
+
+Only GitHub accounts you name get in. Sign-in is GitHub's OAuth web flow; the GitHub token it
+yields is used once to read who signed in and is dropped. The session is a random cookie
+(`HttpOnly`, `Secure`, `SameSite=Lax`, 30 days); the database keeps only its SHA-256, so a backup
+signs nobody in. A login taken off the list is out at its next request. Without the settings
+below the dashboard does not exist: its paths answer 404.
+
+1. On GitHub, **Settings → Developer settings → OAuth Apps → New OAuth App**: any name, homepage
+   `https://runners.example.com`, authorization callback URL
+   `https://runners.example.com/auth/callback`. Generate a client secret. (The App from
+   [Connect GitHub](#connect-github-a-personal-github-app) works too, with the same callback URL
+   added; a separate OAuth App keeps the two apart.)
+2. On the server, beside `.env`:
+
+   ```bash
+   printf '%s' 'THE_CLIENT_SECRET' > dashboard_client_secret && chmod 600 dashboard_client_secret
+   sudo chown 10001:10001 dashboard_client_secret     # the coordinator image's account
+   cat >> .env <<'ENV'
+   COORDINATOR_DASHBOARD_CLIENT_ID=Ov23li...
+   COORDINATOR_DASHBOARD_USERS=your-login,a-colleague
+   ENV
+   ```
+
+   and in `docker-compose.override.yml`:
+
+   ```yaml
+   services:
+     coordinator:
+       environment:
+         COORDINATOR_DASHBOARD_CLIENT_SECRET_FILE: /run/secrets/dashboard_client_secret
+       secrets:
+         - dashboard_client_secret
+   secrets:
+     dashboard_client_secret:
+       file: ./dashboard_client_secret
+   ```
+
+3. `docker compose up -d`. The log says `no dashboard sign-in is configured` while any of the
+   three is missing.
+
+The page loads nothing from elsewhere (GitHub avatars aside) and is served with a strict
+Content-Security-Policy. History is a sample a minute per machine, kept 7 days in the same
+database (schema 6, from 0.4.58). The job lists are built from the `workflow_job` webhooks and
+kept in memory, so after a restart they fill again as jobs move. Without a proxy in front, forward
+`/`, `/assets/*`, `/auth/*` and `/api/*` as well as the four endpoints in [Deploy](#deploy).
+
+## Updates
+
+Each release publishes the coordinator's two images to GHCR, built from `deploy/coordinator/Dockerfile`
+and `Dockerfile.backup` at the release tag, for linux/amd64, with a build provenance attestation:
+
+```
+ghcr.io/ivanmurzak/runner-manager-coordinator:X.Y.Z          (and :latest)
+ghcr.io/ivanmurzak/runner-manager-coordinator-backup:X.Y.Z   (and :latest)
+```
+
+The compose file runs the version `.env` names as `COORDINATOR_VERSION` (`latest` when unset).
+`docker compose up -d --build` still builds both from the checkout instead. A deployment that pulls
+can keep itself on the newest release with `deploy/coordinator/update.sh`, run every 15 minutes by a
+systemd timer.
+
+GHCR makes a new package private. The owner makes both packages public once (on GitHub: the package →
+Package settings → Change visibility → Public); until then the machine has to `docker login ghcr.io`
+as its deploy account, with a token that has `read:packages`.
+
+### Switch an existing deployment
+
+For a deployment made from source as under [Deploy](#deploy), once, as the account that owns the checkout
+and is in the `docker` group (`ubuntu` below); X.Y.Z is the newest release, one that has `update.sh`:
+
+```bash
+cd /opt/services/runner-coordinator              # the checkout
+git fetch --tags && git checkout vX.Y.Z
+cd deploy/coordinator
+echo "COORDINATOR_VERSION=X.Y.Z" >> .env
+docker compose pull && docker compose up -d
+docker compose up -d --force-recreate caddy      # the release's Caddyfile
+sudo ./install-updater.sh                        # or: sudo ./install-updater.sh --user ubuntu
+```
+
+`install-updater.sh` writes `runner-coordinator-update.service` and `.timer` into `/etc/systemd/system`
+with this checkout as the working directory and that account as the user, creates `state/`, and starts
+the timer (5 minutes after boot, then every 15 minutes, up to 2 minutes later at random). The units hold
+no secret. They are copies: run it again when a release changes them, or to move them to another
+checkout. The checkout is left on a release tag (a detached HEAD) from now on.
+
+### What an update does
+
+The timer runs `update.sh` in `deploy/coordinator`. It asks the GitHub API (no token) for the newest
+release that is neither a draft nor a prerelease and compares it with `COORDINATOR_VERSION` in `.env`;
+when that is missing it updates. When the newest release is newer:
+
+1. It refuses, changing nothing, when tracked files in the checkout have local changes (it never discards
+   them), when the release predates `update.sh`, or when the release's images cannot be pulled (not
+   published yet, private, no network). The next run tries again.
+2. It takes a backup through the backup service (`backup.sh once`) and remembers its name.
+3. It checks out the release tag, so the compose file, the Caddyfile and `update.sh` are the release's,
+   and sets `COORDINATOR_VERSION`. `.env`, `docker-compose.override.yml`, the secrets and `state/` are
+   untracked and stay as they are.
+4. `docker compose pull`, `docker compose up -d`, and `caddy` recreated when the Caddyfile changed.
+5. It waits up to 2 minutes for `runner-manager-coordinator --version` in the container to print the new
+   version and for `https://$COORDINATOR_HOST/healthz` (through this machine's Caddy) to answer `ok`.
+
+Two runs never overlap (`state/update.lock`). A run that finds nothing to do changes nothing.
+
+### Rollback
+
+When the new version is not healthy in time, `update.sh` goes back by itself: the previous checkout and
+`COORDINATOR_VERSION`, then the restore under [Back up and restore](#back-up-and-restore) with the backup
+of step 2 (stop `coordinator` and `backup`, copy it into the volume through the backup image, remove the
+WAL files, check it), then `docker compose up -d`, and the same health check for the previous version.
+The database is restored because the new version may already have upgraded it, and an older coordinator
+refuses such a database. What happened in the minutes between the backup and the restore is lost; the
+warning there about revocations applies.
+
+The version that failed is held back: the timer does not try it again, and takes the next release when
+there is one. `./update.sh --version X.Y.Z` tries it again. If the rollback fails too, the status says so,
+the unit fails, and the machine needs a hand: `journalctl -u runner-coordinator-update` shows each step.
+
+### Status
+
+`update.sh` writes `state/status.json` after every run. The coordinator reads it (mounted read-only at
+`/run/coordinator-update`) and shows it on its dashboard:
+
+```json
+{"state":"updated","current":"0.4.58","previous":"0.4.57","latest":"0.4.58","checked_at":1794355480,"changed_at":1794355480,"message":"moved from 0.4.57 to 0.4.58; database backup coordinator-20261110T030000Z.db"}
+```
+
+`state` is `updated`, `rolled_back`, `failed` (the move or the check failed; `message` says what), or
+`current` (nothing to do). `previous` is the version that ran before the last change at `changed_at`;
+times are Unix seconds. A run that GitHub's rate limit stopped keeps the last state and says so.
+
+```bash
+systemctl list-timers runner-coordinator-update.timer   # when it runs next
+systemctl status runner-coordinator-update.service      # the last run
+journalctl -u runner-coordinator-update                 # every run, step by step
+./update.sh --check                                     # running and newest version; changes nothing
+```
+
+### Pause, or move by hand
+
+```bash
+sudo systemctl disable --now runner-coordinator-update.timer   # pause
+sudo systemctl enable --now runner-coordinator-update.timer    # resume
+./update.sh --version 0.4.57      # in deploy/coordinator: move to that release, older or newer
+```
+
+`--version` makes the same move, with the same backup, health check and rollback. Moving to an older
+release holds back the newest one, so the timer does not undo it; it updates again at the next release.
+A move to an older release whose coordinator cannot open the newer database fails its health check and
+rolls back. To go back past a database upgrade, restore a backup from before it as under
+[Back up and restore](#back-up-and-restore) (see the rollback notes under [Poll modes](#poll-modes)).
+
 ## Security notes
 
 - Public endpoints: `/webhook` (HMAC-SHA256 checked in constant time before anything else,

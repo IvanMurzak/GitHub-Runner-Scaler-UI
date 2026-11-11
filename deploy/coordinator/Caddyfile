@@ -2,8 +2,14 @@
 # COORDINATOR_HOST is the public name, e.g. runners.example.com; its DNS
 # record must point at this machine and ports 80/443 must be open.
 {$COORDINATOR_HOST} {
-	# Only the four endpoints exist; everything else is refused here.
-	@coordinator path /webhook /connect /enroll /healthz
+	# The site is HTTPS only; browsers keep to it for a year. `?` sets it only
+	# when the coordinator did not: its own security headers (CSP,
+	# X-Frame-Options and the rest) pass through untouched.
+	header ?Strict-Transport-Security "max-age=31536000"
+
+	# The coordinator's endpoints and its web dashboard (`/`, `/assets/*`,
+	# `/auth/*`, `/api/*`); everything else is refused here.
+	@coordinator path /webhook /connect /enroll /healthz / /assets/* /auth/* /api/*
 	handle @coordinator {
 		# WebSocket upgrades on /connect are proxied as-is.
 		reverse_proxy coordinator:8080

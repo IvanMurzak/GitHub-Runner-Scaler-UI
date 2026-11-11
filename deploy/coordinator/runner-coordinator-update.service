@@ -1,0 +1,24 @@
+# Moves the coordinator deployment to the newest release, with a database
+# backup first and a rollback when the new version is not healthy
+# (docs/coordinator.md, "Updates"). Started by runner-coordinator-update.timer.
+#
+# install-updater.sh installs this with User= and WorkingDirectory= set for
+# its checkout; the values below are the documented deployment's. No secret
+# belongs here: update.sh reads .env and the compose files itself.
+[Unit]
+Description=Update the runner-manager coordinator to the newest release
+Documentation=https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/blob/main/docs/coordinator.md#updates
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+# A member of the docker group, and the owner of the checkout.
+User=ubuntu
+WorkingDirectory=/opt/services/runner-coordinator/deploy/coordinator
+ExecStart=/bin/bash ./update.sh
+# Image pulls and two health waits, with room to spare.
+TimeoutStartSec=30min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full

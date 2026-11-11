@@ -1,3 +1,7 @@
 # The webhook secret and the host name never enter the repository.
 webhook_secret
 .env
+# update.sh's status and lock; the directory itself is kept so that it exists,
+# owned by the deploy user, before compose mounts it into the coordinator.
+state/*
+!state/.gitkeep

@@ -102,6 +102,22 @@ enum Command {
         /// is placed on only when no other host can take the job: 10GiB.
         #[arg(long, env = "COORDINATOR_MIN_DISK_FREE", default_value_t = stats::DEFAULT_MIN_DISK_FREE, value_parser = parse_bytes)]
         min_disk_free: u64,
+        /// The web dashboard's GitHub OAuth client id. With its secret
+        /// (COORDINATOR_DASHBOARD_CLIENT_SECRET_FILE or
+        /// COORDINATOR_DASHBOARD_CLIENT_SECRET, never an argument) and
+        /// --dashboard-users, the dashboard is served at /.
+        #[arg(long, env = "COORDINATOR_DASHBOARD_CLIENT_ID")]
+        dashboard_client_id: Option<String>,
+        /// GitHub logins allowed into the dashboard, comma-separated.
+        #[arg(long, env = "COORDINATOR_DASHBOARD_USERS", value_delimiter = ',')]
+        dashboard_users: Vec<String>,
+        /// GitHub's web address, for GitHub Enterprise Server.
+        #[arg(
+            long,
+            env = "COORDINATOR_GITHUB_WEB_URL",
+            default_value = "https://github.com"
+        )]
+        github_web_url: url::Url,
     },
     /// The job weight statistics: heaviest jobs, hosts, recent placements.
     Stats {
@@ -275,6 +291,51 @@ fn github_app(id: Option<u64>, api: url::Url) -> anyhow::Result<Option<GithubApp
     )?))
 }
 
+/// The dashboard's sign-in settings, or `None` without a client id.
+fn dashboard_auth(
+    client_id: Option<String>,
+    users: Vec<String>,
+    web: &url::Url,
+    api: &url::Url,
+) -> anyhow::Result<Option<runner_manager_coordinator::dashboard::auth::AuthConfig>> {
+    let Some(client_id) = client_id.filter(|id| !id.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let secret = if let Some(path) = std::env::var_os("COORDINATOR_DASHBOARD_CLIENT_SECRET_FILE") {
+        std::fs::read_to_string(&path)
+            .map(|text| text.trim().to_string())
+            .context("cannot read the file COORDINATOR_DASHBOARD_CLIENT_SECRET_FILE names")?
+    } else if let Ok(value) = std::env::var("COORDINATOR_DASHBOARD_CLIENT_SECRET") {
+        value.trim().to_string()
+    } else {
+        bail!(
+            "the dashboard needs its OAuth client secret: set \
+             COORDINATOR_DASHBOARD_CLIENT_SECRET_FILE (preferred) or \
+             COORDINATOR_DASHBOARD_CLIENT_SECRET"
+        );
+    };
+    let users: Vec<String> = users
+        .into_iter()
+        .map(|user| user.trim().to_string())
+        .filter(|user| !user.is_empty())
+        .collect();
+    if users.is_empty() {
+        bail!("set COORDINATOR_DASHBOARD_USERS: the GitHub logins allowed into the dashboard");
+    }
+    if secret.is_empty() {
+        bail!("the dashboard's OAuth client secret is empty");
+    }
+    Ok(Some(
+        runner_manager_coordinator::dashboard::auth::AuthConfig {
+            client_id: client_id.trim().to_string(),
+            client_secret: SecretString::from(secret),
+            allowed_logins: users,
+            web_base: web.as_str().trim_end_matches('/').to_string(),
+            api_base: api.as_str().trim_end_matches('/').to_string(),
+        },
+    ))
+}
+
 fn webhook_secret() -> anyhow::Result<SecretString> {
     let secret = if let Some(path) = std::env::var_os("COORDINATOR_WEBHOOK_SECRET_FILE") {
         std::fs::read_to_string(&path)
@@ -327,6 +388,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             lease_ttl,
             cpu_busy_percent,
             min_disk_free,
+            dashboard_client_id,
+            dashboard_users,
+            github_web_url,
         } => {
             let origin = CoordinatorUrl::parse(&public_url)
                 .context("COORDINATOR_PUBLIC_URL is not a usable https URL")?
@@ -345,6 +409,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 },
                 ..StatsConfig::default()
             };
+            config.dashboard = dashboard_auth(
+                dashboard_client_id,
+                dashboard_users,
+                &github_web_url,
+                &github_api_url,
+            )?;
+            if config.dashboard.is_none() {
+                tracing::info!("no dashboard sign-in is configured: the web dashboard is off");
+            }
             let app = github_app(github_app_id, github_api_url)?;
             let store = Store::open(&cli.db)?;
             let runtime = tokio::runtime::Runtime::new()?;

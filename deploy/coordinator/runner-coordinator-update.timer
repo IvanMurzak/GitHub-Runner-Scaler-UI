@@ -1,0 +1,15 @@
+# Runs runner-coordinator-update.service every 15 minutes
+# (docs/coordinator.md, "Updates"). Pause updates with
+#   sudo systemctl disable --now runner-coordinator-update.timer
+[Unit]
+Description=Check for a new runner-manager coordinator release every 15 minutes
+Documentation=https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/blob/main/docs/coordinator.md#updates
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

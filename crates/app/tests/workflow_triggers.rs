@@ -393,6 +393,13 @@ fn release_workflow_requests_contents_write_and_nothing_else() {
         // relaxation: every other job, and the top-level block above, still
         // gets `contents` only.
         const OIDC_JOB: &str = "channels";
+        // The coordinator's container images go to GHCR under the workflow's
+        // own short-lived `GITHUB_TOKEN` (`packages: write`), and their
+        // build provenance is attested with an OIDC-signed statement
+        // (`id-token: write`, `attestations: write`). No other credential
+        // exists in that job, and nothing the npm, crates.io or Homebrew
+        // path publishes passes through it.
+        const IMAGE_JOB: &str = "images";
 
         for (_, text) in &permissions.block {
             let (scope, level) = permission_entry(text);
@@ -400,14 +407,21 @@ fn release_workflow_requests_contents_write_and_nothing_else() {
                 (scope.as_str(), level.as_str()),
                 ("contents", "write") | ("contents", "read")
             ) || (job == OIDC_JOB
-                && (scope.as_str(), level.as_str()) == ("id-token", "write"));
+                && (scope.as_str(), level.as_str()) == ("id-token", "write"))
+                || (job == IMAGE_JOB
+                    && matches!(
+                        (scope.as_str(), level.as_str()),
+                        ("packages" | "id-token" | "attestations", "write")
+                    ));
             assert!(
                 allowed,
                 "release.yml job `{job}` requests `{text}`. A release job may \
                  request `contents: write` (or `contents: read`) and nothing \
                  else, except `{OIDC_JOB}`, which may also request \
-                 `id-token: write` for registry trusted publishing. `packages: \
-                 write` -- and `id-token: write` in any other job -- would let \
+                 `id-token: write` for registry trusted publishing, and \
+                 `{IMAGE_JOB}`, which may request `packages`, `id-token` and \
+                 `attestations: write` for the coordinator images. Those \
+                 scopes in any other job would let \
                  the workflow that publishes mint credentials of its own \
                  (`07-security.md`)."
             );

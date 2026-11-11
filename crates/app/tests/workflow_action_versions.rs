@@ -83,6 +83,14 @@ fn external_workflow_actions_use_the_supported_node_24_majors() {
         "taiki-e/install-action@nextest",
         "mozilla-actions/sccache-action@v0.0.11",
         "rust-lang/crates-io-auth-action@v1",
+        // The coordinator images (`release.yml`, job `images`): pinned to a
+        // commit, since they run beside `packages: write`. Audited Node 24:
+        // the three docker actions run on `node24`, and the attestation
+        // action is a composite of GitHub's own `actions/attest`.
+        "docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0",
+        "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1",
+        "docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0",
+        "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2",
     ]);
 
     for (workflow, action_ref) in &refs {

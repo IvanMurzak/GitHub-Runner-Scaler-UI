@@ -1,4 +1,5 @@
-//! The HTTP surface: `/webhook`, `/connect`, `/enroll`, `/healthz`.
+//! The HTTP surface: `/webhook`, `/connect`, `/enroll`, `/healthz`, and the
+//! web dashboard ([`crate::dashboard`]).
 //!
 //! TLS is terminated by the reverse proxy in front (Caddy, see
 //! `deploy/coordinator`), so this listens on plain HTTP.
@@ -85,6 +86,8 @@ pub struct Config {
     /// How long an accepted launch counts without its runner taking a job
     /// (`COORDINATOR_LEASE_TTL`).
     pub lease_ttl: Duration,
+    /// The web dashboard's GitHub sign-in; `None`, no dashboard.
+    pub dashboard: Option<crate::dashboard::auth::AuthConfig>,
 }
 
 impl Config {
@@ -101,6 +104,7 @@ impl Config {
             stats: StatsConfig::default(),
             placement_tick: crate::placement::TICK,
             lease_ttl: crate::placement::LEASE_TTL,
+            dashboard: None,
         }
     }
 }
@@ -115,6 +119,8 @@ pub struct AppState {
     pub placement: Arc<Placement>,
     /// Stage 4: what jobs used, and the counters `stats` shows.
     pub statistics: Arc<Statistics>,
+    /// The web dashboard: its sign-in, and its view of the jobs.
+    pub dashboard: crate::dashboard::Dashboard,
     deliveries: Mutex<DeliveryLog>,
     limiter: RateLimiter,
 }
@@ -126,7 +132,23 @@ impl AppState {
         let store = Arc::new(Mutex::new(store));
         let statistics = Arc::new(Statistics::load(Arc::clone(&store), config.stats));
         let lease_ttl = config.lease_ttl;
+        let dashboard = crate::dashboard::Dashboard::new(config.dashboard.clone());
+        if let Some(auth) = &dashboard.auth {
+            // A login taken off the allowlist keeps no session.
+            if let Ok(removed) = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .delete_sessions_except(&auth.allowed_logins)
+                && removed > 0
+            {
+                tracing::info!(
+                    removed,
+                    "dashboard sessions of logins no longer allowed were ended"
+                );
+            }
+        }
         Arc::new(Self {
+            dashboard,
             limiter: RateLimiter::new(config.attempts_per_minute),
             config,
             store,
@@ -191,6 +213,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(CONNECT_PATH, get(connect))
         .route(HEALTH_PATH, get(|| async { "ok" }))
+        .merge(crate::dashboard::routes())
         .with_state(state)
 }
 
@@ -207,6 +230,7 @@ pub async fn serve(
     let placement = tokio::spawn(Arc::clone(&state.placement).run(state.config.placement_tick));
     let revocations = tokio::spawn(watch_revocations(Arc::clone(&state)));
     let counters = tokio::spawn(flush_counters(Arc::clone(&state)));
+    let history = tokio::spawn(crate::dashboard::record_metrics(Arc::clone(&state)));
     let served = axum::serve(
         listener,
         router(Arc::clone(&state)).into_make_service_with_connect_info::<SocketAddr>(),
@@ -216,6 +240,7 @@ pub async fn serve(
     placement.abort();
     revocations.abort();
     counters.abort();
+    history.abort();
     collect_wakes(&state);
     state.statistics.flush();
     served
@@ -331,6 +356,10 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             let Ok(job) = serde_json::from_slice::<WorkflowJobEvent>(&body) else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
+            state
+                .dashboard
+                .activity
+                .job_event(&job, Utc::now().timestamp());
             let action = action_name(&job.action);
             let required = required_labels(&job.workflow_job.labels);
             let repository = &job.repository.full_name;
@@ -749,6 +778,7 @@ async fn serve_host(
                     }
                     Ok(HostMessage::AttemptStarted(started)) if version >= LAUNCH_VERSION => {
                         state.placement.attempt_started(host_id, &started);
+                        state.dashboard.activity.runner_started(host_id, &started.runner_name);
                     }
                     Ok(HostMessage::AttemptFinished(finished)) if version >= LAUNCH_VERSION => {
                         state.placement.attempt_finished(host_id, &finished);

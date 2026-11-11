@@ -21,6 +21,8 @@
 #   8. update the downstream channels       job `channels`
 #      -- the install scripts, the npm packages and the Homebrew tap formula,
 #         each pinned to the checksums THIS run published
+# Beside steps 5-6, and waited on by nothing: the coordinator's container
+# images, pushed to GHCR                       job `images`
 #
 # ----------------------------------------------------------------------------
 # THE DECISIONS LIVE IN .github/scripts/release.sh, NOT IN THESE STEP BODIES.
@@ -176,11 +178,12 @@ on:
 #
 # Every job below also names its own scopes, because a job-level block REPLACES
 # this one rather than being bounded by it -- so this line alone constrains only
-# the jobs that forgot to. `packages: write` is refused outright by
-# `crates/app/tests/workflow_triggers.rs`, and so is `id-token: write`
-# EVERYWHERE BUT THE `channels` JOB, which needs it to authenticate to npm
-# through trusted publishing and holds no publishing secret of its own. Neither
-# belongs here at the top level, where every job would inherit it.
+# the jobs that forgot to. `crates/app/tests/workflow_triggers.rs` refuses
+# `id-token: write` everywhere but the `channels` job, which needs it to
+# authenticate to npm through trusted publishing and holds no publishing secret
+# of its own, and the `images` job, which pushes to GHCR with `packages: write`
+# and attests what it pushed. Neither belongs here at the top level, where
+# every job would inherit it.
 permissions:
   contents: write
 
@@ -844,6 +847,148 @@ jobs:
           path: dist/runner-manager-*
           if-no-files-found: error
           retention-days: 7
+
+  # --------------------------------------------------------------------------
+  # The coordinator's container images, beside steps 5-6.
+  # --------------------------------------------------------------------------
+  # deploy/coordinator/Dockerfile and Dockerfile.backup at the tagged commit,
+  # pushed as ghcr.io/<owner>/runner-manager-coordinator{,-backup}:X.Y.Z and
+  # :latest, for linux/amd64, with a provenance attestation for each digest. A
+  # coordinator deployment pulls these and nothing else; its update.sh moves it
+  # to each new release (docs/coordinator.md, "Updates").
+  #
+  # NOTHING WAITS ON THIS JOB, ON PURPOSE. `publish` and `channels` do not need
+  # it, so a registry outage or a failed image build cannot hold back the
+  # binaries, npm, crates.io or Homebrew, which do not use these images. The
+  # one consumer, update.sh, pulls a release's images before it changes
+  # anything and stops there when they are missing, so a GitHub Release that
+  # is published before its images (or without them) only makes a deployment
+  # wait; it never leaves one half moved. A red run of this job is recovered
+  # with `Re-run failed jobs`, which pushes the same tags again from the same
+  # commit. Re-running it for an OLDER release moves `:latest` back to that
+  # release; update.sh pins COORDINATOR_VERSION and does not follow `:latest`,
+  # so that affects only a deployment that names no version.
+  #
+  # `packages: write`, `id-token: write` and `attestations: write` are this
+  # job's alone, and it holds no secret: GHCR takes the run's GITHUB_TOKEN, and
+  # the attestation is signed with a certificate bound to this workflow run.
+  # The registry path needs the owner in lower case, which is computed from
+  # `github.repository_owner` through `env:`, never interpolated into a script.
+  images:
+    name: publish the coordinator images
+    needs: [validate, tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.tag.outputs.sha }}
+          persist-credentials: false
+
+      - name: Name the images
+        id: names
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          # A GitHub login is letters, digits and hyphens; anything else would
+          # not be a valid registry path, so refuse rather than push elsewhere.
+          case "$owner" in
+            '' | *[!a-z0-9-]*)
+              echo "REJECTED: repository owner '${OWNER}' is not a valid registry namespace" >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "coordinator=ghcr.io/${owner}/runner-manager-coordinator"
+            echo "backup=ghcr.io/${owner}/runner-manager-coordinator-backup"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and push the coordinator image
+        id: coordinator
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/coordinator/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.names.outputs.coordinator }}:${{ needs.validate.outputs.version }}
+            ${{ steps.names.outputs.coordinator }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.tag.outputs.sha }}
+          cache-from: type=gha,scope=coordinator
+          cache-to: type=gha,mode=max,scope=coordinator
+
+      - name: Build and push the backup image
+        id: backup
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/coordinator/Dockerfile.backup
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.names.outputs.backup }}:${{ needs.validate.outputs.version }}
+            ${{ steps.names.outputs.backup }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.tag.outputs.sha }}
+          cache-from: type=gha,scope=coordinator-backup
+          cache-to: type=gha,mode=max,scope=coordinator-backup
+
+      # Verifiable with `gh attestation verify oci://<image>:X.Y.Z --repo <owner>/<repo>`.
+      # The storage record would need a further scope (`artifact-metadata`)
+      # for a listing nothing here reads, so it is not created.
+      - name: Attest the coordinator image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.names.outputs.coordinator }}
+          subject-digest: ${{ steps.coordinator.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest the backup image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.names.outputs.backup }}
+          subject-digest: ${{ steps.backup.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Report what was pushed
+        env:
+          COORDINATOR: ${{ steps.names.outputs.coordinator }}
+          COORDINATOR_DIGEST: ${{ steps.coordinator.outputs.digest }}
+          BACKUP: ${{ steps.names.outputs.backup }}
+          BACKUP_DIGEST: ${{ steps.backup.outputs.digest }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          {
+            echo "### Coordinator images ${VERSION}"
+            echo
+            echo "- \`${COORDINATOR}:${VERSION}\` \`${COORDINATOR_DIGEST}\`"
+            echo "- \`${BACKUP}:${VERSION}\` \`${BACKUP_DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # --------------------------------------------------------------------------
   # Step 7. The only job that publishes, and the last one to run.

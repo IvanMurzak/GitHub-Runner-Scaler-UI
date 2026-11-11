@@ -7,6 +7,25 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.58
+
+### Added
+
+- Coordinator web dashboard at the coordinator's own address: machines with
+  CPU, memory, disk and runner slots, the queued, running and recently
+  finished self-hosted jobs, pool queues and leases, and a week of history as
+  charts. It works on phones and desktops, signs in with GitHub, and lets in
+  only the logins in `COORDINATOR_DASHBOARD_USERS`. Off until
+  `COORDINATOR_DASHBOARD_CLIENT_ID` and its secret are set. The coordinator's
+  database moves to schema 6.
+- Each release publishes the coordinator images to GHCR
+  (`ghcr.io/ivanmurzak/runner-manager-coordinator` and `-backup`), with build
+  provenance attestations.
+- `deploy/coordinator/update.sh` and a systemd timer keep a coordinator on the
+  newest release: every 15 minutes it backs up the database, moves to the new
+  release, checks its health, and rolls back to the previous version and
+  database if the new one does not come up. The dashboard shows its status.
+
 ## 0.4.57
 
 ### Changed
