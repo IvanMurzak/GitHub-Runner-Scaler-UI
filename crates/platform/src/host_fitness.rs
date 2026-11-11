@@ -230,12 +230,10 @@ fn meminfo_field(text: &str, field: &str) -> Option<u64> {
 /// The page counts `host_statistics64` reports on macOS that available
 /// memory is made of.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 struct VmPages {
-    /// `free_count`: the speculative pages included, as the kernel counts.
     free: u64,
     speculative: u64,
-    /// `external_page_count`: file-backed pages, the speculative ones too.
     external: u64,
     purgeable: u64,
 }
@@ -243,12 +241,9 @@ struct VmPages {
 /// Memory macOS hands to new work without compressing or swapping anything,
 /// in bytes: free pages, the file cache (file-backed pages, active ones too)
 /// and purgeable pages. It is what Activity Monitor does not count as used,
-/// and like Linux's `MemAvailable` it counts the file cache.
-///
-/// Up to 0.4.62 it was free plus inactive pages, `psutil`'s figure: that
-/// counts inactive app memory, which only compression frees, and leaves out
-/// the active file cache, so a host that had just read many files looked
-/// gigabytes fuller than it was.
+/// and like Linux's `MemAvailable` it counts the file cache. Not `psutil`'s
+/// free plus inactive: that counts inactive app memory, which only
+/// compression frees, and leaves out the active file cache.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn available_pages_bytes(pages: VmPages, page: u64) -> Option<u64> {
     // The speculative pages are in both the free and the file-backed counts.
@@ -1503,12 +1498,8 @@ mod tests {
         assert_eq!(busy_share((10, 20), (5, 40)), None, "went back");
     }
 
-    /// macOS keeps file contents a job read in active pages, which it drops
-    /// as soon as anything needs them. Measured on a 24 GiB Mac mini
-    /// (2026-11-11): reading 8.3 GB of files took 1.6 GB of free pages into
-    /// the file cache, and free plus inactive fell from 10.96 GB to 9.37 GB
-    /// while what the system could hand out grew. Reading files must not
-    /// make a host look fuller.
+    /// Reading files moves free pages into the file cache, which macOS drops
+    /// on demand: it must not lower available memory.
     #[test]
     fn file_cache_a_job_reads_in_stays_available_on_macos() {
         // The Mac mini's `vm_stat` before the read, in 16 KiB pages.
@@ -1529,8 +1520,6 @@ mod tests {
             available_pages_bytes(after, page),
             available_pages_bytes(before, page)
         );
-        // Free (less speculative), file-backed and purgeable pages: the
-        // memory Activity Monitor does not count as used.
         assert_eq!(
             available_pages_bytes(before, page),
             Some((231_617 + 361_612 + 15_016) * page)
