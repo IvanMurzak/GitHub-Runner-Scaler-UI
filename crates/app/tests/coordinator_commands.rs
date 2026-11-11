@@ -592,15 +592,18 @@ fn coordinator_login_signs_this_account_in_through_a_browser_and_logout_forgets_
     let token = stored["token"].as_str().expect("token").to_owned();
     assert_eq!(token.len(), 64);
     assert!(!transcript.contains(&token), "the token is never printed");
-    #[cfg(unix)]
+    // On Linux the session is a plain file, and its mode is what keeps other
+    // accounts out; macOS keeps it in an encrypted keychain, Windows under
+    // DPAPI, where a file mode decides nothing.
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let file = data
-            .join("secrets")
-            .join("user")
-            .join("coordinator-cli-session");
-        let mode = std::fs::metadata(&file)
-            .expect("the session file")
+        let guard = PlatformSecretStore::rooted_at(SecretScope::User, data)
+            .expect("store")
+            .for_item(SecretItem::CoordinatorCliSession)
+            .guard();
+        let mode = std::fs::metadata(&guard)
+            .unwrap_or_else(|error| panic!("{}: {error}", guard.display()))
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0, "{mode:o}");
