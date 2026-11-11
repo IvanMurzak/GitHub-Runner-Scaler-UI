@@ -1534,29 +1534,22 @@ async fn serve(
                         ports.memory.set_coordinator_estimates(estimates);
                     }
                     Ok(ServerMessage::RunCommand(command)) if version >= COMMAND_VERSION => {
-                        let refusal = |message: &str| CommandResult {
-                            request_id: command.request_id.clone(),
-                            exit_code: super::Failure::Conflict.code(),
-                            stdout: String::new(),
-                            stderr: format!("error: {message}\n"),
-                            truncated: false,
-                        };
                         let context = match &ports.commands {
-                            Some(context) if running.load(Ordering::Relaxed) < COMMANDS_AT_ONCE => {
-                                context.clone()
-                            }
-                            Some(_) => {
-                                if let Err(end) = send(socket, &HostMessage::CommandResult(refusal(
-                                    "this host is already running as many commands as it takes at once; try again",
-                                ))).await {
-                                    return end;
-                                }
-                                continue;
-                            }
-                            None => {
-                                if let Err(end) = send(socket, &HostMessage::CommandResult(refusal(
-                                    "this host does not take commands from the coordinator",
-                                ))).await {
+                            None => Err("this host does not take commands from the coordinator"),
+                            Some(_) if running.load(Ordering::Relaxed) >= COMMANDS_AT_ONCE => Err(
+                                "this host is already running as many commands as it takes at once; try again",
+                            ),
+                            Some(context) => Ok(context.clone()),
+                        };
+                        let context = match context {
+                            Ok(context) => context,
+                            Err(message) => {
+                                let refused = CommandResult::refused(
+                                    &command.request_id,
+                                    super::Failure::Conflict.code(),
+                                    message,
+                                );
+                                if let Err(end) = send(socket, &HostMessage::CommandResult(refused)).await {
                                     return end;
                                 }
                                 continue;

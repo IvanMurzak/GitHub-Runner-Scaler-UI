@@ -1169,6 +1169,27 @@ pub struct CommandResult {
     /// The output was cut to [`MAX_COMMAND_OUTPUT_BYTES`].
     #[serde(default)]
     pub truncated: bool,
+    /// What the host judged the command to be: `read` or `change`; absent
+    /// for one it refused before judging (malformed, unknown, not allowed
+    /// remotely).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+}
+
+impl CommandResult {
+    /// A command the host would not run, with the exit code `exit_code` and
+    /// why in `message`.
+    #[must_use]
+    pub fn refused(request_id: &str, exit_code: u8, message: &str) -> Self {
+        Self {
+            request_id: request_id.to_owned(),
+            exit_code,
+            stdout: String::new(),
+            stderr: format!("error: {message}\n"),
+            truncated: false,
+            access: None,
+        }
+    }
 }
 
 macro_rules! json_codec {

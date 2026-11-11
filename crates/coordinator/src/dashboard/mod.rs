@@ -365,10 +365,7 @@ async fn callback(
 
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     // A cross-site form cannot sign anyone out.
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok());
-    if origin != Some(state.config.public_origin.trim_end_matches('/')) {
+    if !same_origin(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
     if let Some(token) = auth::cookie(&headers, SESSION_COOKIE) {
@@ -684,14 +681,12 @@ async fn run_on_host(
         argv,
         outcome: match &outcome {
             Ok(result) => format!("exit {}", result.exit_code),
-            Err(error) => match error {
-                crate::remote::RemoteError::Offline => "offline",
-                crate::remote::RemoteError::TooOld => "too_old",
-                crate::remote::RemoteError::Malformed => "malformed",
-                crate::remote::RemoteError::Timeout => "timeout",
-            }
-            .to_owned(),
+            Err(error) => error.code().to_owned(),
         },
+        access: outcome
+            .as_ref()
+            .ok()
+            .and_then(|result| result.access.clone()),
     };
     if let Err(error) = state.store().record_remote_command(&record) {
         tracing::warn!(%error, "a remote command was not recorded");
@@ -702,15 +697,15 @@ async fn run_on_host(
 }
 
 fn remote_failure(error: crate::remote::RemoteError) -> Response {
-    let status = match error {
-        crate::remote::RemoteError::Offline => StatusCode::SERVICE_UNAVAILABLE,
-        crate::remote::RemoteError::TooOld => StatusCode::CONFLICT,
-        crate::remote::RemoteError::Malformed => StatusCode::BAD_REQUEST,
-        crate::remote::RemoteError::Timeout => StatusCode::GATEWAY_TIMEOUT,
-    };
+    error_json(error.status(), &error.to_string())
+}
+
+/// A JSON error answer, never cached.
+fn error_json(status: StatusCode, message: &str) -> Response {
     (
         status,
-        Json(serde_json::json!({"error": error.to_string()})),
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "error": message })),
     )
         .into_response()
 }
@@ -750,22 +745,17 @@ async fn host_config(
     match run_on_host(&state, &host_id, argv, &session.login).await {
         Ok(result) if result.exit_code == 0 => {
             let Ok(config) = serde_json::from_str::<serde_json::Value>(&result.stdout) else {
-                return (
+                return error_json(
                     StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({"error": "the host's answer was not understood"})),
-                )
-                    .into_response();
+                    "the host's answer was not understood",
+                );
             };
             json(&serde_json::json!({
                 "remote_changes": state.registry.remote_changes(&host_id),
                 "config": config,
             }))
         }
-        Ok(result) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": result.stderr.trim()})),
-        )
-            .into_response(),
+        Ok(result) => error_json(StatusCode::BAD_GATEWAY, result.stderr.trim()),
         Err(error) => remote_failure(error),
     }
 }
@@ -784,6 +774,7 @@ async fn audit(State(state): State<Arc<AppState>>) -> Response {
                 "host_name": host_name,
                 "argv": record.argv,
                 "outcome": record.outcome,
+                "access": record.access,
             })
         })
         .collect();

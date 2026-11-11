@@ -731,8 +731,16 @@ pub struct CoordinatorHostsArgs {
 #[derive(Debug, Args)]
 pub struct CoordinatorRemoteChangesArgs {
     /// `allow`, `deny`, or `status` to show the current choice.
-    #[arg(value_name = "CHOICE", value_parser = ["allow", "deny", "status"])]
-    pub choice: String,
+    #[arg(value_name = "CHOICE", value_enum)]
+    pub choice: RemoteChangesChoice,
+}
+
+/// What `coordinator remote-changes` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RemoteChangesChoice {
+    Allow,
+    Deny,
+    Status,
 }
 
 #[derive(Debug, Args)]

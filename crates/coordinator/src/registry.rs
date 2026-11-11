@@ -299,6 +299,14 @@ impl Registry {
             .is_some_and(|hello| hello.remote_changes)
     }
 
+    /// Whether `host_id` takes remote commands (protocol version 5), or
+    /// `None` when it is not connected.
+    #[must_use]
+    pub fn takes_commands(&self, host_id: &str) -> Option<bool> {
+        self.protocol_version(host_id)
+            .map(|version| version >= runner_manager_domain::coordinator_protocol::COMMAND_VERSION)
+    }
+
     /// The protocol version `host_id`'s connection negotiated, when it is
     /// connected.
     #[must_use]

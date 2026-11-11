@@ -241,7 +241,8 @@ impl Store {
                     login TEXT NOT NULL,
                     host_id TEXT NOT NULL,
                     argv TEXT NOT NULL,
-                    outcome TEXT NOT NULL
+                    outcome TEXT NOT NULL,
+                    access TEXT
                 );
                 PRAGMA user_version = 7;",
             )?;
@@ -728,6 +729,9 @@ pub struct RemoteCommandRecord {
     pub argv: Vec<String>,
     /// `exit 0`, `exit 3`, `offline`, `timeout`, ...
     pub outcome: String,
+    /// What the host judged it: `read` or `change`; `None` when it refused
+    /// it unjudged or never answered.
+    pub access: Option<String>,
 }
 
 /// The most remote commands the record keeps.
@@ -901,14 +905,15 @@ impl Store {
         let argv = serde_json::to_string(&record.argv).unwrap_or_else(|_| "[]".into());
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT INTO remote_commands (at, login, host_id, argv, outcome)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO remote_commands (at, login, host_id, argv, outcome, access)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 record.at,
                 record.login,
                 record.host_id,
                 argv,
-                record.outcome
+                record.outcome,
+                record.access
             ],
         )?;
         transaction.execute(
@@ -926,7 +931,7 @@ impl Store {
     /// SQLite's.
     pub fn remote_commands(&self, limit: u32) -> Result<Vec<RemoteCommandRecord>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT at, login, host_id, argv, outcome FROM remote_commands
+            "SELECT at, login, host_id, argv, outcome, access FROM remote_commands
              ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit], |row| {
@@ -937,6 +942,7 @@ impl Store {
                 host_id: row.get(2)?,
                 argv: serde_json::from_str(&argv).unwrap_or_default(),
                 outcome: row.get(4)?,
+                access: row.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

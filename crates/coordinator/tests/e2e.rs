@@ -1404,6 +1404,7 @@ async fn a_command_posted_over_http_is_relayed_to_the_host_and_its_result_return
                 stdout: "octo/app: max_capacity 4\n".into(),
                 stderr: String::new(),
                 truncated: false,
+                access: Some("change".into()),
             })
             .encode()
             .into(),
@@ -1434,7 +1435,12 @@ async fn a_command_posted_over_http_is_relayed_to_the_host_and_its_result_return
     assert_eq!(commands[0]["host_name"], "ivan-ms-a2");
     assert_eq!(commands[0]["argv"][1], "set-capacity");
     assert_eq!(commands[0]["outcome"], "exit 0");
+    assert_eq!(
+        commands[0]["access"], "change",
+        "the host's judgement is kept"
+    );
     assert_eq!(commands[1]["outcome"], "offline");
+    assert!(commands[1]["access"].is_null(), "no host judged it");
 }
 
 #[tokio::test]

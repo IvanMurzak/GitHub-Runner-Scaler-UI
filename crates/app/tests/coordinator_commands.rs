@@ -672,6 +672,7 @@ fn the_signed_in_account_lists_hosts_and_runs_commands_on_them_remotely() {
                 String::new()
             },
             truncated: false,
+            access: Some(if change { "change" } else { "read" }.into()),
         }
     });
     coordinator.host("old-box", 62, Some(4), |_| unreachable!("never asked"));

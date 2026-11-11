@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Cli, CliError, Command, Context, CoordinatorRemoteChangesArgs, Failure, HostCommand,
-    RepoCommand, RepoProfileCommand, Styling, write_failed,
+    RemoteChangesChoice, RepoCommand, RepoProfileCommand, Styling, write_failed,
 };
 
 /// The operator's choice, in the configuration directory.
@@ -55,10 +55,10 @@ pub fn remote_changes(
 ) -> Result<(), CliError> {
     let failed = write_failed("the remote-changes setting");
     let path = context.paths().config_dir().join(SETTINGS_FILE);
-    let allow = match args.choice.as_str() {
-        "allow" => true,
-        "deny" => false,
-        _ => {
+    let allow = match args.choice {
+        RemoteChangesChoice::Allow => true,
+        RemoteChangesChoice::Deny => false,
+        RemoteChangesChoice::Status => {
             let allowed = changes_allowed(context.paths());
             writeln!(
                 out,
@@ -109,9 +109,14 @@ pub enum Access {
 /// What a command parsed from the coordinator does, or `None` for one this
 /// host never runs remotely: anything that signs in, installs, updates,
 /// touches another host, or is not about repositories and capacity.
+///
+/// Every flag of an allowed command comes with it, so the commands here are
+/// the ones whose every flag may be set remotely; a test lists those flags,
+/// and a new one fails it until someone decides. Creating or removing a
+/// profile is not here: it picks an execution backend and an image.
 #[must_use]
 pub fn access(cli: &Cli) -> Option<Access> {
-    if cli.data_dir.is_some() || cli.host != super::HostSelector::Local {
+    if cli.host != super::HostSelector::Local {
         return None;
     }
     match &cli.command {
@@ -131,13 +136,11 @@ pub fn access(cli: &Cli) -> Option<Access> {
             | RepoCommand::RemoveLabel(_)
             | RepoCommand::SetWorkspace(_)
             | RepoCommand::Profile(
-                RepoProfileCommand::Add(_)
-                | RepoProfileCommand::SetCapacity(_)
+                RepoProfileCommand::SetCapacity(_)
                 | RepoProfileCommand::SetScale(_)
                 | RepoProfileCommand::AddLabel(_)
                 | RepoProfileCommand::RemoveLabel(_)
-                | RepoProfileCommand::SetWorkspace(_)
-                | RepoProfileCommand::Remove(_),
+                | RepoProfileCommand::SetWorkspace(_),
             ),
         ) => Some(Access::Change),
         _ => None,
@@ -148,47 +151,68 @@ pub fn access(cli: &Cli) -> Option<Access> {
 /// how it ended. Never panics on the command's input.
 #[must_use]
 pub fn execute(context: &Context, command: &RunCommand) -> CommandResult {
-    let result = |exit_code: u8, stdout: String, stderr: String| {
-        let (stdout, stderr, truncated) = bounded(stdout, stderr);
-        CommandResult {
-            request_id: command.request_id.clone(),
-            exit_code,
-            stdout,
-            stderr,
-            truncated,
-        }
-    };
-    let refused = |class: Failure, message: String| {
-        result(class.code(), String::new(), format!("error: {message}\n"))
+    let refused = |class: Failure, message: &str| {
+        CommandResult::refused(&command.request_id, class.code(), message)
     };
     let outcome = (|| {
         if !command.well_formed() {
-            return refused(Failure::InvalidArgument, "the command is malformed".into());
+            return refused(Failure::InvalidArgument, "the command is malformed");
+        }
+        // Asked of the arguments themselves: `--data-dir` would point the
+        // command at another tree, and the service's own environment may set
+        // `RUNNER_MANAGER_DATA_DIR`, which clap would read into the same field.
+        if names_another_tree(&command.argv) {
+            return refused(
+                Failure::InvalidArgument,
+                "a command from the coordinator runs against this host's own data",
+            );
         }
         let cli = match <Cli as clap::Parser>::try_parse_from(
             std::iter::once("runner-manager".to_owned()).chain(command.argv.iter().cloned()),
         ) {
             Ok(cli) => cli,
             Err(error) => {
-                return result(2, String::new(), error.render().to_string());
+                let mut result = refused(Failure::InvalidArgument, "");
+                result.exit_code = 2;
+                result.stderr = error.render().to_string();
+                return result;
             }
         };
         let Some(access) = access(&cli) else {
             return refused(
                 Failure::InvalidArgument,
                 "this host does not run that command for the coordinator; only reading and \
-                 changing repositories, labels, limits and workspaces"
-                    .into(),
+                 changing repositories, labels, limits and workspaces",
             );
         };
+        let judged = |mut result: CommandResult| {
+            result.access = Some(
+                match access {
+                    Access::Read => "read",
+                    Access::Change => "change",
+                }
+                .to_owned(),
+            );
+            result
+        };
         if access == Access::Change && !changes_allowed(context.paths()) {
-            return refused(
+            return judged(refused(
                 Failure::Conflict,
                 "this host does not take changes through the coordinator; its operator can allow \
-                 them there with `runner-manager coordinator remote-changes allow`"
-                    .into(),
-            );
+                 them there with `runner-manager coordinator remote-changes allow`",
+            ));
         }
+        let result = |exit_code: u8, stdout: String, stderr: String| {
+            let (stdout, stderr, truncated) = bounded(stdout, stderr);
+            judged(CommandResult {
+                request_id: command.request_id.clone(),
+                exit_code,
+                stdout,
+                stderr,
+                truncated,
+                access: None,
+            })
+        };
         let mut stdout = Vec::new();
         match super::route(
             &cli.command,
@@ -213,12 +237,22 @@ pub fn execute(context: &Context, command: &RunCommand) -> CommandResult {
             }
         }
     })();
-    record(context.paths().state_dir(), command, outcome.exit_code);
+    // Reads are not kept here: opening a host on the dashboard reads it, and
+    // that would push the changes out of the record.
+    if outcome.access.as_deref() != Some("read") {
+        record(context.paths().state_dir(), command, outcome.exit_code);
+    }
     tracing::info!(
         exit_code = outcome.exit_code,
         "ran a command the coordinator relayed"
     );
     outcome
+}
+
+/// Whether `argv` names a data directory of its own.
+fn names_another_tree(argv: &[String]) -> bool {
+    argv.iter()
+        .any(|argument| argument == "--data-dir" || argument.starts_with("--data-dir="))
 }
 
 /// `stdout` and `stderr` cut to [`MAX_COMMAND_OUTPUT_BYTES`] together,
@@ -305,7 +339,7 @@ mod tests {
             &["coordinator", "leave"],
             &["--host", "wsl:Ubuntu", "repo", "list"],
             &["--host", "remote:other", "repo", "list"],
-            &["--data-dir", "/tmp/x", "repo", "list"],
+            &["repo", "profile", "add", "octo/app", "--name", "gpu"],
         ] {
             assert_eq!(access(&parsed(refused)), None, "{refused:?}");
         }
@@ -321,6 +355,118 @@ mod tests {
         assert_eq!(
             bounded("a".into(), String::new()),
             ("a".into(), String::new(), false)
+        );
+    }
+
+    #[test]
+    fn a_command_naming_its_own_data_directory_is_refused() {
+        let argv = |items: &[&str]| items.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(names_another_tree(&argv(&[
+            "--data-dir",
+            "/x",
+            "repo",
+            "list"
+        ])));
+        assert!(names_another_tree(&argv(&[
+            "--data-dir=/x",
+            "repo",
+            "list"
+        ])));
+        assert!(!names_another_tree(&argv(&["repo", "list"])));
+    }
+
+    /// Every flag of a command the coordinator may run can be set by a person
+    /// signed in to it. A flag added to one of these commands fails this test
+    /// until someone has decided it may be set remotely.
+    #[test]
+    fn every_flag_of_a_remote_command_was_decided_on() {
+        use clap::CommandFactory as _;
+        let approved: &[(&[&str], &[&str])] = &[
+            (&["status"], &["json"]),
+            (&["host", "show"], &[]),
+            (&["host", "set-capacity"], &["capacity"]),
+            (&["repo", "list"], &["json"]),
+            (
+                &["repo", "add"],
+                &[
+                    "repository",
+                    "host_label",
+                    "max_capacity",
+                    "labels",
+                    "enable",
+                ],
+            ),
+            (&["repo", "remove"], &["repository", "profile", "purge"]),
+            (
+                &["repo", "set-capacity"],
+                &["repository", "profile", "max_capacity"],
+            ),
+            (
+                &["repo", "set-scale"],
+                &["repository", "profile", "enabled"],
+            ),
+            (&["repo", "add-label"], &["repository", "profile", "labels"]),
+            (
+                &["repo", "remove-label"],
+                &["repository", "profile", "labels"],
+            ),
+            (
+                &["repo", "set-workspace"],
+                &["repository", "profile", "mode", "path"],
+            ),
+            (&["repo", "profile", "list"], &["repository"]),
+            (&["repo", "profile", "show"], &["repository", "profile"]),
+            (
+                &["repo", "profile", "set-capacity"],
+                &["repository", "profile", "max_capacity"],
+            ),
+            (
+                &["repo", "profile", "set-scale"],
+                &["repository", "profile", "enabled"],
+            ),
+            (
+                &["repo", "profile", "add-label"],
+                &["repository", "profile", "labels"],
+            ),
+            (
+                &["repo", "profile", "remove-label"],
+                &["repository", "profile", "labels"],
+            ),
+            (
+                &["repo", "profile", "set-workspace"],
+                &["repository", "profile", "mode", "path"],
+            ),
+        ];
+        let root = Cli::command();
+        let globals: Vec<String> = root
+            .get_arguments()
+            .filter(|argument| argument.is_global_set())
+            .map(|argument| argument.get_id().to_string())
+            .collect();
+        let mut undecided = Vec::new();
+        for (path, flags) in approved {
+            let mut command = &root;
+            for name in *path {
+                command = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("no command {path:?}"));
+            }
+            let mut actual: Vec<String> = command
+                .get_arguments()
+                .map(|argument| argument.get_id().to_string())
+                .filter(|id| id != "help" && !globals.contains(id))
+                .collect();
+            actual.sort();
+            let mut expected: Vec<String> = flags.iter().map(ToString::to_string).collect();
+            expected.sort();
+            if actual != expected {
+                undecided.push(format!("runner-manager {}: {actual:?}", path.join(" ")));
+            }
+        }
+        assert!(
+            undecided.is_empty(),
+            "flags no one decided on for remote use:\n{}",
+            undecided.join("\n")
         );
     }
 }

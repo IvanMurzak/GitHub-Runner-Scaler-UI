@@ -7,9 +7,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use runner_manager_domain::coordinator_protocol::{
-    COMMAND_VERSION, CommandResult, RunCommand, ServerMessage,
-};
+use runner_manager_domain::coordinator_protocol::{CommandResult, RunCommand, ServerMessage};
 use tokio::sync::oneshot;
 
 use crate::registry::Registry;
@@ -28,6 +26,31 @@ pub enum RemoteError {
     Malformed,
     #[error("the host did not answer in time")]
     Timeout,
+}
+
+impl RemoteError {
+    /// The word the record keeps for it.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::TooOld => "too_old",
+            Self::Malformed => "malformed",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    /// The HTTP status it answers with.
+    #[must_use]
+    pub const fn status(self) -> axum::http::StatusCode {
+        use axum::http::StatusCode;
+        match self {
+            Self::Offline => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TooOld => StatusCode::CONFLICT,
+            Self::Malformed => StatusCode::BAD_REQUEST,
+            Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        }
+    }
 }
 
 /// The commands sent and not yet answered.
@@ -55,10 +78,10 @@ impl RemoteCommands {
         by: &str,
         timeout: Duration,
     ) -> Result<CommandResult, RemoteError> {
-        match registry.protocol_version(host_id) {
+        match registry.takes_commands(host_id) {
             None => return Err(RemoteError::Offline),
-            Some(version) if version < COMMAND_VERSION => return Err(RemoteError::TooOld),
-            Some(_) => {}
+            Some(false) => return Err(RemoteError::TooOld),
+            Some(true) => {}
         }
         let command = RunCommand {
             request_id: hex::encode(rand::random::<[u8; 16]>()),
@@ -120,6 +143,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             truncated: false,
+            access: None,
         });
     }
 }

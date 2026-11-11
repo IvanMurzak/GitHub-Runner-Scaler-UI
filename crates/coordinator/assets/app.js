@@ -800,8 +800,8 @@
     504: 'The machine did not answer in time.',
   };
   // Reads the panel itself makes; the activity log hides them unless asked.
-  const READS = [['repo', 'list'], ['repo', 'profile', 'list'], ['repo', 'profile', 'show'], ['host', 'show'], ['status']];
-  const isRead = (argv) => READS.some((r) => r.every((w, i) => argv[i] === w));
+  // The host says what each command was; one it refused unjudged counts as a change attempt.
+  const isRead = (c) => c.access === 'read';
 
   const shq = (a) => (/^[A-Za-z0-9_\-.,/:=@%+]+$/.test(String(a)) ? String(a) : `'${String(a).replace(/'/g, `'\\''`)}'`);
   const cmdLine = (argv) => ['runner-manager', ...(argv || []).map(shq)].join(' ');
@@ -897,7 +897,7 @@
     if (!state.audit && !state.auditErr) return;  // first load still on its way
     sec.hidden = false;
     const all = state.audit || [];
-    const list = state.auditAll ? all : all.filter((c) => !isRead(c.argv || []));
+    const list = state.auditAll ? all : all.filter((c) => !isRead(c));
     const sig = JSON.stringify([all, state.auditAll, state.auditOpen, state.showAllAudit, state.auditErr]);
     if (!force && sig === state.auditSig) return;
     state.auditSig = sig;
