@@ -240,10 +240,12 @@ struct VmPages {
 
 /// Memory macOS hands to new work without compressing or swapping anything,
 /// in bytes: free pages, the file cache (file-backed pages, active ones too)
-/// and purgeable pages. It is what Activity Monitor does not count as used,
-/// and like Linux's `MemAvailable` it counts the file cache. Not `psutil`'s
-/// free plus inactive: that counts inactive app memory, which only
-/// compression frees, and leaves out the active file cache.
+/// and purgeable pages. It is what Activity Monitor does not count as used.
+/// Like Linux's `MemAvailable` it counts the file cache, but it holds none of
+/// it back (pages still to be written, files in use): the admission and
+/// placement margins are that reserve. Not `psutil`'s free plus inactive:
+/// that counts inactive app memory, which only compression frees, and leaves
+/// out the active file cache.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn available_pages_bytes(pages: VmPages, page: u64) -> Option<u64> {
     // The speculative pages are in both the free and the file-backed counts.
