@@ -772,13 +772,13 @@ needs the [web dashboard](#web-dashboard) configured, and hosts and coordinator 
 ### What a host allows
 
 The coordinator only relays `runner-manager` arguments; the host parses them and decides. It runs
-nothing outside this list, and never anything that signs in, installs, updates, removes the
-service, or addresses another host (`--host`, `--data-dir`):
+nothing outside this list, and never anything that signs in, installs, removes the service, or
+addresses another host (`--host`, `--data-dir`):
 
 | Kind | Commands | Answered |
 | --- | --- | --- |
 | Read | `status`, `host show`, `repo list [--json]`, `repo profile list`, `repo profile show` | always |
-| Change | `host set-capacity`; `repo add`, `remove`, `set-capacity`, `set-scale`, `add-label`, `remove-label`, `set-workspace`; `repo profile add`, `remove`, `set-capacity`, `set-scale`, `add-label`, `remove-label`, `set-workspace` | only after `runner-manager coordinator remote-changes allow` **on that host** |
+| Change | `host set-capacity`; `repo add`, `remove`, `set-capacity`, `set-scale`, `add-label`, `remove-label`, `set-workspace`; `repo profile add`, `remove`, `set-capacity`, `set-scale`, `add-label`, `remove-label`, `set-workspace`; `update` (from 0.4.64, no flags) | only after `runner-manager coordinator remote-changes allow` **on that host** |
 
 Changes are off until the host's own operator turns them on there:
 
@@ -790,6 +790,35 @@ runner-manager coordinator remote-changes status
 The host runs a command as its service would, in its own data directories, and answers with the
 command's exit code and output (up to 48 KiB). The running service tells the coordinator within a
 minute when the choice changes; the dashboard and `coordinator hosts` show it.
+
+### Versions and updates
+
+From 0.4.64 each host's heartbeat names its runner-manager builds, and the dashboard shows them on
+the machine's card and in its panel:
+
+- **service**: the build the service runs now;
+- **app**: the installed binary the service was installed from and upgrades itself from (npm,
+  Homebrew, the release archive, `cargo install`), usually the `runner-manager` on the machine's
+  command line;
+- on Windows, the version each managed WSL distribution was last given by `wsl install`. A WSL
+  distribution is a host of its own at the coordinator, with its own service and app, marked WSL.
+
+An app newer than the service means the service is finishing its jobs before it restarts into it.
+
+**Update** in a machine's panel sends `update` to the host. The host answers at once that it
+started, and in the background does what its daily automatic update does: it updates the app to
+the newest GitHub release through the channel that installed it (the release archive is checked
+against the release's `SHA256SUMS`; npm, Homebrew and cargo install from their own registries,
+npm and cargo pinned to that release's version); the coordinator names no version and no source.
+The service then stops taking new jobs, waits for its running ones without a deadline, and
+restarts into the new build. The dashboard shows the progress and how it ended, with the end of
+the package manager's output when it failed; the audit trail records only that it was started.
+
+A host refuses, and says why, when its operator turned automatic updates off (`host
+set-auto-update false`), when its service was installed from a build in a checkout (a release
+binary that `update --force` put at such a path, with the copy it keeps beside it, is updated like
+the release archive), and when its service runs as root and the app belongs to another account (a
+Homebrew prefix, an nvm npm). A WSL distribution is updated through its own host.
 
 ### Sign in the CLI
 
@@ -830,7 +859,7 @@ old to take commands; the coordinator waits up to a minute for an answer.
 | `POST /auth/cli/approve` | a browser's session cookie, this origin | form `code`, `decision=approve\|deny` |
 | `POST /auth/cli/poll` | the CLI, `{"device_code"}` | `428 {"status":"pending"}`, `403 denied`, `410 expired`, or once `200 {"token", "login"}` |
 | `POST /auth/cli/logout` | `Authorization: Bearer` | `204` |
-| `GET /api/overview` | a session | hosts with `online`, `manageable`, `remote_changes` |
+| `GET /api/overview` | a session | hosts with `online`, `manageable`, `remote_changes`, and from 0.4.64 `versions` (`service`, `app`, `app_source`, `updatable`, `update`, `wsl`, `wsl_guest`) |
 | `POST /api/hosts/{id}/command` | a session; a cookie also needs this origin | `{"argv": [...]}` to `{"request_id", "exit_code", "stdout", "stderr", "truncated"}`; `503` offline, `409` too old, `504` no answer |
 | `GET /api/hosts/{id}/config` | a session | the host's `repo list --json` and `remote_changes` |
 | `GET /api/audit` | a session | the last 100 remote commands |
@@ -855,7 +884,10 @@ A person on the allowlist, or anyone holding their session, can read every host'
 and limits, and change those of hosts that allowed changes. So can anyone who controls the
 coordinator itself: a compromised coordinator can change, within the list above, any host that
 ran `remote-changes allow`. It can never change a host that did not, and no host runs anything
-outside the list, whoever asks: no shell, no sign-in, no update, no service removal. A host that
+outside the list, whoever asks: no shell, no sign-in, no service removal. An update it starts
+installs only the newest published release, through the channel the host's operator installed
+it with, as the daily automatic update would; a host with automatic updates off refuses it. From
+0.4.64 `remote-changes allow` covers this update too. A host that
 does not want to be managed at all keeps changes off (the default), or leaves the coordinator.
 
 ## Updates

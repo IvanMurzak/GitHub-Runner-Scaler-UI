@@ -62,6 +62,7 @@ pub mod service;
 pub mod status;
 pub mod ui;
 pub mod update;
+pub mod versions;
 pub mod workspace;
 pub mod wsl;
 mod wsl_watchdog;
@@ -704,7 +705,8 @@ pub enum CoordinatorCommand {
     /// Allow or deny changes to this host through the coordinator.
     ///
     /// People signed in to the coordinator may then change this host's
-    /// repositories, labels, limits and workspaces. Reads are always answered.
+    /// repositories, labels, limits and workspaces, and update its
+    /// runner-manager to the newest release. Reads are always answered.
     RemoteChanges(CoordinatorRemoteChangesArgs),
     /// Sign in to a coordinator with GitHub, to manage its hosts from here.
     Login(CoordinatorLoginArgs),

@@ -56,7 +56,7 @@ fn tick(context: &Context) -> Result<(), CliError> {
                 force: false,
             },
             report,
-            true,
+            super::update::Caller::Schedule,
         )
     })
 }

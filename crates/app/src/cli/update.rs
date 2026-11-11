@@ -62,6 +62,7 @@ use runner_manager_platform::service::InstallRecord;
 
 #[path = "update_force.rs"]
 pub(super) mod force;
+pub(crate) use force::executable_version;
 use force::{force_service_handover, preflight_force, report_force_check};
 
 // ---------------------------------------------------------------------------
@@ -314,7 +315,7 @@ fn host_target() -> Result<HostTarget, CliError> {
 /// `bin` under `CARGO_HOME`. So the detection reads the evidence that exists
 /// rather than the evidence that would be convenient.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Channel {
+pub(crate) enum Channel {
     /// The install script's layout, or any copy an operator placed by hand.
     /// This is the one channel this command updates itself.
     Archive,
@@ -332,7 +333,7 @@ enum Channel {
 
 impl Channel {
     /// How this channel is described in a report.
-    const fn describe(&self) -> &'static str {
+    pub(crate) const fn describe(&self) -> &'static str {
         match self {
             Self::Archive => "release archive",
             Self::Npm => "npm",
@@ -346,12 +347,25 @@ impl Channel {
 
 /// The binary this command would replace, and how it got there.
 #[derive(Debug, Clone)]
-struct Installation {
-    channel: Channel,
+pub(crate) struct Installation {
+    pub(crate) channel: Channel,
     /// Absolute and symlink-free: Homebrew's `bin` entry is a symlink into
     /// `Cellar`, and the `Cellar` component is the whole of how that channel is
     /// recognised.
-    path: PathBuf,
+    pub(crate) path: PathBuf,
+}
+
+/// Who runs an update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Caller {
+    /// `runner-manager update` on the machine: updates the binary it runs.
+    Operator,
+    /// The daily check of the TUI or the service: updates the binary the
+    /// service was installed from, and passes over what it cannot update.
+    Schedule,
+    /// A person signed in to the coordinator: like the daily check, but says
+    /// why when it cannot.
+    Coordinator,
 }
 
 /// Homebrew moves versioned Cellar paths on upgrade. Follow its stable opt link
@@ -428,6 +442,71 @@ impl Installation {
         })
     }
 
+    /// The installed binary the service was installed from and upgrades
+    /// itself from, as `service install` recorded it. `None` without a
+    /// service.
+    ///
+    /// A release binary in a checkout's `target` directory is put there by
+    /// `update --force`, which replaces a service source that was a build in
+    /// a checkout and keeps the build it replaced beside it
+    /// ([`FORCE_BACKUP_PREFIX`]): with that backup there and a release
+    /// version (`X.Y.Z`, never a checkout build's `X.Y.Z+git.<sha>`), it is
+    /// updated as a release archive is, since nothing of the checkout's owner
+    /// is in it any more. Any other build in a checkout is left alone.
+    ///
+    /// # Errors
+    /// [`Failure::LocalState`] when the record cannot be read.
+    pub(crate) fn of_service(
+        paths: &runner_manager_platform::paths::AppPaths,
+    ) -> Result<Option<Self>, CliError> {
+        Ok(service_source(paths)?.map(|path| {
+            let version = force::executable_version(&path);
+            Self::of_source(paths, path, version.as_deref())
+        }))
+    }
+
+    /// The service source at `path`, which answered `--version` with
+    /// `version`. See [`Self::of_service`].
+    pub(crate) fn of_source(
+        paths: &runner_manager_platform::paths::AppPaths,
+        path: PathBuf,
+        version: Option<&str>,
+    ) -> Self {
+        let mut channel = classify(&path, paths.state_dir());
+        if channel == Channel::SourceBuild
+            && version.is_some_and(|version| !version.contains('+'))
+            && forced_here(&path)
+        {
+            channel = Channel::Archive;
+        }
+        Self { channel, path }
+    }
+
+    /// Why the service, running as root, must not update this binary: it
+    /// belongs to another account (a Homebrew prefix, an nvm npm), where root
+    /// would leave files that account can no longer replace, and Homebrew
+    /// refuses to run as root at all. `None` elsewhere.
+    pub(crate) fn foreign_to_root_service(&self) -> Option<CliError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let owner = std::fs::metadata(&self.path).ok()?.uid();
+            if runner_manager_platform::host_fitness::is_elevated() && owner != 0 {
+                return Some(CliError::with_remedy(
+                    Failure::UpdateUnsupported,
+                    format!(
+                        "the service runs as root and {} belongs to another account; updating it \
+                         as root would leave files that account cannot replace. Update it as \
+                         its owner.",
+                        display_path(&self.path)
+                    ),
+                    "runner-manager update",
+                ));
+            }
+        }
+        None
+    }
+
     /// Why this copy cannot be updated in place, when it cannot.
     ///
     /// Both cases are files this command is able to overwrite and must not.
@@ -437,7 +516,7 @@ impl Installation {
     /// binary an operator owns -- writing it here would put a version under the
     /// registration that the next `service install` overwrites anyway, and
     /// would leave the operator's own binary still on the old release.
-    fn refusal(&self) -> Option<CliError> {
+    pub(crate) fn refusal(&self) -> Option<CliError> {
         match self.channel {
             Channel::SourceBuild => Some(CliError::with_remedy(
                 Failure::UpdateUnsupported,
@@ -488,6 +567,43 @@ impl Installation {
                 )
             })
     }
+}
+
+/// The path of the binary the service was installed from, as `service
+/// install` recorded it, absolute and with Homebrew's versioned `Cellar` path
+/// followed to its stable link. `None` without a service.
+///
+/// # Errors
+/// [`Failure::LocalState`] when the record cannot be read.
+pub(crate) fn service_source(
+    paths: &runner_manager_platform::paths::AppPaths,
+) -> Result<Option<PathBuf>, CliError> {
+    let record = InstallRecord::read(paths)
+        .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?;
+    Ok(record.and_then(|record| record.source_binary).map(|path| {
+        let path = restart_path(&path);
+        std::fs::canonicalize(&path).unwrap_or(path)
+    }))
+}
+
+/// The name `update --force` gives the copy of the service source it keeps.
+pub(crate) const FORCE_BACKUP_PREFIX: &str = ".runner-manager-before-force-update-";
+
+/// Whether `update --force` replaced the binary at `path`: the copy it keeps
+/// is beside it.
+fn forced_here(path: &Path) -> bool {
+    path.parent()
+        .and_then(|parent| std::fs::read_dir(parent).ok())
+        .is_some_and(|mut entries| {
+            entries.any(|entry| {
+                entry.is_ok_and(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(FORCE_BACKUP_PREFIX)
+                })
+            })
+        })
 }
 
 /// The global npm prefix that holds the npm copy at `binary`.
@@ -730,39 +846,45 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
         runner_manager_platform::lock::LockKind::Update,
     )
     .map_err(|error| CliError::new(Failure::Conflict, error.to_string()))?;
-    perform(context, args, out, false)
+    perform(context, args, out, Caller::Operator)
 }
 
 pub(super) fn perform(
     context: &Context,
     args: &UpdateArgs,
     out: &mut dyn Write,
-    automatic: bool,
+    caller: Caller,
 ) -> Result<(), CliError> {
     let failed = write_failed("this update");
     let mut err = std::io::stderr();
 
     let mut installation = Installation::detect(context)?;
-    if automatic && matches!(installation.channel, Channel::ServiceCopy) {
-        let record = InstallRecord::read(context.paths())
-            .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?;
-        if let Some(path) = record.and_then(|record| record.source_binary) {
-            let path = restart_path(&path);
-            let path = std::fs::canonicalize(&path).unwrap_or(path);
-            installation = Installation {
-                channel: classify(&path, context.paths().state_dir()),
-                path,
+    if caller != Caller::Operator
+        && matches!(installation.channel, Channel::ServiceCopy)
+        && let Some(source) = Installation::of_service(context.paths())?
+    {
+        installation = source;
+    }
+    if caller != Caller::Operator {
+        let refusal = match installation.channel {
+            Channel::SourceBuild => installation.refusal(),
+            _ => installation.foreign_to_root_service(),
+        };
+        if let Some(refusal) = refusal {
+            return match caller {
+                Caller::Coordinator => Err(refusal),
+                _ => Ok(()),
             };
         }
-    }
-    if automatic {
-        if matches!(installation.channel, Channel::SourceBuild) {
-            return Ok(());
-        }
         // The daemon may still be draining after its source was updated.
-        if super::daemon::upgraded_version(&installation.path)
-            .is_some_and(|version| compare_versions(&version, running_version()).is_gt())
+        if let Some(version) = super::daemon::upgraded_version(&installation.path)
+            && compare_versions(&version, running_version()).is_gt()
         {
+            writeln!(
+                out,
+                "{version} is installed already; the service restarts into it once its jobs finish."
+            )
+            .map_err(failed)?;
             return Ok(());
         }
     }
@@ -2156,6 +2278,42 @@ mod tests {
         assert_eq!(
             classify(Path::new("/opt/release/runner-manager"), &state),
             Channel::Archive
+        );
+    }
+
+    #[test]
+    fn a_release_binary_in_a_checkout_is_updated_as_an_archive_and_a_build_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = runner_manager_platform::paths::AppPaths::rooted_at(dir.path());
+        let release_dir = dir.path().join("checkout/target/release");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let source = release_dir.join("runner-manager");
+        // Without the copy `update --force` keeps, even a plain version is a
+        // checkout build: one built without git says no `+git`.
+        let built = Installation::of_source(&paths, source.clone(), Some("0.4.63"));
+        assert_eq!(built.channel, Channel::SourceBuild);
+        std::fs::write(
+            release_dir.join(format!("{FORCE_BACKUP_PREFIX}abc")),
+            b"old",
+        )
+        .unwrap();
+        // What `update --force` leaves at a checkout's service source.
+        let release = Installation::of_source(&paths, source.clone(), Some("0.4.63"));
+        assert_eq!(release.channel, Channel::Archive);
+        assert!(release.refusal().is_none());
+        // The checkout's own build, and one that does not answer: left alone.
+        for version in [Some("0.4.63+git.0123456789ab"), None] {
+            let build = Installation::of_source(&paths, source.clone(), version);
+            assert_eq!(build.channel, Channel::SourceBuild, "{version:?}");
+            assert!(build.refusal().is_some());
+        }
+        // Elsewhere the version changes nothing.
+        let npm = PathBuf::from(
+            "/usr/lib/node_modules/@ivan-murzak/runner-manager-linux-x64/bin/runner-manager",
+        );
+        assert_eq!(
+            Installation::of_source(&paths, npm, Some("0.4.63")).channel,
+            Channel::Npm
         );
     }
 

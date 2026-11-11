@@ -393,6 +393,7 @@
         meterRow('Memory', used != null && total ? (used / total) * 100 : null, `${fmtBytes(used)} / ${fmtBytes(total)}`),
         meterRow('Slots', slots ? ((x.busy_slots || 0) / slots) * 100 : null, slots ? `${x.busy_slots || 0} / ${slots}` : '—')),
       sparkline(x.id),
+      versionLine(x),
       h('footer', { class: 'host-foot' },
         h('span', {}, 'Disk free ', h('b', { class: 'num', text: fmtBytes(x.disk_free_bytes) })),
         !x.online ? h('span', {}, 'Last seen ', ago(x.last_seen_at))
@@ -854,6 +855,122 @@
       : h('span', { class: 'access access-ro', title: 'Its operator has not allowed changes through the coordinator' }, lockIcon(), 'Read-only');
   }
 
+  // ------------------------------------------------------------- versions
+  // `X.Y.Z`, or a local build's `X.Y.Z+git.<sha>`, by its `X.Y.Z`.
+  function verParts(v) {
+    const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(v || ''));
+    return m ? [+m[1], +m[2], +m[3]] : null;
+  }
+  function cmpVer(a, b) {
+    const x = verParts(a), y = verParts(b);
+    if (!x || !y) return 0;
+    for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+    return 0;
+  }
+  // The newest release the coordinator knows of: its own build, or the one its updater saw published.
+  function newestRelease() {
+    const ov = state.ov || {};
+    const latest = ov.update && ov.update.latest;
+    return latest && cmpVer(latest, ov.version) > 0 ? latest : ov.version || null;
+  }
+  // The one word on a machine's runner-manager, and its badge colour.
+  function versionState(v) {
+    const u = v.update;
+    if (u && u.state === 'running') return { cls: 'dim', text: 'Updating…' };
+    if (v.app && cmpVer(v.app, v.service) > 0) return { cls: 'warn', text: `Restarts into v${v.app} after its jobs` };
+    if (u && u.state === 'failed') return { cls: 'err', text: 'Update failed' };
+    const newest = newestRelease();
+    if (newest && cmpVer(v.app || v.service, newest) < 0) return { cls: 'warn', text: `v${newest} available` };
+    return null;
+  }
+  // The Windows machine a WSL host runs on: WSL keeps the Windows computer name by default.
+  function wslParent(x) {
+    const name = String(x.hostname || '').toLowerCase();
+    if (!name) return null;
+    return ((state.ov && state.ov.hosts) || []).find((y) => y.id !== x.id && y.versions && (y.versions.wsl || []).length
+      && String(y.hostname || '').toLowerCase() === name) || null;
+  }
+
+  function versionLine(x) {
+    const v = x.versions;
+    if (!v) return x.online ? h('p', { class: 'host-ver', title: 'Machines report their versions from runner-manager 0.4.64' }, h('span', { class: 'muted', text: justConnected(x) ? 'Reading versions…' : 'Version unknown (before 0.4.64)' })) : null;
+    const st = versionState(v);
+    const appDiffers = v.app && v.app !== v.service;
+    return h('p', { class: 'host-ver' },
+      v.wsl_guest ? h('span', { class: 'badge badge-dim', title: 'Runs inside a WSL distribution of a Windows machine', text: 'WSL' }) : null,
+      h('span', { title: 'The build the service runs' }, 'Service ', h('b', { class: 'num', text: `v${v.service}` })),
+      appDiffers ? h('span', { title: `The installed app the service upgrades from${v.app_source ? ` (${v.app_source})` : ''}` }, 'App ', h('b', { class: 'num', text: `v${v.app}` })) : null,
+      (v.wsl || []).map((w) => h('span', { title: `WSL ${w.distribution}: the runner-manager this machine last installed in it` }, `WSL ${w.distribution} `, h('b', { class: 'num', text: `v${w.installed_version}` }))),
+      st ? h('span', { class: `badge badge-${st.cls}`, text: st.text }) : null);
+  }
+
+  // Connected so recently that its first heartbeat may still be on its way.
+  const justConnected = (x) => isNum(x.connected_since) && serverNow() - x.connected_since < 60;
+  // After an Update click, until the host reports an update started at or after it.
+  function awaitingUpdate(x) {
+    if (!dw.updateSent || dw.updateSent.id !== (x && x.id)) return false;
+    const u = x.versions && x.versions.update;
+    if ((u && u.at >= dw.updateSent.at - 5) || serverNow() - dw.updateSent.at > 120) { dw.updateSent = null; return false; }
+    return true;
+  }
+  function versionSig(x) {
+    const p = x && x.versions && x.versions.wsl_guest ? wslParent(x) : null;
+    return JSON.stringify(x && [x.online, x.manageable, x.remote_changes, x.versions, newestRelease(), awaitingUpdate(x), p && (p.name || p.hostname), !x.versions && justConnected(x)]);
+  }
+
+  function versionCard(x) {
+    const v = x && x.versions;
+    const row = (label, value, note) => h('div', { class: 'ver-row' },
+      h('dt', { text: label }), h('dd', {}, h('b', { class: 'num', text: value ? `v${value}` : '—' }), note ? h('span', { class: 'muted', text: ` ${note}` }) : null));
+    const parent = v && v.wsl_guest ? wslParent(x) : null;
+    const waiting = awaitingUpdate(x);
+    const u = v && !waiting ? v.update : null;
+    const busy = dw.busy.has('update') || waiting || (u && u.state === 'running');
+    const can = !!(x && x.online && x.manageable && x.remote_changes && v && v.updatable);
+    let hint;
+    if (!x || !x.online) hint = 'Shown while the machine is connected.';
+    else if (!v) hint = justConnected(x) ? 'Reading this machine’s versions…' : 'This machine runs a runner-manager older than 0.4.64, which does not report its versions or take updates from here. Update it on the machine once.';
+    else if (!x.remote_changes) hint = 'Updating from here needs changes through the coordinator allowed on the machine.';
+    else if (!v.updatable) hint = `Its app is ${v.app_source || 'not known'}, which the service cannot update. Update it on the machine.`;
+    else hint = 'Update installs the newest release the way the app was installed. The service finishes its running jobs first, then restarts into it.';
+    const st = v ? versionState(v) : null;
+    return h('section', { class: 'card dw-card', 'data-key': 'update', 'data-sig': versionSig(x), 'aria-labelledby': 'dw-h-ver' },
+      h('fieldset', { class: 'fs', disabled: busy || null },
+        h('div', { class: 'cap-row' },
+          h('div', { class: 'cap-text' },
+            h('h3', { id: 'dw-h-ver', class: 'cap-title' }, 'runner-manager ', st ? h('span', { class: `badge badge-${st.cls}`, text: st.text }) : null),
+            h('p', { class: 'cap-hint', text: hint })),
+          can ? h('button', {
+            type: 'button', class: 'btn-sm btn-primary', 'data-fk': 'update', 'aria-busy': busy ? 'true' : null,
+            text: busy ? 'Updating…' : 'Update',
+            onclick: (e) => run('update', ['update'], e.currentTarget),
+          }) : null),
+        v ? h('dl', { class: 'ver-list' },
+          row('Service', v.service, 'running now'),
+          row('App', v.app, v.app_source ? `· ${v.app_source}` : null),
+          (v.wsl || []).map((w) => row(`WSL ${w.distribution}`, w.installed_version, '· installed by this machine; updated through its own host')),
+          parent ? h('div', { class: 'ver-row' }, h('dt', { text: 'Runs on' }), h('dd', { text: `${parent.name || parent.hostname} (WSL)` })) : null) : null,
+        u ? h('p', { class: `ver-progress ${u.state === 'failed' ? 'text-err' : 'muted'}` },
+          u.state === 'running' ? 'Update started ' : u.state === 'failed' ? 'Update failed ' : 'Update finished ', ago(u.at), u.message ? ` · ${u.message}` : '') : null),
+      resultNote('update'));
+  }
+
+  // Heartbeats bring the versions and an update's progress: the card follows them.
+  function refreshVersionCard() {
+    if (!dw.id || dw.busy.has('update')) return;
+    const old = $('[data-key="update"]', $('#dw-body'));
+    if (!old) return;
+    const x = hostById(dw.id);
+    if (old.dataset.sig === versionSig(x)) return;
+    const had = old.contains(document.activeElement);
+    const card = versionCard(x);
+    old.replaceWith(card);
+    if (!had) return;
+    const b = $('[data-fk="update"]', card), note = $('[data-result="update"]', card);
+    const target = b && !b.closest('fieldset:disabled') ? b : note || $('#dw-body');
+    target.focus({ preventScroll: true });
+  }
+
   // ------------------------------------------------------------ audit log
   function buildAuditControls() {
     $('#audit-filter').replaceChildren(...[['changes', 'Changes'], ['all', 'All']].map(([v, t]) => h('button', {
@@ -936,7 +1053,7 @@
   const dw = {
     id: null, gen: 0, pushed: false, sig: '',
     cfg: null, rc: null, loading: false, error: null, cfgSeq: 0,
-    results: new Map(), busy: new Set(), add: null, confirm: null,
+    results: new Map(), busy: new Set(), add: null, confirm: null, updateSent: null,
   };
 
   function hashHost() {
@@ -1010,6 +1127,7 @@
     if (!dw.id) return;
     const before = dw.sig;
     renderDrawerHead();
+    refreshVersionCard();
     if (dw.sig === before) return;
     const x = hostById(dw.id);
     if (x && x.manageable && !dw.loading && !dw.busy.size && (!dw.cfg || dw.rc !== !!x.remote_changes)) loadConfig({ quiet: !!dw.cfg });
@@ -1147,7 +1265,7 @@
     }
     const known = new Set(pols.map(policyKey));
     // Results whose control is gone: a removed policy, or the add form once it closed.
-    const orphans = [...dw.results.keys()].filter((k) => (k === 'add' ? !dw.add : k !== 'host' && !known.has(k)));
+    const orphans = [...dw.results.keys()].filter((k) => (k === 'add' ? !dw.add : k !== 'host' && k !== 'update' && !known.has(k)));
     return h('div', { class: 'dw-stack' },
       dw.error ? h('div', { class: 'result result-err', role: 'alert' },
         h('span', { class: 'result-icon', 'aria-hidden': 'true', text: '!' }),
@@ -1155,6 +1273,7 @@
         h('button', { type: 'button', class: 'btn-sm', 'data-fk': 'retry', text: 'Retry', onclick: () => loadConfig() }),
         dw.error.error ? h('pre', { class: 'result-pre', text: dw.error.error }) : null) : null,
       doc.schema_version !== 1 ? h('p', { class: 'notice notice-warn', text: `This machine describes its settings in format ${doc.schema_version}; this page reads format 1, so some details may be missing.` }) : null,
+      versionCard(x),
       machineCard(doc.host, can, x),
       h('section', { class: 'dw-section', 'aria-labelledby': 'dw-h-repos' },
         h('div', { class: 'section-head' },
@@ -1517,6 +1636,7 @@
     if (gen !== dw.gen) return;
     const res = toResult(r, argv);
     dw.results.set(key, res);
+    if (res.ok && key === 'update') dw.updateSent = { id, at: serverNow() };
     if (res.ok && key === 'add') dw.add = null;
     if (res.ok && dw.confirm === key) dw.confirm = null;
     if (r.status !== 401) await loadConfig({ quiet: true, render: false });
