@@ -571,6 +571,20 @@ impl fmt::Display for ServiceAccount {
 /// for exactly this purpose.
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
+    /// A boot service an older build installed under another tree was not
+    /// moved to the system tree, and nothing was changed: its host was busy,
+    /// or an operator's drop-in names the old tree.
+    #[error(
+        "this host's data stays under {} for now: {reason}",
+        from.display()
+    )]
+    MoveDeferred {
+        /// The old tree's configuration directory.
+        from: PathBuf,
+        /// Why, for the operator.
+        reason: String,
+    },
+
     /// The single-instance lock is held, so a second agent must not be
     /// registered.
     ///
@@ -1984,6 +1998,28 @@ fn home_root_of(path: &Path) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|root| path.starts_with(root))
+}
+
+/// The first drop-in in `directory` whose text names one of `trees`, leaving
+/// out the ones runner-manager writes itself (they say `Managed by
+/// runner-manager`).
+#[cfg(any(test, target_os = "linux"))]
+fn operator_drop_in_naming(directory: &Path, trees: &[&PathBuf]) -> Option<PathBuf> {
+    let mut drop_ins: Vec<PathBuf> = std::fs::read_dir(directory)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension() == Some("conf".as_ref()))
+        .collect();
+    drop_ins.sort();
+    drop_ins.into_iter().find(|path| {
+        std::fs::read_to_string(path).is_ok_and(|text| {
+            !text.contains("Managed by runner-manager")
+                && trees
+                    .iter()
+                    .any(|tree| text.contains(tree.to_string_lossy().as_ref()))
+        })
+    })
 }
 
 /// Renames a non-empty directory at `path` to `<name>.before-move-<stamp>`
@@ -4817,7 +4853,9 @@ impl ServiceOperations {
         // Item 1. The guard lives until the end of this function; dropping it is
         // the release, so an early return releases it too.
         let _guard = self.refuse_while_an_agent_runs()?;
-        let adopted = self.adopt_boot_installation(request.start_mode())?;
+        // `service install` moved an older tree in, if there was one, before
+        // it opened the database here; this finds nothing left to move.
+        let adopted = self.adopt_boot_installation(request.start_mode(), &|_| Ok(()))?;
         // Replacing applies to this account's own registration only: over
         // another installation's it would re-register that service against
         // this account's directories.
@@ -5555,18 +5593,26 @@ impl ServiceOperations {
     /// # Errors
     ///
     /// Whatever stopping the old service or copying its tree reports.
-    pub fn adopt_boot_installation(&self, mode: StartMode) -> Result<bool, ServiceError> {
+    pub fn adopt_boot_installation(
+        &self,
+        mode: StartMode,
+        idle: &dyn Fn(&ServiceDirectories) -> Result<(), String>,
+    ) -> Result<bool, ServiceError> {
         #[cfg(target_os = "linux")]
-        return self.adopt_boot_installation_on_linux(mode);
+        return self.adopt_boot_installation_on_linux(mode, idle);
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = mode;
+            let _ = (mode, idle);
             Ok(false)
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn adopt_boot_installation_on_linux(&self, mode: StartMode) -> Result<bool, ServiceError> {
+    fn adopt_boot_installation_on_linux(
+        &self,
+        mode: StartMode,
+        idle: &dyn Fn(&ServiceDirectories) -> Result<(), String>,
+    ) -> Result<bool, ServiceError> {
         if mode != StartMode::Boot {
             return Ok(false);
         }
@@ -5580,9 +5626,43 @@ impl ServiceOperations {
         let Some(old) = self.foreign_directories(&found) else {
             return Ok(false);
         };
-        self.controls
-            .control(StartMode::Boot)?
-            .stop(&self.identity)?;
+        let deferred = |reason: String| ServiceError::MoveDeferred {
+            from: old.config.clone(),
+            reason,
+        };
+        // The moved unit hides `/root` and `/home`, so a setting of the
+        // operator's that points into the old tree would point nowhere.
+        let unit = self.identity.systemd_unit();
+        // Every directory systemd reads a unit's drop-ins from.
+        let trees = [&old.config, &old.state, &old.runtime, &old.logs];
+        if let Some(drop_in) = [
+            SYSTEMD_SYSTEM_DIR,
+            "/run/systemd/system",
+            "/usr/lib/systemd/system",
+        ]
+        .iter()
+        .find_map(|base| {
+            operator_drop_in_naming(&Path::new(base).join(format!("{unit}.d")), &trees)
+        }) {
+            return Err(deferred(format!(
+                "{} names that tree, and the moved service could not see it; change or remove it, \
+                 run `sudo systemctl daemon-reload`, and run this again",
+                drop_in.display()
+            )));
+        }
+        let control = self.controls.control(StartMode::Boot)?;
+        let was_running = control.stop(&self.identity)?;
+        // Asked once the service is stopped, so no runner can start after: a
+        // runner keeps running when the service stops (`KillMode=process`),
+        // in a directory the moved service could not see. Asked of the tree
+        // the registration names, which is not always the caller's own.
+        if let Err(reason) = idle(&old) {
+            // Unchanged: a service the operator had stopped stays stopped.
+            if was_running {
+                control.start(&self.identity)?;
+            }
+            return Err(deferred(reason));
+        }
         // No service was ever installed against this tree, so whatever is in it
         // is what an interrupted attempt or a stray command left: set aside,
         // never deleted, in favour of the data the running service used. A
@@ -10248,6 +10328,37 @@ mod tests {
         assert!(!reports(&unit, &legacy, "BindPaths", FindingKind::Excess));
         let widened = unit.replace("BindPaths=", "BindPaths=/root/.ssh /etc:/root/.config ");
         assert!(reports(&widened, &legacy, "BindPaths", FindingKind::Excess));
+    }
+
+    #[test]
+    fn a_move_stops_at_an_operator_drop_in_naming_the_old_tree_but_not_at_its_own() {
+        let root = tempfile::tempdir().expect("dir");
+        let drop_ins = root.path().join("runner-manager.service.d");
+        std::fs::create_dir_all(&drop_ins).unwrap();
+        let runtime = PathBuf::from("/root/.local/share/runner-manager/runtime");
+        let config = PathBuf::from("/root/.config/runner-manager");
+        let trees = [&config, &runtime];
+        std::fs::write(
+            drop_ins.join("20-wsl-recovery.conf"),
+            "# Managed by runner-manager; the exact Windows/WSL recovery bridge.\n[Service]\n\
+             ReadWritePaths=/root/.config/runner-manager/wsl-recovery\n",
+        )
+        .unwrap();
+        assert_eq!(operator_drop_in_naming(&drop_ins, &trees), None);
+        std::fs::write(
+            drop_ins.join("10-actions-tar.conf"),
+            "[Service]\nEnvironment=\"TMPDIR=/root/.local/share/runner-manager/runtime/tmp\"\n",
+        )
+        .unwrap();
+        std::fs::write(drop_ins.join("notes.txt"), "/root/.config/runner-manager").unwrap();
+        assert_eq!(
+            operator_drop_in_naming(&drop_ins, &trees),
+            Some(drop_ins.join("10-actions-tar.conf"))
+        );
+        assert_eq!(
+            operator_drop_in_naming(&root.path().join("absent"), &trees),
+            None
+        );
     }
 
     #[test]

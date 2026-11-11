@@ -63,6 +63,14 @@ if [ "$(stat -c %U "$dir")" != "$user" ]; then
     echo "install-updater: $dir is owned by $(stat -c %U "$dir"), not $user; update.sh must be able to check out tags there" >&2
     exit 1
 fi
+# A git command once run here with sudo leaves objects only root may write
+# beside, and update.sh, running as $user, then fails to fetch the next tag.
+git_dir="$(git -C "$dir" rev-parse --absolute-git-dir)"
+foreign="$(find "$git_dir" ! -user "$user" | wc -l)"
+if [ "$foreign" -gt 0 ]; then
+    chown -R "$user:$(id -gn "$user")" "$git_dir"
+    echo "install-updater: gave $user the $foreign entries of $git_dir another account owned"
+fi
 if ! id -nG "$user" | tr ' ' '\n' | grep -qx docker; then
     echo "install-updater: $user is not in the docker group" >&2
     exit 1

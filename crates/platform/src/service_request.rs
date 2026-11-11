@@ -158,17 +158,27 @@ fn read_request(path: &Path) -> Option<String> {
 
 /// The answer file is the service's to write and the asking account's to read,
 /// whichever account the service runs as. It holds no secret.
-fn readable_by_the_asker(path: &Path) -> io::Result<()> {
+fn write_readable_by_the_asker(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    // On the file before it appears under its name: the asker removes an
+    // answer as soon as it has read it, so a mode set afterwards can find
+    // nothing there.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
 }
 
 impl Channel {
@@ -267,8 +277,7 @@ impl Channel {
         };
         let json = serde_json::to_vec_pretty(&answer).map_err(io::Error::other)?;
         let path = self.result_file(state_dir, request);
-        crate::host_fitness::write_atomically(&path, &json)?;
-        readable_by_the_asker(&path)
+        write_readable_by_the_asker(&path, &json)
     }
 
     /// The service's answer to `request`, once it has given one.

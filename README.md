@@ -543,6 +543,14 @@ unit is handled the same way before it is enabled again. Capacity changes only w
 you pass `--capacity`. Re-running it on a healthy host changes nothing, and is the
 documented way to upgrade that host after you update on the Windows side.
 
+A distribution first set up before 0.4.57 keeps its data under `/root`. The first `wsl install`
+that finds it idle moves it to `/var/lib/runner-manager`, where every root service has kept its
+data since, exactly as `sudo runner-manager service install --start-at boot` does: the old tree is
+kept, and the service then runs each job under its own `rm-runner-N` account. A host with runners
+still running waits for a later run. A drop-in of your own under
+`/etc/systemd/system/runner-manager.service.d/` that names the old tree also stops the move, and
+`wsl install` names that file: change or remove it, then run `wsl install` again.
+
 ### Each host signs in separately
 
 `runner-manager --host wsl:Ubuntu auth login` runs the browser sign-in on Windows, where the

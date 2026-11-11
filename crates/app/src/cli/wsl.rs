@@ -287,6 +287,12 @@ pub fn dispatch_wsl_host(
         }
         WslHostCommand::ConvergeService => {
             require_linux()?;
+            // Moved: `service install` wrote and started a current unit, and
+            // this process's paths still name the old tree, whose record
+            // would converge the unit back onto it.
+            if move_to_system_tree(context, out)? {
+                return Ok(());
+            }
             let message = if converge_service_definition(context)? {
                 apply_systemd_changes()?;
                 "The outdated systemd unit was rewritten and the service restarted."
@@ -655,6 +661,47 @@ fn converge_service_definition(context: &Context) -> Result<bool, CliError> {
         "rewrote a systemd unit an older build installed"
     );
     Ok(true)
+}
+
+/// Moves a boot service an older build installed under `/root` (a WSL host
+/// set up before 0.4.57) to the system tree every root service uses since,
+/// through `service install --start-at boot`: it copies the configuration
+/// and database to `/var/lib/runner-manager`, keeps the old tree, and writes
+/// and starts the unit against the new one. When the move has to wait (the
+/// host is busy, or an operator's drop-in names the old tree), says why and
+/// changes nothing. Returns whether it moved.
+fn move_to_system_tree(context: &Context, out: &mut dyn Write) -> Result<bool, CliError> {
+    let Some(record) = InstallRecord::read(context.paths()).map_err(|source| {
+        CliError::new(
+            Failure::LocalState,
+            format!("cannot read the install record: {source}"),
+        )
+    })?
+    else {
+        return Ok(false);
+    };
+    let system = runner_manager_platform::paths::AppPaths::system();
+    if record.start_mode != StartMode::Boot
+        || record.directories.config.as_path() == system.config_dir()
+    {
+        return Ok(false);
+    }
+    let args = super::ServiceInstallArgs {
+        start_at: super::StartAt::Boot,
+    };
+    let deferred = super::service::install_or_defer_move(context, &args, &mut Vec::new())?;
+    let moved = deferred.is_none();
+    let said = match deferred {
+        Some(deferred) => deferred,
+        None => format!(
+            "This host's data moved from {} to {}; the old tree is kept, and the service now \
+             runs from the system tree.",
+            record.directories.config.display(),
+            runner_manager_platform::paths::SYSTEM_DATA_ROOT,
+        ),
+    };
+    writeln!(out, "{said}").map_err(write_failed("this move"))?;
+    Ok(moved)
 }
 
 /// Reload systemd and restart an active service onto what changed.
