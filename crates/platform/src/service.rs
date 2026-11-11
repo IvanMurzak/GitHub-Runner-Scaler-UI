@@ -2880,6 +2880,28 @@ fn review_systemd(
         }),
     }
 
+    // `BindPaths=` reopens what `ProtectHome=tmpfs` hides, read-write, and can
+    // mount any host path anywhere (`source:destination`): it may name only the
+    // unit's own directories, each bound onto itself.
+    if let Some(value) = directives.get("BindPaths") {
+        let permitted = permitted_paths(DefinitionKind::SystemdUnit, plan);
+        for entry in split_quoted(value) {
+            if !permitted
+                .iter()
+                .any(|allowed| same_path_for(DefinitionKind::SystemdUnit, allowed, &entry))
+            {
+                findings.push(PrivilegeFinding {
+                    kind: FindingKind::Excess,
+                    subject: "BindPaths".to_string(),
+                    detail: format!(
+                        "{entry} is bound into the unit but is not one of this registration's \
+                         required paths"
+                    ),
+                });
+            }
+        }
+    }
+
     // Each path the operator protected must stay inaccessible: a unit that no
     // longer lists one has let every job back into it.
     if !plan.protected_paths().is_empty() {
@@ -4032,22 +4054,43 @@ impl DefinitionDrift {
     ///
     /// The first directory that could not be created.
     pub fn create_writable(&self) -> std::io::Result<()> {
-        let mut leaf = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut leaf, 0o700);
-        for directory in &self.writable {
-            if let Some(parent) = directory.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            match leaf.create(directory) {
-                Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
-                    return Err(error);
-                }
-                _ => {}
-            }
-        }
-        Ok(())
+        create_writable_directories(&self.writable)
     }
+}
+
+/// Creates every missing directory in `directories`: the directory itself
+/// `0700`, whatever the umask, and its parents as the umask says.
+///
+/// # Errors
+///
+/// The first that could not be created, or a path that holds something
+/// other than a directory: a file or a dangling link there fails a unit as
+/// surely as nothing at all.
+pub fn create_writable_directories(directories: &[PathBuf]) -> std::io::Result<()> {
+    for directory in directories {
+        if let Some(parent) = directory.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::create_dir(directory) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !directory.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("{} exists and is not a directory", directory.display()),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Compares the installed definition against this build's rendering.
@@ -5294,6 +5337,30 @@ impl ServiceOperations {
     pub fn definition_drift(&self) -> Result<Option<DefinitionDrift>, ServiceError> {
         Ok(InstallRecord::read(&self.paths)?
             .and_then(|record| definition_drift(self.controls.as_ref(), &self.identity, &record)))
+    }
+
+    /// The directories the recorded systemd boot unit lets the service write,
+    /// whether or not the unit has drifted; empty for any other registration.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the install record reports.
+    pub fn boot_unit_writable_directories(&self) -> Result<Vec<PathBuf>, ServiceError> {
+        Ok(InstallRecord::read(&self.paths)?
+            .filter(|record| {
+                record.start_mode == StartMode::Boot
+                    && host_definition_kind(record.start_mode) == DefinitionKind::SystemdUnit
+            })
+            .map(|record| {
+                permitted_paths(
+                    DefinitionKind::SystemdUnit,
+                    &record.plan(self.identity.clone()),
+                )
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Writes the plist this build renders over an outdated one, then has a
@@ -9522,6 +9589,13 @@ mod tests {
             0o700
         );
         drift.create_writable().expect("and again changes nothing");
+
+        std::fs::remove_dir(&state).expect("state removed");
+        std::fs::write(&state, "").expect("a file in its place");
+        assert!(
+            drift.create_writable().is_err(),
+            "a file is not a directory"
+        );
     }
 
     #[test]
@@ -10171,6 +10245,9 @@ mod tests {
              /root/.local/share/runner-manager/runtime /root/.local/share/runner-manager/logs",
             "only the directories under a home tree, never the secrets outside it"
         );
+        assert!(!reports(&unit, &legacy, "BindPaths", FindingKind::Excess));
+        let widened = unit.replace("BindPaths=", "BindPaths=/root/.ssh /etc:/root/.config ");
+        assert!(reports(&widened, &legacy, "BindPaths", FindingKind::Excess));
     }
 
     #[test]
