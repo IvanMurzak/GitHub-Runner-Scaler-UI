@@ -7,6 +7,15 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.59
+
+### Fixed
+
+- A WSL host first set up by an older build no longer fails to start after
+  `runner-manager wsl install` rewrites its systemd unit
+  (`226/NAMESPACE`, "Failed to set up mount namespacing"): the directories
+  the unit lets the service write are created before the unit is replaced.
+
 ## 0.4.58
 
 ### Added

@@ -608,6 +608,12 @@ fn converge_service_definition(context: &Context) -> Result<bool, CliError> {
             ),
         )
     };
+    // Before the unit that names them: systemd refuses to start a unit whose
+    // writable directory is missing, and an older build may never have
+    // created one (0.4.44 left the configuration directory to be made later).
+    drift
+        .create_writable()
+        .map_err(|source| failed("create the directories of", &source))?;
     let directory = drift.path.parent().unwrap_or_else(|| Path::new("/"));
     let mut temporary = tempfile::NamedTempFile::new_in(directory)
         .map_err(|source| failed("stage a replacement for", &source))?;

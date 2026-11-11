@@ -1061,6 +1061,27 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    /// Writes an executable script that a test then runs. Through `sh`, so
+    /// this process never holds the file open for writing: a sibling test
+    /// that forks meanwhile would carry that descriptor into its child until
+    /// it execs, and running the script then fails with `ETXTBSY`.
+    fn write_script(path: &std::path::Path, script: &str) {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "the script was written");
+    }
+
     fn fixture(info: &str) -> (tempfile::TempDir, OciProcesses) {
         fixture_with_quota(info, true)
     }
@@ -1077,8 +1098,7 @@ mod tests {
             "#!/bin/sh\n{quota_gate}printf '%s' '{}'\n",
             info.replace('\'', "'\\''")
         );
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_script(&path, &script);
         let mut provider = OciProcesses::new(HostId::from_u128(1));
         provider.runtime = path.to_string_lossy().into_owned();
         (root, provider)
@@ -1226,8 +1246,7 @@ mod tests {
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n  info) printf '%s' '{degraded_info}' ;;\n  ps) printf '%s\\n' '{id}' ;;\n  container) printf '%s' '{labels}' ;;\n  *) exit 1 ;;\nesac\n"
         );
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_script(&path, &script);
         let mut provider = OciProcesses::new(host);
         provider.runtime = path.to_string_lossy().into_owned();
         assert_eq!(provider.ready(), ProviderCapability::Degraded);

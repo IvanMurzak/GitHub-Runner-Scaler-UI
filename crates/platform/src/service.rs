@@ -3998,6 +3998,33 @@ pub struct DefinitionDrift {
     pub start_mode: StartMode,
     /// Which manager reads the definition.
     pub manager: DefinitionKind,
+    /// The directories the rendered definition lets the service write. A
+    /// systemd unit fails before its first instruction (`226/NAMESPACE`)
+    /// when one is missing, so whoever writes `rendered` creates them first:
+    /// a host installed by an older build may never have made one, and
+    /// `ProtectHome=tmpfs` mounts only those that exist.
+    pub writable: Vec<PathBuf>,
+}
+
+impl DefinitionDrift {
+    /// Creates every missing directory in [`Self::writable`], `0700`.
+    ///
+    /// # Errors
+    ///
+    /// The first directory that could not be created.
+    pub fn create_writable(&self) -> std::io::Result<()> {
+        for directory in &self.writable {
+            if directory.is_dir() {
+                continue;
+            }
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(directory)?;
+        }
+        Ok(())
+    }
 }
 
 /// Compares the installed definition against this build's rendering.
@@ -4043,6 +4070,7 @@ fn launchd_definition_drift(
             rendered: launchd_plist(&record.plan(identity.clone())),
             start_mode: record.start_mode,
             manager: DefinitionKind::LaunchdPlist,
+            writable: Vec::new(),
         },
     )
 }
@@ -4053,13 +4081,18 @@ fn systemd_definition_drift(
     path: PathBuf,
     installed: &str,
 ) -> Option<DefinitionDrift> {
-    let rendered = systemd_unit(&record.plan(identity.clone()));
+    let plan = record.plan(identity.clone());
+    let rendered = systemd_unit(&plan);
     (installed != rendered).then(|| DefinitionDrift {
         path,
         installed_by_version: record.installed_by_version.clone(),
         rendered,
         start_mode: record.start_mode,
         manager: DefinitionKind::SystemdUnit,
+        writable: permitted_paths(DefinitionKind::SystemdUnit, &plan)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
     })
 }
 
@@ -9443,6 +9476,31 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn converging_a_unit_first_creates_the_directories_it_lets_the_service_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("dir");
+        let config = root.path().join(".config").join("runner-manager");
+        let state = root.path().join("state");
+        std::fs::create_dir_all(&state).expect("state");
+        let drift = DefinitionDrift {
+            path: root.path().join("runner-manager.service"),
+            installed_by_version: "0.4.44".into(),
+            rendered: String::new(),
+            start_mode: StartMode::Boot,
+            manager: DefinitionKind::SystemdUnit,
+            writable: vec![config.clone(), state.clone()],
+        };
+        drift.create_writable().expect("created");
+        assert!(config.is_dir(), "the missing one is made");
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drift.create_writable().expect("and again changes nothing");
+    }
+
     #[test]
     fn a_plist_with_an_old_process_type_is_drift_and_an_operator_edit_is_not() {
         let host = Host::new();
@@ -9528,6 +9586,7 @@ mod tests {
             rendered: launchd_plist(&linux_plan(StartMode::Login)),
             start_mode: StartMode::Login,
             manager: DefinitionKind::LaunchdPlist,
+            writable: Vec::new(),
         };
 
         replace_definition("runner-manager", &drift).expect("replaced");
@@ -9577,6 +9636,7 @@ mod tests {
                 ),
                 start_mode: StartMode::Login,
                 manager: DefinitionKind::LaunchdPlist,
+                writable: Vec::new(),
             };
             replace_definition(identity.name(), &drift).expect("plist replaced");
             super::sys::reload_detached(&identity, StartMode::Login, &path)
