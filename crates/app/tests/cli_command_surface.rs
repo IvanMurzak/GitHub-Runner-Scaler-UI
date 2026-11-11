@@ -120,7 +120,10 @@ const SURFACE: [(&str, &[&str]); 11] = [
     // Owner decisions D1-D10, 2026-11-07
     // (`.taskflow/2026-11-07-coordinator-server`): an optional coordinator a
     // host joins with a one-time code and can leave at any time.
-    ("coordinator", &["join", "status", "leave", "stats"]),
+    (
+        "coordinator",
+        &["join", "status", "leave", "stats", "remote-changes"],
+    ),
 ];
 
 /// Profile and provider leaves added by the runner-sandbox architecture, and

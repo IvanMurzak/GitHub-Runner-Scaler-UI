@@ -775,6 +775,7 @@ mod tests {
                         warm: false,
                     }],
                 }],
+                remote_changes: false,
             },
         );
         rx

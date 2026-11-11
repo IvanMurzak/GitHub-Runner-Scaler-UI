@@ -257,6 +257,7 @@ pub fn host(registry: &Registry) -> mpsc::Receiver<Outbound> {
                     warm: false,
                 }],
             }],
+            remote_changes: false,
         },
     );
     rx

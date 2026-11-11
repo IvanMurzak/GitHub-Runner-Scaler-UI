@@ -350,3 +350,25 @@ fn stats_are_read_over_the_hosts_signed_link_and_need_a_join() {
         Vec::<String>::new()
     );
 }
+
+#[test]
+fn remote_changes_are_off_until_the_operator_allows_them_here() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let say = |choice: &str| -> Outcome {
+        run({
+            let mut command = runner_manager(data_dir.path());
+            command.args(["coordinator", "remote-changes", choice]);
+            command
+        })
+    };
+    let status = say("status");
+    assert_eq!(status.code, 0, "{}", status.both());
+    assert!(status.stdout.contains("not allowed"), "{}", status.stdout);
+    let allowed = say("allow");
+    assert_eq!(allowed.code, 0, "{}", allowed.both());
+    assert!(say("status").stdout.contains("allowed"));
+    assert!(!say("status").stdout.contains("not allowed"));
+    assert_eq!(say("deny").code, 0);
+    assert!(say("status").stdout.contains("not allowed"));
+    assert_ne!(say("maybe").code, 0, "an unknown choice is refused");
+}

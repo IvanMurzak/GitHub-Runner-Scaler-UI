@@ -290,6 +290,22 @@ fn scripted_policy_flow_uses_read_only_github_and_preserves_each_requested_label
             .stdout
             .contains("repair: runner-manager repo remove octo/two --purge")
     );
+    let json = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args(["repo", "list", "--json"]);
+        command
+    });
+    assert_eq!(json.code, 0, "{}", json.both());
+    let document: serde_json::Value = serde_json::from_str(&json.stdout).expect("JSON");
+    assert_eq!(document["schema_version"], 1);
+    let listed = document["policies"].as_array().expect("policies");
+    let two = listed
+        .iter()
+        .find(|policy| policy["repository"] == "octo/two")
+        .expect("octo/two listed");
+    assert_eq!(two["state"], "repair_required");
+    assert!(two["workspace"]["kind"].is_string());
+    assert!(two["labels"].is_array());
     assert!(
         github
             .seen()

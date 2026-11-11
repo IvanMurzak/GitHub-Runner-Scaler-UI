@@ -56,6 +56,7 @@ pub mod policy;
 pub mod polling;
 pub mod profile;
 pub mod protect_path;
+pub mod remote;
 pub mod service;
 pub mod status;
 pub mod ui;
@@ -678,6 +679,18 @@ pub enum CoordinatorCommand {
     Leave,
     /// Show the coordinator's job statistics and recent placements.
     Stats(CoordinatorStatusArgs),
+    /// Allow or deny changes to this host through the coordinator.
+    ///
+    /// People signed in to the coordinator may then change this host's
+    /// repositories, labels, limits and workspaces. Reads are always answered.
+    RemoteChanges(CoordinatorRemoteChangesArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CoordinatorRemoteChangesArgs {
+    /// `allow`, `deny`, or `status` to show the current choice.
+    #[arg(value_name = "CHOICE", value_parser = ["allow", "deny", "status"])]
+    pub choice: String,
 }
 
 #[derive(Debug, Args)]
@@ -1354,7 +1367,7 @@ pub enum RepoCommand {
     /// Create a repository-scoped policy in `pending`. Never enables scaling.
     Add(RepoAddArgs),
     /// List repository-scoped policies.
-    List,
+    List(RepoListArgs),
     /// Set a policy's `max_capacity`, promoting monitor-only to autoscale.
     SetCapacity(RepoSetCapacityArgs),
     /// Arm or drain a policy.
@@ -1373,6 +1386,15 @@ pub enum RepoCommand {
     /// Persistent dependency caches for this repository's runners.
     #[command(subcommand)]
     Cache(RepoCacheCommand),
+}
+
+#[derive(Debug, Args, Default)]
+pub struct RepoListArgs {
+    /// One JSON document (`schema_version` 1) instead of the table: the host's
+    /// capacity and every repository policy with its profile, labels, limit
+    /// and workspace.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2454,7 +2476,9 @@ fn is_decorated_report(command: &Command) -> bool {
         Command::Wsl(WslCommand::Status(args)) => !args.json,
         Command::Wsl(WslCommand::List | WslCommand::Detach(_)) => true,
         Command::Coordinator(CoordinatorCommand::Status(args)) => !args.json,
-        Command::Coordinator(CoordinatorCommand::Leave) => true,
+        Command::Coordinator(CoordinatorCommand::Leave | CoordinatorCommand::RemoteChanges(_)) => {
+            true
+        }
         Command::Coordinator(CoordinatorCommand::Stats(args)) => !args.json,
         // `host prepare` asks questions and waits for an elevation prompt, and
         // `host doctor --json` is a document; neither may be buffered or

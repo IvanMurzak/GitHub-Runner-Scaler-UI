@@ -25,8 +25,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
 use runner_manager_domain::coordinator_protocol::{
-    CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CONNECT_PATH, ENROLL_PATH, EnrollRequest,
-    EnrollResponse, HEALTH_PATH, HostMessage, LAUNCH_VERSION, MAX_MEMORY_ESTIMATES,
+    CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, COMMAND_VERSION, CONNECT_PATH, ENROLL_PATH,
+    EnrollRequest, EnrollResponse, HEALTH_PATH, HostMessage, LAUNCH_VERSION, MAX_MEMORY_ESTIMATES,
     MAX_MESSAGE_BYTES, MIN_PROTOCOL_VERSION, MemoryEstimates, NONCE_LEN, PROTOCOL_VERSION,
     STATS_VERSION, ServerMessage, SessionPurpose, TargetRef, WEBHOOK_PATH, WakeReason,
     decode_public_key, encode_nonce, supported, verify_challenge,
@@ -125,6 +125,8 @@ pub struct AppState {
     pub statistics: Arc<Statistics>,
     /// The web dashboard, when its sign-in is configured.
     pub dashboard: Option<crate::dashboard::Dashboard>,
+    /// Commands relayed to hosts and not yet answered.
+    pub remote: crate::remote::RemoteCommands,
     deliveries: Mutex<DeliveryLog>,
     limiter: RateLimiter,
 }
@@ -154,6 +156,7 @@ impl AppState {
         });
         Arc::new(Self {
             dashboard,
+            remote: crate::remote::RemoteCommands::default(),
             limiter: RateLimiter::new(config.attempts_per_minute),
             config,
             store,
@@ -793,6 +796,9 @@ async fn serve_host(
                             dashboard.activity.runner_started(host_id, &started.runner_name);
                         }
                     }
+                    Ok(HostMessage::CommandResult(result)) if version >= COMMAND_VERSION => {
+                        state.remote.complete(result);
+                    }
                     Ok(HostMessage::AttemptFinished(finished)) if version >= LAUNCH_VERSION => {
                         state.placement.attempt_finished(host_id, &finished);
                         state.statistics.attempt_finished(
@@ -810,7 +816,8 @@ async fn serve_host(
                         | HostMessage::Unknown
                         | HostMessage::LaunchAck(_)
                         | HostMessage::AttemptStarted(_)
-                        | HostMessage::AttemptFinished(_),
+                        | HostMessage::AttemptFinished(_)
+                        | HostMessage::CommandResult(_),
                     )
                     | Err(_) => {}
                 }

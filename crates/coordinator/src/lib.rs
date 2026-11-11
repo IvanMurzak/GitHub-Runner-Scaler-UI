@@ -31,6 +31,7 @@ pub mod dashboard;
 pub mod github_app;
 pub mod placement;
 pub mod registry;
+pub mod remote;
 pub mod server;
 pub mod stats;
 pub mod store;

@@ -425,6 +425,7 @@ runner-manager coordinator join URL --code CODE                # Join an optiona
 runner-manager coordinator status [--json]                     # Show the coordinator link
 runner-manager coordinator leave                               # Forget the coordinator and its key
 runner-manager coordinator stats [--json]                      # Show the coordinator's job statistics and placements
+runner-manager coordinator remote-changes allow|deny|status    # Let people signed in to the coordinator change this host
 ```
 
 Host capacity changes take effect on the next allocation without restarting the

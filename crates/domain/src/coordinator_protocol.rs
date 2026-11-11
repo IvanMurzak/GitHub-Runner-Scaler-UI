@@ -57,7 +57,7 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol this build speaks.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The oldest protocol this build still speaks: stage 1's.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
@@ -75,6 +75,19 @@ pub const LAUNCH_VERSION: u32 = 3;
 /// [`ServerMessage::Stats`]). A version-3 peer ignores the usage field and
 /// never opens or is offered a query session.
 pub const STATS_VERSION: u32 = 4;
+
+/// The first version with remote commands: [`ServerMessage::RunCommand`] and
+/// [`HostMessage::CommandResult`], and [`Hello::remote_changes`]. A version-4
+/// peer never sees or sends them.
+pub const COMMAND_VERSION: u32 = 5;
+
+/// The most arguments a remote command carries, and the longest one.
+pub const MAX_COMMAND_ARGS: usize = 64;
+pub const MAX_COMMAND_ARG_BYTES: usize = 1024;
+
+/// The most a [`CommandResult`] carries of the command's output, stdout and
+/// stderr together, so that the frame stays under [`MAX_MESSAGE_BYTES`].
+pub const MAX_COMMAND_OUTPUT_BYTES: usize = 48 * 1024;
 
 /// The version a connection runs at, given the newest version the peer
 /// speaks and the oldest it still accepts: the highest both sides speak, or
@@ -229,6 +242,11 @@ pub struct Hello {
     pub disk_free_bytes: Option<u64>,
     #[serde(default)]
     pub targets: Vec<Target>,
+    /// Version 5: whether this host's operator allowed changes through the
+    /// coordinator (`runner-manager coordinator remote-changes allow`).
+    /// Without it the host answers only reads.
+    #[serde(default)]
+    pub remote_changes: bool,
 }
 
 /// A host's periodic load report.
@@ -1067,6 +1085,8 @@ pub enum HostMessage {
     AttemptFinished(AttemptFinished),
     /// Version 4, on a query session only: send the statistics.
     StatsRequest,
+    /// Version 5: how a [`ServerMessage::RunCommand`] ended.
+    CommandResult(CommandResult),
     #[serde(other)]
     Unknown,
 }
@@ -1103,8 +1123,52 @@ pub enum ServerMessage {
     Stats(StatsReport),
     /// Version 4, from 0.4.53: expected peak memory per target.
     MemoryEstimates(MemoryEstimates),
+    /// Version 5: run one `runner-manager` command on the host, for a person
+    /// signed in to the coordinator. The host decides what it runs.
+    RunCommand(RunCommand),
     #[serde(other)]
     Unknown,
+}
+
+/// A command a person asked the coordinator to run on a host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCommand {
+    /// Echoed in the [`CommandResult`].
+    pub request_id: String,
+    /// The arguments after the program name, as `runner-manager` takes them:
+    /// `["repo", "set-capacity", "octo/app", "4"]`. The host parses them and
+    /// runs only the commands it allows.
+    pub argv: Vec<String>,
+    /// The GitHub login of the person who asked, for the host's record.
+    pub by: String,
+}
+
+impl RunCommand {
+    /// Whether the arguments are within [`MAX_COMMAND_ARGS`] and
+    /// [`MAX_COMMAND_ARG_BYTES`], with no control character in them.
+    #[must_use]
+    pub fn well_formed(&self) -> bool {
+        self.argv.len() <= MAX_COMMAND_ARGS
+            && self.argv.iter().all(|argument| {
+                argument.len() <= MAX_COMMAND_ARG_BYTES && !argument.chars().any(char::is_control)
+            })
+            && self.by.len() <= 64
+            && self.request_id.len() <= 64
+    }
+}
+
+/// How a [`RunCommand`] ended on the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandResult {
+    pub request_id: String,
+    /// The process exit code the same command would have had on the host's
+    /// own terminal.
+    pub exit_code: u8,
+    pub stdout: String,
+    pub stderr: String,
+    /// The output was cut to [`MAX_COMMAND_OUTPUT_BYTES`].
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 macro_rules! json_codec {
@@ -1370,6 +1434,7 @@ mod tests {
                     warm: false,
                 }],
             }],
+            remote_changes: false,
         }
     }
 

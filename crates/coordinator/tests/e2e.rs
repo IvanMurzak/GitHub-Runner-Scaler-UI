@@ -199,6 +199,7 @@ fn hello(version: u32, host_id: &str) -> HostMessage {
                 warm: false,
             }],
         }],
+        remote_changes: false,
     })
 }
 
@@ -974,7 +975,7 @@ async fn query_stats(
 #[tokio::test]
 async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_query() {
     use runner_manager_domain::coordinator_protocol::{
-        AttemptFinished, AttemptOutcomeKind, AttemptUsage, STATS_VERSION,
+        AttemptFinished, AttemptOutcomeKind, AttemptUsage,
     };
 
     let coordinator = start().await;
@@ -984,7 +985,7 @@ async fn a_measured_attempt_becomes_a_job_sample_read_over_an_authenticated_quer
     assert!(matches!(
         next(&mut link).await,
         ServerMessage::Welcome {
-            protocol_version: STATS_VERSION,
+            protocol_version: PROTOCOL_VERSION,
             ..
         }
     ));

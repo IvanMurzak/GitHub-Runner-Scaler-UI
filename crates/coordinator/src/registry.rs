@@ -289,6 +289,23 @@ impl Registry {
 
     /// Queues `message` for `host_id`'s connection; `false` when it is not
     /// connected or its queue is full.
+    /// Whether `host_id`'s operator allowed changes through the coordinator,
+    /// by its last `hello`.
+    #[must_use]
+    pub fn remote_changes(&self, host_id: &str) -> bool {
+        self.lock()
+            .get(host_id)
+            .and_then(|connected| connected.hello.as_ref())
+            .is_some_and(|hello| hello.remote_changes)
+    }
+
+    /// The protocol version `host_id`'s connection negotiated, when it is
+    /// connected.
+    #[must_use]
+    pub fn protocol_version(&self, host_id: &str) -> Option<u32> {
+        self.lock().get(host_id).map(|connected| connected.version)
+    }
+
     pub fn send(&self, host_id: &str, message: ServerMessage) -> bool {
         self.lock()
             .get(host_id)
@@ -678,6 +695,7 @@ mod tests {
                     warm: false,
                 }],
             }],
+            remote_changes: false,
         }
     }
 

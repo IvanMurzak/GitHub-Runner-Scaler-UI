@@ -70,11 +70,12 @@ use futures::{SinkExt as _, StreamExt as _};
 use runner_manager_agent::reconcile::{Jitter, RandomJitter};
 use runner_manager_domain::attempt::active_count;
 use runner_manager_domain::coordinator_protocol::{
-    CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, CoordinatorUrl, EnrollRequest, EnrollResponse,
-    HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, HostMessage, HostSigningKey, LAUNCH_VERSION,
-    MAX_MESSAGE_BYTES, MIN_PROTOCOL_VERSION, Profile, STATS_VERSION, ServerMessage, SessionPurpose,
-    StatsReport, Target, TargetRef, TargetScope, Wake, decode_nonce, decode_signing_key,
-    encode_public_key, encode_signing_key, negotiate, sign_challenge, signing_key_from_seed,
+    CLOSE_UNAUTHORIZED, CLOSE_UNSUPPORTED_VERSION, COMMAND_VERSION, CommandResult, CoordinatorUrl,
+    EnrollRequest, EnrollResponse, HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck, HostMessage,
+    HostSigningKey, LAUNCH_VERSION, MAX_MESSAGE_BYTES, MIN_PROTOCOL_VERSION, Profile,
+    STATS_VERSION, ServerMessage, SessionPurpose, StatsReport, Target, TargetRef, TargetScope,
+    Wake, decode_nonce, decode_signing_key, encode_public_key, encode_signing_key, negotiate,
+    sign_challenge, signing_key_from_seed,
 };
 use runner_manager_domain::model::{OwnerRepo, ScaleTarget, StartMode};
 use runner_manager_domain::policy::ScalePolicy;
@@ -145,6 +146,9 @@ pub fn dispatch(
         CoordinatorCommand::Status(args) => status(context, args.json, out),
         CoordinatorCommand::Leave => leave(context, out),
         CoordinatorCommand::Stats(args) => stats(context, args.json, out),
+        CoordinatorCommand::RemoteChanges(args) => {
+            super::remote::remote_changes(context, args, out)
+        }
     }
 }
 
@@ -942,7 +946,13 @@ pub struct LinkPorts {
     /// The host's memory admission: its meters, and where the coordinator's
     /// memory estimates go (0.4.53).
     pub memory: Arc<HostMemory>,
+    /// The service's own context, for commands the coordinator relays
+    /// (0.4.61); `None` answers each with a refusal.
+    pub commands: Option<super::Context>,
 }
+
+/// The most relayed commands this host runs at once.
+const COMMANDS_AT_ONCE: usize = 4;
 
 /// Why one session ended, as fixed words for the link record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1232,6 +1242,7 @@ fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy
         ram_bytes: runner_manager_platform::host_fitness::physical_memory_bytes(),
         disk_free_bytes: runner_manager_platform::host_fitness::free_disk_bytes(&ports.runner_root),
         targets: advertised_targets(policies),
+        remote_changes: super::remote::changes_allowed(&ports.paths),
     }
 }
 
@@ -1452,6 +1463,12 @@ async fn serve(
 ) -> SessionEnd {
     let policies = ports.store.policies().unwrap_or_default();
     let mut described = advertised_targets(&policies);
+    let mut described_changes = super::remote::changes_allowed(&ports.paths);
+    // Commands the coordinator relays run on threads of their own: one may
+    // ask GitHub, and some start a runtime of their own, which a task on this
+    // one cannot. Their results come back here.
+    let (results, mut finished) = tokio::sync::mpsc::channel::<CommandResult>(COMMANDS_AT_ONCE);
+    let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     if let Err(end) = send(
         socket,
         &HostMessage::Hello(hello(ports, &config.host_id, version, &policies)),
@@ -1510,6 +1527,44 @@ async fn serve(
                         );
                         ports.memory.set_coordinator_estimates(estimates);
                     }
+                    Ok(ServerMessage::RunCommand(command)) if version >= COMMAND_VERSION => {
+                        let refusal = |message: &str| CommandResult {
+                            request_id: command.request_id.clone(),
+                            exit_code: super::Failure::Conflict.code(),
+                            stdout: String::new(),
+                            stderr: format!("error: {message}\n"),
+                            truncated: false,
+                        };
+                        let context = match &ports.commands {
+                            Some(context) if running.load(Ordering::Relaxed) < COMMANDS_AT_ONCE => {
+                                context.clone()
+                            }
+                            Some(_) => {
+                                if let Err(end) = send(socket, &HostMessage::CommandResult(refusal(
+                                    "this host is already running as many commands as it takes at once; try again",
+                                ))).await {
+                                    return end;
+                                }
+                                continue;
+                            }
+                            None => {
+                                if let Err(end) = send(socket, &HostMessage::CommandResult(refusal(
+                                    "this host does not take commands from the coordinator",
+                                ))).await {
+                                    return end;
+                                }
+                                continue;
+                            }
+                        };
+                        running.fetch_add(1, Ordering::Relaxed);
+                        let results = results.clone();
+                        let running = Arc::clone(&running);
+                        std::thread::spawn(move || {
+                            let result = super::remote::execute(&context, &command);
+                            running.fetch_sub(1, Ordering::Relaxed);
+                            let _ = results.blocking_send(result);
+                        });
+                    }
                     Ok(ServerMessage::HelloAck(ack)) => {
                         tracing::info!(
                             covered = ack.covered.len(),
@@ -1526,6 +1581,11 @@ async fn serve(
                     _ => {}
                 }
             }
+            Some(result) = finished.recv() => {
+                if let Err(end) = send(socket, &HostMessage::CommandResult(result)).await {
+                    return end;
+                }
+            }
             _ = ticks.tick() => {
                 if records::configured(&ports.paths).ok().flatten().as_ref() != Some(config) {
                     let _ = socket.close(None).await;
@@ -1535,8 +1595,10 @@ async fn serve(
                 // hardware figures that drift belong to the heartbeat.
                 let policies = ports.store.policies().unwrap_or_default();
                 let current = advertised_targets(&policies);
-                if current != described {
+                let changes = super::remote::changes_allowed(&ports.paths);
+                if current != described || changes != described_changes {
                     described = current;
+                    described_changes = changes;
                     let message =
                         HostMessage::Hello(hello(ports, &config.host_id, version, &policies));
                     if let Err(end) = send(socket, &message).await {
@@ -1805,6 +1867,7 @@ mod tests {
             coordination: Arc::clone(&coordination),
             launches,
             memory,
+            commands: None,
         }));
 
         // Connected and described.
@@ -2012,6 +2075,7 @@ mod tests {
             coordination: Arc::clone(&coordination),
             launches: Arc::clone(&launches),
             memory,
+            commands: None,
         }));
 
         // Connected at version 3, covered, and its heartbeat in.

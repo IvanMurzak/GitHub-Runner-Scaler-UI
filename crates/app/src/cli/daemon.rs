@@ -776,6 +776,7 @@ fn start_coordinator_link(
             coordination,
             launches,
             memory,
+            commands: Some(context.clone()),
         }),
     )))
 }

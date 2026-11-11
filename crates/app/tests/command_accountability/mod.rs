@@ -328,6 +328,18 @@ pub const MANIFEST: &[Classification] = &[
         }),
     },
     Classification {
+        leaf: "coordinator remote-changes",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            COORDINATOR_COMMANDS,
+            "remote_changes_are_off_until_the_operator_allows_them_here",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::CoordinatorServer,
+            reason: "Stores the operator's choice for commands a coordinator relays, which the policy chain oracle does not model; the dedicated test checks the default, allow, status and deny.",
+        }),
+    },
+    Classification {
         leaf: "coordinator stats",
         coverage: Coverage::Dedicated,
         evidence: &[at(

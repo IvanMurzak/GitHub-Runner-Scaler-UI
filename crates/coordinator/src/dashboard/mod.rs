@@ -97,6 +97,9 @@ pub fn routes(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
         .route("/api/session", get(session))
         .route("/api/overview", get(overview))
         .route("/api/metrics", get(metrics_route))
+        .route("/api/hosts/{id}/config", get(host_config))
+        .route("/api/hosts/{id}/command", post(host_command))
+        .route("/api/audit", get(audit))
         .route_layer(from_fn_with_state(Arc::clone(state), require_session));
     axum::Router::new()
         .route("/", asset(INDEX_HTML, "text/html; charset=utf-8"))
@@ -353,6 +356,10 @@ struct HostView {
     last_seen_at: Option<i64>,
     enrolled_at: i64,
     connected_since: Option<i64>,
+    /// Connected and new enough to take commands (protocol version 5).
+    manageable: bool,
+    /// Its operator allowed changes through the coordinator.
+    remote_changes: bool,
 }
 
 /// A job with the host its runner belongs to, when its host said.
@@ -417,6 +424,13 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
                 last_seen_at: record.last_seen_at.map(|at| at.timestamp()),
                 enrolled_at: record.enrolled_at.timestamp(),
                 connected_since: link.map(|host| host.since.timestamp()),
+                manageable: state
+                    .registry
+                    .protocol_version(&record.id)
+                    .is_some_and(|version| {
+                        version >= runner_manager_domain::coordinator_protocol::COMMAND_VERSION
+                    }),
+                remote_changes: state.registry.remote_changes(&record.id),
             }
         })
         .collect();
@@ -557,4 +571,143 @@ pub fn record_minute(state: &AppState) {
     {
         tracing::warn!(%error, "the dashboard's minute of history was not saved");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Remote commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct CommandBody {
+    argv: Vec<String>,
+}
+
+/// Runs a command on a host for the signed-in person, and records it.
+async fn run_on_host(
+    state: &AppState,
+    host_id: &str,
+    argv: Vec<String>,
+    login: &str,
+) -> Result<runner_manager_domain::coordinator_protocol::CommandResult, crate::remote::RemoteError>
+{
+    let outcome = state
+        .remote
+        .run(
+            &state.registry,
+            host_id,
+            argv.clone(),
+            login,
+            crate::remote::COMMAND_TIMEOUT,
+        )
+        .await;
+    let record = crate::store::RemoteCommandRecord {
+        at: Utc::now().timestamp(),
+        login: login.to_owned(),
+        host_id: host_id.to_owned(),
+        argv,
+        outcome: match &outcome {
+            Ok(result) => format!("exit {}", result.exit_code),
+            Err(error) => match error {
+                crate::remote::RemoteError::Offline => "offline",
+                crate::remote::RemoteError::TooOld => "too_old",
+                crate::remote::RemoteError::Malformed => "malformed",
+                crate::remote::RemoteError::Timeout => "timeout",
+            }
+            .to_owned(),
+        },
+    };
+    if let Err(error) = state.store().record_remote_command(&record) {
+        tracing::warn!(%error, "a remote command was not recorded");
+    }
+    // The host and the outcome only: arguments are text off the wire.
+    tracing::info!(host_id, outcome = %record.outcome, "a remote command ran");
+    outcome
+}
+
+fn remote_failure(error: crate::remote::RemoteError) -> Response {
+    let status = match error {
+        crate::remote::RemoteError::Offline => StatusCode::SERVICE_UNAVAILABLE,
+        crate::remote::RemoteError::TooOld => StatusCode::CONFLICT,
+        crate::remote::RemoteError::Malformed => StatusCode::BAD_REQUEST,
+        crate::remote::RemoteError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+    };
+    (
+        status,
+        Json(serde_json::json!({"error": error.to_string()})),
+    )
+        .into_response()
+}
+
+/// Whether a state-changing request came from this origin: a cross-site page
+/// can send the cookie with a form, never this header.
+fn same_origin(state: &AppState, headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        == Some(state.config.public_origin.trim_end_matches('/'))
+}
+
+async fn host_command(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<DashboardSession>,
+    axum::extract::Path(host_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CommandBody>,
+) -> Response {
+    if !same_origin(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match run_on_host(&state, &host_id, body.argv, &session.login).await {
+        Ok(result) => json(&result),
+        Err(error) => remote_failure(error),
+    }
+}
+
+async fn host_config(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<DashboardSession>,
+    axum::extract::Path(host_id): axum::extract::Path<String>,
+) -> Response {
+    let argv = ["repo", "list", "--json"].map(String::from).to_vec();
+    match run_on_host(&state, &host_id, argv, &session.login).await {
+        Ok(result) if result.exit_code == 0 => {
+            let Ok(config) = serde_json::from_str::<serde_json::Value>(&result.stdout) else {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": "the host's answer was not understood"})),
+                )
+                    .into_response();
+            };
+            json(&serde_json::json!({
+                "remote_changes": state.registry.remote_changes(&host_id),
+                "config": config,
+            }))
+        }
+        Ok(result) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": result.stderr.trim()})),
+        )
+            .into_response(),
+        Err(error) => remote_failure(error),
+    }
+}
+
+async fn audit(State(state): State<Arc<AppState>>) -> Response {
+    let records = state.store().remote_commands(100).unwrap_or_default();
+    let names = host_names(&state.store().hosts().unwrap_or_default());
+    let records: Vec<_> = records
+        .into_iter()
+        .map(|record| {
+            let host_name = names.get(&record.host_id).cloned();
+            serde_json::json!({
+                "at": record.at,
+                "login": record.login,
+                "host_id": record.host_id,
+                "host_name": host_name,
+                "argv": record.argv,
+                "outcome": record.outcome,
+            })
+        })
+        .collect();
+    json(&serde_json::json!({ "commands": records }))
 }

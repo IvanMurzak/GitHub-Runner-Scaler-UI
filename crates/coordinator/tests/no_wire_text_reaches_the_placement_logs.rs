@@ -67,6 +67,7 @@ fn connect(registry: &Registry, id: &str, ram: u64) -> tokio::sync::mpsc::Receiv
                     warm: false,
                 }],
             }],
+            remote_changes: false,
         },
     );
     registry.set_heartbeat(

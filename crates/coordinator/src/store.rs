@@ -16,7 +16,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// The prefix every invite code carries, so one is recognisable in a paste.
 pub const INVITE_PREFIX: &str = "rmc_";
@@ -229,6 +229,21 @@ impl Store {
                     expires_at INTEGER NOT NULL
                 );
                 PRAGMA user_version = 6;",
+            )?;
+        }
+        if version < 7 {
+            // 0.4.61: every command a person ran on a host through the
+            // coordinator, by whom, and how it ended.
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS remote_commands (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    at INTEGER NOT NULL,
+                    login TEXT NOT NULL,
+                    host_id TEXT NOT NULL,
+                    argv TEXT NOT NULL,
+                    outcome TEXT NOT NULL
+                );
+                PRAGMA user_version = 7;",
             )?;
         }
         Ok(Self { connection })
@@ -693,6 +708,21 @@ pub struct MetricSample {
     pub running: Option<u32>,
 }
 
+/// One command a person ran on a host through the coordinator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoteCommandRecord {
+    /// Unix seconds.
+    pub at: i64,
+    pub login: String,
+    pub host_id: String,
+    pub argv: Vec<String>,
+    /// `exit 0`, `exit 3`, `offline`, `timeout`, ...
+    pub outcome: String,
+}
+
+/// The most remote commands the record keeps.
+const REMOTE_COMMANDS_KEPT: i64 = 1000;
+
 /// A signed-in dashboard session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DashboardSession {
@@ -826,6 +856,58 @@ impl Store {
                 },
             )
             .optional()?)
+    }
+
+    /// Records a remote command, keeping the newest [`REMOTE_COMMANDS_KEPT`].
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn record_remote_command(
+        &mut self,
+        record: &RemoteCommandRecord,
+    ) -> Result<(), StoreError> {
+        let argv = serde_json::to_string(&record.argv).unwrap_or_else(|_| "[]".into());
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO remote_commands (at, login, host_id, argv, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.at,
+                record.login,
+                record.host_id,
+                argv,
+                record.outcome
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM remote_commands WHERE id NOT IN (
+                SELECT id FROM remote_commands ORDER BY id DESC LIMIT ?1)",
+            params![REMOTE_COMMANDS_KEPT],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// The newest `limit` remote commands, newest first.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn remote_commands(&self, limit: u32) -> Result<Vec<RemoteCommandRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT at, login, host_id, argv, outcome FROM remote_commands
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit], |row| {
+            let argv: String = row.get(3)?;
+            Ok(RemoteCommandRecord {
+                at: row.get(0)?,
+                login: row.get(1)?,
+                host_id: row.get(2)?,
+                argv: serde_json::from_str(&argv).unwrap_or_default(),
+                outcome: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Ends a session.
