@@ -227,11 +227,29 @@ fn meminfo_field(text: &str, field: &str) -> Option<u64> {
     kib.checked_mul(1024)
 }
 
+/// The page counts `host_statistics64` reports on macOS that available
+/// memory is made of.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+struct VmPages {
+    /// `free_count`: the speculative pages included, as the kernel counts.
+    free: u64,
+    speculative: u64,
+    inactive: u64,
+    /// `external_page_count`: file-backed pages, the speculative ones too.
+    external: u64,
+    purgeable: u64,
+}
+
 /// Free plus inactive pages in bytes: memory macOS hands to new work without
 /// paging anything out (the `available` figure `psutil` reports).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn available_pages_bytes(free: u64, inactive: u64, page: u64) -> Option<u64> {
-    free.checked_add(inactive)?.checked_mul(page)
+fn available_pages_bytes(pages: VmPages, page: u64) -> Option<u64> {
+    pages
+        .free
+        .saturating_sub(pages.speculative)
+        .checked_add(pages.inactive)?
+        .checked_mul(page)
 }
 
 /// The Windows system directory, from the kernel rather than from the
@@ -1261,16 +1279,14 @@ mod sys {
         }
         // SAFETY: `sysconf` reads a constant.
         let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        let (free, speculative, inactive) = (
-            stats.free_count,
-            stats.speculative_count,
-            stats.inactive_count,
-        );
-        // The kernel's free count includes the speculative pages, which
-        // `vm_stat` prints apart; free here is what it calls free.
         super::available_pages_bytes(
-            u64::from(free).saturating_sub(u64::from(speculative)),
-            u64::from(inactive),
+            super::VmPages {
+                free: u64::from(stats.free_count),
+                speculative: u64::from(stats.speculative_count),
+                inactive: u64::from(stats.inactive_count),
+                external: u64::from(stats.external_page_count),
+                purgeable: u64::from(stats.purgeable_count),
+            },
             page,
         )
     }
@@ -1478,7 +1494,41 @@ mod tests {
         assert_eq!(busy_share((0, 0), (250, 1000)), Some(75));
         assert_eq!(busy_share((250, 1000), (250, 1000)), None);
         assert_eq!(busy_share((10, 20), (5, 40)), None, "went back");
-        assert_eq!(available_pages_bytes(10, 5, 16_384), Some(15 * 16_384));
+    }
+
+    /// macOS keeps file contents a job read in active pages, which it drops
+    /// as soon as anything needs them. Measured on a 24 GiB Mac mini
+    /// (2026-11-11): reading 8.3 GB of files took 1.6 GB of free pages into
+    /// the file cache, and free plus inactive fell from 10.96 GB to 9.37 GB
+    /// while what the system could hand out grew. Reading files must not
+    /// make a host look fuller.
+    #[test]
+    fn file_cache_a_job_reads_in_stays_available_on_macos() {
+        // The Mac mini's `vm_stat` before the read, in 16 KiB pages.
+        let before = VmPages {
+            free: 231_617 + 35_446,
+            speculative: 35_446,
+            inactive: 449_756,
+            external: 361_612,
+            purgeable: 15_016,
+        };
+        let read = 100_000;
+        let after = VmPages {
+            free: before.free - read,
+            external: before.external + read,
+            ..before
+        };
+        let page = 16_384;
+        assert_eq!(
+            available_pages_bytes(after, page),
+            available_pages_bytes(before, page)
+        );
+        // Free (less speculative), file-backed and purgeable pages: the
+        // memory Activity Monitor does not count as used.
+        assert_eq!(
+            available_pages_bytes(before, page),
+            Some((231_617 + 361_612 + 15_016) * page)
+        );
     }
 
     /// Linux reports what new work can have, page cache included: the WSL
