@@ -176,7 +176,7 @@ fn hand_over(
             continue;
         }
         match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() && !pool.is_shared(&metadata) => {
+            Ok(metadata) if metadata.is_dir() && !pool.is_shared(path) => {
                 pool.share_tree(path)?;
             }
             Ok(_) => {}
