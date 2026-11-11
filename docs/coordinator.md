@@ -268,7 +268,10 @@ every other candidate (0.4.52): a host whose last heartbeat reports its CPU load
 `COORDINATOR_CPU_BUSY_PERCENT` (90 %), or less free disk on its runner root's volume than
 `COORDINATOR_MIN_DISK_FREE` (10 GiB; low disk is the worse). It is not excluded: when no other host can
 take the job now, it gets it. A host older than 0.4.52 reports its disk only at connect; that figure
-is used until a heartbeat carries one. It sends that host a `launch` and waits up to 10 seconds for the
+is used until a heartbeat carries one. The CPU load is the share of the host's CPU time spent busy
+between two heartbeats, 0 to 100 on every operating system from 0.4.60; an older Linux or macOS
+host reports its one-minute load average over its CPU count instead, which can exceed 100 (the
+dashboard shows it capped at 100). It sends that host a `launch` and waits up to 10 seconds for the
 answer; a refusal (`max_capacity`, `host_capacity`, `memory` from 0.4.53, `unfit`, `draining`,
 `disabled`, `not_coordinated`, ...) or no answer moves on to the next candidate. A host refuses with
 `memory` when its own [memory admission](#memory-estimates-for-the-hosts-own-admission) would not

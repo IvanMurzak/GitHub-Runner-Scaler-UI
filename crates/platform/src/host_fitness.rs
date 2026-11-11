@@ -123,29 +123,100 @@ pub fn free_disk_bytes(path: &Path) -> Option<u64> {
     sys::free_disk_bytes(path)
 }
 
-/// How busy the CPUs are, in whole percent of all logical CPUs. Unix: the
-/// one-minute load average over the CPU count. Windows, which has no load
-/// average: the busy share of `GetSystemTimes` since the previous call, so
-/// the first call answers `None`. Advisory.
+/// How busy the CPUs are: the share of all logical CPUs' time spent busy
+/// since the previous call, in whole percent, 0 to 100. The first call in a
+/// process answers `None`. Windows reads `GetSystemTimes`, Linux `/proc/stat`
+/// (time waiting on I/O counts as idle), macOS `HOST_CPU_LOAD_INFO`.
+///
+/// Up to 0.4.59 Linux and macOS answered the one-minute load average over
+/// the CPU count instead: a queue length, not a share of time, which runs
+/// far past 100 on a host waiting on its disks. Advisory.
 #[must_use]
 pub fn cpu_load_percent() -> Option<u32> {
-    sys::cpu_load_percent()
+    static SAMPLER: std::sync::Mutex<CpuSampler> = std::sync::Mutex::new(CpuSampler::new());
+    let now = sys::cpu_times()?;
+    SAMPLER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .read(now, std::time::Instant::now())
 }
 
-/// The busy share of the CPUs between two `GetSystemTimes` readings of
-/// `(idle, kernel, user)`, where kernel time includes idle time.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn busy_percent(previous: (u64, u64, u64), now: (u64, u64, u64)) -> Option<u32> {
+/// The shortest window a CPU figure is measured over. A heartbeat also goes
+/// out right after a job ends, moments after the last one: over a few
+/// milliseconds the kernel counts a handful of ticks, so the share would read
+/// 0 or 100, and 100 marks the host busy for placement.
+const CPU_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`cpu_load_percent`]'s state: the reading the next window starts from,
+/// and the last figure, repeated for a call that comes too soon.
+struct CpuSampler {
+    start: Option<((u64, u64), std::time::Instant)>,
+    last: Option<u32>,
+}
+
+impl CpuSampler {
+    const fn new() -> Self {
+        Self {
+            start: None,
+            last: None,
+        }
+    }
+
+    /// The share since the window's start when it is at least
+    /// [`CPU_WINDOW`] long, which then starts a new one; otherwise the last
+    /// figure, keeping the window open.
+    fn read(&mut self, now: (u64, u64), at: std::time::Instant) -> Option<u32> {
+        match self.start {
+            Some((_, began)) if at.duration_since(began) < CPU_WINDOW => self.last,
+            Some((previous, _)) => {
+                self.start = Some((now, at));
+                self.last = busy_share(previous, now);
+                self.last
+            }
+            None => {
+                self.start = Some((now, at));
+                None
+            }
+        }
+    }
+}
+
+/// The busy share, in whole percent, between two readings of cumulative
+/// `(idle, total)` CPU time. `None` when no time passed, or a counter went
+/// back (it wrapped, or the readings are from different boots). Idle a little
+/// over the total, which Windows' rounding produces on an idle host, is 0.
+fn busy_share(previous: (u64, u64), now: (u64, u64)) -> Option<u32> {
     let idle = now.0.checked_sub(previous.0)?;
-    let total = now
-        .1
-        .checked_sub(previous.1)?
-        .checked_add(now.2.checked_sub(previous.2)?)?;
+    let total = now.1.checked_sub(previous.1)?;
     if total == 0 {
         return None;
     }
     let busy = total.saturating_sub(idle);
     u32::try_from(busy.saturating_mul(100).saturating_add(total / 2) / total).ok()
+}
+
+/// Cumulative `(idle, total)` CPU time from `/proc/stat`'s aggregate `cpu`
+/// line: user, nice, system, idle, iowait, irq, softirq and steal (guest time
+/// is already inside user and nice). Waiting on I/O counts as idle: the CPU
+/// could have run something else.
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+fn proc_stat_cpu_times(text: &str) -> Option<(u64, u64)> {
+    let line = text.lines().find(|line| line.starts_with("cpu "))?;
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .take(8)
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if fields.len() < 5 {
+        return None;
+    }
+    let idle = fields[3].checked_add(fields[4])?;
+    let total = fields
+        .iter()
+        .try_fold(0_u64, |sum, field| sum.checked_add(*field))?;
+    Some((idle, total))
 }
 
 /// One field of `/proc/meminfo`'s text, in bytes.
@@ -800,11 +871,9 @@ mod sys {
         Some(free)
     }
 
-    /// The previous `GetSystemTimes` reading: idle, kernel (idle included)
-    /// and user time, in 100 ns units.
-    static PREVIOUS_TIMES: std::sync::Mutex<Option<(u64, u64, u64)>> = std::sync::Mutex::new(None);
-
-    fn system_times() -> Option<(u64, u64, u64)> {
+    /// Cumulative `(idle, total)` CPU time from `GetSystemTimes`, in 100 ns
+    /// units: kernel time includes idle, so the total is kernel plus user.
+    pub(super) fn cpu_times() -> Option<(u64, u64)> {
         use windows::Win32::Foundation::FILETIME;
         let (mut idle, mut kernel, mut user) = (
             FILETIME::default(),
@@ -822,16 +891,7 @@ mod sys {
         .ok()?;
         let value =
             |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
-        Some((value(idle), value(kernel), value(user)))
-    }
-
-    pub(super) fn cpu_load_percent() -> Option<u32> {
-        let now = system_times()?;
-        let previous = PREVIOUS_TIMES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .replace(now)?;
-        super::busy_percent(previous, now)
+        Some((value(idle), value(kernel).checked_add(value(user))?))
     }
 
     pub(super) fn read_dword(subkey: &str, value: &str) -> Result<Option<u32>, RegistryError> {
@@ -1234,20 +1294,39 @@ mod sys {
         u64::from(stats.f_bavail).checked_mul(u64::from(stats.f_frsize))
     }
 
-    pub(super) fn cpu_load_percent() -> Option<u32> {
-        let mut loads = [0f64; 3];
-        // SAFETY: `loads` is a live buffer of the three doubles requested.
-        if unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) } != 1 {
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn cpu_times() -> Option<(u64, u64)> {
+        super::proc_stat_cpu_times(&std::fs::read_to_string("/proc/stat").ok()?)
+    }
+
+    /// Cumulative `(idle, total)` ticks of every CPU. The kernel keeps them
+    /// in 32 bits, so they wrap after weeks; the one reading across a wrap
+    /// goes back and answers nothing.
+    #[cfg(target_os = "macos")]
+    #[allow(
+        deprecated,
+        reason = "libc marks the mach bindings deprecated in favour of a crate this workspace does not take; the call is stable"
+    )]
+    pub(super) fn cpu_times() -> Option<(u64, u64)> {
+        // SAFETY: `host_cpu_load_info` is plain old data; zeroed is valid.
+        let mut load: libc::host_cpu_load_info = unsafe { std::mem::zeroed() };
+        let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+        // SAFETY: `load` is a live buffer of `count` integers, the size the
+        // flavor names; the kernel writes at most that and updates `count`.
+        let result = unsafe {
+            libc::host_statistics(
+                host_port(),
+                libc::HOST_CPU_LOAD_INFO,
+                (&raw mut load).cast(),
+                &raw mut count,
+            )
+        };
+        if result != libc::KERN_SUCCESS {
             return None;
         }
-        let cores = std::thread::available_parallelism().ok()?.get();
-        let percent = loads[0] * 100.0 / f64::from(u32::try_from(cores).ok()?);
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "clamped to a small non-negative range first"
-        )]
-        Some(percent.clamp(0.0, 10_000.0).round() as u32)
+        let ticks = load.cpu_ticks.map(u64::from);
+        let idle = ticks[usize::try_from(libc::CPU_STATE_IDLE).ok()?];
+        Some((idle, ticks.iter().sum()))
     }
 
     fn unsupported() -> RegistryError {
@@ -1349,11 +1428,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_cpu_figure_asked_too_soon_repeats_the_last_one_and_keeps_its_window() {
+        let start = std::time::Instant::now();
+        let after = |secs| start + std::time::Duration::from_secs(secs);
+        let mut sampler = CpuSampler::new();
+        assert_eq!(
+            sampler.read((0, 0), start),
+            None,
+            "the first reading starts a window"
+        );
+        assert_eq!(
+            sampler.read((50, 100), after(1)),
+            None,
+            "too soon, and nothing yet"
+        );
+        assert_eq!(sampler.read((50, 100), after(6)), Some(50));
+        // A heartbeat right after: the same figure, the window still open.
+        assert_eq!(sampler.read((50, 110), after(7)), Some(50));
+        // Measured from 6 s, not from the early call at 7 s.
+        assert_eq!(sampler.read((60, 200), after(11)), Some(90));
+        assert_eq!(
+            busy_share((0, 100), (11, 110)),
+            Some(0),
+            "rounding past the total"
+        );
+    }
+
+    #[test]
+    fn the_cpu_share_is_busy_time_over_all_time_and_never_past_100() {
+        let first = "cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 1 2 3 4 5\n";
+        let second = "cpu  400 0 150 1000 50 0 0 0 0 0\n";
+        let (a, b) = (
+            proc_stat_cpu_times(first).unwrap(),
+            proc_stat_cpu_times(second).unwrap(),
+        );
+        assert_eq!(a, (850, 1000), "iowait counts as idle");
+        // 400 more busy (300 user, 100 system) of 600 more in all.
+        assert_eq!(busy_share(a, b), Some(67));
+        assert_eq!(busy_share(a, a), None, "no time passed");
+        assert_eq!(busy_share(b, a), None, "a counter went back");
+        assert_eq!(busy_share((0, 100), (0, 200)), Some(100));
+        assert_eq!(proc_stat_cpu_times("cpu0 1 2 3 4 5\n"), None);
+        assert_eq!(proc_stat_cpu_times("cpu  1 2 x 4 5\n"), None);
+    }
+
+    #[test]
     fn the_busy_share_comes_from_the_difference_of_two_readings() {
-        // Kernel time includes idle: 400 kernel + 600 user, 250 idle.
-        assert_eq!(busy_percent((0, 0, 0), (250, 400, 600)), Some(75));
-        assert_eq!(busy_percent((250, 400, 600), (250, 400, 600)), None);
-        assert_eq!(busy_percent((10, 10, 10), (5, 20, 20)), None, "went back");
+        // 1000 in all, 250 of it idle.
+        assert_eq!(busy_share((0, 0), (250, 1000)), Some(75));
+        assert_eq!(busy_share((250, 1000), (250, 1000)), None);
+        assert_eq!(busy_share((10, 20), (5, 40)), None, "went back");
         assert_eq!(available_pages_bytes(10, 5, 16_384), Some(15 * 16_384));
     }
 
@@ -1380,12 +1504,14 @@ mod tests {
         assert!(free > 0 && free <= total, "{free} of {total}");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
-    fn windows_reports_cpu_load_from_the_second_reading() {
-        let _ = cpu_load_percent();
+    fn this_hosts_cpu_counters_are_read_and_move_forward() {
+        let first = sys::cpu_times().expect("CPU times");
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(cpu_load_percent().is_some_and(|percent| percent <= 100));
+        let second = sys::cpu_times().expect("CPU times");
+        assert!(second.1 > first.1, "{first:?} then {second:?}");
+        assert!(busy_share(first, second).is_some_and(|percent| percent <= 100));
     }
 
     #[test]
