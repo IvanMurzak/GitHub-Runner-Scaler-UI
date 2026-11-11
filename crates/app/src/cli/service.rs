@@ -279,7 +279,7 @@ impl From<CliError> for Installed {
 
 /// How many processes under `proc` (`/proc`) run a program, or in a working
 /// directory, inside `runtime`: runners an attempt there started.
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(all(test, unix), target_os = "linux"))]
 fn runner_processes_under(proc: &std::path::Path, runtime: &std::path::Path) -> usize {
     let Ok(entries) = std::fs::read_dir(proc) else {
         return 0;
