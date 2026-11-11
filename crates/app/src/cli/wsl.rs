@@ -590,6 +590,23 @@ fn configure_guest_recovery_path(context: &Context, shared_root: &Path) -> Resul
 /// which is what may write `/etc/systemd/system`. The caller reloads systemd.
 fn converge_service_definition(context: &Context) -> Result<bool, CliError> {
     let operations = super::service::operations(context);
+    // On every start, current unit or not: a directory removed after the
+    // last rewrite fails the unit just the same (see
+    // `DefinitionDrift::writable`).
+    let writable = operations
+        .boot_unit_writable_directories()
+        .map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("cannot read the install record: {source}"),
+            )
+        })?;
+    runner_manager_platform::service::create_writable_directories(&writable).map_err(|source| {
+        CliError::new(
+            Failure::WslProvisioning,
+            format!("cannot create the service's directories: {source}"),
+        )
+    })?;
     let drift = operations.definition_drift().map_err(|source| {
         CliError::new(
             Failure::LocalState,
@@ -608,6 +625,10 @@ fn converge_service_definition(context: &Context) -> Result<bool, CliError> {
             ),
         )
     };
+    // Before the unit that names them (see `DefinitionDrift::writable`).
+    drift
+        .create_writable()
+        .map_err(|source| failed("create the directories of", &source))?;
     let directory = drift.path.parent().unwrap_or_else(|| Path::new("/"));
     let mut temporary = tempfile::NamedTempFile::new_in(directory)
         .map_err(|source| failed("stage a replacement for", &source))?;

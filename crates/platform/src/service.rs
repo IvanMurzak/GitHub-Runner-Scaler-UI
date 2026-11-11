@@ -1764,10 +1764,22 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    out.push_str(&format!(
-        "ReadWritePaths={}\n",
-        quoted(&permitted_paths(DefinitionKind::SystemdUnit, plan))
-    ));
+    let permitted = permitted_paths(DefinitionKind::SystemdUnit, plan);
+    out.push_str(&format!("ReadWritePaths={}\n", quoted(&permitted)));
+    // `ProtectHome=tmpfs` hides the home trees, and only `BindPaths=` brings
+    // a directory back (see `DefinitionDrift::writable`). New boot units keep
+    // theirs outside them; one an older build put under `/root` (a WSL host
+    // set up before 0.4.57) keeps working this way.
+    if plan.start_mode() == StartMode::Boot {
+        let under_home: Vec<String> = permitted
+            .iter()
+            .filter(|path| home_root_of(Path::new(path.as_str())).is_some())
+            .cloned()
+            .collect();
+        if !under_home.is_empty() {
+            out.push_str(&format!("BindPaths={}\n", quoted(&under_home)));
+        }
+    }
     if !plan.protected_paths().is_empty() {
         out.push_str(&format!(
             "InaccessiblePaths={}\n",
@@ -1963,9 +1975,16 @@ impl ProtectedPaths {
 }
 
 /// The trees `ProtectHome=` hides, which a boot unit's directories must
-/// therefore lie outside.
-#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+/// therefore lie outside, or be bound back into ([`systemd_unit`]).
 const SYSTEMD_HOME_ROOTS: [&str; 3] = ["/home", "/root", "/run/user"];
+
+/// The home tree `path` lies under, which `ProtectHome=` hides.
+fn home_root_of(path: &Path) -> Option<&'static str> {
+    SYSTEMD_HOME_ROOTS
+        .iter()
+        .copied()
+        .find(|root| path.starts_with(root))
+}
 
 /// Renames a non-empty directory at `path` to `<name>.before-move-<stamp>`
 /// beside it, leaving nothing at `path`.
@@ -2027,10 +2046,7 @@ fn copy_tree(from: &Path, to: &Path, skip: Option<&str>) -> std::io::Result<()> 
 /// one its `ProtectHome=` hides.
 #[cfg(any(test, all(unix, not(target_os = "macos"))))]
 fn boot_directory_refusal(path: &Path, owner: Option<u32>) -> Option<String> {
-    if let Some(root) = SYSTEMD_HOME_ROOTS
-        .iter()
-        .find(|root| path.starts_with(root))
-    {
+    if let Some(root) = home_root_of(path) {
         return Some(format!(
             "{} is under {root}, which a boot service cannot see",
             path.display()
@@ -2862,6 +2878,28 @@ fn review_systemd(
             detail: "is absent, so `ProtectSystem=strict` leaves the daemon nowhere to write"
                 .to_string(),
         }),
+    }
+
+    // `BindPaths=` reopens what `ProtectHome=tmpfs` hides, read-write, and can
+    // mount any host path anywhere (`source:destination`): it may name only the
+    // unit's own directories, each bound onto itself.
+    if let Some(value) = directives.get("BindPaths") {
+        let permitted = permitted_paths(DefinitionKind::SystemdUnit, plan);
+        for entry in split_quoted(value) {
+            if !permitted
+                .iter()
+                .any(|allowed| same_path_for(DefinitionKind::SystemdUnit, allowed, &entry))
+            {
+                findings.push(PrivilegeFinding {
+                    kind: FindingKind::Excess,
+                    subject: "BindPaths".to_string(),
+                    detail: format!(
+                        "{entry} is bound into the unit but is not one of this registration's \
+                         required paths"
+                    ),
+                });
+            }
+        }
     }
 
     // Each path the operator protected must stay inaccessible: a unit that no
@@ -3998,6 +4036,61 @@ pub struct DefinitionDrift {
     pub start_mode: StartMode,
     /// Which manager reads the definition.
     pub manager: DefinitionKind,
+    /// The directories the rendered definition lets the service write. A
+    /// systemd unit fails before its first instruction (`226/NAMESPACE`) when
+    /// one it lists is missing, or is under a home tree its
+    /// `ProtectHome=tmpfs` hides without a `BindPaths=` for it. So whoever
+    /// writes `rendered` creates them first: a host an older build installed
+    /// may never have made one.
+    pub writable: Vec<PathBuf>,
+}
+
+impl DefinitionDrift {
+    /// Creates every missing directory in [`Self::writable`]: the directory
+    /// itself `0700`, its parents (`~/.local` and its like, not this
+    /// program's to tighten) as the umask says.
+    ///
+    /// # Errors
+    ///
+    /// The first directory that could not be created.
+    pub fn create_writable(&self) -> std::io::Result<()> {
+        create_writable_directories(&self.writable)
+    }
+}
+
+/// Creates every missing directory in `directories`: the directory itself
+/// `0700`, whatever the umask, and its parents as the umask says.
+///
+/// # Errors
+///
+/// The first that could not be created, or a path that holds something
+/// other than a directory: a file or a dangling link there fails a unit as
+/// surely as nothing at all.
+pub fn create_writable_directories(directories: &[PathBuf]) -> std::io::Result<()> {
+    for directory in directories {
+        if let Some(parent) = directory.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::create_dir(directory) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !directory.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("{} exists and is not a directory", directory.display()),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Compares the installed definition against this build's rendering.
@@ -4043,6 +4136,7 @@ fn launchd_definition_drift(
             rendered: launchd_plist(&record.plan(identity.clone())),
             start_mode: record.start_mode,
             manager: DefinitionKind::LaunchdPlist,
+            writable: Vec::new(),
         },
     )
 }
@@ -4053,13 +4147,18 @@ fn systemd_definition_drift(
     path: PathBuf,
     installed: &str,
 ) -> Option<DefinitionDrift> {
-    let rendered = systemd_unit(&record.plan(identity.clone()));
+    let plan = record.plan(identity.clone());
+    let rendered = systemd_unit(&plan);
     (installed != rendered).then(|| DefinitionDrift {
         path,
         installed_by_version: record.installed_by_version.clone(),
         rendered,
         start_mode: record.start_mode,
         manager: DefinitionKind::SystemdUnit,
+        writable: permitted_paths(DefinitionKind::SystemdUnit, &plan)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
     })
 }
 
@@ -5238,6 +5337,30 @@ impl ServiceOperations {
     pub fn definition_drift(&self) -> Result<Option<DefinitionDrift>, ServiceError> {
         Ok(InstallRecord::read(&self.paths)?
             .and_then(|record| definition_drift(self.controls.as_ref(), &self.identity, &record)))
+    }
+
+    /// The directories the recorded systemd boot unit lets the service write,
+    /// whether or not the unit has drifted; empty for any other registration.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the install record reports.
+    pub fn boot_unit_writable_directories(&self) -> Result<Vec<PathBuf>, ServiceError> {
+        Ok(InstallRecord::read(&self.paths)?
+            .filter(|record| {
+                record.start_mode == StartMode::Boot
+                    && host_definition_kind(record.start_mode) == DefinitionKind::SystemdUnit
+            })
+            .map(|record| {
+                permitted_paths(
+                    DefinitionKind::SystemdUnit,
+                    &record.plan(self.identity.clone()),
+                )
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Writes the plist this build renders over an outdated one, then has a
@@ -9443,6 +9566,38 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn converging_a_unit_first_creates_the_directories_it_lets_the_service_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("dir");
+        let config = root.path().join(".config").join("runner-manager");
+        let state = root.path().join("state");
+        std::fs::create_dir_all(&state).expect("state");
+        let drift = DefinitionDrift {
+            path: root.path().join("runner-manager.service"),
+            installed_by_version: "0.4.44".into(),
+            rendered: String::new(),
+            start_mode: StartMode::Boot,
+            manager: DefinitionKind::SystemdUnit,
+            writable: vec![config.clone(), state.clone()],
+        };
+        drift.create_writable().expect("created");
+        assert!(config.is_dir(), "the missing one is made");
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drift.create_writable().expect("and again changes nothing");
+
+        std::fs::remove_dir(&state).expect("state removed");
+        std::fs::write(&state, "").expect("a file in its place");
+        assert!(
+            drift.create_writable().is_err(),
+            "a file is not a directory"
+        );
+    }
+
     #[test]
     fn a_plist_with_an_old_process_type_is_drift_and_an_operator_edit_is_not() {
         let host = Host::new();
@@ -9528,6 +9683,7 @@ mod tests {
             rendered: launchd_plist(&linux_plan(StartMode::Login)),
             start_mode: StartMode::Login,
             manager: DefinitionKind::LaunchdPlist,
+            writable: Vec::new(),
         };
 
         replace_definition("runner-manager", &drift).expect("replaced");
@@ -9577,6 +9733,7 @@ mod tests {
                 ),
                 start_mode: StartMode::Login,
                 manager: DefinitionKind::LaunchdPlist,
+                writable: Vec::new(),
             };
             replace_definition(identity.name(), &drift).expect("plist replaced");
             super::sys::reload_detached(&identity, StartMode::Login, &path)
@@ -10063,6 +10220,34 @@ mod tests {
         };
         list.save(directory.path()).unwrap();
         assert_eq!(ProtectedPaths::load(directory.path()).unwrap(), list);
+    }
+
+    #[test]
+    fn a_boot_unit_with_directories_under_root_binds_them_back_into_its_tmpfs_home() {
+        let legacy = InstallPlan::unchecked(
+            ServiceIdentity::product(),
+            StartMode::Boot,
+            "/root/.local/state/runner-manager/bin/runner-manager",
+            ServiceDirectories {
+                config: PathBuf::from("/root/.config/runner-manager"),
+                state: PathBuf::from("/root/.local/state/runner-manager"),
+                runtime: PathBuf::from("/root/.local/share/runner-manager/runtime"),
+                logs: PathBuf::from("/root/.local/share/runner-manager/logs"),
+            },
+        )
+        .with_secret_guard("/var/lib/runner-manager/secrets/user-access-token");
+        let unit = systemd_unit(&legacy);
+        let directives = ini_directives(&unit, "Service");
+        assert_eq!(directives["ProtectHome"], "tmpfs");
+        assert_eq!(
+            directives["BindPaths"],
+            "/root/.config/runner-manager /root/.local/state/runner-manager \
+             /root/.local/share/runner-manager/runtime /root/.local/share/runner-manager/logs",
+            "only the directories under a home tree, never the secrets outside it"
+        );
+        assert!(!reports(&unit, &legacy, "BindPaths", FindingKind::Excess));
+        let widened = unit.replace("BindPaths=", "BindPaths=/root/.ssh /etc:/root/.config ");
+        assert!(reports(&widened, &legacy, "BindPaths", FindingKind::Excess));
     }
 
     #[test]

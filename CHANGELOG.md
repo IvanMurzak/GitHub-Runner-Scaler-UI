@@ -7,6 +7,18 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.59
+
+### Fixed
+
+- A WSL host first set up before 0.4.57 starts again after
+  `runner-manager wsl install` rewrites its systemd unit. Its directories are
+  under `/root`, which the unit's `ProtectHome=tmpfs` hid, and systemd failed
+  the unit before it started (`226/NAMESPACE`, "Failed to set up mount
+  namespacing"). A boot unit now binds directories under `/root`, `/home` or
+  `/run/user` back with `BindPaths=`, and the WSL update creates any that are
+  missing before it replaces the unit.
+
 ## 0.4.58
 
 ### Added
