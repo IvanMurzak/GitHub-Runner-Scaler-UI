@@ -251,6 +251,23 @@ pub(super) fn set_attribute(fd: &OwnedFd, name: &CStr, value: &[u8]) -> io::Resu
     })
 }
 
+/// Reads the extended attribute `name` of the open directory `fd` into
+/// `value`, returning its length.
+#[cfg(target_os = "linux")]
+pub(super) fn attribute(fd: &OwnedFd, name: &CStr, value: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: the descriptor is open, `name` is NUL-terminated and `value`
+    // is writable for its length.
+    let length = unsafe {
+        libc::fgetxattr(
+            fd.as_raw_fd(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    usize::try_from(length).map_err(|_| io::Error::last_os_error())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

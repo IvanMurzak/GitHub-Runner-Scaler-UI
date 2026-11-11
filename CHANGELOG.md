@@ -7,6 +7,20 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.62
+
+### Fixed
+
+- A `container:` job on a Linux boot service whose steps run as the image's
+  own user (`runuser -u ci`, `USER` in the image) could not run a toolchain
+  it installed with `setup-node`, `setup-go` or `setup-java`: `env: 'node':
+  Permission denied`. Since 0.4.57 the default ACL on shared cache
+  directories gave every account outside the `rm-runner` group nothing, so a
+  folder created under `/__t` was `2770`, and the image's user is outside the
+  group. Shared caches now let any account read and run what is in them, as a
+  umask of `022` did before 0.4.57; only the pool's group may write. A cache
+  shared by 0.4.57 to 0.4.61 is opened up at the next launch that uses it.
+
 ## 0.4.61
 
 ### Added

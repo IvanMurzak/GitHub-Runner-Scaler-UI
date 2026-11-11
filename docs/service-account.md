@@ -299,7 +299,11 @@ host is using:
   lines, as any account can;
 - dependency caches are the exception, shared on purpose: each cache directory
   belongs to the `rm-runner` group, is set-group-ID and carries a default ACL,
-  so what one runner's job writes there the next one can use and update. Sharing
+  so what one runner's job writes there the next one can use and update. Any
+  other account may read and run what is cached, never change it: the steps of
+  a `container:` job that run as the image's own user are no account of the
+  host, and they run the toolchains the runner mounts from the tool cache at
+  `/__t`. On the host, the runner root keeps accounts outside the pool out. Sharing
   a cache is sharing trust: a job can leave in it what another repository's job
   then runs. Repositories you trust differently should not share a cache; see
   `repo cache set-namespace`;

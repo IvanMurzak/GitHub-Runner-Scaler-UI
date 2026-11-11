@@ -302,10 +302,12 @@ impl RunnerPool {
     /// the group becomes [`RUNNER_GROUP`], which may read and write it, new
     /// entries in a directory inherit that group (set-group-ID), and a default
     /// ACL gives the group write access to what any account creates later,
-    /// whatever umask that account's job runs with.
+    /// whatever umask that account's job runs with. Everyone else may read
+    /// and search it, as under a umask of `022`, but never write it.
     ///
     /// A directory already shared is not entered, so a second call over a
-    /// large cache costs one `lstat`. Links are never followed.
+    /// large cache costs a `stat` and a read of its ACL. Links are never
+    /// followed.
     ///
     /// # Errors
     ///
@@ -322,17 +324,17 @@ impl RunnerPool {
         }
     }
 
-    /// Whether `metadata` describes a directory [`Self::share_tree`] has
-    /// already shared.
+    /// Whether `path` is a directory [`Self::share_tree`] has already
+    /// shared, as this release shares it. A link is not.
     #[must_use]
-    pub fn is_shared(&self, metadata: &std::fs::Metadata) -> bool {
+    pub fn is_shared(&self, path: &Path) -> bool {
         #[cfg(unix)]
         {
-            sys::is_shared(self.gid, metadata)
+            sys::is_shared(self.gid, path)
         }
         #[cfg(not(unix))]
         {
-            let _ = metadata;
+            let _ = path;
             true
         }
     }
@@ -362,8 +364,26 @@ mod sys {
 
     use super::RunnerAccount;
 
-    pub(super) fn is_shared(gid: u32, metadata: &std::fs::Metadata) -> bool {
-        metadata.is_dir() && metadata.gid() == gid && metadata.mode() & 0o2070 == 0o2070
+    /// What a shared directory grants beyond its owner: set-group-ID, the
+    /// group everything, and everyone else read and search.
+    const SHARED_DIRECTORY: u32 = 0o2075;
+
+    /// Whether the directory at `path` is shared already: its group, its
+    /// mode, and the default ACL this release sets. A tree shared by a release
+    /// whose ACL gave everyone else nothing fails the last check, so it is
+    /// walked once more and opened up.
+    pub(super) fn is_shared(gid: u32, path: &Path) -> bool {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let Ok(directory) = std::fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+        else {
+            return false;
+        };
+        directory.metadata().is_ok_and(|metadata| {
+            metadata.gid() == gid && metadata.mode() & SHARED_DIRECTORY == SHARED_DIRECTORY
+        }) && has_default_acl(&directory.into())
     }
 
     /// Shares `path` and what is under it that is not shared yet. A
@@ -377,17 +397,23 @@ mod sys {
             // `mode_t` is narrower than `u32` on macOS.
             #[allow(clippy::useless_conversion)]
             let mode = u32::from(stat.st_mode) & 0o7777;
-            if below && directory && stat.st_gid == gid && mode & 0o2070 == 0o2070 {
+            if below
+                && let super::walk::Node::Directory { fd, .. } = node
+                && stat.st_gid == gid
+                && mode & SHARED_DIRECTORY == SHARED_DIRECTORY
+                && has_default_acl(fd)
+            {
                 return Ok(false);
             }
             if stat.st_gid != gid {
                 node.chown(u32::MAX, gid)?;
             }
             let wanted = if directory {
-                mode | 0o2070
+                mode | SHARED_DIRECTORY
             } else {
-                // The group gets what the owner has, short of the special bits.
-                mode | ((mode & 0o700) >> 3)
+                // The group gets what the owner has, short of the special bits,
+                // and everyone else what the owner may read and run.
+                mode | ((mode & 0o700) >> 3) | ((mode & 0o500) >> 6)
             };
             if wanted != mode {
                 node.chmod(wanted)?;
@@ -399,20 +425,46 @@ mod sys {
         })
     }
 
-    /// The default ACL `user::rwx group::rwx other::---`, in the kernel's
+    /// The default ACL `user::rwx group::rwx other::r-x`, in the kernel's
     /// `system.posix_acl_default` encoding.
+    ///
+    /// Everyone else may read and run what is cached, never change it: a
+    /// `container:` job's steps that run as the image's own user are no
+    /// account of this host, and they run the toolchains the runner mounts
+    /// from the tool cache at `/__t`. The runner root keeps every account
+    /// outside the pool from reaching a cache under it on the host.
     #[cfg(any(test, target_os = "linux"))]
     pub(super) fn default_acl() -> Vec<u8> {
         const VERSION: u32 = 2;
         const UNDEFINED: u32 = u32::MAX;
         let mut acl = VERSION.to_le_bytes().to_vec();
         // (tag, permissions): ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_OTHER.
-        for (tag, permissions) in [(0x01_u16, 7_u16), (0x04, 7), (0x20, 0)] {
+        for (tag, permissions) in [(0x01_u16, 7_u16), (0x04, 7), (0x20, 5)] {
             acl.extend_from_slice(&tag.to_le_bytes());
             acl.extend_from_slice(&permissions.to_le_bytes());
             acl.extend_from_slice(&UNDEFINED.to_le_bytes());
         }
         acl
+    }
+
+    /// Whether `directory` carries [`default_acl`], or sits on a filesystem
+    /// that keeps no ACL, where there is none to set.
+    fn has_default_acl(directory: &std::os::fd::OwnedFd) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let wanted = default_acl();
+            // One byte more than wanted, so a longer ACL does not compare equal.
+            let mut value = vec![0_u8; wanted.len() + 1];
+            match super::walk::attribute(directory, c"system.posix_acl_default", &mut value) {
+                Ok(length) => value[..length] == wanted[..],
+                Err(error) => error.raw_os_error() == Some(libc::ENOTSUP),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = directory;
+            true
+        }
     }
 
     fn set_default_acl(directory: &std::os::fd::OwnedFd) -> io::Result<()> {
@@ -612,14 +664,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_default_acl_is_the_kernel_encoding_of_group_rwx() {
+    fn the_default_acl_is_the_kernel_encoding_of_group_rwx_other_rx() {
         assert_eq!(
             sys::default_acl(),
             [
                 2, 0, 0, 0, // version
                 1, 0, 7, 0, 255, 255, 255, 255, // user::rwx
                 4, 0, 7, 0, 255, 255, 255, 255, // group::rwx
-                32, 0, 0, 0, 255, 255, 255, 255, // other::---
+                32, 0, 5, 0, 255, 255, 255, 255, // other::r-x
             ]
         );
     }
@@ -651,8 +703,9 @@ mod tests {
 
         let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
         assert_eq!(mode(&root.join("npm")) & 0o2070, 0o2070);
-        assert_eq!(mode(&root.join("npm/_cacache/entry")), 0o660);
-        assert!(pool.is_shared(&std::fs::metadata(root.join("npm")).unwrap()));
+        assert_eq!(mode(&root.join("npm/_cacache/entry")), 0o664);
+        assert!(pool.is_shared(&root.join("npm")));
+        assert!(!pool.is_shared(&root.join("link")));
         assert_eq!(
             mode(outside.path()) & 0o2000,
             0,
@@ -721,5 +774,68 @@ mod tests {
             assert_eq!(mode(&path), 0o2775, "{}", path.display());
         }
         assert_eq!(mode(&bin.join("node")), 0o755);
+    }
+
+    /// 0.4.57 to 0.4.61 shared caches with a default ACL that gave everyone
+    /// else nothing. Such a tree reads as not shared, and sharing it again
+    /// opens what those releases' jobs left in it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cache_shared_by_an_earlier_release_is_opened_up_on_the_next_launch() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("tool-cache");
+        let bin = root.join("node/24.22.2/x64/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("node"), b"x").unwrap();
+        let earlier_acl: &[u8] = &[
+            2, 0, 0, 0, 1, 0, 7, 0, 255, 255, 255, 255, 4, 0, 7, 0, 255, 255, 255, 255, 32, 0, 0,
+            0, 255, 255, 255, 255,
+        ];
+        let set_mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for path in [&root, &root.join("node"), &root.join("node/24.22.2")] {
+            let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: both names are NUL-terminated and the value is valid
+            // for its length.
+            let status = unsafe {
+                libc::setxattr(
+                    name.as_ptr(),
+                    c"system.posix_acl_default".as_ptr(),
+                    earlier_acl.as_ptr().cast(),
+                    earlier_acl.len(),
+                    0,
+                )
+            };
+            if status != 0 {
+                eprintln!("skipped: {} keeps no default ACL", path.display());
+                return;
+            }
+        }
+        // The top was created by the daemon (umask 022), the rest by jobs.
+        set_mode(&root, 0o2775);
+        for path in [root.join("node"), root.join("node/24.22.2")] {
+            set_mode(&path, 0o2770);
+        }
+        set_mode(&bin.join("node"), 0o750);
+        let pool = RunnerPool {
+            gid: std::fs::metadata(&root).unwrap().gid(),
+            accounts: Vec::new(),
+            legacy: None,
+        };
+
+        assert!(!pool.is_shared(&root));
+        pool.share_tree(&root).unwrap();
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
+        for path in [root.join("node"), root.join("node/24.22.2"), bin.clone()] {
+            assert_eq!(mode(&path), 0o2775, "{}", path.display());
+        }
+        // The group gets what the owner has, everyone else read and run.
+        assert_eq!(mode(&bin.join("node")), 0o775);
+        assert!(pool.is_shared(&root));
+        assert!(pool.is_shared(&root.join("node/24.22.2")));
     }
 }
