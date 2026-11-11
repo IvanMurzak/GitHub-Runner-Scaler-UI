@@ -29,6 +29,13 @@ the version being prepared rather than the version in `Cargo.toml`.
   the update timer runs as when a command once run with sudo left part of it
   to root, which made every update fail at `git fetch`. `update.sh` says so
   when a fetch fails.
+- Linux and macOS hosts report their CPU load as the share of CPU time spent
+  busy since the last heartbeat (`/proc/stat`, `HOST_CPU_LOAD_INFO`), 0 to
+  100, as Windows hosts already did. They reported the one-minute load
+  average over the CPU count, a queue length that runs far past 100 on a host
+  waiting on its disks, so the coordinator dashboard showed CPU above 100 %
+  and placement could treat such a host as busier than it was. The dashboard
+  caps an older host's figure at 100.
 
 ## 0.4.59
 

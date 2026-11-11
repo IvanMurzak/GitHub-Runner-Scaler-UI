@@ -406,7 +406,9 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
                 cores: hello.map(|hello| hello.cores),
                 ram_bytes: live.and_then(|live| live.ram_bytes),
                 free_ram_bytes: live.and_then(|live| live.free_ram_bytes),
-                cpu_load_percent: live.and_then(|live| live.cpu_load_percent),
+                cpu_load_percent: live
+                    .and_then(|live| live.cpu_load_percent)
+                    .map(metrics::cpu_share),
                 disk_free_bytes: live.and_then(|live| live.disk_free_bytes),
                 busy_slots: live.map(|live| live.busy_slots),
                 free_slots: live.map(|live| live.free_slots),
@@ -531,7 +533,7 @@ pub fn sample(state: &AppState, dashboard: &Dashboard, now: i64) -> Vec<MetricSa
                 .zip(host.free_ram_bytes)
                 .map(|(total, free)| total.saturating_sub(free)),
             ram_total: host.ram_bytes,
-            cpu: host.cpu_load_percent,
+            cpu: host.cpu_load_percent.map(metrics::cpu_share),
             busy: Some(host.busy_slots),
             slots: Some(host.busy_slots + host.free_slots),
             disk_free: host.disk_free_bytes,

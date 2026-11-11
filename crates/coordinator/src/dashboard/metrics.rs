@@ -13,6 +13,15 @@ pub const SAMPLE_EVERY_SECS: u64 = 60;
 /// How long samples are kept: the longest range a chart shows.
 pub const RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// A host's CPU figure as a share of its CPUs. A host older than 0.4.60 on
+/// Linux or macOS reports its load average over its CPU count, which runs
+/// past 100 on a host waiting on its disks; the dashboard shows that as fully
+/// busy rather than as a share it cannot be.
+#[must_use]
+pub fn cpu_share(percent: u32) -> u32 {
+    percent.min(100)
+}
+
 /// A chart's time range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Range {
@@ -170,7 +179,10 @@ pub fn series(
         .into_iter()
         .map(|(id, steps)| HostSeries {
             name: names.get(&id).cloned().unwrap_or_else(|| id.clone()),
-            cpu: steps.iter().map(|step| step.cpu.get32()).collect(),
+            cpu: steps
+                .iter()
+                .map(|step| step.cpu.get32().map(cpu_share))
+                .collect(),
             ram_used: steps.iter().map(|step| step.ram_used.get()).collect(),
             ram_total: steps.iter().map(|step| step.ram_total.get()).collect(),
             busy: steps.iter().map(|step| step.busy.get32()).collect(),
