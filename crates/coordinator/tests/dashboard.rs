@@ -204,11 +204,14 @@ async fn an_allowed_login_signs_in_and_sees_the_queue() {
         .expect("json");
     assert_eq!(me["login"], "ivanmurzak");
 
+    // Queued a minute ago by the real clock: the dashboard forgets a job
+    // queued for a day, so a fixed date would drop out of the queue a day on.
+    let created_at = (chrono::Utc::now() - chrono::TimeDelta::minutes(1)).to_rfc3339();
     let body = serde_json::json!({
         "action": "queued",
         "workflow_job": {"id": 41, "run_id": 7, "name": "build",
                          "labels": ["self-hosted", "linux"],
-                         "created_at": "2026-11-10T10:00:00Z"},
+                         "created_at": created_at},
         "repository": {"full_name": "IvanMurzak/app"},
     })
     .to_string();
