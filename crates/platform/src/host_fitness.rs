@@ -109,9 +109,9 @@ pub fn physical_memory_bytes() -> Option<u64> {
 }
 
 /// Physical memory available to new work right now, in bytes: Windows'
-/// available physical memory, Linux's `MemAvailable`, macOS's free plus
-/// inactive pages (`host_statistics64`, what `vm_stat` prints). Advisory: a
-/// coordinator heartbeat.
+/// available physical memory, Linux's `MemAvailable`, macOS's free,
+/// file-backed and purgeable pages (`host_statistics64`, what `vm_stat`
+/// prints). Advisory: a coordinator heartbeat.
 #[must_use]
 pub fn available_memory_bytes() -> Option<u64> {
     sys::available_memory_bytes()
@@ -235,20 +235,28 @@ struct VmPages {
     /// `free_count`: the speculative pages included, as the kernel counts.
     free: u64,
     speculative: u64,
-    inactive: u64,
     /// `external_page_count`: file-backed pages, the speculative ones too.
     external: u64,
     purgeable: u64,
 }
 
-/// Free plus inactive pages in bytes: memory macOS hands to new work without
-/// paging anything out (the `available` figure `psutil` reports).
+/// Memory macOS hands to new work without compressing or swapping anything,
+/// in bytes: free pages, the file cache (file-backed pages, active ones too)
+/// and purgeable pages. It is what Activity Monitor does not count as used,
+/// and like Linux's `MemAvailable` it counts the file cache.
+///
+/// Up to 0.4.62 it was free plus inactive pages, `psutil`'s figure: that
+/// counts inactive app memory, which only compression frees, and leaves out
+/// the active file cache, so a host that had just read many files looked
+/// gigabytes fuller than it was.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn available_pages_bytes(pages: VmPages, page: u64) -> Option<u64> {
+    // The speculative pages are in both the free and the file-backed counts.
     pages
         .free
         .saturating_sub(pages.speculative)
-        .checked_add(pages.inactive)?
+        .checked_add(pages.external)?
+        .checked_add(pages.purgeable)?
         .checked_mul(page)
 }
 
@@ -1283,7 +1291,6 @@ mod sys {
             super::VmPages {
                 free: u64::from(stats.free_count),
                 speculative: u64::from(stats.speculative_count),
-                inactive: u64::from(stats.inactive_count),
                 external: u64::from(stats.external_page_count),
                 purgeable: u64::from(stats.purgeable_count),
             },
@@ -1508,7 +1515,6 @@ mod tests {
         let before = VmPages {
             free: 231_617 + 35_446,
             speculative: 35_446,
-            inactive: 449_756,
             external: 361_612,
             purgeable: 15_016,
         };
