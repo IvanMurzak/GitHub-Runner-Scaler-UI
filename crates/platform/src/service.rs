@@ -4855,7 +4855,7 @@ impl ServiceOperations {
         let _guard = self.refuse_while_an_agent_runs()?;
         // `service install` moved an older tree in, if there was one, before
         // it opened the database here; this finds nothing left to move.
-        let adopted = self.adopt_boot_installation(request.start_mode(), &|| Ok(()))?;
+        let adopted = self.adopt_boot_installation(request.start_mode(), &|_| Ok(()))?;
         // Replacing applies to this account's own registration only: over
         // another installation's it would re-register that service against
         // this account's directories.
@@ -5596,7 +5596,7 @@ impl ServiceOperations {
     pub fn adopt_boot_installation(
         &self,
         mode: StartMode,
-        idle: &dyn Fn() -> Result<(), String>,
+        idle: &dyn Fn(&ServiceDirectories) -> Result<(), String>,
     ) -> Result<bool, ServiceError> {
         #[cfg(target_os = "linux")]
         return self.adopt_boot_installation_on_linux(mode, idle);
@@ -5611,7 +5611,7 @@ impl ServiceOperations {
     fn adopt_boot_installation_on_linux(
         &self,
         mode: StartMode,
-        idle: &dyn Fn() -> Result<(), String>,
+        idle: &dyn Fn(&ServiceDirectories) -> Result<(), String>,
     ) -> Result<bool, ServiceError> {
         if mode != StartMode::Boot {
             return Ok(false);
@@ -5633,10 +5633,17 @@ impl ServiceOperations {
         // The moved unit hides `/root` and `/home`, so a setting of the
         // operator's that points into the old tree would point nowhere.
         let unit = self.identity.systemd_unit();
-        if let Some(drop_in) = operator_drop_in_naming(
-            &Path::new(SYSTEMD_SYSTEM_DIR).join(format!("{unit}.d")),
-            &[&old.config, &old.state, &old.runtime, &old.logs],
-        ) {
+        // Every directory systemd reads a unit's drop-ins from.
+        let trees = [&old.config, &old.state, &old.runtime, &old.logs];
+        if let Some(drop_in) = [
+            SYSTEMD_SYSTEM_DIR,
+            "/run/systemd/system",
+            "/usr/lib/systemd/system",
+        ]
+        .iter()
+        .find_map(|base| {
+            operator_drop_in_naming(&Path::new(base).join(format!("{unit}.d")), &trees)
+        }) {
             return Err(deferred(format!(
                 "{} names that tree, and the moved service could not see it; change or remove it, \
                  run `sudo systemctl daemon-reload`, and run this again",
@@ -5644,12 +5651,16 @@ impl ServiceOperations {
             )));
         }
         let control = self.controls.control(StartMode::Boot)?;
-        control.stop(&self.identity)?;
+        let was_running = control.stop(&self.identity)?;
         // Asked once the service is stopped, so no runner can start after: a
         // runner keeps running when the service stops (`KillMode=process`),
-        // in a directory the moved service could not see.
-        if let Err(reason) = idle() {
-            control.start(&self.identity)?;
+        // in a directory the moved service could not see. Asked of the tree
+        // the registration names, which is not always the caller's own.
+        if let Err(reason) = idle(&old) {
+            // Unchanged: a service the operator had stopped stays stopped.
+            if was_running {
+                control.start(&self.identity)?;
+            }
             return Err(deferred(reason));
         }
         // No service was ever installed against this tree, so whatever is in it

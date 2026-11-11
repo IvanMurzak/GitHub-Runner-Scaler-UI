@@ -301,11 +301,20 @@ fn runner_processes_under(proc: &std::path::Path, runtime: &std::path::Path) -> 
         .count()
 }
 
-/// Whether the host whose tree `context` names is idle, asked once its
+/// Whether the host whose service runs against `old` is idle, asked once its
 /// service has stopped: no attempt its database still counts as active, and
 /// no process left running from its runtime (one a lost record would hide).
+/// `old` is the registration's tree, which need not be the one `context`
+/// resolved.
 #[cfg(target_os = "linux")]
-fn idle_for_a_move(context: &Context) -> Result<(), String> {
+fn idle_for_a_move(
+    context: &Context,
+    old: &runner_manager_platform::service::ServiceDirectories,
+) -> Result<(), String> {
+    let context = Context {
+        paths: old.paths(),
+        ..context.clone()
+    };
     let active = context
         .store()
         .map_err(|error| format!("its database could not be read: {error}"))?
@@ -358,10 +367,20 @@ fn install_with(
         // on a retry as much as on the first attempt.
         system = context.in_system_tree()?;
         match operations(&system)
-            .adopt_boot_installation(StartMode::Boot, &|| idle_for_a_move(context))
+            .adopt_boot_installation(StartMode::Boot, &|old| idle_for_a_move(context, old))
         {
             Ok(_) => {}
             Err(deferred @ ServiceError::MoveDeferred { .. }) => {
+                // `in_system_tree` created the system tree's directories, and
+                // `root` resolves that tree as soon as its configuration
+                // directory exists: left behind empty, every later command
+                // would open it instead of the tree the service still runs
+                // against, and never move that one. Only empty ones go.
+                for directory in
+                    runner_manager_platform::service::ServiceDirectories::of(system.paths()).all()
+                {
+                    let _ = std::fs::remove_dir(directory);
+                }
                 return Err(Installed::Deferred(deferred.to_string()));
             }
             Err(error) => return Err(service_failure(error).into()),
@@ -844,6 +863,14 @@ fn service_failure(source: ServiceError) -> CliError {
 mod tests {
     use super::*;
 
+    use clap::Parser as _;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::cli::{Cli, Command, DaemonCommand};
+    use runner_manager_domain::path::LocalAbsolutePath;
+    use runner_manager_platform::service::{RecordingControls, ServiceIdentity, ServiceOperations};
+
     #[cfg(unix)]
     #[test]
     fn a_move_counts_only_numbered_processes_running_from_the_old_runtime() {
@@ -878,13 +905,6 @@ mod tests {
             0
         );
     }
-    use clap::Parser as _;
-    use std::path::Path;
-    use std::sync::Arc;
-
-    use crate::cli::{Cli, Command, DaemonCommand};
-    use runner_manager_domain::path::LocalAbsolutePath;
-    use runner_manager_platform::service::{RecordingControls, ServiceIdentity, ServiceOperations};
 
     #[test]
     fn only_the_running_pre_supervisor_login_action_needs_migration() {
