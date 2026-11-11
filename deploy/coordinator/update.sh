@@ -9,7 +9,8 @@
 #
 # One move: a fresh database backup, the release tag checked out (compose file,
 # Caddyfile and this script are the release's), COORDINATOR_VERSION in .env,
-# the release's images, `docker compose up -d`, and up to two minutes for the
+# `docker compose up -d` with the release's images (pulled before anything
+# changed, so a release without them is refused), and up to two minutes for the
 # coordinator to report the new version and answer /healthz. If it does not,
 # everything goes back: the previous checkout and version, and the database
 # from the backup just taken, because a coordinator refuses a database a newer
@@ -137,30 +138,39 @@ write_status_unchanged() {
 # GitHub is rate limiting this address, 1 on any other failure.
 latest_release() {
     local body code tag
-    body="$(mktemp)" || return 1
-    code="$(curl -sS --connect-timeout 10 --max-time 30 -o "$body" -w '%{http_code}' \
+    # The body, then the status code on a line of its own.
+    body="$(curl -sS --connect-timeout 10 --max-time 30 -w '\n%{http_code}' \
         -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
-        "https://api.github.com/repos/$REPOSITORY/releases/latest")" || {
-        rm -f "$body"
-        return 1
-    }
-    if [[ "$code" == 403 || "$code" == 429 ]] && grep -qi 'rate limit' "$body"; then
-        rm -f "$body"
+        "https://api.github.com/repos/$REPOSITORY/releases/latest")" || return 1
+    code="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+    if [[ "$code" == 403 || "$code" == 429 ]] && grep -qi 'rate limit' <<<"$body"; then
         return 2
     fi
     if [[ "$code" != 200 ]]; then
         log "GitHub answered HTTP $code" >&2
-        rm -f "$body"
         return 1
     fi
-    tag="$(sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$body" | head -n 1)"
-    rm -f "$body"
+    tag="$(sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$body" | head -n 1)"
     tag="${tag#v}"
     is_version "$tag" || {
         log "the newest release's tag is not vX.Y.Z: '$tag'" >&2
         return 1
     }
     printf '%s\n' "$tag"
+}
+
+# decide LATEST CURRENT HELD: prints `up-to-date` when LATEST is not newer than
+# CURRENT (an empty CURRENT is older than anything), `held` when it is the
+# version held back, else `update`.
+decide() {
+    if [[ -n "$2" ]] && ! version_gt "$1" "$2"; then
+        echo up-to-date
+    elif [[ "$1" == "$3" ]]; then
+        echo held
+    else
+        echo update
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -233,18 +243,8 @@ take_backup() {
 
 # The restore of docs/coordinator.md ("Back up and restore"), from backup $1.
 restore_backup() {
-    local name="$1" check
-    docker compose stop coordinator backup || return 1
-    # shellcheck disable=SC2016  # $1 is expanded by the container's shell.
-    check="$(docker compose run --rm --no-deps -T --entrypoint sh backup -c '
-        cp "/backups/$1" /data/coordinator.db \
-            && rm -f /data/coordinator.db-wal /data/coordinator.db-shm \
-            && sqlite3 /data/coordinator.db "PRAGMA integrity_check"' sh "$name")" || return 1
-    [[ "$check" == ok ]] || {
-        log "the restored database failed its integrity check: $check"
-        return 1
-    }
-    log "restored the database from $name"
+    docker compose stop coordinator backup &&
+        docker compose run --rm --no-deps -T backup restore "$1" 2>&1 | sed 's/^/update: /'
 }
 
 # A Caddyfile replaced by a checkout is a new file, and a container that bind
@@ -264,14 +264,13 @@ reload_caddy_if_changed() {
 # is the newest release, empty when unknown), writes the status, and returns
 # non-zero on failure.
 move_to() {
-    local target="$1" mode="$2" latest="$3" tag="v$1"
-    local from detected known shown from_ref backup_name caddy_before
+    local target="$1" mode="$2" latest="${3:-$1}" tag="v$1"
+    local from known shown from_ref backup_name caddy_before
+    # What .env records goes back into it on a rollback; what is known of the
+    # running version, recorded or not, goes into the status.
     from="$(recorded_version)"
-    detected=""
-    [[ -n "$from" ]] || detected="$(running_version)"
-    known="${from:-$detected}"
+    known="${from:-$(running_version)}"
     shown="${known:-unknown}"
-    [[ -n "$latest" ]] || latest="$target"
 
     # A refusal before anything changed: the status says so, nothing to undo.
     refuse() {
@@ -280,7 +279,7 @@ move_to() {
         return 1
     }
 
-    log "moving from ${from:-an unrecorded version${detected:+ ($detected running)}} to $target"
+    log "moving from ${from:-an unrecorded version${known:+ ($known running)}} to $target"
 
     tree_is_clean || {
         git status --short --untracked-files=no
@@ -301,6 +300,8 @@ move_to() {
         refuse "$tag predates update.sh; move to it by hand (docs/coordinator.md, Updates)"
         return
     }
+    # The release's compose file names these same tags, so `up -d` below finds
+    # them here and pulls nothing again.
     log "pulling the $target images"
     if ! docker pull --quiet "$COORDINATOR_IMAGE:$target" || ! docker pull --quiet "$BACKUP_IMAGE:$target"; then
         refuse "could not pull the $target images: not published yet, private, or no network"
@@ -319,7 +320,6 @@ move_to() {
     log "checking out $tag (was $from_ref)"
     if git checkout --quiet --detach "$tag" &&
         env_set_version "$target" &&
-        docker compose pull --quiet &&
         docker compose up -d &&
         reload_caddy_if_changed "$caddy_before" &&
         wait_healthy "$target"; then
@@ -394,6 +394,7 @@ main() {
 
     local current latest held rc
     current="$(recorded_version)"
+    held="$(cat "$HELD_FILE" 2>/dev/null || true)"
 
     if $check; then
         latest="$(latest_release)"
@@ -404,20 +405,15 @@ main() {
         2) echo "newest release: unknown, GitHub is rate limiting this address" ;;
         *) echo "newest release: unknown, the GitHub API did not answer" ;;
         esac
-        held="$(cat "$HELD_FILE" 2>/dev/null || true)"
         [[ -n "$held" ]] && echo "held back: $held was rolled back and is not retried by the timer"
         if [[ -n "$wanted" ]]; then
             echo "would move to $wanted"
         elif ((rc == 0)); then
-            if [[ -z "$current" ]] || version_gt "$latest" "$current"; then
-                if [[ "$latest" == "$held" ]]; then
-                    echo "would do nothing: $latest is held back"
-                else
-                    echo "would update to $latest"
-                fi
-            else
-                echo "would do nothing: up to date"
-            fi
+            case "$(decide "$latest" "$current" "$held")" in
+            up-to-date) echo "would do nothing: up to date" ;;
+            held) echo "would do nothing: $latest is held back" ;;
+            update) echo "would update to $latest" ;;
+            esac
         fi
         if [[ -f "$STATUS_FILE" ]]; then
             echo "last status: $(cat "$STATUS_FILE")"
@@ -454,31 +450,31 @@ main() {
     local shown="${current:-unknown}"
     local last_state
     last_state="$(status_get state)"
-    if ((rc == 2)); then
-        log "GitHub is rate limiting this address; trying again next time"
-        write_status_unchanged "${last_state:-current}" "$shown" "$(status_get latest)" \
-            "not checked: GitHub API rate limit"
-        exit 0
-    elif ((rc != 0)); then
-        log "could not read the newest release"
-        write_status_unchanged "${last_state:-current}" "$shown" "$(status_get latest)" \
-            "not checked: the GitHub API did not answer"
-        exit 1
+    if ((rc != 0)); then
+        # A rate limit passes; anything else fails the unit.
+        local msg="the GitHub API did not answer" code=1
+        ((rc == 2)) && msg="GitHub API rate limit" code=0
+        log "not checked: $msg; trying again next time"
+        write_status_unchanged "${last_state:-current}" "$shown" "$(status_get latest)" "not checked: $msg"
+        exit "$code"
     fi
     log "running ${current:-an unrecorded version}; newest release $latest"
 
-    if [[ -n "$current" ]] && ! version_gt "$latest" "$current"; then
+    case "$(decide "$latest" "$current" "$held")" in
+    up-to-date)
         write_status_unchanged current "$current" "$latest" ""
-        exit 0
-    fi
-    held="$(cat "$HELD_FILE" 2>/dev/null || true)"
-    if [[ "$latest" == "$held" ]]; then
+        ;;
+    held)
         log "$latest was rolled back before; not trying it again (./update.sh --version $latest does)"
         write_status_unchanged "${last_state:-rolled_back}" "$shown" "$latest" \
             "$latest was rolled back and is held back; ./update.sh --version $latest tries it again"
-        exit 0
-    fi
-    move_to "$latest" timer "$latest"
+        ;;
+    update)
+        move_to "$latest" timer "$latest"
+        return
+        ;;
+    esac
+    return 0
 }
 
 main "$@"

@@ -118,6 +118,10 @@ enum Command {
             default_value = "https://github.com"
         )]
         github_web_url: url::Url,
+        /// Where the updater (deploy/coordinator/update.sh) leaves its status
+        /// for the dashboard.
+        #[arg(long, env = "COORDINATOR_UPDATE_STATUS", default_value = runner_manager_coordinator::dashboard::UPDATE_STATUS)]
+        update_status: std::path::PathBuf,
     },
     /// The job weight statistics: heaviest jobs, hosts, recent placements.
     Stats {
@@ -257,17 +261,29 @@ fn parse_weights(text: &str) -> Result<Weights, String> {
     Ok(weights)
 }
 
+/// A secret from the file `{name}_FILE` names (preferred) or from `{name}`
+/// itself, as written; `None` when neither is set. Never from an argument.
+fn secret_from_env(name: &str) -> anyhow::Result<Option<SecretString>> {
+    let file = format!("{name}_FILE");
+    if let Some(path) = std::env::var_os(&file) {
+        return std::fs::read_to_string(&path)
+            .map(|text| Some(SecretString::from(text)))
+            .with_context(|| format!("cannot read the file {file} names"));
+    }
+    Ok(std::env::var(name).ok().map(SecretString::from))
+}
+
+/// [`secret_from_env`] with surrounding whitespace (a file's trailing
+/// newline) removed.
+fn trimmed_secret_from_env(name: &str) -> anyhow::Result<Option<SecretString>> {
+    Ok(secret_from_env(name)?
+        .map(|secret| SecretString::from(secret.expose_secret().trim().to_string())))
+}
+
 /// The App's private key, from a file or the environment; `None` when
 /// neither is set.
 fn github_app_key() -> anyhow::Result<Option<SecretString>> {
-    if let Some(path) = std::env::var_os("COORDINATOR_GITHUB_APP_PRIVATE_KEY_FILE") {
-        return std::fs::read_to_string(&path)
-            .map(|text| Some(SecretString::from(text)))
-            .context("cannot read the file COORDINATOR_GITHUB_APP_PRIVATE_KEY_FILE names");
-    }
-    Ok(std::env::var("COORDINATOR_GITHUB_APP_PRIVATE_KEY")
-        .ok()
-        .map(SecretString::from))
+    secret_from_env("COORDINATOR_GITHUB_APP_PRIVATE_KEY")
 }
 
 /// The GitHub App, when one is configured.
@@ -301,13 +317,7 @@ fn dashboard_auth(
     let Some(client_id) = client_id.filter(|id| !id.trim().is_empty()) else {
         return Ok(None);
     };
-    let secret = if let Some(path) = std::env::var_os("COORDINATOR_DASHBOARD_CLIENT_SECRET_FILE") {
-        std::fs::read_to_string(&path)
-            .map(|text| text.trim().to_string())
-            .context("cannot read the file COORDINATOR_DASHBOARD_CLIENT_SECRET_FILE names")?
-    } else if let Ok(value) = std::env::var("COORDINATOR_DASHBOARD_CLIENT_SECRET") {
-        value.trim().to_string()
-    } else {
+    let Some(secret) = trimmed_secret_from_env("COORDINATOR_DASHBOARD_CLIENT_SECRET")? else {
         bail!(
             "the dashboard needs its OAuth client secret: set \
              COORDINATOR_DASHBOARD_CLIENT_SECRET_FILE (preferred) or \
@@ -322,13 +332,13 @@ fn dashboard_auth(
     if users.is_empty() {
         bail!("set COORDINATOR_DASHBOARD_USERS: the GitHub logins allowed into the dashboard");
     }
-    if secret.is_empty() {
+    if secret.expose_secret().is_empty() {
         bail!("the dashboard's OAuth client secret is empty");
     }
     Ok(Some(
         runner_manager_coordinator::dashboard::auth::AuthConfig {
             client_id: client_id.trim().to_string(),
-            client_secret: SecretString::from(secret),
+            client_secret: secret,
             allowed_logins: users,
             web_base: web.as_str().trim_end_matches('/').to_string(),
             api_base: api.as_str().trim_end_matches('/').to_string(),
@@ -337,19 +347,13 @@ fn dashboard_auth(
 }
 
 fn webhook_secret() -> anyhow::Result<SecretString> {
-    let secret = if let Some(path) = std::env::var_os("COORDINATOR_WEBHOOK_SECRET_FILE") {
-        std::fs::read_to_string(&path)
-            .map(|text| text.trim().to_string())
-            .context("cannot read the file COORDINATOR_WEBHOOK_SECRET_FILE names")?
-    } else if let Ok(value) = std::env::var("COORDINATOR_WEBHOOK_SECRET") {
-        value.trim().to_string()
-    } else {
+    let Some(secret) = trimmed_secret_from_env("COORDINATOR_WEBHOOK_SECRET")? else {
         bail!("set COORDINATOR_WEBHOOK_SECRET_FILE (preferred) or COORDINATOR_WEBHOOK_SECRET");
     };
-    if secret.len() < MIN_SECRET_LEN {
+    if secret.expose_secret().len() < MIN_SECRET_LEN {
         bail!("the webhook secret must be at least {MIN_SECRET_LEN} characters");
     }
-    Ok(SecretString::from(secret))
+    Ok(secret)
 }
 
 #[derive(Serialize)]
@@ -391,6 +395,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             dashboard_client_id,
             dashboard_users,
             github_web_url,
+            update_status,
         } => {
             let origin = CoordinatorUrl::parse(&public_url)
                 .context("COORDINATOR_PUBLIC_URL is not a usable https URL")?
@@ -409,6 +414,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 },
                 ..StatsConfig::default()
             };
+            config.update_status = update_status;
             config.dashboard = dashboard_auth(
                 dashboard_client_id,
                 dashboard_users,

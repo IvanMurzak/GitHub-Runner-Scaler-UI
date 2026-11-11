@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+use crate::stats::JobTimes;
 use crate::webhook::WorkflowJobEvent;
 
 /// The most finished jobs kept.
@@ -84,13 +85,13 @@ pub struct Snapshot {
 fn self_hosted(labels: &[String]) -> bool {
     labels.iter().any(|label| {
         label.eq_ignore_ascii_case("self-hosted")
-            || label.to_ascii_lowercase().starts_with("rm-pool-")
+            || runner_manager_domain::policy::in_pool_namespace(label)
     })
 }
 
-fn unix(text: Option<&str>) -> Option<i64> {
-    text.and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-        .map(|time| time.timestamp())
+/// Runner names compare without case, as placement's do.
+fn runner_key(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 impl Activity {
@@ -100,52 +101,40 @@ impl Activity {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A `workflow_job` webhook arrived at `now` (Unix seconds).
-    pub fn job_event(&self, event: &WorkflowJobEvent, now: i64) {
+    /// A `workflow_job` webhook arrived at `now` (Unix seconds); `times` are
+    /// its timestamps as the statistics read them.
+    pub fn job_event(&self, event: &WorkflowJobEvent, times: &JobTimes, now: i64) {
         let job = &event.workflow_job;
         if !self_hosted(&job.labels) {
             return;
         }
+        let unix = |at: Option<chrono::DateTime<chrono::Utc>>| at.map(|at| at.timestamp());
         let mut inner = self.lock();
         match event.action.as_str() {
-            "queued" | "waiting" => {
-                inner.jobs.entry(job.id).or_insert_with(|| ActiveJob {
-                    id: job.id,
-                    run_id: job.run_id,
-                    repository: event.repository.full_name.clone(),
-                    name: job.name.clone(),
-                    labels: job.labels.clone(),
-                    queued_at: unix(job.created_at.as_deref()).unwrap_or(now),
-                    started_at: None,
-                    runner_name: None,
-                });
-            }
-            "in_progress" => {
+            action @ ("queued" | "waiting" | "in_progress") => {
                 let entry = inner.jobs.entry(job.id).or_insert_with(|| ActiveJob {
                     id: job.id,
                     run_id: job.run_id,
                     repository: event.repository.full_name.clone(),
                     name: job.name.clone(),
                     labels: job.labels.clone(),
-                    queued_at: unix(job.created_at.as_deref()).unwrap_or(now),
+                    queued_at: unix(times.created_at).unwrap_or(now),
                     started_at: None,
                     runner_name: None,
                 });
-                entry.started_at = unix(job.started_at.as_deref()).or(Some(now));
-                entry.runner_name.clone_from(&job.runner_name);
-                if job.name.is_some() {
-                    entry.name.clone_from(&job.name);
+                if action == "in_progress" {
+                    entry.started_at = unix(times.started_at).or(Some(now));
+                    entry.runner_name.clone_from(&job.runner_name);
+                    if job.name.is_some() {
+                        entry.name.clone_from(&job.name);
+                    }
                 }
             }
             "completed" => {
-                let active = inner.jobs.remove(&job.id);
-                let queued_at = unix(job.created_at.as_deref())
-                    .or_else(|| active.as_ref().map(|active| active.queued_at));
-                let started_at = unix(job.started_at.as_deref())
-                    .or_else(|| active.as_ref().and_then(|active| active.started_at));
-                let completed_at = unix(job.completed_at.as_deref()).unwrap_or(now);
+                inner.jobs.remove(&job.id);
                 // A job cancelled before any runner took it never ran.
                 let ran = job.runner_name.is_some();
+                let seconds = |secs: Option<u64>| secs.and_then(|secs| i64::try_from(secs).ok());
                 inner.recent.push_front(FinishedJob {
                     id: job.id,
                     run_id: job.run_id,
@@ -153,13 +142,9 @@ impl Activity {
                     name: job.name.clone(),
                     runner_name: job.runner_name.clone(),
                     conclusion: job.conclusion.clone(),
-                    completed_at,
-                    duration_secs: started_at
-                        .filter(|_| ran)
-                        .map(|started| (completed_at - started).max(0)),
-                    queued_secs: queued_at
-                        .zip(started_at.filter(|_| ran))
-                        .map(|(queued, started)| (started - queued).max(0)),
+                    completed_at: unix(times.completed_at).unwrap_or(now),
+                    duration_secs: seconds(times.run_secs()).filter(|_| ran),
+                    queued_secs: seconds(times.queue_wait_secs()).filter(|_| ran),
                 });
                 inner.recent.truncate(RECENT);
             }
@@ -182,12 +167,13 @@ impl Activity {
     /// A host said one of its runners took a job.
     pub fn runner_started(&self, host_id: &str, runner_name: &str) {
         let mut inner = self.lock();
+        let key = runner_key(runner_name);
         if inner
             .runners
-            .insert(runner_name.to_owned(), host_id.to_owned())
+            .insert(key.clone(), host_id.to_owned())
             .is_none()
         {
-            inner.runner_order.push_back(runner_name.to_owned());
+            inner.runner_order.push_back(key);
             while inner.runner_order.len() > MAX_RUNNERS {
                 if let Some(old) = inner.runner_order.pop_front() {
                     inner.runners.remove(&old);
@@ -199,16 +185,32 @@ impl Activity {
     /// The host a runner belongs to, when its host said.
     #[must_use]
     pub fn host_of(&self, runner_name: &str) -> Option<String> {
-        self.lock().runners.get(runner_name).cloned()
+        self.lock().runners.get(&runner_key(runner_name)).cloned()
+    }
+
+    /// How many jobs are queued and running now.
+    pub fn counts(&self, now: i64) -> (usize, usize) {
+        let mut inner = self.lock();
+        Self::forget_stale(&mut inner, now);
+        let running = inner
+            .jobs
+            .values()
+            .filter(|job| job.started_at.is_some())
+            .count();
+        (inner.jobs.len() - running, running)
+    }
+
+    fn forget_stale(inner: &mut Inner, now: i64) {
+        inner.jobs.retain(|_, job| match job.started_at {
+            Some(started) => now - started < RUNNING_FOR,
+            None => now - job.queued_at < QUEUED_FOR,
+        });
     }
 
     /// The jobs now, forgetting the ones no webhook moved on for too long.
     pub fn snapshot(&self, now: i64) -> Snapshot {
         let mut inner = self.lock();
-        inner.jobs.retain(|_, job| match job.started_at {
-            Some(started) => now - started < RUNNING_FOR,
-            None => now - job.queued_at < QUEUED_FOR,
-        });
+        Self::forget_stale(&mut inner, now);
         let (mut running, mut queued): (Vec<ActiveJob>, Vec<ActiveJob>) = inner
             .jobs
             .values()
@@ -245,30 +247,50 @@ mod tests {
         .expect("an event")
     }
 
+    fn feed(activity: &Activity, event: &WorkflowJobEvent, now: i64) {
+        let job = &event.workflow_job;
+        let times = JobTimes::parse(
+            job.created_at.as_deref(),
+            job.started_at.as_deref(),
+            job.completed_at.as_deref(),
+        );
+        activity.job_event(event, &times, now);
+    }
+
     #[test]
     fn a_job_moves_from_the_queue_to_running_to_recent() {
         let activity = Activity::default();
         let now = chrono::DateTime::parse_from_rfc3339("2026-11-10T10:00:30Z")
             .unwrap()
             .timestamp();
-        activity.job_event(&event("queued", 1, &["self-hosted", "linux"], None), now);
-        activity.job_event(&event("queued", 2, &["ubuntu-latest"], None), now);
+        feed(
+            &activity,
+            &event("queued", 1, &["self-hosted", "linux"], None),
+            now,
+        );
+        feed(
+            &activity,
+            &event("queued", 2, &["ubuntu-latest"], None),
+            now,
+        );
         let snapshot = activity.snapshot(now);
         assert_eq!(
             snapshot.queued.len(),
             1,
             "GitHub's own runners are not shown"
         );
-        activity.job_event(
+        feed(
+            &activity,
             &event("in_progress", 1, &["self-hosted", "linux"], Some("rm-a")),
             now,
         );
-        activity.runner_started("host-1", "rm-a");
+        activity.runner_started("host-1", "RM-A");
         let snapshot = activity.snapshot(now);
         assert!(snapshot.queued.is_empty());
         assert_eq!(snapshot.running[0].runner_name.as_deref(), Some("rm-a"));
         assert_eq!(activity.host_of("rm-a").as_deref(), Some("host-1"));
-        activity.job_event(
+        feed(
+            &activity,
             &event("completed", 1, &["self-hosted", "linux"], Some("rm-a")),
             now,
         );
@@ -276,6 +298,7 @@ mod tests {
         assert!(snapshot.running.is_empty());
         assert_eq!(snapshot.recent[0].duration_secs, Some(60));
         assert_eq!(snapshot.recent[0].queued_secs, Some(5));
+        assert_eq!(activity.counts(now), (0, 0));
     }
 
     #[test]
@@ -284,7 +307,11 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-11-10T10:00:30Z")
             .unwrap()
             .timestamp();
-        activity.job_event(&event("queued", 1, &["rm-pool-linux"], None), now);
+        feed(
+            &activity,
+            &event("queued", 1, &["rm-pool-linux"], None),
+            now,
+        );
         assert_eq!(activity.snapshot(now).queued.len(), 1);
         assert!(activity.snapshot(now + QUEUED_FOR).queued.is_empty());
     }

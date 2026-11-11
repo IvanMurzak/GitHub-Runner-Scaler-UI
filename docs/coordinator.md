@@ -685,9 +685,11 @@ The copies hold what the database holds: enrolled hosts' names, hostnames and pu
 last seen, hashes of invites, repository and job names, statistics and placement decisions. No GitHub
 credential is in there, nor the webhook secret. Treat them as private all the same.
 
-To restore, stop the writers, put the copy in place, remove the old database's WAL files, and start again.
-Hosts reconnect on their own; a host enrolled after that copy was made must `coordinator leave` and join
-again with a new invite. Samples and counters since the copy are lost.
+To restore, stop the writers, run `backup.sh restore` with the copy's name through the backup image, and
+start again. It stops nothing itself, so run it only with the coordinator stopped. It refuses a name that
+is not one of its copies and a copy that fails `PRAGMA integrity_check`, leaving the database as it was;
+otherwise it replaces the database and removes the old one's WAL files. Hosts reconnect on their own; a
+host enrolled after that copy was made must `coordinator leave` and join again with a new invite. Samples and counters since the copy are lost.
 
 **A restore undoes what happened since the copy, revocations included.** A host revoked since then is
 accepted again, and an invite used since then, if it has not expired, can be used again. After restoring,
@@ -696,11 +698,8 @@ coordinator again if you can.
 
 ```bash
 docker compose stop coordinator backup
-docker compose run --rm --no-deps --entrypoint sh backup -c 'ls -1 /backups'
-docker compose run --rm --no-deps --entrypoint sh backup -c '
-    cp /backups/coordinator-20261109T030000Z.db /data/coordinator.db \
-        && rm -f /data/coordinator.db-wal /data/coordinator.db-shm \
-        && sqlite3 /data/coordinator.db "PRAGMA integrity_check"'
+docker compose run --rm --no-deps --entrypoint ls backup -1 /backups
+docker compose run --rm --no-deps backup restore coordinator-20261109T030000Z.db
 docker compose up -d
 ```
 
@@ -808,12 +807,13 @@ when that is missing it updates. When the newest release is newer:
 
 1. It refuses, changing nothing, when tracked files in the checkout have local changes (it never discards
    them), when the release predates `update.sh`, or when the release's images cannot be pulled (not
-   published yet, private, no network). The next run tries again.
+   published yet, private, no network). The next run tries again. The images pulled here are the ones
+   step 4 starts.
 2. It takes a backup through the backup service (`backup.sh once`) and remembers its name.
 3. It checks out the release tag, so the compose file, the Caddyfile and `update.sh` are the release's,
    and sets `COORDINATOR_VERSION`. `.env`, `docker-compose.override.yml`, the secrets and `state/` are
    untracked and stay as they are.
-4. `docker compose pull`, `docker compose up -d`, and `caddy` recreated when the Caddyfile changed.
+4. `docker compose up -d`, and `caddy` recreated when the Caddyfile changed.
 5. It waits up to 2 minutes for `runner-manager-coordinator --version` in the container to print the new
    version and for `https://$COORDINATOR_HOST/healthz` (through this machine's Caddy) to answer `ok`.
 
@@ -823,8 +823,8 @@ Two runs never overlap (`state/update.lock`). A run that finds nothing to do cha
 
 When the new version is not healthy in time, `update.sh` goes back by itself: the previous checkout and
 `COORDINATOR_VERSION`, then the restore under [Back up and restore](#back-up-and-restore) with the backup
-of step 2 (stop `coordinator` and `backup`, copy it into the volume through the backup image, remove the
-WAL files, check it), then `docker compose up -d`, and the same health check for the previous version.
+of step 2 (`docker compose stop coordinator backup`, then `backup.sh restore <name>` through the backup
+image), then `docker compose up -d`, and the same health check for the previous version.
 The database is restored because the new version may already have upgraded it, and an older coordinator
 refuses such a database. What happened in the minutes between the backup and the restore is lost; the
 warning there about revocations applies.

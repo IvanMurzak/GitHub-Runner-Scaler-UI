@@ -22,12 +22,24 @@ struct Coordinator {
 }
 
 async fn start(dashboard: Option<AuthConfig>) -> Coordinator {
+    start_with_status(
+        dashboard,
+        std::path::PathBuf::from("/nonexistent/status.json"),
+    )
+    .await
+}
+
+async fn start_with_status(
+    dashboard: Option<AuthConfig>,
+    update_status: std::path::PathBuf,
+) -> Coordinator {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let base = format!("http://{}", listener.local_addr().expect("addr"));
     let mut config = Config::new(base.clone(), SecretString::from(SECRET));
     config.dashboard = dashboard;
+    config.update_status = update_status;
     let state = AppState::new(config, Store::open_in_memory().expect("store"));
     let (shutdown, stopped) = tokio::sync::oneshot::channel();
     tokio::spawn(serve(listener, Arc::clone(&state), async {
@@ -296,4 +308,26 @@ async fn without_sign_in_settings_there_is_no_dashboard() {
         );
     }
     assert_eq!(get(&coordinator, "/healthz", None).await.status(), 200);
+}
+
+#[tokio::test]
+async fn the_updaters_status_reaches_the_overview() {
+    let github = github_for("ivanmurzak").await;
+    let directory = tempfile::tempdir().expect("dir");
+    let status = directory.path().join("status.json");
+    std::fs::write(
+        &status,
+        r#"{"state":"rolled_back","current":"0.4.57","previous":null,"latest":"0.4.58",
+            "checked_at":1794349000,"changed_at":null,"message":"0.4.58 did not come up"}"#,
+    )
+    .expect("written");
+    let coordinator = start_with_status(Some(auth(&github)), status).await;
+    let (_, session) = sign_in(&coordinator).await;
+    let overview: serde_json::Value = get(&coordinator, "/api/overview", session.as_deref())
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(overview["update"]["state"], "rolled_back");
+    assert_eq!(overview["update"]["latest"], "0.4.58");
 }

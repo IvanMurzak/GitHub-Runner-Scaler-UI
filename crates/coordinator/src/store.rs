@@ -694,12 +694,10 @@ pub struct MetricSample {
 }
 
 /// A signed-in dashboard session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DashboardSession {
     pub login: String,
     pub avatar_url: Option<String>,
-    /// Unix seconds.
-    pub expires_at: i64,
 }
 
 impl Store {
@@ -766,7 +764,8 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Keeps a session under the hash of its cookie.
+    /// Keeps a session under the hash of its cookie until `expires_at`
+    /// (Unix seconds), and drops the expired ones.
     ///
     /// # Errors
     /// SQLite's.
@@ -775,6 +774,7 @@ impl Store {
         token_hash: &str,
         session: &DashboardSession,
         now: i64,
+        expires_at: i64,
     ) -> Result<(), StoreError> {
         self.connection.execute(
             "DELETE FROM dashboard_sessions WHERE expires_at <= ?1",
@@ -788,7 +788,7 @@ impl Store {
                 session.login,
                 session.avatar_url,
                 now,
-                session.expires_at
+                expires_at
             ],
         )?;
         Ok(())
@@ -806,14 +806,13 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                "SELECT login, avatar_url, expires_at FROM dashboard_sessions
+                "SELECT login, avatar_url FROM dashboard_sessions
                  WHERE token_hash = ?1 AND expires_at > ?2",
                 params![token_hash, now],
                 |row| {
                     Ok(DashboardSession {
                         login: row.get(0)?,
                         avatar_url: row.get(1)?,
-                        expires_at: row.get(2)?,
                     })
                 },
             )
@@ -832,29 +831,31 @@ impl Store {
         Ok(())
     }
 
-    /// Ends every session of a login no longer allowed in.
+    /// Ends every session of a login `allowed` refuses.
     ///
     /// # Errors
     /// SQLite's.
-    pub fn delete_sessions_except(&self, allowed: &[String]) -> Result<usize, StoreError> {
-        let sessions: Vec<(String, String)> = {
+    pub fn delete_sessions_except(
+        &self,
+        allowed: impl Fn(&str) -> bool,
+    ) -> Result<usize, StoreError> {
+        let refused: Vec<String> = {
             let mut statement = self
                 .connection
                 .prepare("SELECT token_hash, login FROM dashboard_sessions")?;
-            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            rows.collect::<Result<_, _>>()?
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, login)| !allowed(login))
+                .map(|(hash, _)| hash)
+                .collect()
         };
-        let mut removed = 0;
-        for (hash, login) in sessions {
-            if !allowed
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(&login))
-            {
-                self.delete_session(&hash)?;
-                removed += 1;
-            }
+        for hash in &refused {
+            self.delete_session(hash)?;
         }
-        Ok(removed)
+        Ok(refused.len())
     }
 }
 

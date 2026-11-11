@@ -884,6 +884,18 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+    # One leg per image. Neither waits on the other: a re-run of failed jobs
+    # builds only the one that failed.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: runner-manager-coordinator
+            dockerfile: deploy/coordinator/Dockerfile
+            cache: coordinator
+          - image: runner-manager-coordinator-backup
+            dockerfile: deploy/coordinator/Dockerfile.backup
+            cache: coordinator-backup
     steps:
       - name: Check out the tagged commit
         uses: actions/checkout@v7
@@ -891,10 +903,11 @@ jobs:
           ref: ${{ needs.tag.outputs.sha }}
           persist-credentials: false
 
-      - name: Name the images
+      - name: Name the image
         id: names
         env:
           OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ matrix.image }}
         run: |
           owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
           # A GitHub login is letters, digits and hyphens; anything else would
@@ -905,10 +918,7 @@ jobs:
               exit 1
               ;;
           esac
-          {
-            echo "coordinator=ghcr.io/${owner}/runner-manager-coordinator"
-            echo "backup=ghcr.io/${owner}/runner-manager-coordinator-backup"
-          } >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${owner}/${IMAGE}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -920,75 +930,44 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Build and push the coordinator image
-        id: coordinator
+      # mode=min: the cargo build layer follows `COPY . .`, so it never hits
+      # from one release to the next; exporting it would only fill the cache.
+      - name: Build and push the image
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          file: deploy/coordinator/Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ steps.names.outputs.coordinator }}:${{ needs.validate.outputs.version }}
-            ${{ steps.names.outputs.coordinator }}:latest
+            ${{ steps.names.outputs.image }}:${{ needs.validate.outputs.version }}
+            ${{ steps.names.outputs.image }}:latest
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
             org.opencontainers.image.revision=${{ needs.tag.outputs.sha }}
-          cache-from: type=gha,scope=coordinator
-          cache-to: type=gha,mode=max,scope=coordinator
-
-      - name: Build and push the backup image
-        id: backup
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: deploy/coordinator/Dockerfile.backup
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ steps.names.outputs.backup }}:${{ needs.validate.outputs.version }}
-            ${{ steps.names.outputs.backup }}:latest
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
-            org.opencontainers.image.revision=${{ needs.tag.outputs.sha }}
-          cache-from: type=gha,scope=coordinator-backup
-          cache-to: type=gha,mode=max,scope=coordinator-backup
+          cache-from: type=gha,scope=${{ matrix.cache }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.cache }}
 
       # Verifiable with `gh attestation verify oci://<image>:X.Y.Z --repo <owner>/<repo>`.
       # The storage record would need a further scope (`artifact-metadata`)
       # for a listing nothing here reads, so it is not created.
-      - name: Attest the coordinator image
+      - name: Attest the image
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ${{ steps.names.outputs.coordinator }}
-          subject-digest: ${{ steps.coordinator.outputs.digest }}
-          push-to-registry: true
-          create-storage-record: false
-
-      - name: Attest the backup image
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ steps.names.outputs.backup }}
-          subject-digest: ${{ steps.backup.outputs.digest }}
+          subject-name: ${{ steps.names.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
           create-storage-record: false
 
       - name: Report what was pushed
         env:
-          COORDINATOR: ${{ steps.names.outputs.coordinator }}
-          COORDINATOR_DIGEST: ${{ steps.coordinator.outputs.digest }}
-          BACKUP: ${{ steps.names.outputs.backup }}
-          BACKUP_DIGEST: ${{ steps.backup.outputs.digest }}
+          IMAGE: ${{ steps.names.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          {
-            echo "### Coordinator images ${VERSION}"
-            echo
-            echo "- \`${COORDINATOR}:${VERSION}\` \`${COORDINATOR_DIGEST}\`"
-            echo "- \`${BACKUP}:${VERSION}\` \`${BACKUP_DIGEST}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${IMAGE}:${VERSION}\` \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
 
   # --------------------------------------------------------------------------
   # Step 7. The only job that publishes, and the last one to run.

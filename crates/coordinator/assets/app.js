@@ -9,7 +9,7 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
-  function apply(el, props, isSvg) {
+  function apply(el, props) {
     if (!props) return;
     for (const [k, v] of Object.entries(props)) {
       if (v == null || v === false) continue;
@@ -27,7 +27,7 @@
     }
   }
   function h(tag, props, ...kids) { const el = document.createElement(tag); apply(el, props); append(el, kids); return el; }
-  function s(tag, props, ...kids) { const el = document.createElementNS(SVGNS, tag); apply(el, props, true); append(el, kids); return el; }
+  function s(tag, props, ...kids) { const el = document.createElementNS(SVGNS, tag); apply(el, props); append(el, kids); return el; }
 
   const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
   const pad2 = (n) => String(n).padStart(2, '0');
@@ -37,7 +37,7 @@
   // ------------------------------------------------------------------ state
   const RANGES = ['1h', '6h', '24h', '7d'];
   const RANGE_LABEL = { '1h': 'last hour', '6h': 'last 6 hours', '24h': 'last 24 hours', '7d': 'last 7 days' };
-  const OVERVIEW_MS = 5000, METRICS_MS = 60000, STALE_SECS = 20;
+  const OVERVIEW_MS = 5000, METRICS_MIN_MS = 60000, STALE_SECS = 20;
 
   const state = {
     session: null, ov: null, metrics: null,
@@ -101,6 +101,7 @@
   const humanize = (v) => (v ? String(v).replace(/_/g, ' ') : '—');
   const jobUrl = (j) => `https://github.com/${j.repository}/actions/runs/${j.run_id}/job/${j.id}`;
   const repoUrl = (r) => `https://github.com/${r}`;
+  const repoLink = (r, cls) => h('a', { class: cls, href: repoUrl(r), target: '_blank', rel: 'noopener', title: r, text: repoShort(r) });
 
   // Live-updating text: elements carry data-since (elapsed) or data-ago (relative).
   const since = (t, cls) => h('span', { class: cls || 'num', 'data-since': isNum(t) ? t : null, text: isNum(t) ? fmtDur(serverNow() - t) : '—' });
@@ -185,6 +186,7 @@
     clearTimeout(state.timers.ov); clearTimeout(state.timers.m); clearInterval(state.timers.tick);
     state.timers = {};
   }
+  const polling = () => !document.hidden && !$('#app').hidden;
   function onVisibility() {
     if ($('#app').hidden) return;
     if (document.hidden) stopTimers(); else startTimers();
@@ -202,7 +204,7 @@
       state.failed = true;
       renderLive();
     }
-    if (!document.hidden && !$('#app').hidden) state.timers.ov = setTimeout(loadOverview, OVERVIEW_MS);
+    if (polling()) state.timers.ov = setTimeout(loadOverview, OVERVIEW_MS);
   }
 
   async function loadMetrics() {
@@ -217,7 +219,9 @@
     } finally {
       $('#charts').classList.remove('is-loading');
     }
-    if (!document.hidden && !$('#app').hidden) state.timers.m = setTimeout(loadMetrics, METRICS_MS);
+    // No point refetching faster than the series gains a point: 7d steps are 30 min.
+    const step = state.metrics && state.metrics.range === state.range ? state.metrics.step_secs : 0;
+    if (polling()) state.timers.m = setTimeout(loadMetrics, Math.max(METRICS_MIN_MS, isNum(step) ? step * 1000 : 0));
   }
 
   // ---------------------------------------------------------------- header
@@ -305,6 +309,8 @@
   }
 
   // ---------------------------------------------------------------- hosts
+  // The one client-side sort: colours follow the name order of every known host in
+  // either list, so they stay put when a host goes offline. The lists come sorted.
   function assignHostColors() {
     const names = new Map();
     for (const x of (state.ov && state.ov.hosts) || []) names.set(x.id, x.name || x.hostname || x.id);
@@ -313,6 +319,8 @@
     state.hostColors = new Map(ids.map((id, i) => [id, `var(--s${(i % 8) + 1})`]));
   }
   const hostColor = (id) => state.hostColors.get(id) || 'var(--muted)';
+  const hostDot = (id) => h('span', { class: 'host-dot', 'aria-hidden': 'true', vars: { '--c': hostColor(id) } });
+  const machine = (id, name) => h('span', { class: 'machine' }, hostDot(id), name);
 
   function hostStatus(x) {
     if (!x.online) return { key: 'offline', label: 'Offline' };
@@ -353,7 +361,7 @@
     const os = String(x.os || '').toLowerCase();
     return h('article', { class: `host is-${st.key}`, 'aria-label': `${x.name || x.hostname}, ${st.label}` },
       h('header', { class: 'host-head' },
-        h('span', { class: 'host-dot', 'aria-hidden': 'true', vars: { '--c': hostColor(x.id) } }),
+        hostDot(x.id),
         h('div', { class: 'host-id' },
           h('h3', { class: 'host-name', text: x.name || x.hostname || x.id, title: x.hostname || null }),
           h('p', { class: 'host-sub' },
@@ -367,13 +375,12 @@
       sparkline(x.id),
       h('footer', { class: 'host-foot' },
         h('span', {}, 'Disk free ', h('b', { class: 'num', text: fmtBytes(x.disk_free_bytes) })),
-        x.online
-          ? h('span', {}, 'Up ', isNum(x.connected_since) ? since(x.connected_since) : '—')
-          : h('span', {}, 'Last seen ', ago(x.last_seen_at))));
+        !x.online ? h('span', {}, 'Last seen ', ago(x.last_seen_at))
+          : isNum(x.connected_since) ? h('span', {}, 'Up ', since(x.connected_since)) : null));
   }
 
   function renderHosts(ov) {
-    const hosts = (ov.hosts || []).slice().sort((a, b) => (b.online - a.online) || String(a.name).localeCompare(String(b.name)));
+    const hosts = ov.hosts || [];  // online first, then by name
     const on = hosts.filter((x) => x.online).length;
     $('#machines-count').textContent = hosts.length ? `${on} of ${hosts.length} online` : '';
     $('#hosts').replaceChildren(...(hosts.length ? hosts.map(hostCard)
@@ -388,9 +395,10 @@
   function jobCell(j) {
     return h('td', { class: 'c-job' },
       h('a', { class: 'job-link', href: jobUrl(j), target: '_blank', rel: 'noopener', text: j.name || `Job ${j.id}` }),
-      h('a', { class: 'repo-link', href: repoUrl(j.repository), target: '_blank', rel: 'noopener', title: j.repository, text: repoShort(j.repository) }));
+      repoLink(j.repository, 'repo-link'));
   }
   const td = (label, cls, ...kids) => h('td', { class: cls, 'data-label': label }, ...kids);
+  const numCell = (label, text) => td(label, 'c-num', h('span', { class: 'num', text }));
   function chips(labels) {
     const list = Array.isArray(labels) ? labels : labels ? String(labels).split(',') : [];
     return h('span', { class: 'chips' }, list.map((l) => h('span', { class: `chip${l === 'self-hosted' ? ' chip-dim' : ''}`, text: l })));
@@ -407,7 +415,7 @@
   }
   function machineCell(j) {
     return td('Machine', 'c-machine',
-      h('span', { class: 'machine' }, h('span', { class: 'host-dot', 'aria-hidden': 'true', vars: { '--c': hostColor(j.host_id) } }), j.host_name || hostName(j.host_id)),
+      machine(j.host_id, j.host_name || hostName(j.host_id)),
       j.runner_name ? h('span', { class: 'runner mono', title: j.runner_name, text: j.runner_name }) : null);
   }
 
@@ -417,7 +425,7 @@
     $('#queue').replaceChildren(q.length
       ? table('Queued jobs', [['Job'], ['Labels', 'c-labels'], ['Waiting', 'c-num']], q.map((j) => h('tr', {},
         jobCell(j), td('Labels', 'c-labels', chips(j.labels)),
-        td('Waiting', 'c-num', since(isNum(j.queued_at) ? j.queued_at : serverNow() - (j.wait_secs || 0), 'num wait'))))
+        td('Waiting', 'c-num', since(j.queued_at, 'num wait'))))
       ) : empty('Queue is clear', 'New jobs are placed as soon as a slot frees up.'));
   }
 
@@ -450,7 +458,7 @@
     $('#recent').replaceChildren(list.length
       ? table('Recently completed jobs', [['Result'], ['Job'], ['Machine'], ['Duration', 'c-num'], ['Finished', 'c-num']], list.map((j) => h('tr', {},
         td('Result', 'c-result', conclusion(j.conclusion)), jobCell(j), machineCell(j),
-        td('Duration', 'c-num', h('span', { class: 'num', text: fmtDur(j.duration_secs) })),
+        numCell('Duration', fmtDur(j.duration_secs)),
         td('Finished', 'c-num c-when', ago(j.completed_at, 'muted')))))
       : empty('No completed jobs yet', null));
   }
@@ -463,18 +471,18 @@
     const parts = [];
     if (pools.length) parts.push(h('div', { class: 'card' }, h('h3', { class: 'card-title', text: 'Pools' }),
       table('Pools', [['Repository'], ['Labels'], ['Queued', 'c-num'], ['Leases', 'c-num'], ['Oldest', 'c-num'], ['Reason']], pools.map((p) => h('tr', {},
-        h('td', { class: 'c-job' }, h('a', { class: 'job-link', href: repoUrl(p.repository), target: '_blank', rel: 'noopener', title: p.repository, text: repoShort(p.repository) })),
+        h('td', { class: 'c-job' }, repoLink(p.repository, 'job-link')),
         td('Labels', '', chips(p.labels)),
-        td('Queued', 'c-num', h('span', { class: 'num', text: fmtInt(p.queued) })),
-        td('Leases', 'c-num', h('span', { class: 'num', text: fmtInt(p.leases) })),
-        td('Oldest', 'c-num', h('span', { class: 'num', text: fmtDur(p.oldest_wait_secs) })),
+        numCell('Queued', fmtInt(p.queued)),
+        numCell('Leases', fmtInt(p.leases)),
+        numCell('Oldest', fmtDur(p.oldest_wait_secs)),
         td('Reason', '', h('span', { class: p.refusal ? 'text-err' : 'muted', text: p.refusal || humanize(p.reason) })))))));
     if (leases.length) parts.push(h('div', { class: 'card' }, h('h3', { class: 'card-title', text: 'Leases' }),
       table('Leases', [['Machine'], ['Repository'], ['State'], ['Age', 'c-num']], leases.map((l) => h('tr', {},
-        h('td', { class: 'c-job' }, h('span', { class: 'machine' }, h('span', { class: 'host-dot', 'aria-hidden': 'true', vars: { '--c': hostColor(l.host_id) } }), hostName(l.host_id))),
-        td('Repository', '', l.repository ? h('a', { href: repoUrl(l.repository), target: '_blank', rel: 'noopener', title: l.repository, text: repoShort(l.repository) }) : '—'),
+        h('td', { class: 'c-job' }, machine(l.host_id, hostName(l.host_id))),
+        td('Repository', '', l.repository ? repoLink(l.repository) : '—'),
         td('State', '', h('span', { class: 'badge badge-dim', text: humanize(l.state) })),
-        td('Age', 'c-num', h('span', { class: 'num', text: fmtDur(l.age_secs) })))))));
+        numCell('Age', fmtDur(l.age_secs)))))));
     $('#pools').replaceChildren(...parts);
   }
 
@@ -550,11 +558,7 @@
       e.preventDefault();
       showTip(c, clamp((c.idx == null ? n - 1 : c.idx) + step, 0, n - 1));
     });
-    if ('ResizeObserver' in window) {
-      new ResizeObserver(() => { cancelAnimationFrame(c.frame); c.frame = requestAnimationFrame(() => drawChart(c)); }).observe(plot);
-    } else {
-      window.addEventListener('resize', () => drawChart(c));
-    }
+    new ResizeObserver(() => { cancelAnimationFrame(c.frame); c.frame = requestAnimationFrame(() => drawChart(c)); }).observe(plot);
     charts.push(c);
     return c;
   }
@@ -701,8 +705,8 @@
     const m = state.metrics || {};
     assignHostColors();
     const t = m.t || [];
-    const hosts = (m.hosts || []).slice().sort((a, b) => String(a.name).localeCompare(String(b.name)));
-    const pct = (v) => fmtPct(v);
+    const hosts = m.hosts || [];  // sorted by name
+    const hostSeries = (x) => ({ name: x.name || x.id, color: hostColor(x.id) });
     const pctTick = (v) => `${v}%`;
     const intTick = (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
 
@@ -712,13 +716,13 @@
     ];
     setChart(chartRefs.jobs, { t, series: jobs, integer: true, fill: true, fmtVal: fmtInt, fmtTick: intTick, summary: summarize('Jobs queued and running', jobs, fmtInt) });
 
-    const cpu = hosts.map((x) => ({ name: x.name || x.id, color: hostColor(x.id), values: x.cpu || [] }));
-    setChart(chartRefs.cpu, { t, series: cpu, yMax: 100, fmtVal: pct, fmtTick: pctTick, summary: summarize('CPU per machine', cpu, pct) });
+    const cpu = hosts.map((x) => ({ ...hostSeries(x), values: x.cpu || [] }));
+    setChart(chartRefs.cpu, { t, series: cpu, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('CPU per machine', cpu, fmtPct) });
 
-    const busy = hosts.map((x) => ({
-      name: x.name || x.id, color: hostColor(x.id), values: x.busy || [],
-      fmtAt: (i) => (isNum((x.busy || [])[i]) ? `${x.busy[i]}${isNum((x.slots || [])[i]) ? ` / ${x.slots[i]}` : ''}` : '—'),
-    }));
+    const busy = hosts.map((x) => {
+      const values = x.busy || [], slots = x.slots || [];
+      return { ...hostSeries(x), values, fmtAt: (i) => (isNum(values[i]) ? `${values[i]}${isNum(slots[i]) ? ` / ${slots[i]}` : ''}` : '—') };
+    });
     setChart(chartRefs.busy, {
       t, series: busy, stacked: true, integer: true, fmtVal: fmtInt, fmtTick: intTick, summary: summarize('Busy runner slots per machine, stacked', busy, fmtInt),
       total: (i) => {
@@ -727,12 +731,12 @@
       },
     });
 
-    const ram = hosts.map((x) => ({
-      name: x.name || x.id, color: hostColor(x.id),
-      values: (x.ram_used || []).map((u, i) => { const tot = (x.ram_total || [])[i]; return isNum(u) && isNum(tot) && tot > 0 ? (u / tot) * 100 : null; }),
-      fmtAt: (i) => { const u = (x.ram_used || [])[i], tot = (x.ram_total || [])[i]; return isNum(u) && isNum(tot) && tot > 0 ? `${fmtPct((u / tot) * 100)} · ${fmtBytes(u)}` : '—'; },
-    }));
-    setChart(chartRefs.ram, { t, series: ram, yMax: 100, fmtVal: pct, fmtTick: pctTick, summary: summarize('Memory used per machine', ram, pct) });
+    const ram = hosts.map((x) => {
+      const used = x.ram_used || [], total = x.ram_total || [];
+      const values = used.map((u, i) => (isNum(u) && isNum(total[i]) && total[i] > 0 ? (u / total[i]) * 100 : null));
+      return { ...hostSeries(x), values, fmtAt: (i) => (isNum(values[i]) ? `${fmtPct(values[i])} · ${fmtBytes(used[i])}` : '—') };
+    });
+    setChart(chartRefs.ram, { t, series: ram, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('Memory used per machine', ram, fmtPct) });
 
     $('#charts-sub').textContent = m.step_secs ? `${RANGE_LABEL[state.range]} · ${m.step_secs % 60 ? `${m.step_secs}s` : `${m.step_secs / 60} min`} steps` : RANGE_LABEL[state.range];
   }
