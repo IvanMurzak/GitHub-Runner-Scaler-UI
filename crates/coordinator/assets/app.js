@@ -893,7 +893,7 @@
 
   function versionLine(x) {
     const v = x.versions;
-    if (!v) return x.online ? h('p', { class: 'host-ver', title: 'Machines report their versions from runner-manager 0.4.64' }, h('span', { class: 'muted', text: 'Version unknown (before 0.4.64)' })) : null;
+    if (!v) return x.online ? h('p', { class: 'host-ver', title: 'Machines report their versions from runner-manager 0.4.64' }, h('span', { class: 'muted', text: justConnected(x) ? 'Reading versions…' : 'Version unknown (before 0.4.64)' })) : null;
     const st = versionState(v);
     const appDiffers = v.app && v.app !== v.service;
     return h('p', { class: 'host-ver' },
@@ -904,19 +904,32 @@
       st ? h('span', { class: `badge badge-${st.cls}`, text: st.text }) : null);
   }
 
-  function versionSig(x) { return JSON.stringify(x && [x.online, x.manageable, x.remote_changes, x.versions, newestRelease()]); }
+  // Connected so recently that its first heartbeat may still be on its way.
+  const justConnected = (x) => isNum(x.connected_since) && serverNow() - x.connected_since < 60;
+  // After an Update click, until the host reports an update started at or after it.
+  function awaitingUpdate(x) {
+    if (!dw.updateSent || dw.updateSent.id !== (x && x.id)) return false;
+    const u = x.versions && x.versions.update;
+    if ((u && u.at >= dw.updateSent.at - 5) || serverNow() - dw.updateSent.at > 120) { dw.updateSent = null; return false; }
+    return true;
+  }
+  function versionSig(x) {
+    const p = x && x.versions && x.versions.wsl_guest ? wslParent(x) : null;
+    return JSON.stringify(x && [x.online, x.manageable, x.remote_changes, x.versions, newestRelease(), awaitingUpdate(x), p && (p.name || p.hostname), !x.versions && justConnected(x)]);
+  }
 
   function versionCard(x) {
     const v = x && x.versions;
     const row = (label, value, note) => h('div', { class: 'ver-row' },
       h('dt', { text: label }), h('dd', {}, h('b', { class: 'num', text: value ? `v${value}` : '—' }), note ? h('span', { class: 'muted', text: ` ${note}` }) : null));
     const parent = v && v.wsl_guest ? wslParent(x) : null;
-    const u = v && v.update;
-    const busy = dw.busy.has('update') || (u && u.state === 'running');
+    const waiting = awaitingUpdate(x);
+    const u = v && !waiting ? v.update : null;
+    const busy = dw.busy.has('update') || waiting || (u && u.state === 'running');
     const can = !!(x && x.online && x.manageable && x.remote_changes && v && v.updatable);
     let hint;
     if (!x || !x.online) hint = 'Shown while the machine is connected.';
-    else if (!v) hint = 'This machine runs a runner-manager older than 0.4.64, which does not report its versions or take updates from here. Update it on the machine once.';
+    else if (!v) hint = justConnected(x) ? 'Reading this machine’s versions…' : 'This machine runs a runner-manager older than 0.4.64, which does not report its versions or take updates from here. Update it on the machine once.';
     else if (!x.remote_changes) hint = 'Updating from here needs changes through the coordinator allowed on the machine.';
     else if (!v.updatable) hint = `Its app is ${v.app_source || 'not known'}, which the service cannot update. Update it on the machine.`;
     else hint = 'Update installs the newest release the way the app was installed. The service finishes its running jobs first, then restarts into it.';
@@ -952,7 +965,10 @@
     const had = old.contains(document.activeElement);
     const card = versionCard(x);
     old.replaceWith(card);
-    if (had) { const b = $('[data-fk="update"]', card); if (b) b.focus({ preventScroll: true }); }
+    if (!had) return;
+    const b = $('[data-fk="update"]', card), note = $('[data-result="update"]', card);
+    const target = b && !b.closest('fieldset:disabled') ? b : note || $('#dw-body');
+    target.focus({ preventScroll: true });
   }
 
   // ------------------------------------------------------------ audit log
@@ -1037,7 +1053,7 @@
   const dw = {
     id: null, gen: 0, pushed: false, sig: '',
     cfg: null, rc: null, loading: false, error: null, cfgSeq: 0,
-    results: new Map(), busy: new Set(), add: null, confirm: null,
+    results: new Map(), busy: new Set(), add: null, confirm: null, updateSent: null,
   };
 
   function hashHost() {
@@ -1620,6 +1636,7 @@
     if (gen !== dw.gen) return;
     const res = toResult(r, argv);
     dw.results.set(key, res);
+    if (res.ok && key === 'update') dw.updateSent = { id, at: serverNow() };
     if (res.ok && key === 'add') dw.add = null;
     if (res.ok && dw.confirm === key) dw.confirm = null;
     if (r.status !== 401) await loadConfig({ quiet: true, render: false });

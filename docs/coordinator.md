@@ -805,14 +805,20 @@ the machine's card and in its panel:
 
 An app newer than the service means the service is finishing its jobs before it restarts into it.
 
-**Update** in a machine's panel sends `update` to the host. The host answers at once and, in the
-background, does what its daily automatic update does: it updates the app through the channel
-that installed it, from the newest GitHub release and checked against its `SHA256SUMS`; the
-coordinator names no version and no source. The service then stops taking new jobs, waits for its
-running ones without a deadline, and restarts into the new build. The dashboard shows the
-progress and how it ended. A host whose service was installed from a build in a checkout
-(`X.Y.Z+git.<sha>`) is not updated and says so; a release binary that `update --force` put at such
-a path is updated like the release archive. A WSL distribution is updated through its own host.
+**Update** in a machine's panel sends `update` to the host. The host answers at once that it
+started, and in the background does what its daily automatic update does: it updates the app to
+the newest GitHub release through the channel that installed it (the release archive is checked
+against the release's `SHA256SUMS`; npm, Homebrew and cargo install from their own registries,
+npm and cargo pinned to that release's version); the coordinator names no version and no source.
+The service then stops taking new jobs, waits for its running ones without a deadline, and
+restarts into the new build. The dashboard shows the progress and how it ended, with the end of
+the package manager's output when it failed; the audit trail records only that it was started.
+
+A host refuses, and says why, when its operator turned automatic updates off (`host
+set-auto-update false`), when its service was installed from a build in a checkout (a release
+binary that `update --force` put at such a path, with the copy it keeps beside it, is updated like
+the release archive), and when its service runs as root and the app belongs to another account (a
+Homebrew prefix, an nvm npm). A WSL distribution is updated through its own host.
 
 ### Sign in the CLI
 
@@ -879,8 +885,9 @@ and limits, and change those of hosts that allowed changes. So can anyone who co
 coordinator itself: a compromised coordinator can change, within the list above, any host that
 ran `remote-changes allow`. It can never change a host that did not, and no host runs anything
 outside the list, whoever asks: no shell, no sign-in, no service removal. An update it starts
-installs only the newest published release, checked by the host against the release's own
-`SHA256SUMS`, exactly as the daily automatic update would. A host that
+installs only the newest published release, through the channel the host's operator installed
+it with, as the daily automatic update would; a host with automatic updates off refuses it. From
+0.4.64 `remote-changes allow` covers this update too. A host that
 does not want to be managed at all keeps changes off (the default), or leaves the coordinator.
 
 ## Updates

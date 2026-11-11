@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use runner_manager_domain::coordinator_protocol::{HostVersions, ManagedWsl};
@@ -47,6 +47,8 @@ static READING: Mutex<Reading> = Mutex::new(Reading {
     source: None,
 });
 static REFRESHING: AtomicBool = AtomicBool::new(false);
+/// Bumped by [`invalidate`]: a reading begun before it is not fresh.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn reading() -> std::sync::MutexGuard<'static, Reading> {
     READING
@@ -76,7 +78,16 @@ pub fn report(paths: &AppPaths) -> Option<HostVersions> {
 
 /// Reads again at the next heartbeat: an update just changed the binary.
 pub fn invalidate() {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
     reading().at = None;
+}
+
+/// Reads now, unless a reading exists: for the first heartbeat of a session,
+/// which would otherwise say nothing. Blocks; call it off the runtime.
+pub fn prime(paths: &AppPaths) {
+    if reading().versions.is_none() {
+        refresh(paths);
+    }
 }
 
 fn refresh_in_background(paths: AppPaths) {
@@ -90,6 +101,7 @@ fn refresh_in_background(paths: AppPaths) {
 }
 
 fn refresh(paths: &AppPaths) {
+    let generation = GENERATION.load(Ordering::Acquire);
     let mut versions = HostVersions {
         service: env!("RUNNER_MANAGER_BUILD_VERSION").to_owned(),
         wsl: WslProviderRecord::all(paths)
@@ -128,6 +140,7 @@ fn refresh(paths: &AppPaths) {
     }
     let mut reading = reading();
     reading.versions = Some(versions);
-    reading.at = Some(Instant::now());
+    // Read before an update changed the binary: stale at once.
+    reading.at = (GENERATION.load(Ordering::Acquire) == generation).then(Instant::now);
     reading.source = source;
 }

@@ -420,7 +420,7 @@ fn back_up_and_stage_source(candidate: &Path, source: &Path) -> Result<PathBuf, 
         )
     })?;
     let mut backup = tempfile::Builder::new()
-        .prefix(".runner-manager-before-force-update-")
+        .prefix(super::FORCE_BACKUP_PREFIX)
         .tempfile_in(parent)
         .map_err(|error| {
             CliError::new(

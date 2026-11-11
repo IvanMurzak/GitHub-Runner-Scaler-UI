@@ -1476,6 +1476,9 @@ async fn serve(
     // one cannot. Their results come back here.
     let (results, mut finished) = tokio::sync::mpsc::channel::<CommandResult>(COMMANDS_AT_ONCE);
     let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The first heartbeat goes out at once: let it name this host's builds.
+    let paths = ports.paths.clone();
+    let _ = tokio::task::spawn_blocking(move || super::versions::prime(&paths)).await;
     if let Err(end) = send(
         socket,
         &HostMessage::Hello(hello(ports, &config.host_id, version, &policies)),

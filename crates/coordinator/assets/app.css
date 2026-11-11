@@ -256,9 +256,10 @@ button { font: inherit; color: inherit; }
 .host-foot { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12.5px; padding-top: 10px; border-top: 1px solid var(--border); }
 .host-foot b, .host-ver b { color: var(--text-2); font-weight: 550; }
 .host-ver { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; color: var(--muted); font-size: 12.5px; }
-.ver-list { display: grid; gap: 6px; margin: 0; font-size: 13px; }
-.ver-row { display: grid; grid-template-columns: minmax(90px, max-content) 1fr; gap: 12px; }
-.ver-row dt { color: var(--text-2); }
+.ver-list { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 12px; margin: 0; font-size: 13px; }
+.ver-row { display: contents; }
+.ver-row dt { color: var(--text-2); max-width: 40vw; overflow-wrap: anywhere; }
+.host-ver .badge, .cap-title .badge { white-space: normal; }
 .ver-row dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .ver-progress { font-size: 12.5px; overflow-wrap: anywhere; }
 .cap-title .badge { margin-left: 6px; vertical-align: 1px; }

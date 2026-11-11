@@ -448,9 +448,11 @@ impl Installation {
     ///
     /// A release binary in a checkout's `target` directory is put there by
     /// `update --force`, which replaces a service source that was a build in
-    /// a checkout: it is updated as a release archive is, since nothing of
-    /// the checkout's owner is in it any more. A build of the checkout says
-    /// so in its version (`X.Y.Z+git.<sha>`) and is still left alone.
+    /// a checkout and keeps the build it replaced beside it
+    /// ([`FORCE_BACKUP_PREFIX`]): with that backup there and a release
+    /// version (`X.Y.Z`, never a checkout build's `X.Y.Z+git.<sha>`), it is
+    /// updated as a release archive is, since nothing of the checkout's owner
+    /// is in it any more. Any other build in a checkout is left alone.
     ///
     /// # Errors
     /// [`Failure::LocalState`] when the record cannot be read.
@@ -471,11 +473,38 @@ impl Installation {
         version: Option<&str>,
     ) -> Self {
         let mut channel = classify(&path, paths.state_dir());
-        if channel == Channel::SourceBuild && version.is_some_and(|version| !version.contains('+'))
+        if channel == Channel::SourceBuild
+            && version.is_some_and(|version| !version.contains('+'))
+            && forced_here(&path)
         {
             channel = Channel::Archive;
         }
         Self { channel, path }
+    }
+
+    /// Why the service, running as root, must not update this binary: it
+    /// belongs to another account (a Homebrew prefix, an nvm npm), where root
+    /// would leave files that account can no longer replace, and Homebrew
+    /// refuses to run as root at all. `None` elsewhere.
+    pub(crate) fn foreign_to_root_service(&self) -> Option<CliError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let owner = std::fs::metadata(&self.path).ok()?.uid();
+            if runner_manager_platform::host_fitness::is_elevated() && owner != 0 {
+                return Some(CliError::with_remedy(
+                    Failure::UpdateUnsupported,
+                    format!(
+                        "the service runs as root and {} belongs to another account; updating it \
+                         as root would leave files that account cannot replace. Update it as \
+                         its owner.",
+                        display_path(&self.path)
+                    ),
+                    "runner-manager update",
+                ));
+            }
+        }
+        None
     }
 
     /// Why this copy cannot be updated in place, when it cannot.
@@ -555,6 +584,26 @@ pub(crate) fn service_source(
         let path = restart_path(&path);
         std::fs::canonicalize(&path).unwrap_or(path)
     }))
+}
+
+/// The name `update --force` gives the copy of the service source it keeps.
+pub(crate) const FORCE_BACKUP_PREFIX: &str = ".runner-manager-before-force-update-";
+
+/// Whether `update --force` replaced the binary at `path`: the copy it keeps
+/// is beside it.
+fn forced_here(path: &Path) -> bool {
+    path.parent()
+        .and_then(|parent| std::fs::read_dir(parent).ok())
+        .is_some_and(|mut entries| {
+            entries.any(|entry| {
+                entry.is_ok_and(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(FORCE_BACKUP_PREFIX)
+                })
+            })
+        })
 }
 
 /// The global npm prefix that holds the npm copy at `binary`.
@@ -817,11 +866,13 @@ pub(super) fn perform(
         installation = source;
     }
     if caller != Caller::Operator {
-        if matches!(installation.channel, Channel::SourceBuild) {
+        let refusal = match installation.channel {
+            Channel::SourceBuild => installation.refusal(),
+            _ => installation.foreign_to_root_service(),
+        };
+        if let Some(refusal) = refusal {
             return match caller {
-                Caller::Coordinator => Err(installation.refusal().unwrap_or_else(|| {
-                    CliError::new(Failure::UpdateUnsupported, "nothing to update")
-                })),
+                Caller::Coordinator => Err(refusal),
                 _ => Ok(()),
             };
         }
@@ -2234,7 +2285,18 @@ mod tests {
     fn a_release_binary_in_a_checkout_is_updated_as_an_archive_and_a_build_is_not() {
         let dir = tempfile::tempdir().unwrap();
         let paths = runner_manager_platform::paths::AppPaths::rooted_at(dir.path());
-        let source = PathBuf::from("/home/me/checkout/target/release/runner-manager");
+        let release_dir = dir.path().join("checkout/target/release");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let source = release_dir.join("runner-manager");
+        // Without the copy `update --force` keeps, even a plain version is a
+        // checkout build: one built without git says no `+git`.
+        let built = Installation::of_source(&paths, source.clone(), Some("0.4.63"));
+        assert_eq!(built.channel, Channel::SourceBuild);
+        std::fs::write(
+            release_dir.join(format!("{FORCE_BACKUP_PREFIX}abc")),
+            b"old",
+        )
+        .unwrap();
         // What `update --force` leaves at a checkout's service source.
         let release = Installation::of_source(&paths, source.clone(), Some("0.4.63"));
         assert_eq!(release.channel, Channel::Archive);

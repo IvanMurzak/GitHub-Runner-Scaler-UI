@@ -88,7 +88,8 @@ pub fn remote_changes(
         "{}",
         if allow {
             "A person signed in to the coordinator may now change this host's repositories, labels, \
-             limits and workspaces, and update its runner-manager. Every change is recorded in remote-commands.jsonl here and on \
+             limits and workspaces, and update its runner-manager to the newest release (unless \
+             automatic updates are off here). Every change is recorded in remote-commands.jsonl here and on \
              the coordinator. `runner-manager coordinator remote-changes deny` takes it back."
         } else {
             "The coordinator may only read this host's settings now."
@@ -181,6 +182,21 @@ pub fn update_progress() -> Option<UpdateProgress> {
 /// longer than the coordinator waits for an answer. The heartbeat carries how
 /// it went ([`update_progress`]).
 fn start_update(context: &Context, request_id: &str) -> CommandResult {
+    // An operator who turned the daily update off keeps this version.
+    match super::auto_update::enabled(context) {
+        Ok(true) => {}
+        Ok(false) => {
+            return CommandResult::refused(
+                request_id,
+                Failure::Conflict.code(),
+                "this host's operator turned automatic updates off (`runner-manager host \
+                 set-auto-update false`), so it is not updated from the coordinator either",
+            );
+        }
+        Err(error) => {
+            return CommandResult::refused(request_id, Failure::LocalState.code(), error.message());
+        }
+    }
     let lock = match HostLock::try_acquire(context.paths(), LockKind::Update) {
         Ok(lock) => lock,
         Err(LockError::Held { .. }) => {
@@ -203,32 +219,37 @@ fn start_update(context: &Context, request_id: &str) -> CommandResult {
     std::thread::spawn(move || {
         let _lock = lock;
         let mut report = Vec::new();
-        let outcome = super::update::perform(
-            &context,
-            &UpdateArgs {
-                check: false,
-                force: false,
-            },
-            &mut report,
-            super::update::Caller::Coordinator,
-        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::update::perform(
+                &context,
+                &UpdateArgs {
+                    check: false,
+                    force: false,
+                },
+                &mut report,
+                super::update::Caller::Coordinator,
+            )
+        }));
         super::versions::invalidate();
+        let report = outcome_text(&String::from_utf8_lossy(&report));
         match outcome {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 tracing::info!("the update the coordinator started ended");
-                set_update("done", outcome_text(&String::from_utf8_lossy(&report)));
+                set_update("done", report);
             }
-            Err(error) => {
-                tracing::warn!(%error, "the update the coordinator started failed");
-                set_update("failed", error.to_string());
+            Ok(Err(error)) => {
+                tracing::warn!(%error, %report, "the update the coordinator started failed");
+                set_update("failed", failure_text(&error.to_string(), &report));
             }
+            Err(_) => set_update("failed", "the update stopped unexpectedly".to_owned()),
         }
     });
     CommandResult {
         request_id: request_id.to_owned(),
         exit_code: 0,
-        stdout: "Updating runner-manager on this host. The service restarts into the new \
-                 version once its running jobs finish; the dashboard shows how it goes.\n"
+        stdout: "Started updating runner-manager on this host. A newer release, once installed, \
+                 is taken up by the service when its running jobs finish; the dashboard shows \
+                 how the update ends.\n"
             .to_owned(),
         stderr: String::new(),
         truncated: false,
@@ -243,6 +264,18 @@ fn outcome_text(report: &str) -> String {
         .split_once("\n\n")
         .map_or(report, |(_, outcome)| outcome);
     outcome.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Why an update failed: the error, then the end of what the package manager
+/// printed, which the error points to and the heartbeat has room for.
+fn failure_text(error: &str, report: &str) -> String {
+    const TAIL: usize = 300;
+    if report.is_empty() {
+        return error.to_owned();
+    }
+    let start = report.ceil_char_boundary(report.len().saturating_sub(TAIL));
+    let ellipsis = if start > 0 { "…" } else { "" };
+    format!("{error} Output: {ellipsis}{}", &report[start..])
 }
 
 /// Runs a command the coordinator relayed, as this host's service, and says
@@ -491,6 +524,10 @@ mod tests {
             "0.4.64 is installed. The service restarts."
         );
         assert_eq!(outcome_text("only a line\n"), "only a line");
+        assert_eq!(failure_text("npm failed.", ""), "npm failed.");
+        let failed = failure_text("npm failed.", &"é".repeat(400));
+        assert!(failed.starts_with("npm failed. Output: …é"), "{failed}");
+        assert!(failed.len() < 700);
     }
 
     #[test]
@@ -528,6 +565,16 @@ mod tests {
         assert_eq!(busy.exit_code, Failure::Conflict.code());
         assert!(busy.stderr.contains("already running"), "{busy:?}");
         drop(held);
+        assert_eq!(update_progress(), None);
+
+        // An operator who turned automatic updates off keeps this version.
+        super::super::auto_update::set_enabled(&context, false, &mut Vec::new()).unwrap();
+        let pinned = execute(&context, &command);
+        assert_eq!(pinned.exit_code, Failure::Conflict.code());
+        assert!(
+            pinned.stderr.contains("set-auto-update false"),
+            "{pinned:?}"
+        );
         assert_eq!(update_progress(), None);
     }
 
