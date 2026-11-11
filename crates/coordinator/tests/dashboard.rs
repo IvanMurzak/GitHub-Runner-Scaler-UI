@@ -206,7 +206,8 @@ async fn an_allowed_login_signs_in_and_sees_the_queue() {
 
     // Queued a minute ago by the real clock: the dashboard forgets a job
     // queued for a day, so a fixed date would drop out of the queue a day on.
-    let created_at = (chrono::Utc::now() - chrono::TimeDelta::minutes(1)).to_rfc3339();
+    let created_at = (chrono::Utc::now() - chrono::TimeDelta::minutes(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let body = serde_json::json!({
         "action": "queued",
         "workflow_job": {"id": 41, "run_id": 7, "name": "build",
