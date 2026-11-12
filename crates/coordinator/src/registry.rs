@@ -126,6 +126,8 @@ pub struct Registry {
     /// The sweep's inventory may be out of date: a host advertised a target
     /// it does not list, or a webhook named a repository it does not know.
     inventory_wanted: Notify,
+    /// Runs webhooks named as queued, until the sweep takes them.
+    expected_runs: Mutex<Vec<(String, u64)>>,
 }
 
 /// What the App's installations list, whether or not the sweep could read
@@ -424,6 +426,33 @@ impl Registry {
         }
     }
 
+    /// A webhook said `run_id` of `repository` has a queued job: the sweep
+    /// reads that run by its id as well as from GitHub's run listing, which
+    /// can leave it out.
+    pub fn expect_run(&self, repository: &str, run_id: u64) {
+        /// What a sweep that cannot keep up keeps: the newest.
+        const KEPT: usize = 256;
+        let mut runs = self
+            .expected_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !runs.iter().any(|(_, known)| *known == run_id) {
+            runs.push((repository.to_owned(), run_id));
+        }
+        let excess = runs.len().saturating_sub(KEPT);
+        runs.drain(..excess);
+    }
+
+    /// The runs [`Self::expect_run`] named since the last call.
+    pub fn take_expected_runs(&self) -> Vec<(String, u64)> {
+        std::mem::take(
+            &mut *self
+                .expected_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     /// A webhook named `repository`: asks for a fresh inventory when a
     /// connected host serves it and the inventory does not list it.
     pub fn repository_seen(&self, repository: &str) {
@@ -581,7 +610,13 @@ impl Registry {
     /// Returns how many were woken.
     pub fn wake_for_job(&self, repository: &str, labels: &[String], delivery_id: &str) -> usize {
         required_labels(labels).map_or(0, |required| {
-            self.wake_for(repository, &required, WakeReason::JobQueued, delivery_id)
+            self.wake_for(
+                repository,
+                &required,
+                WakeReason::JobQueued,
+                delivery_id,
+                None,
+            )
         })
     }
 
@@ -593,6 +628,7 @@ impl Registry {
         required: &[Label],
         reason: WakeReason,
         delivery_id: &str,
+        run_id: Option<u64>,
     ) -> usize {
         let pool = is_pool_job(required);
         let coverage = self.coverage();
@@ -616,6 +652,7 @@ impl Registry {
                 repository: repository.to_string(),
                 reason,
                 delivery_id: delivery_id.to_string(),
+                run_id,
             };
             match connected
                 .sender

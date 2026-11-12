@@ -244,6 +244,20 @@ impl Sweeper {
                 .map(|installation| installation.account.to_ascii_lowercase())
                 .collect(),
         });
+        // Runs webhooks named as queued, read by their id as well as listed.
+        for (repository, run_id) in self.registry.take_expected_runs() {
+            let installation = installations.iter().find(|installation| {
+                installation
+                    .repositories
+                    .iter()
+                    .any(|known| known.to_string().eq_ignore_ascii_case(&repository))
+            });
+            if let (Some(installation), Ok(owner_repo)) =
+                (installation, OwnerRepo::parse(&repository))
+            {
+                installation.demand.expect_run(&owner_repo, run_id);
+            }
+        }
         let advertised = self.registry.advertised();
         let mut report = SweepReport::default();
         // What this sweep could not read is not covered: a host relies on the
@@ -365,6 +379,7 @@ impl Sweeper {
         let mut listed = HashSet::new();
         let mut complete = !demand.is_truncated(repository);
         for (job, identity) in demand.identified_jobs_for(repository) {
+            let run_id = identity.and_then(|identity| identity.run_id);
             match identity.as_ref().and_then(|identity| identity.id) {
                 Some(id) => {
                     listed.insert(id);
@@ -394,9 +409,13 @@ impl Sweeper {
                 report.already_woken += 1;
                 continue;
             }
-            let woken =
-                self.registry
-                    .wake_for(&name, &required, WakeReason::Reconcile, SWEEP_DELIVERY);
+            let woken = self.registry.wake_for(
+                &name,
+                &required,
+                WakeReason::Reconcile,
+                SWEEP_DELIVERY,
+                run_id,
+            );
             report.wakes += u32::try_from(woken).unwrap_or(u32::MAX);
         }
         if let Some(activity) = &self.activity
@@ -632,11 +651,13 @@ mod tests {
             vec![
                 QueuedJobIdentity {
                     workflow: None,
+                    run_id: None,
                     id: Some(11),
                     name: Some("light".into()),
                 },
                 QueuedJobIdentity {
                     workflow: None,
+                    run_id: None,
                     id: Some(12),
                     name: None,
                 },
@@ -725,6 +746,7 @@ mod tests {
                 repository,
                 vec![QueuedJobIdentity {
                     workflow: Some(".github/workflows/ci.yml".into()),
+                    run_id: None,
                     id: Some(11),
                     name: Some("build".into()),
                 }],

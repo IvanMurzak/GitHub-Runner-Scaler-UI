@@ -799,6 +799,10 @@ impl WakeRoutes {
             && wake.target.covers(&wake.repository)
         {
             demand.forget_shared_reading(&repository);
+            // GitHub's run listing can leave the run out: read it by its id.
+            if let Some(run_id) = wake.run_id {
+                demand.expect_run(&repository, run_id);
+            }
         }
         signals.wake.notify_one();
         tracing::info!(target = %target, "the coordinator woke a target; polling it now");
@@ -1718,6 +1722,7 @@ mod tests {
             repository: "octo/app".into(),
             reason: WakeReason::JobQueued,
             delivery_id: "d".into(),
+            run_id: None,
         };
         assert!(routes.deliver(&wake(TargetScope::Repo, "octo/app")));
         assert!(!routes.deliver(&wake(TargetScope::Org, "octo")));
