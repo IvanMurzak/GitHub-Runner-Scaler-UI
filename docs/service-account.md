@@ -239,6 +239,19 @@ paths named in `ReadWritePaths`, plus the private `/tmp` that `PrivateTmp=yes`
 supplies. `review_least_privilege` fails a unit that names any other path there,
 that drops any of the directives above, or that weakens one of them.
 
+That includes the binary the service was installed from, which its daily
+update (and the update a coordinator starts) replaces: `install.sh` puts it in
+`/usr/local/bin` or `~/.local/bin`. From 0.4.67 the service downloads and
+verifies the release, stages the binary in its state directory, and has a
+transient unit (`systemd-run --wait`, in the account's own manager for a login
+unit) copy it into place with one rename. That unit only copies the staged file
+over that one binary; the sandbox stays as it is, so a job running as a runner
+pool account still cannot write there, nor start such a unit for `root`. (A job
+of a login unit runs as the service's own account and could always start one.)
+Before 0.4.67 the update failed with "Read-only file system", and a Linux service
+never updated itself: update such a host once by hand (`sudo runner-manager
+update` for a boot unit, `runner-manager update` for a login unit).
+
 A login unit drops every capability. A boot unit's daemon keeps exactly these,
 all to run its jobs as a separate account (next section):
 
