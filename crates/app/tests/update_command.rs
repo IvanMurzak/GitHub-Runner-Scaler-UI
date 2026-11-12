@@ -786,8 +786,8 @@ fn an_npm_copy_is_updated_by_the_npm_of_its_prefix_when_none_is_on_path() {
 }
 
 /// macm6 asked npm for the release in the minutes between its GitHub release
-/// and its npm publication: `ETARGET`. That is not a failed update, and says
-/// so; nothing is changed.
+/// and its npm publication: `ETARGET`. An operator is told the release is not
+/// on npm yet, to try again shortly; nothing is changed.
 #[test]
 fn a_release_not_on_npm_yet_is_said_and_changes_nothing() {
     let fixtures = tempfile::tempdir().expect("a temporary directory");
@@ -803,9 +803,9 @@ fn a_release_not_on_npm_yet_is_said_and_changes_nothing() {
     );
 
     let outcome = installed.update_with_path(&release.assets, &[], Some(&path_with_first(&tools)));
-    assert_eq!(outcome.code, 0, "output was:\n{}", outcome.both());
+    assert_ne!(outcome.code, 0, "output was:\n{}", outcome.both());
     assert!(
-        outcome.stdout.contains("is not on npm yet"),
+        outcome.both().contains("is not on npm yet") && outcome.both().contains("Try again"),
         "output was:\n{}",
         outcome.both()
     );

@@ -1211,11 +1211,28 @@ pub(super) fn perform(
             );
             match installed {
                 // The release puts the archives on GitHub minutes before it
-                // publishes to npm: not a failure, and the daily check tries
-                // again soon (`NOT_ON_NPM_YET`).
+                // publishes to npm. The daily check is not failed and tries
+                // again soon (it looks for `NOT_ON_NPM_YET`); a person is told
+                // to try again shortly, as a failure, since nothing changed.
                 Err(problem) if problem.message().contains(NOT_ON_NPM_YET) => {
-                    writeln!(out, "\n{}", problem.message()).map_err(failed)?;
-                    return Ok(());
+                    let said = format!(
+                        "{} {NOT_ON_NPM_YET}: the release publishes to npm a few minutes after \
+                         GitHub. Nothing was changed.",
+                        published.version
+                    );
+                    if caller == Caller::Schedule {
+                        writeln!(
+                            out,
+                            "\n{said} The daily check tries again in a quarter of an hour."
+                        )
+                        .map_err(failed)?;
+                        return Ok(());
+                    }
+                    return Err(CliError::with_remedy(
+                        Failure::UpdateFailed,
+                        format!("{said} Try again in a few minutes."),
+                        "runner-manager update",
+                    ));
                 }
                 installed => installed?,
             }
@@ -2130,11 +2147,7 @@ fn run_package_manager(
         Ok(status) if status.success() => Ok(()),
         Ok(_) if not_published => Err(CliError::with_remedy(
             Failure::UpdateFailed,
-            format!(
-                "The release {NOT_ON_NPM_YET}: the release workflow publishes to npm a few \
-                 minutes after GitHub. Nothing was changed; the daily check tries again in a \
-                 quarter of an hour."
-            ),
+            format!("the version asked for {NOT_ON_NPM_YET}"),
             remedy,
         )),
         Ok(status) => Err(CliError::with_remedy(
