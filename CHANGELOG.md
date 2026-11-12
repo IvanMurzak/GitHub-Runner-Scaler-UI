@@ -16,9 +16,9 @@ the version being prepared rather than the version in `Cargo.toml`.
   concurrent Linux runner is its own account; pnpm hard-linked packages out of
   the shared store, so they stayed owned by the account that stored them, and
   pnpm's `chmod` of a package's bin failed for every other account. On Linux
-  the runner now gets `PNPM_CONFIG_PACKAGE_IMPORT_METHOD=copy` (and
-  `npm_config_package_import_method=copy` for pnpm 9 and 10) with the shared
-  store: the downloads stay shared, the files in `node_modules` are the job's.
+  the runner now gets `PNPM_CONFIG_PACKAGE_IMPORT_METHOD=clone-or-copy` (and
+  `npm_config_package_import_method` for pnpm 9 and 10) with the shared store:
+  the downloads stay shared, the files in `node_modules` are the job's.
 
 ## 0.4.67
 

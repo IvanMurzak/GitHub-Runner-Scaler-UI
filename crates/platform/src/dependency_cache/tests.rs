@@ -152,7 +152,7 @@ fn pnpm_copies_out_of_the_shared_store_on_linux_and_only_there() {
         let variables: Vec<_> = pnpm.variables_on(platform).collect();
         let copies = variables.iter().any(|variable| {
             variable.name == "PNPM_CONFIG_PACKAGE_IMPORT_METHOD"
-                && variable.value == VarValue::Literal("copy")
+                && variable.value == VarValue::Literal("clone-or-copy")
         });
         assert!(
             variables

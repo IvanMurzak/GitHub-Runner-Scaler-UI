@@ -325,6 +325,11 @@ impl CacheTool {
     }
 }
 
+/// How pnpm imports a package out of the shared store on Linux, under both
+/// spellings: never a hard link, which stays owned by the account that stored
+/// the file. See the `pnpm` entry of [`TOOLS`].
+const PNPM_IMPORT_METHOD: VarValue = VarValue::Literal("clone-or-copy");
+
 /// Every cache this module knows. Adding a tool is one entry.
 ///
 /// Each variable name below was checked against the tool's own documentation
@@ -391,22 +396,17 @@ pub const TOOLS: &[CacheTool] = &[
             // by the account that stored it, and pnpm's `chmod` of a bin then
             // fails for any other (`ERR_PNPM_CMD_SHIM_CHMOD`): `chmod` needs
             // the owner or `CAP_FOWNER`, which a group ACL never grants. A
-            // copy belongs to the job's account; the downloads stay shared.
+            // copy, or a reflink where the file system has them (btrfs,
+            // XFS), belongs to the job's account; the downloads stay shared.
             // A hard link would also let one job's edit of `node_modules`
             // change the store under every other.
-            linux(
-                "npm_config_package_import_method",
-                VarValue::Literal("copy"),
-            ),
-            linux(
-                "PNPM_CONFIG_PACKAGE_IMPORT_METHOD",
-                VarValue::Literal("copy"),
-            ),
+            linux("npm_config_package_import_method", PNPM_IMPORT_METHOD),
+            linux("PNPM_CONFIG_PACKAGE_IMPORT_METHOD", PNPM_IMPORT_METHOD),
         ],
         note: "the content-addressed store: pnpm 9 and 10 read npm_config_store_dir, pnpm 11 and \
                later PNPM_CONFIG_STORE_DIR; npm 12 warns that store-dir is unknown. On Linux \
-               packages are copied out of it (package-import-method copy), since each runner \
-               account owns only what it copied",
+               packages are cloned or copied out of it (package-import-method clone-or-copy), \
+               since each runner account owns only what it made",
     },
     CacheTool {
         id: "yarn",
