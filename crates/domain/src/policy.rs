@@ -590,6 +590,13 @@ impl RoutingLabels {
         self.host_label == *label || self.additional.contains(label)
     }
 
+    /// Whether a runner with this set can take a job requiring `label`: it
+    /// carries it, or `label` is `not-X` and it does not carry `X`.
+    #[must_use]
+    pub fn satisfies(&self, label: &Label) -> bool {
+        label_satisfied(|offered| self.contains(offered), label)
+    }
+
     /// The shared pool labels this set carries (see [`POOL_LABEL_PREFIX`]):
     /// at most its OS pool label and [`ANY_POOL_LABEL`] once checked. The
     /// host label is never one: it is derived from the host's identity.
@@ -636,7 +643,7 @@ impl RoutingLabels {
     #[must_use]
     pub fn as_registration_labels(&self) -> Vec<String> {
         self.iter()
-            .filter(|label| label_satisfied(|offered| self.contains(offered), label))
+            .filter(|label| self.satisfies(label))
             .map(|l| l.as_str().to_string())
             .collect()
     }
@@ -684,7 +691,7 @@ impl RoutingLabels {
 
         let missing: Vec<Label> = required
             .iter()
-            .filter(|label| !label_satisfied(|offered| self.contains(offered), label))
+            .filter(|label| !self.satisfies(label))
             .cloned()
             .collect();
 

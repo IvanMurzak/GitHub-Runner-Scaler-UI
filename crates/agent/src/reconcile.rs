@@ -3964,10 +3964,14 @@ fn route_demand(
     let Some(first) = profiles.first() else {
         return (tallies, refusals);
     };
+    // Each owner's labels as its runners carry them, host traits included.
     let owners: Vec<_> = all_policies
         .iter()
         .filter(|policy| policy.target == first.target && policy.host_id == first.host_id)
-        .filter(|policy| policy.owns_runners())
+        .filter_map(|policy| {
+            let labels = policy.routing_labels()?;
+            Some((policy.id, labels.with_labels(host_labels.iter().cloned())))
+        })
         .collect();
     let jobs: Vec<&runner_manager_domain::policy::RunsOn> = match &first.target {
         ScaleTarget::Repository(repository) => reading.jobs_for(repository).iter().collect(),
@@ -3986,15 +3990,8 @@ fn route_demand(
         }
         let matched: Vec<PolicyId> = owners
             .iter()
-            .filter(|policy| {
-                policy.routing_labels().is_some_and(|labels| {
-                    labels
-                        .with_labels(host_labels.iter().cloned())
-                        .matches(job)
-                        .is_match()
-                })
-            })
-            .map(|policy| policy.id)
+            .filter(|(_, labels)| labels.matches(job).is_match())
+            .map(|(id, _)| *id)
             .collect();
         if matched.len() > 1 {
             *refusals
