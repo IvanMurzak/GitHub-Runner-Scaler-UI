@@ -22,6 +22,11 @@ the version being prepared rather than the version in `Cargo.toml`.
   is not on this PATH"; the package manager is now also looked for beside the
   copy it installed, and runs with that directory on `PATH`. A host on an older
   release has to be updated once by hand (`runner-manager update`).
+- A queued job that GitHub's run listing leaves out is still run. GitHub's
+  `status=queued` listing can miss a queued run entirely (two jobs waited half
+  an hour with every machine idle). The coordinator now reads each run a
+  `queued` webhook names by its id, and passes the run in its wake so the
+  machine does the same, until none of the run's jobs is queued.
 
 ## 0.4.66
 
