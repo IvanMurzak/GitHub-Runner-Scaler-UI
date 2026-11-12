@@ -1274,6 +1274,7 @@ fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
     // A launch with no runner yet has a slot spoken for: said here, the
     // coordinator offers what this host can really start.
     let spoken_for = ports.launches.unstarted();
+    let disk = runner_manager_platform::host_fitness::disk_space(&ports.runner_root);
     Heartbeat {
         free_slots: u32::from(
             ports
@@ -1290,11 +1291,9 @@ fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
         unfit: ports.unfit.load(Ordering::Relaxed),
         draining: ports.draining.load(Ordering::Relaxed),
         open_leases,
-        disk_free_bytes: runner_manager_platform::host_fitness::free_disk_bytes(&ports.runner_root),
+        disk_free_bytes: disk.map(|(free, _)| free),
         versions: super::versions::report(&ports.paths),
-        disk_total_bytes: runner_manager_platform::host_fitness::total_disk_bytes(
-            &ports.runner_root,
-        ),
+        disk_total_bytes: disk.map(|(_, total)| total),
         runners: Some(runners),
     }
 }

@@ -123,10 +123,11 @@ pub fn free_disk_bytes(path: &Path) -> Option<u64> {
     sys::disk_space(path).map(|(free, _)| free)
 }
 
-/// The size of the volume holding `path`, in bytes.
+/// `(free for this account, volume size)` of the volume holding `path`, in
+/// bytes, from one read.
 #[must_use]
-pub fn total_disk_bytes(path: &Path) -> Option<u64> {
-    sys::disk_space(path).map(|(_, total)| total)
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    sys::disk_space(path)
 }
 
 /// How busy the CPUs are: the share of all logical CPUs' time spent busy
@@ -1569,8 +1570,7 @@ mod tests {
     #[test]
     fn the_disk_is_reported_with_its_size() {
         let here = std::env::current_dir().expect("current directory");
-        let free = free_disk_bytes(&here).expect("free disk");
-        let total = total_disk_bytes(&here).expect("disk size");
+        let (free, total) = disk_space(&here).expect("disk space");
         assert!(total > 0 && free <= total, "{free} of {total}");
     }
 

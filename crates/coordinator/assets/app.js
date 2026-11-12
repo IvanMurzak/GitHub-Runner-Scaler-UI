@@ -354,15 +354,19 @@
       meterBar(pct));
   }
 
+  // A machine's memory used, as a percent of its total, per sample.
+  function ramPct(x) {
+    return (x.ram_used || []).map((u, i) => {
+      const total = (x.ram_total || [])[i];
+      return isNum(u) && isNum(total) && total > 0 ? (u / total) * 100 : null;
+    });
+  }
+
   function sparkline(hostId) {
     const m = state.metrics;
     const mh = m && (m.hosts || []).find((x) => x.id === hostId);
     if (!mh || !Array.isArray(mh.cpu) || mh.cpu.filter(isNum).length < 2) return h('div', { class: 'spark spark-empty', text: 'No CPU history yet' });
-    const ram = (mh.ram_used || []).map((u, i) => {
-      const total = (mh.ram_total || [])[i];
-      return isNum(u) && isNum(total) && total > 0 ? (u / total) * 100 : null;
-    });
-    const g = regroup(m.t || [], m.step_secs || 60, groupOf(mh.cpu.length, SPARK_POINTS), [mh.cpu, ram]);
+    const g = regroup(m.t || [], m.step_secs || 60, groupOf(mh.cpu.length, SPARK_POINTS), [mh.cpu, ramPct(mh)]);
     const [cpu, mem] = g.series;
     const n = cpu.length, W = 120, H = 32;
     const toPts = (vals) => vals.map((v, i) => (isNum(v) ? [(i / Math.max(1, n - 1)) * W, H - (clamp(v, 0, 100) / 100) * (H - 2) - 1] : null));
@@ -585,15 +589,16 @@
     }
     return d;
   }
-  function runs(idx) {
-    const out = []; let start = null;
-    idx.forEach((v, i) => {
-      if (v != null && start == null) start = i;
-      if ((v == null || i === idx.length - 1) && start != null) { out.push([start, v == null ? i - 1 : i]); start = null; }
-    });
+  // The unbroken runs of points, split where a point is missing.
+  function runsOf(pts) {
+    const out = []; let run = [];
+    for (const p of pts) {
+      if (p) run.push(p);
+      else if (run.length) { out.push(run); run = []; }
+    }
+    if (run.length) out.push(run);
     return out;
   }
-  const runsOf = (pts) => runs(pts.map((p, i) => (p ? i : null))).map(([a, b]) => pts.slice(a, b + 1));
   const linePath = (pts, smooth) => runsOf(pts).map((r) => curve(r, smooth)).join('');
   // Area under a line down to a fixed baseline, one closed shape per run of values.
   const areaPath = (pts, base, smooth) => runsOf(pts).map((r) =>
@@ -787,7 +792,7 @@
       h('span', { class: 'tip-name', text: sr.name })));
     const from = cfg.t[i], to = from + cfg.step;
     const wide = cfg.t[cfg.t.length - 1] - cfg.t[0] > 86400;
-    const head = `${wide ? fmtStamp(from) : fmtClock(from)}${cfg.step > 60 ? `–${fmtClock(to)}` : ''}${cfg.step > 60 ? ' · average' : ''}`;
+    const head = `${wide ? fmtStamp(from) : fmtClock(from)}${cfg.step > 60 ? `–${fmtClock(to)} · average` : ''}`;
     g.tip.replaceChildren(h('div', { class: 'tip-time', text: head }), ...rows, ...(cfg.total ? [cfg.total(i)] : []));
     g.tip.classList.add('on');
     const tw = g.tip.offsetWidth;
@@ -872,10 +877,6 @@
     });
     $('#busy-sub').textContent = bg.step > step ? `Average per ${per(bg.step)}, stacked per machine` : 'Stacked per machine';
 
-    const ramPct = (x) => (x.ram_used || []).map((u, i) => {
-      const total = (x.ram_total || [])[i];
-      return isNum(u) && isNum(total) && total > 0 ? (u / total) * 100 : null;
-    });
     const rg = regroup(t, step, kLine, [...hosts.map(ramPct), ...hosts.map((x) => x.ram_used || [])]);
     const ram = hosts.map((x, k) => {
       const values = rg.series[k], used = rg.series[hosts.length + k];
@@ -1030,15 +1031,13 @@
     if (!v) return x.online ? h('p', { class: 'host-ver', title: 'Machines report their versions from runner-manager 0.4.64' }, h('span', { class: 'muted', text: justConnected(x) ? 'Reading versions…' : 'Version unknown (before 0.4.64)' })) : null;
     const st = versionState(v);
     const appDiffers = v.app && v.app !== v.service;
+    const live = wslVersion(x);
     return h('p', { class: 'host-ver' },
       v.wsl_guest ? h('span', { class: 'badge badge-dim', title: 'Runs inside a WSL distribution of a Windows machine', text: 'WSL' }) : null,
       h('span', { title: 'The build the service runs' }, 'Service ', h('b', { class: 'num', text: `v${v.service}` })),
       appDiffers ? h('span', { title: `The installed app the service upgrades from${v.app_source ? ` (${v.app_source})` : ''}` }, 'App ', h('b', { class: 'num', text: `v${v.app}` })) : null,
-      (v.wsl || []).map((w) => {
-        const live = wslVersion(x);
-        return h('span', { title: live ? `WSL ${w.distribution}: the service its own host runs` : `WSL ${w.distribution}: the runner-manager this machine last installed in it` },
-          `WSL ${w.distribution} `, h('b', { class: 'num', text: `v${live || w.installed_version}` }));
-      }),
+      (v.wsl || []).map((w) => h('span', { title: live ? `WSL ${w.distribution}: the service its own host runs` : `WSL ${w.distribution}: the runner-manager this machine last installed in it` },
+        `WSL ${w.distribution} `, h('b', { class: 'num', text: `v${live || w.installed_version}` }))),
       st ? h('span', { class: `badge badge-${st.cls}`, text: st.text }) : null);
   }
 
