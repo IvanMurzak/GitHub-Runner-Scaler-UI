@@ -7,6 +7,20 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.69
+
+### Fixed
+
+- `sudo runner-manager update` no longer updates an npm, Homebrew or
+  `cargo install` copy that another account installed (the account that owns
+  the npm prefix's `node_modules`, the `Cellar`, the cargo `bin`). npm run as
+  root left the package owned by root, so the account's own service (a macOS
+  LaunchAgent) could never update it again, and every update failed. It now
+  refuses and says to run it as that account, without `sudo`; for a package an
+  earlier `sudo` already left owned by root, it names the `sudo chown -R` that
+  gives it back. `sudo runner-manager update --force` at the same version, which
+  only hands the service over, is not refused.
+
 ## 0.4.68
 
 ### Fixed

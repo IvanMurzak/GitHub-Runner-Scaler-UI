@@ -382,8 +382,59 @@ pub(crate) fn restart_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+mod foreign_to_root_tests {
+    use super::*;
+
+    /// Root leaves alone what another account owns, and only root does.
+    #[test]
+    fn only_root_is_refused_what_another_account_owns() {
+        for (elevated, owner, refused) in [
+            (true, 501, true),
+            (true, 0, false),
+            (false, 501, false),
+            (false, 0, false),
+        ] {
+            assert_eq!(
+                refused_as_root(elevated, owner),
+                refused,
+                "{elevated} {owner}"
+            );
+        }
+    }
+
+    /// The tree whose owner decides is the one the package manager writes:
+    /// on macm6 the package was root's after a `sudo` update while the
+    /// prefix's `lib/node_modules` stayed the operator's.
+    #[test]
+    fn the_package_managers_tree_decides_not_the_binary() {
+        let npm = Path::new(
+            "/opt/homebrew/lib/node_modules/@ivan-murzak/runner-manager/node_modules/\
+             @ivan-murzak/runner-manager-darwin-arm64/bin/runner-manager",
+        );
+        assert_eq!(
+            package_tree(&Channel::Npm, npm, false),
+            Some(PathBuf::from("/opt/homebrew/lib/node_modules"))
+        );
+        let brew = Path::new("/opt/homebrew/Cellar/runner-manager/0.4.67/bin/runner-manager");
+        assert_eq!(
+            package_tree(&Channel::Homebrew, brew, false),
+            Some(PathBuf::from("/opt/homebrew/Cellar"))
+        );
+        let cargo = Path::new("/home/ivan/.cargo/bin/runner-manager");
+        assert_eq!(
+            package_tree(&Channel::Cargo, cargo, false),
+            Some(PathBuf::from("/home/ivan/.cargo/bin"))
+        );
+        // A release archive is renamed into place: nothing to refuse.
+        let archive = Path::new("/usr/local/bin/runner-manager");
+        assert_eq!(package_tree(&Channel::Archive, archive, false), None);
+    }
+}
+
+#[cfg(test)]
 mod restart_path_tests {
     use super::*;
+
     #[test]
     #[cfg(windows)]
     fn repeated_replacement_does_not_need_to_delete_a_locked_old_image() {
@@ -487,24 +538,61 @@ impl Installation {
     /// would leave files that account can no longer replace, and Homebrew
     /// refuses to run as root at all. `None` elsewhere.
     pub(crate) fn foreign_to_root_service(&self) -> Option<CliError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let owner = std::fs::metadata(&self.path).ok()?.uid();
-            if runner_manager_platform::host_fitness::is_elevated() && owner != 0 {
-                return Some(CliError::with_remedy(
-                    Failure::UpdateUnsupported,
-                    format!(
-                        "the service runs as root and {} belongs to another account; updating it \
-                         as root would leave files that account cannot replace. Update it as \
-                         its owner.",
-                        display_path(&self.path)
-                    ),
-                    "runner-manager update",
-                ));
-            }
+        let owner = owner_of(&self.path)?;
+        refused_as_root(runner_manager_platform::host_fitness::is_elevated(), owner).then(|| {
+            CliError::with_remedy(
+                Failure::UpdateUnsupported,
+                format!(
+                    "the service runs as root and {} belongs to another account; updating it \
+                     as root would leave files that account cannot replace. Update it as its \
+                     owner.",
+                    display_path(&self.path)
+                ),
+                "runner-manager update",
+            )
+        })
+    }
+
+    /// Why `sudo runner-manager update` must not run a package manager here:
+    /// another account owns the tree it would write (an npm prefix's
+    /// `node_modules`, a Homebrew `Cellar`, a cargo `bin`). npm run as root
+    /// leaves the package owned by root, so that account, and the service it
+    /// runs, can no longer update it: a macOS LaunchAgent then failed every
+    /// update. Homebrew refuses root itself. `None` elsewhere, and for a
+    /// release archive, which is renamed into place.
+    pub(crate) fn foreign_to_root_operator(&self) -> Option<CliError> {
+        let tree = package_tree(&self.channel, &self.path, cfg!(windows))?;
+        let owner = owner_of(&tree)?;
+        if !refused_as_root(runner_manager_platform::host_fitness::is_elevated(), owner) {
+            return None;
         }
-        None
+        // A copy an earlier `sudo` update already left owned by root: say how
+        // to give it back, or the account's own update fails next.
+        let package = match self.channel {
+            Channel::Npm => Some(tree.join(NPM_PACKAGE)),
+            _ => None,
+        }
+        .filter(|package| owner_of(package).is_some_and(|uid| uid != owner));
+        let mut remedy = String::new();
+        if let Some(package) = &package {
+            remedy.push_str(&format!(
+                "sudo chown -R {owner} \"{}\" && ",
+                display_path(package)
+            ));
+        }
+        remedy.push_str("runner-manager update  (as that account, without sudo)");
+        Some(CliError::with_remedy(
+            Failure::UpdateUnsupported,
+            format!(
+                "this runs as root and {} belongs to another account (uid {owner}); {} as \
+                 root would leave files only root can replace, and that account, and the \
+                 service it runs, could no longer update this copy. Run it as that account, \
+                 without sudo.",
+                display_path(&tree),
+                self.channel.describe()
+            ),
+            remedy,
+        ))
     }
 
     /// Why this copy cannot be updated in place, when it cannot.
@@ -604,6 +692,48 @@ fn forced_here(path: &Path) -> bool {
                 })
             })
         })
+}
+
+/// The tree a package manager writes when it updates the copy at `binary`:
+/// the npm prefix's `node_modules` (`lib/node_modules` off Windows), the
+/// Homebrew `Cellar`, the cargo `bin`. Whoever owns it owns the copy, even
+/// when an earlier `sudo` left the copy itself owned by root.
+fn package_tree(channel: &Channel, binary: &Path, windows: bool) -> Option<PathBuf> {
+    match channel {
+        Channel::Npm => npm_global_prefix(binary, windows).map(|prefix| {
+            if windows {
+                prefix.join("node_modules")
+            } else {
+                prefix.join("lib").join("node_modules")
+            }
+        }),
+        Channel::Homebrew => binary
+            .ancestors()
+            .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new("Cellar")))
+            .map(Path::to_path_buf),
+        Channel::Cargo => binary.parent().map(Path::to_path_buf),
+        _ => None,
+    }
+}
+
+/// Whether a process that is root (`elevated`) must leave alone what `owner`
+/// owns.
+const fn refused_as_root(elevated: bool, owner: u32) -> bool {
+    elevated && owner != 0
+}
+
+/// The uid that owns `path`. `None` on Windows, or when it cannot be read.
+fn owner_of(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).ok().map(|metadata| metadata.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// The global npm prefix that holds the npm copy at `binary`.
@@ -980,6 +1110,14 @@ pub(super) fn perform(
     // copy, where the command it just recommended refuses. A dry run that
     // predicts the wrong outcome is worse than no dry run: it is the one thing
     // an operator uses it to avoid.
+    //
+    // Only here, where a package manager runs: `--force` at the same version
+    // only hands the service over, which root may do.
+    let refusal = refusal.or_else(|| {
+        (caller == Caller::Operator)
+            .then(|| installation.foreign_to_root_operator())
+            .flatten()
+    });
     if args.check {
         writeln!(out).map_err(failed)?;
         writeln!(
