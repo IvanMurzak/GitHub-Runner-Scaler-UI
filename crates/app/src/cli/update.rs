@@ -384,6 +384,34 @@ pub(crate) fn restart_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod restart_path_tests {
     use super::*;
+
+    /// `sudo runner-manager update` is refused only for a package-manager copy
+    /// another account owns, and only as root: an operator updating their own
+    /// copy, and a release archive, are never refused.
+    #[test]
+    fn only_root_is_refused_a_package_managers_copy_of_another_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("runner-manager");
+        std::fs::write(&binary, b"binary").unwrap();
+        let elevated = runner_manager_platform::host_fitness::is_elevated();
+        for channel in [
+            Channel::Npm,
+            Channel::Homebrew,
+            Channel::Cargo,
+            Channel::Archive,
+        ] {
+            let installation = Installation {
+                channel: channel.clone(),
+                path: binary.clone(),
+            };
+            // The file is this process's own: refused by no one.
+            let refused = installation.foreign_to_root_operator().is_some();
+            assert!(
+                !refused || (elevated && cfg!(unix) && channel != Channel::Archive),
+                "{channel:?}"
+            );
+        }
+    }
     #[test]
     #[cfg(windows)]
     fn repeated_replacement_does_not_need_to_delete_a_locked_old_image() {
@@ -487,24 +515,61 @@ impl Installation {
     /// would leave files that account can no longer replace, and Homebrew
     /// refuses to run as root at all. `None` elsewhere.
     pub(crate) fn foreign_to_root_service(&self) -> Option<CliError> {
+        self.owned_by_another_than_root().then(|| {
+            CliError::with_remedy(
+                Failure::UpdateUnsupported,
+                format!(
+                    "the service runs as root and {} belongs to another account; updating it \
+                     as root would leave files that account cannot replace. Update it as its \
+                     owner.",
+                    display_path(&self.path)
+                ),
+                "runner-manager update",
+            )
+        })
+    }
+
+    /// Why `sudo runner-manager update` must not run a package manager over a
+    /// copy another account installed: npm run as root leaves the package
+    /// owned by root, so that account, and the service it runs, can no longer
+    /// update it. A macOS service that runs as its operator then failed every
+    /// update with npm's `EACCES`. Homebrew refuses root itself. A release
+    /// archive is renamed into place and needs no such guard. `None` elsewhere.
+    pub(crate) fn foreign_to_root_operator(&self) -> Option<CliError> {
+        if !matches!(
+            self.channel,
+            Channel::Npm | Channel::Homebrew | Channel::Cargo
+        ) || !self.owned_by_another_than_root()
+        {
+            return None;
+        }
+        Some(CliError::with_remedy(
+            Failure::UpdateUnsupported,
+            format!(
+                "this runs as root and {} was installed by another account through {}; updating \
+                 it as root would leave files only root can replace, and that account, and the \
+                 service it runs, could no longer update it. Run it as that account, without \
+                 sudo.",
+                display_path(&self.path),
+                self.channel.describe()
+            ),
+            "runner-manager update",
+        ))
+    }
+
+    /// Whether this process runs as root and the copy belongs to another
+    /// account. Never on Windows.
+    fn owned_by_another_than_root(&self) -> bool {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            let owner = std::fs::metadata(&self.path).ok()?.uid();
-            if runner_manager_platform::host_fitness::is_elevated() && owner != 0 {
-                return Some(CliError::with_remedy(
-                    Failure::UpdateUnsupported,
-                    format!(
-                        "the service runs as root and {} belongs to another account; updating it \
-                         as root would leave files that account cannot replace. Update it as \
-                         its owner.",
-                        display_path(&self.path)
-                    ),
-                    "runner-manager update",
-                ));
-            }
+            runner_manager_platform::host_fitness::is_elevated()
+                && std::fs::metadata(&self.path).is_ok_and(|metadata| metadata.uid() != 0)
         }
-        None
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     /// Why this copy cannot be updated in place, when it cannot.
@@ -911,7 +976,13 @@ pub(super) fn perform(
     let document = runtime.block_on(fetch_text(&source, "SHA256SUMS"))?;
     let published = read_published_archive(&document, target, &source)?;
     writeln!(out, "  published                 {}", published.version).map_err(failed)?;
-    let refusal = installation.refusal();
+    let refusal = installation.refusal().or_else(|| {
+        if caller == Caller::Operator {
+            installation.foreign_to_root_operator()
+        } else {
+            None
+        }
+    });
 
     let ordering = compare_versions(&published.version, running_version());
     if ordering != std::cmp::Ordering::Greater {
