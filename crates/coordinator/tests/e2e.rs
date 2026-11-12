@@ -200,6 +200,7 @@ fn hello(version: u32, host_id: &str) -> HostMessage {
             }],
         }],
         remote_changes: false,
+        label_exclusions: false,
     })
 }
 
@@ -539,6 +540,98 @@ async fn a_pool_job_launches_on_one_version_three_host_and_wakes_a_version_two_o
     let key = runner_manager_coordinator::placement::JobKey::new(
         "octo/app",
         &[runner_manager_domain::model::Label::new("rm-pool-linux").expect("label")],
+    );
+    for _ in 0..100 {
+        if coordinator.state.placement.counts(&key) == (1, 1) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the accepted launch was not recorded as a lease");
+}
+
+/// `runs-on: [rm-pool-linux, not-wsl]`: only a host that understands
+/// exclusions and does not carry `wsl` is sent the launch, and the launch
+/// names the exclusion its runner must register with.
+#[tokio::test]
+async fn a_pool_job_excluding_wsl_launches_only_on_a_host_outside_wsl() {
+    use runner_manager_coordinator::registry::Coverage;
+    use runner_manager_domain::coordinator_protocol::{Heartbeat, LaunchAck};
+
+    let coordinator = start().await;
+    coordinator.state.registry.set_coverage(Coverage {
+        interval: Some(Duration::from_secs(120)),
+        repositories: std::collections::BTreeSet::new(),
+        accounts: std::collections::BTreeSet::from(["octo".to_string()]),
+    });
+    let mut hosts = Vec::new();
+    // The WSL host has the most free slots: placement would prefer it.
+    for (name, seed, trait_label, understands, free) in [
+        ("guest", 21, Some("wsl"), true, 8),
+        ("older", 22, None, false, 8),
+        ("native", 23, Some("not-wsl"), true, 1),
+    ] {
+        let (host_id, key) = enrolled(&coordinator, name, seed).await;
+        let mut socket = coordinator.connect(&host_id, &key).await;
+        assert!(matches!(
+            next(&mut socket).await,
+            ServerMessage::Welcome { .. }
+        ));
+        let HostMessage::Hello(mut hello) = hello(PROTOCOL_VERSION, &host_id) else {
+            unreachable!()
+        };
+        let labels = &mut hello.targets[0].profiles[0].labels;
+        labels.push("rm-pool-linux".into());
+        labels.extend(trait_label.map(String::from));
+        hello.label_exclusions = understands;
+        for message in [
+            HostMessage::Hello(hello),
+            HostMessage::Heartbeat(Heartbeat {
+                free_slots: free,
+                ..Heartbeat::default()
+            }),
+        ] {
+            send(&mut socket, &message).await;
+        }
+        assert!(matches!(
+            next(&mut socket).await,
+            ServerMessage::HelloAck(_)
+        ));
+        hosts.push(socket);
+    }
+    for _ in 0..100 {
+        if coordinator
+            .state
+            .registry
+            .connected()
+            .iter()
+            .all(|host| host.heartbeat.is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let body = queued("octo/app", &["rm-pool-linux", "not-wsl"]);
+    assert_eq!(
+        coordinator
+            .webhook("workflow_job", "pool-x", &body, true)
+            .await,
+        200
+    );
+    let ServerMessage::Launch(launch) = next(&mut hosts[2]).await else {
+        panic!("the host outside WSL is sent the launch");
+    };
+    assert_eq!(launch.exclusions, vec!["not-wsl".to_string()]);
+    send(
+        &mut hosts[2],
+        &HostMessage::LaunchAck(LaunchAck::accepted(&launch.lease_id)),
+    )
+    .await;
+    let key = runner_manager_coordinator::placement::JobKey::new(
+        "octo/app",
+        &["rm-pool-linux", "not-wsl"]
+            .map(|label| runner_manager_domain::model::Label::new(label).expect("label")),
     );
     for _ in 0..100 {
         if coordinator.state.placement.counts(&key) == (1, 1) {

@@ -45,7 +45,7 @@
 //! retry within that limit, and is not closed at once: its job would only be
 //! placed on this host again, with nothing to slow the cycle down.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -56,8 +56,10 @@ use runner_manager_domain::coordinator_protocol::{
     AttemptFinished, AttemptOutcomeKind, AttemptStarted, Launch, LaunchAck, MAX_OPEN_LEASES,
     RefusalReason,
 };
-use runner_manager_domain::model::{AttemptId, Host, PolicyId, ScaleTarget};
-use runner_manager_domain::policy::{ScalePolicy, is_any_pool_label, may_carry_pool};
+use runner_manager_domain::model::{AttemptId, Host, Label, PolicyId, ScaleTarget};
+use runner_manager_domain::policy::{
+    Exclusion, HostTraits, ScalePolicy, excluded_label, is_any_pool_label, may_carry_pool,
+};
 use runner_manager_domain::store::Store;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -105,6 +107,9 @@ struct Open {
     blocked_since: Option<Instant>,
     /// A younger launch stopped waiting for it: its loop did not reserve.
     passed_over: bool,
+    /// What its job excludes (`wsl` for `not-wsl`): its runner registers
+    /// with `not-X` for each.
+    excluded: BTreeSet<Label>,
 }
 
 #[derive(Debug, Default)]
@@ -331,6 +336,9 @@ pub struct Launches {
     /// The host's memory admission: a launch it would refuse to start is
     /// refused here, so the coordinator places the job elsewhere at once.
     memory: Option<Arc<HostMemory>>,
+    /// [`HostTraits::labels`], which every profile here carries: a launch
+    /// whose job excludes one is refused.
+    host_labels: Vec<Label>,
 }
 
 impl Launches {
@@ -342,7 +350,16 @@ impl Launches {
             view,
             book: Mutex::new(Book::default()),
             memory: None,
+            host_labels: Vec::new(),
         }
+    }
+
+    /// The labels every profile of this host carries without being configured
+    /// to. See [`HostTraits`].
+    #[must_use]
+    pub fn with_host_traits(mut self, traits: HostTraits) -> Self {
+        self.host_labels = traits.labels();
+        self
     }
 
     /// Refuses a launch the host's memory cannot hold (`memory`).
@@ -521,6 +538,14 @@ impl Launches {
         if !self.is_directed(policy) {
             return refuse(RefusalReason::NotCoordinated);
         }
+        let Some(excluded) = self.launch_exclusions(policy, launch) else {
+            tracing::info!(
+                lease = %launch.lease_id,
+                policy_id = %policy.id,
+                "a launch was refused: its job excludes a label this profile carries"
+            );
+            return refuse(RefusalReason::Excluded);
+        };
         let host = self.current_host();
         // Host-wide, as the allocator of the pass counts them: the runners of
         // a repository removed while they finish still hold their slots.
@@ -597,9 +622,27 @@ impl Launches {
                 attempt: None,
                 blocked_since: None,
                 passed_over: false,
+                excluded,
             },
         );
         LaunchAck::accepted(&launch.lease_id)
+    }
+
+    /// What `launch`'s job excludes, or `None` when `policy` cannot honour it:
+    /// an exclusion that is not one, or of a label the profile carries (its
+    /// own or this host's, such as `wsl`).
+    fn launch_exclusions(&self, policy: &ScalePolicy, launch: &Launch) -> Option<BTreeSet<Label>> {
+        let labels = policy
+            .routing_labels()?
+            .with_labels(self.host_labels.iter().cloned());
+        launch
+            .exclusions
+            .iter()
+            .map(|raw| match excluded_label(&Label::new(raw).ok()?)? {
+                Exclusion::Of(excluded) if !labels.contains(&excluded) => Some(excluded),
+                Exclusion::Of(_) | Exclusion::Invalid => None,
+            })
+            .collect()
     }
 
     /// The coordinator's `cancel_launch`: the job is no longer queued. A
@@ -667,6 +710,15 @@ impl DemandDirector for Launches {
         }
         self.settle(Instant::now());
         Some(self.open_for(policy.id))
+    }
+
+    fn directed_exclusions(&self, policy: &ScalePolicy) -> BTreeSet<Label> {
+        self.book()
+            .open
+            .values()
+            .filter(|open| open.policy == policy.id && open.attempt.is_none())
+            .flat_map(|open| open.excluded.iter().cloned())
+            .collect()
     }
 
     fn launched(&self, policy: &ScalePolicy, attempt: AttemptId) {
@@ -950,7 +1002,65 @@ mod tests {
             lease_id: lease.into(),
             expires_at: 0,
             ttl_secs: 300,
+            exclusions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_launch_naming_exclusions_registers_them_unless_the_profile_carries_one() {
+        let excluding = |policy: &ScalePolicy, lease: &str, exclusions: &[&str]| Launch {
+            exclusions: exclusions.iter().map(ToString::to_string).collect(),
+            ..launch(policy, lease)
+        };
+        let (_store, policy, launches) = setup(LAUNCH_VERSION);
+        let launches = launches.with_host_traits(HostTraits::wsl(false));
+        assert!(
+            launches
+                .decide(
+                    &excluding(&policy, "a", &["not-wsl", "NOT-GPU"]),
+                    false,
+                    false
+                )
+                .accepted
+        );
+        assert!(
+            launches
+                .decide(&launch(&policy, "b"), false, false)
+                .accepted
+        );
+        assert_eq!(
+            launches
+                .directed_exclusions(&policy)
+                .iter()
+                .map(Label::as_str)
+                .collect::<Vec<_>>(),
+            vec!["gpu", "wsl"]
+        );
+        // Not an exclusion, or not a usable one: refused rather than ignored.
+        for bad in [&["gpu"][..], &["not-"], &["not-not-wsl"]] {
+            assert_eq!(
+                launches
+                    .decide(&excluding(&policy, &format!("{bad:?}"), bad), false, false)
+                    .reason,
+                Some(RefusalReason::Excluded)
+            );
+        }
+
+        // Inside WSL the profile carries `wsl`: a `not-wsl` launch is refused.
+        let (_store, policy, launches) = setup(LAUNCH_VERSION);
+        let launches = launches.with_host_traits(HostTraits::wsl(true));
+        assert_eq!(
+            launches
+                .decide(&excluding(&policy, "c", &["not-wsl"]), false, false)
+                .reason,
+            Some(RefusalReason::Excluded)
+        );
+        assert!(launches.directed_exclusions(&policy).is_empty());
+        assert!(
+            launches
+                .decide(&excluding(&policy, "d", &["not-gpu"]), false, false)
+                .accepted
+        );
     }
 
     #[test]
@@ -1240,6 +1350,7 @@ mod tests {
                     attempt: None,
                     blocked_since: None,
                     passed_over: false,
+                    excluded: BTreeSet::new(),
                 },
             );
         }
@@ -1310,6 +1421,7 @@ mod tests {
                         attempt: None,
                         blocked_since: None,
                         passed_over: false,
+                        excluded: BTreeSet::new(),
                     },
                 );
             }

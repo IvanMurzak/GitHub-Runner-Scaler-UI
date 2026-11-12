@@ -247,6 +247,13 @@ pub struct Hello {
     /// Without it the host answers only reads.
     #[serde(default)]
     pub remote_changes: bool,
+    /// From 0.4.65: this host understands exclusion labels (`not-wsl`): it
+    /// registers a launch's runner with the launch's
+    /// [`Launch::exclusions`] and refuses a launch its profile cannot honour.
+    /// A coordinator places a job that names an exclusion only on such a
+    /// host.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub label_exclusions: bool,
 }
 
 /// A host's periodic load report.
@@ -450,6 +457,12 @@ pub struct Launch {
     /// The same deadline as a duration from now, which the host uses so a
     /// skewed clock cannot expire a lease early or keep it late.
     pub ttl_secs: u32,
+    /// From 0.4.65: the exclusion labels the job names (`not-wsl`). The host
+    /// registers the runner with them, so GitHub hands it the job, after
+    /// checking that its profile carries none of what they exclude. Sent only
+    /// to a host that said [`Hello::label_exclusions`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclusions: Vec<String>,
 }
 
 /// The job a launch was for is no longer queued: a launch whose runner has
@@ -485,6 +498,10 @@ pub enum RefusalReason {
     /// may still grow into, does not hold the profile's estimate and margin.
     /// An older coordinator reads it as [`Self::Other`].
     Memory,
+    /// From 0.4.65: the profile carries a label the launch's job excludes
+    /// (`wsl` for `not-wsl`), or an exclusion names nothing usable. An older
+    /// coordinator reads it as [`Self::Other`].
+    Excluded,
     /// A reason this build does not know.
     #[serde(other)]
     Other,
@@ -503,6 +520,7 @@ impl RefusalReason {
             Self::Draining => "draining",
             Self::Stale => "stale",
             Self::Memory => "memory",
+            Self::Excluded => "excluded",
             Self::Other => "other",
         }
     }
@@ -1541,6 +1559,7 @@ mod tests {
                 }],
             }],
             remote_changes: false,
+            label_exclusions: false,
         }
     }
 
@@ -1647,6 +1666,7 @@ mod tests {
                 lease_id: "l1".into(),
                 expires_at: 1_800_000_000,
                 ttl_secs: 300,
+                exclusions: vec!["not-wsl".into()],
             }),
             ServerMessage::CancelLaunch(CancelLaunch {
                 lease_id: "l1".into(),

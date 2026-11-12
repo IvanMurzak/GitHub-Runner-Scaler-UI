@@ -519,9 +519,44 @@ impl fmt::Debug for WslHost {
     }
 }
 
+/// Whether this process runs inside a WSL distribution, managed by a Windows
+/// host of this product or not. Read once per process.
+///
+/// The kernel says so (`microsoft` in its release: `…-microsoft-standard-WSL2`,
+/// or WSL 1's `…-Microsoft`), and so do the files WSL itself creates
+/// (`/run/WSL`, the `WSLInterop` binfmt entry). The environment
+/// (`WSL_DISTRO_NAME`) is not asked: a service started by systemd does not
+/// inherit it.
+#[must_use]
+pub fn running_inside_wsl() -> bool {
+    static INSIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INSIDE.get_or_init(|| {
+        cfg!(target_os = "linux")
+            && looks_like_wsl(
+                &std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default(),
+                ["/run/WSL", "/proc/sys/fs/binfmt_misc/WSLInterop"]
+                    .iter()
+                    .any(|path| std::path::Path::new(path).exists()),
+            )
+    })
+}
+
+fn looks_like_wsl(kernel_release: &str, wsl_files: bool) -> bool {
+    wsl_files || kernel_release.to_ascii_lowercase().contains("microsoft")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsl_is_recognised_by_its_kernel_or_its_files() {
+        assert!(looks_like_wsl("6.6.87.2-microsoft-standard-WSL2\n", false));
+        assert!(looks_like_wsl("4.4.0-19041-Microsoft", false));
+        assert!(looks_like_wsl("6.8.0-custom", true));
+        assert!(!looks_like_wsl("6.8.0-45-generic", false));
+        assert!(!looks_like_wsl("", false));
+    }
 
     #[test]
     fn a_non_windows_build_refuses_with_a_sentence_rather_than_not_compiling() {

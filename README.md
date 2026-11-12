@@ -824,6 +824,43 @@ time it comes back after a wait has ended. `host show` prints
 what polling actually cost: full and `304` responses per hour, the busiest minute against
 GitHub's 900-a-minute secondary limit, and what is left of the hourly limit.
 
+### Keep a job off some machines: `not-<label>`
+
+GitHub matches `runs-on` labels positively only: a runner takes a job when it carries every label
+the job names, and nothing in a workflow can say "anything but". runner-manager reads a label
+written `not-<label>` as that missing negation:
+
+```yaml
+jobs:
+  benchmark:
+    # Any self-hosted Linux x64 machine that is not a WSL distribution.
+    runs-on: [self-hosted, linux, x64, not-wsl]
+```
+
+- A profile serves a job asking for `not-X` only when it does **not** carry `X`, and the runner it
+  starts for that job registers with `not-X` as well, so GitHub hands it the job. A profile that
+  carries `X` never serves it, even if `not-X` is among its own labels.
+- Every runner of a machine running inside WSL carries `wsl`, and every runner of any other
+  machine carries `not-wsl`, without configuration (from 0.4.65; `status` lists them as
+  *derived labels*). So `not-wsl` keeps jobs whose wall-clock time matters off WSL machines,
+  and `runs-on: [self-hosted, linux, wsl]` sends a job only to them.
+- Any other label works the same way: `not-gpu` avoids profiles carrying `gpu`, and
+  `not-rm-home-linux-x64` avoids one machine's selector. A runner registers with such an
+  exclusion when the queued jobs it is started for name it; a runner already waiting idle when
+  such a job is queued does not carry it and leaves the job to the next runner. `not-wsl` never
+  has that wait, because every runner carries it from the start.
+- A job that asks for `X` and `not-X` together, or for `not-` alone (or `not-not-X`), can never
+  be served: it is not counted as demand, and the service logs `routing_refused` with reason
+  `unsatisfiable_exclusion` (the coordinator logs it too).
+- `add-label` refuses a label that contradicts one the profile already carries (`not-gpu` beside
+  `gpu`, either way round). Adding `not-X` by hand to a profile is allowed and makes its runners
+  answer `not-X` jobs from the start, without the wait above.
+
+With the [coordinator](docs/coordinator.md#shared-pools), pool jobs work the same way
+(`runs-on: [rm-pool-linux, not-wsl]`): the coordinator places a job naming an exclusion only on a
+0.4.65 or later host whose profile lacks what it excludes, and the host's runner registers with
+the exclusion.
+
 ### Keep heavy jobs from crowding one machine
 
 Before it starts any runner (for a repository or organization label, a selector, or a launch the

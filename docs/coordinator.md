@@ -255,6 +255,18 @@ jobs:
 Labels can be combined (`runs-on: [rm-pool-linux, gpu]`, `runs-on: [rm-pool-any, heavy]`): only
 pool profiles carrying every label are candidates.
 
+An exclusion keeps a pool job off some hosts (0.4.65, see the README's
+[`not-<label>`](../README.md#keep-a-job-off-some-machines-not-label)):
+`runs-on: [rm-pool-linux, not-wsl]` goes to a Linux pool host that is not a WSL distribution. A
+profile is a candidate for `not-X` only when it does not carry `X`, and only on a host that says it
+understands exclusions (`hello.label_exclusions`, 0.4.65): an older host would register a runner
+without `not-X`, which GitHub never hands the job. The `launch` names the job's exclusions
+(`exclusions`), the host registers the runner with them, and it refuses with `excluded` a launch
+whose profile carries what it excludes. Every host of 0.4.65 or later advertises `wsl` or `not-wsl`
+on all its profiles, so even an older coordinator places `not-wsl` jobs correctly. A job asking for
+a label and its exclusion together is never placed (`a queued job's labels can never be satisfied`
+in the coordinator's log).
+
 ### How a host is chosen
 
 When a pool job is queued (webhook `queued`, or counted by the sweep), the coordinator picks one

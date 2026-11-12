@@ -16,7 +16,7 @@ use runner_manager_domain::coordinator_protocol::{
     LAUNCH_VERSION, ServerMessage, Target, TargetRef, TargetScope, Wake, WakeReason,
 };
 use runner_manager_domain::model::Label;
-use runner_manager_domain::policy::is_pool_label;
+use runner_manager_domain::policy::{excluded_label, is_pool_label};
 use tokio::sync::{Notify, mpsc};
 
 use crate::webhook::{profile_covers, required_labels};
@@ -342,7 +342,9 @@ impl Registry {
 
     /// Every connected host in launch mode for `repository` with an enabled
     /// pool profile whose labels cover `required`, and its last heartbeat. A
-    /// host that has not sent a heartbeat yet is not a candidate.
+    /// host that has not sent a heartbeat yet is not a candidate, nor, for a
+    /// job naming an exclusion (`not-wsl`), one that did not say it
+    /// understands exclusions.
     ///
     /// The operating system is not looked at: a job asking for `rm-pool-any`
     /// is covered by every profile carrying that label, on any OS, and one
@@ -353,10 +355,16 @@ impl Registry {
         let coverage = self.coverage();
         let hosts = self.lock();
         let mut candidates = Vec::new();
+        // A host older than exclusions would register the runner without
+        // them: GitHub would never hand it the job.
+        let excludes = required.iter().any(|label| excluded_label(label).is_some());
         for (host_id, connected) in hosts.iter() {
             let (Some(hello), Some(heartbeat)) = (&connected.hello, &connected.heartbeat) else {
                 continue;
             };
+            if excludes && !hello.label_exclusions {
+                continue;
+            }
             for target in &hello.targets {
                 let reference = target.reference();
                 if !reference.covers(repository) || !connected.launch_mode(&coverage, &reference) {
@@ -707,6 +715,7 @@ mod tests {
                 }],
             }],
             remote_changes: false,
+            label_exclusions: false,
         }
     }
 
@@ -896,6 +905,47 @@ mod tests {
         );
         let candidate = &registry.launch_candidates("octo/app", &required(&["rm-pool-any"]))[0];
         assert_eq!((candidate.cores, candidate.disk_free_bytes), (12, Some(40)));
+    }
+
+    #[test]
+    fn a_job_naming_an_exclusion_is_placed_only_on_hosts_that_honour_it() {
+        let registry = Registry::default();
+        registry.set_coverage(Coverage {
+            interval: Some(Duration::from_secs(120)),
+            repositories: BTreeSet::from(["octo/app".to_string()]),
+            accounts: BTreeSet::new(),
+        });
+        for (id, labels, understands) in [
+            ("native", &["rm-pool-linux", "not-wsl"][..], true),
+            ("guest", &["rm-pool-linux", "wsl"], true),
+            ("older", &["rm-pool-linux"], false),
+        ] {
+            let (tx, _rx) = mpsc::channel(8);
+            let connection = registry.register(id, PROTOCOL_VERSION, tx);
+            registry.set_hello(
+                id,
+                connection,
+                Hello {
+                    host_id: id.into(),
+                    label_exclusions: understands,
+                    ..hello(TargetScope::Repo, "octo/app", labels, true)
+                },
+            );
+            registry.set_heartbeat(id, connection, Heartbeat::default());
+        }
+        let hosts = |values: &[&str]| {
+            let mut ids: Vec<String> = registry
+                .launch_candidates("octo/app", &required(values))
+                .into_iter()
+                .map(|candidate| candidate.host_id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(hosts(&["rm-pool-linux"]), ["guest", "native", "older"]);
+        assert_eq!(hosts(&["rm-pool-linux", "not-wsl"]), ["native"]);
+        assert_eq!(hosts(&["rm-pool-linux", "wsl"]), ["guest"]);
+        assert_eq!(hosts(&["rm-pool-linux", "not-gpu"]), ["guest", "native"]);
     }
 
     #[tokio::test]

@@ -340,6 +340,10 @@ pub struct HostSnapshot {
     /// Uncleaned ephemeral attempts that are terminal: they hold no capacity
     /// and still own their directory, so they block a root change.
     pub cleanup_blocked_ephemeral_attempts: u16,
+    /// The labels every runner of this host registers with beside its
+    /// profile's own, derived rather than configured: `wsl` inside WSL,
+    /// `not-wsl` elsewhere (`runs-on: [.., not-wsl]` keeps a job off WSL).
+    pub derived_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -633,6 +637,11 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
             runner_root_unavailable: runner_root.unavailable.clone(),
             active_ephemeral_attempts: ephemeral.active,
             cleanup_blocked_ephemeral_attempts: ephemeral.cleanup_blocked,
+            derived_labels: super::coordinator::host_traits()
+                .labels()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         },
         budget: BudgetSnapshot {
             interval_secs: interval.as_secs(),
@@ -735,6 +744,13 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
         "  service start mode        {}",
         document.host.service_start_mode
     )?;
+    if !document.host.derived_labels.is_empty() {
+        writeln!(
+            out,
+            "  derived labels            {} (every runner of this host carries them)",
+            document.host.derived_labels.join(", ")
+        )?;
+    }
     writeln!(
         out,
         "  memory admission          {}",
@@ -980,6 +996,7 @@ mod tests {
                 runner_root_unavailable: None,
                 active_ephemeral_attempts: 1,
                 cleanup_blocked_ephemeral_attempts: 0,
+                derived_labels: vec!["not-wsl".to_string()],
             },
             budget: BudgetSnapshot {
                 interval_secs: 60,
@@ -1316,6 +1333,7 @@ mod tests {
                 "cleanup_blocked_ephemeral_attempts",
                 "configured",
                 "configured_runner_root",
+                "derived_labels",
                 "display_name",
                 "headroom",
                 "id",

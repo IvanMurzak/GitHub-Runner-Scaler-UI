@@ -116,6 +116,18 @@ pub enum PolicyError {
          coordinator's pools)"
     )]
     PoolLabelMismatch { label: Label, expected: Label },
+
+    #[error(
+        "{label} names no label to exclude: an exclusion is `not-` and one ordinary label, \
+         as in `not-wsl`"
+    )]
+    InvalidExclusion { label: Label },
+
+    #[error(
+        "{label} contradicts {carried}, which this profile carries: a profile cannot both \
+         carry a label and exclude it"
+    )]
+    ContradictoryExclusion { label: Label, carried: Label },
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +212,140 @@ pub fn check_pool_label(label: &Label, os: Os) -> Result<(), PolicyError> {
         });
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Label exclusions (`not-<label>`)
+// ---------------------------------------------------------------------------
+
+/// The prefix of an exclusion label.
+///
+/// GitHub matches `runs-on` positively only: a runner takes a job when its
+/// labels include every label the job names. A job that must avoid machines
+/// carrying `wsl` therefore names `not-wsl`, and this product treats it as a
+/// constraint rather than as a label to have: a profile serves it only when it
+/// does **not** carry `wsl`, and the runner it registers for it carries
+/// `not-wsl`, so GitHub hands it the job. A profile that carries `wsl` never
+/// satisfies `not-wsl`, even when `not-wsl` is among its own labels.
+pub const EXCLUSION_PREFIX: &str = "not-";
+
+/// What an exclusion label excludes. See [`excluded_label`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exclusion {
+    /// `not-wsl` excludes `wsl`.
+    Of(Label),
+    /// `not-` alone, or an exclusion of another exclusion (`not-not-wsl`),
+    /// which would read as a double negative nobody means.
+    Invalid,
+}
+
+/// What `label` excludes when it is an exclusion: `None` for an ordinary
+/// label.
+#[must_use]
+pub fn excluded_label(label: &Label) -> Option<Exclusion> {
+    let rest = label.as_str().strip_prefix(EXCLUSION_PREFIX)?;
+    Some(match Label::new(rest) {
+        Ok(excluded) if !excluded.as_str().starts_with(EXCLUSION_PREFIX) => Exclusion::Of(excluded),
+        _ => Exclusion::Invalid,
+    })
+}
+
+/// The exclusion label for `label`: `wsl` gives `not-wsl`. `None` when the
+/// result would be longer than GitHub allows.
+#[must_use]
+pub fn exclusion_of(label: &Label) -> Option<Label> {
+    Label::new(format!("{EXCLUSION_PREFIX}{label}")).ok()
+}
+
+/// Whether a runner offering the labels `offers` says it has can take a job
+/// requiring `required`: an ordinary label must be offered, and an exclusion
+/// `not-X` holds when `X` is not.
+///
+/// The one rule both the host ([`RoutingLabels::matches`]) and the
+/// coordinator apply.
+#[must_use]
+pub fn label_satisfied(offers: impl Fn(&Label) -> bool, required: &Label) -> bool {
+    match excluded_label(required) {
+        Some(Exclusion::Of(excluded)) => !offers(&excluded),
+        Some(Exclusion::Invalid) => false,
+        None => offers(required),
+    }
+}
+
+/// The labels a job requiring `required` excludes: `wsl` for `not-wsl`.
+pub fn exclusions_in(required: &[Label]) -> impl Iterator<Item = Label> + '_ {
+    required
+        .iter()
+        .filter_map(|label| match excluded_label(label) {
+            Some(Exclusion::Of(excluded)) => Some(excluded),
+            _ => None,
+        })
+}
+
+/// Refuses `label` as a profile's label when it contradicts one the profile
+/// already carries: `not-wsl` beside `wsl`, either way round, or an exclusion
+/// that names nothing usable.
+///
+/// # Errors
+/// [`PolicyError::InvalidExclusion`] and [`PolicyError::ContradictoryExclusion`].
+pub fn check_exclusion_label(labels: &RoutingLabels, label: &Label) -> Result<(), PolicyError> {
+    match excluded_label(label) {
+        Some(Exclusion::Invalid) => Err(PolicyError::InvalidExclusion {
+            label: label.clone(),
+        }),
+        Some(Exclusion::Of(excluded)) if labels.contains(&excluded) => {
+            Err(PolicyError::ContradictoryExclusion {
+                label: label.clone(),
+                carried: excluded,
+            })
+        }
+        Some(Exclusion::Of(_)) => Ok(()),
+        None => match exclusion_of(label).filter(|exclusion| labels.contains(exclusion)) {
+            Some(exclusion) => Err(PolicyError::ContradictoryExclusion {
+                label: label.clone(),
+                carried: exclusion,
+            }),
+            None => Ok(()),
+        },
+    }
+}
+
+/// The label a runner running inside WSL carries without being configured to:
+/// `runs-on: [self-hosted, linux, not-wsl]` keeps a job off WSL machines.
+pub const WSL_LABEL: &str = "wsl";
+
+/// What a host is, as labels nobody configures: derived at runtime and never
+/// stored, so every profile of the host carries them.
+///
+/// Today that is whether the host runs inside WSL: such a host's runners carry
+/// [`WSL_LABEL`], every other host's carry `not-wsl`. Carrying `not-wsl`
+/// outright, rather than only for a job that asks for it, means a runner
+/// already waiting can take such a job, and a coordinator older than
+/// exclusions places it correctly by plain label matching.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostTraits {
+    /// `None`: unknown, and no label is derived (tests, and builds that never
+    /// ask).
+    wsl: Option<bool>,
+}
+
+impl HostTraits {
+    /// A host known to run inside WSL, or known not to.
+    #[must_use]
+    pub const fn wsl(inside: bool) -> Self {
+        Self { wsl: Some(inside) }
+    }
+
+    /// The labels these traits give every profile of the host.
+    #[must_use]
+    pub fn labels(&self) -> Vec<Label> {
+        let wsl = Label::new(WSL_LABEL).expect("`wsl` is a valid label");
+        match self.wsl {
+            None => Vec::new(),
+            Some(true) => vec![wsl],
+            Some(false) => exclusion_of(&wsl).into_iter().collect(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -483,9 +629,40 @@ impl RoutingLabels {
     /// from this array does not answer `runs-on: self-hosted` unless
     /// `self-hosted` is in it (`docs/spikes/d18-org-jit-verification.md`,
     /// Point 3, findings 1 and 2).
+    ///
+    /// An exclusion this set contradicts (`not-wsl` beside `wsl`) is left
+    /// out: GitHub would otherwise hand such a runner the very jobs that
+    /// exclude it.
     #[must_use]
     pub fn as_registration_labels(&self) -> Vec<String> {
-        self.iter().map(|l| l.as_str().to_string()).collect()
+        self.iter()
+            .filter(|label| label_satisfied(|offered| self.contains(offered), label))
+            .map(|l| l.as_str().to_string())
+            .collect()
+    }
+
+    /// This set with `extra` labels added: a host's [`HostTraits`], or the
+    /// exclusions a runner registers with for the jobs it is started for.
+    #[must_use]
+    pub fn with_labels(&self, extra: impl IntoIterator<Item = Label>) -> Self {
+        let mut labels = self.clone();
+        for label in extra {
+            labels.add(label);
+        }
+        labels
+    }
+
+    /// This set with `not-X` for every `X` in `excluded` it does not carry:
+    /// the runner then answers jobs that exclude those labels. One it carries
+    /// is never added, so no runner claims to lack a label it has.
+    #[must_use]
+    pub fn excluding<'a>(&self, excluded: impl IntoIterator<Item = &'a Label>) -> Self {
+        let exclusions: Vec<Label> = excluded
+            .into_iter()
+            .filter(|label| !self.contains(label))
+            .filter_map(exclusion_of)
+            .collect();
+        self.with_labels(exclusions)
     }
 
     /// Decide whether this policy should serve a queued job.
@@ -494,6 +671,10 @@ impl RoutingLabels {
     /// job's required labels, so the predicate is subset-in-the-other-direction:
     /// the job's required labels must all be present here. The immutable selector
     /// is not mandatory. Reconciliation separately refuses overlapping profiles.
+    ///
+    /// An exclusion the job names (`not-wsl`) holds when this set does not
+    /// carry what it excludes (see [`EXCLUSION_PREFIX`]); `missing` then lists
+    /// the exclusion itself.
     #[must_use]
     pub fn matches(&self, runs_on: &RunsOn) -> RunsOnMatch {
         let required = match runs_on.required_labels() {
@@ -503,7 +684,7 @@ impl RoutingLabels {
 
         let missing: Vec<Label> = required
             .iter()
-            .filter(|label| !self.contains(label))
+            .filter(|label| !label_satisfied(|offered| self.contains(offered), label))
             .cloned()
             .collect();
 
@@ -528,7 +709,12 @@ impl RoutingLabels {
         let mut tally = DemandTally::default();
         for job in jobs {
             match self.matches(job) {
-                RunsOnMatch::Match { .. } => tally.matched += 1,
+                RunsOnMatch::Match { .. } => {
+                    tally.matched += 1;
+                    if let Ok(required) = job.required_labels() {
+                        tally.excluded.extend(exclusions_in(&required));
+                    }
+                }
                 RunsOnMatch::NoMatch { .. } => tally.not_matched += 1,
                 RunsOnMatch::Unresolvable(reason) => tally.unresolvable.push(reason),
             }
@@ -555,6 +741,10 @@ pub struct DemandTally {
     /// never discarded — `g2` surfaces these so an operator can see that a
     /// workflow this host will never serve is sitting in the queue.
     pub unresolvable: Vec<UnresolvableRunsOn>,
+    /// What the matched jobs exclude (`wsl` for `runs-on: [.., not-wsl]`):
+    /// a runner started for them registers with `not-X` for each, or GitHub
+    /// would never hand it those jobs.
+    pub excluded: BTreeSet<Label>,
 }
 
 impl DemandTally {
@@ -623,6 +813,34 @@ pub enum UnresolvableRunsOn {
         #[source]
         source: ValidationError,
     },
+
+    /// An exclusion that names nothing usable: `not-` alone, or `not-not-X`.
+    /// No runner can satisfy it.
+    #[error(
+        "`runs-on` contains {label}, which excludes no usable label (write `not-` and one \
+         ordinary label, as in `not-wsl`); no runner can take this job"
+    )]
+    InvalidExclusion { label: Label },
+
+    /// A job asking for a label and for its exclusion (`wsl` and `not-wsl`).
+    /// No runner can satisfy it.
+    #[error(
+        "`runs-on` asks for {label} and for not-{label}; no runner can carry a label and \
+         lack it, so none can take this job"
+    )]
+    ConflictingExclusion { label: Label },
+}
+
+impl UnresolvableRunsOn {
+    /// Whether this is an exclusion no runner can satisfy, as opposed to a
+    /// `runs-on` only GitHub can evaluate.
+    #[must_use]
+    pub const fn is_unsatisfiable_exclusion(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidExclusion { .. } | Self::ConflictingExclusion { .. }
+        )
+    }
 }
 
 /// A queued job's `runs-on`, in each documented form.
@@ -707,6 +925,12 @@ impl RunsOn {
     /// reported, as [`UnresolvableRunsOn::NoLabels`] or
     /// [`UnresolvableRunsOn::RunnerGroupWithoutLabels`].
     ///
+    /// **An exclusion no runner can satisfy is refused here too**
+    /// ([`UnresolvableRunsOn::InvalidExclusion`],
+    /// [`UnresolvableRunsOn::ConflictingExclusion`]), so the host and the
+    /// coordinator, which both start from this, never count such a job as
+    /// demand.
+    ///
     /// # Errors
     /// Every reason the value cannot be turned into a label set — each of which
     /// the caller reports rather than treating as "no demand".
@@ -728,7 +952,7 @@ impl RunsOn {
             };
         }
 
-        usable
+        let labels: Vec<Label> = usable
             .into_iter()
             .map(|raw| {
                 Label::new(raw).map_err(|source| UnresolvableRunsOn::InvalidLabel {
@@ -736,7 +960,22 @@ impl RunsOn {
                     source,
                 })
             })
-            .collect()
+            .collect::<Result<_, _>>()?;
+
+        for label in &labels {
+            match excluded_label(label) {
+                Some(Exclusion::Invalid) => {
+                    return Err(UnresolvableRunsOn::InvalidExclusion {
+                        label: label.clone(),
+                    });
+                }
+                Some(Exclusion::Of(excluded)) if labels.contains(&excluded) => {
+                    return Err(UnresolvableRunsOn::ConflictingExclusion { label: excluded });
+                }
+                Some(Exclusion::Of(_)) | None => {}
+            }
+        }
+        Ok(labels)
     }
 }
 
@@ -1420,6 +1659,23 @@ impl ScalePolicy {
         self.mode.routing_labels()
     }
 
+    /// A copy whose routing labels are `labels(current)`, for the runners of
+    /// one pass only: a host's [`HostTraits`], a job's exclusions. Never
+    /// stored, and the revision is unchanged. A monitor-only policy has no
+    /// labels and is returned as it is.
+    #[must_use]
+    pub fn with_runtime_labels(
+        &self,
+        labels: impl FnOnce(&RoutingLabels) -> RoutingLabels,
+    ) -> Self {
+        let mut copy = self.clone();
+        if let PolicyMode::Autoscale(cfg) = &mut copy.mode {
+            let changed = labels(cfg.routing_labels());
+            *cfg.routing_labels_mut() = changed;
+        }
+        copy
+    }
+
     /// The shared pool labels this profile answers (coordinator stage 3).
     pub fn pool_labels(&self) -> impl Iterator<Item = &Label> {
         self.routing_labels()
@@ -1725,10 +1981,14 @@ impl ScalePolicy {
     /// different claim from "this operation needs an autoscale policy", and one
     /// that had `f2` rendering a validation failure for an ordinary wrong-mode
     /// refusal. That variant is now gone entirely; see the note where it stood.
+    ///
+    /// Also [`PolicyError::InvalidExclusion`] and
+    /// [`PolicyError::ContradictoryExclusion`]: see [`check_exclusion_label`].
     pub fn add_routing_label(&mut self, label: Label) -> Result<bool, PolicyError> {
         match &mut self.mode {
             PolicyMode::MonitorOnly => Err(PolicyError::NotAutoscale),
             PolicyMode::Autoscale(cfg) => {
+                check_exclusion_label(cfg.routing_labels(), &label)?;
                 let added = cfg.routing_labels_mut().add(label);
                 if added {
                     self.revision = self.revision.saturating_add(1);
@@ -3370,5 +3630,198 @@ mod tests {
             ScaleTarget::repository("o/r").unwrap().scope(),
             ScaleTarget::organization("o").unwrap().scope()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Label exclusions
+    // -----------------------------------------------------------------------
+
+    fn job(labels: &[&str]) -> RunsOn {
+        RunsOn::from_job_labels(labels.iter().map(|label| (*label).to_string()))
+    }
+
+    fn linux_profile(extra: &[&str]) -> RoutingLabels {
+        RoutingLabels::from_parts(
+            label("rm-box-linux-x64"),
+            ["self-hosted", "linux", "x64"]
+                .iter()
+                .chain(extra)
+                .map(|value| label(value)),
+        )
+    }
+
+    #[test]
+    fn an_exclusion_is_satisfied_by_a_profile_that_lacks_what_it_excludes() {
+        let native = linux_profile(&[]);
+        let wsl = linux_profile(&["wsl"]);
+        let wanted = job(&["self-hosted", "linux", "x64", "not-wsl"]);
+        assert!(native.matches(&wanted).is_match());
+        assert_eq!(
+            wsl.matches(&wanted),
+            RunsOnMatch::NoMatch {
+                missing: vec![label("not-wsl")]
+            }
+        );
+        // Case-insensitive like every label, and a host label can be excluded.
+        assert!(!wsl.matches(&job(&["Linux", "NOT-WSL"])).is_match());
+        assert!(
+            !native
+                .matches(&job(&["linux", "not-rm-box-linux-x64"]))
+                .is_match()
+        );
+        assert!(
+            native
+                .matches(&job(&["linux", "not-rm-other-linux-x64"]))
+                .is_match()
+        );
+    }
+
+    #[test]
+    fn a_profile_listing_both_a_label_and_its_exclusion_never_satisfies_the_exclusion() {
+        // Stored before validation existed, or by hand: `wsl` wins.
+        let both = linux_profile(&["wsl", "not-wsl"]);
+        assert!(!both.matches(&job(&["linux", "not-wsl"])).is_match());
+        assert!(both.matches(&job(&["linux", "wsl"])).is_match());
+        // GitHub must not hand it such a job either.
+        let registered = both.as_registration_labels();
+        assert!(registered.contains(&"wsl".to_string()));
+        assert!(!registered.contains(&"not-wsl".to_string()));
+    }
+
+    #[test]
+    fn a_job_without_exclusions_matches_exactly_as_before() {
+        let profile = linux_profile(&["gpu"]);
+        assert!(profile.matches(&job(&["self-hosted", "gpu"])).is_match());
+        assert!(!profile.matches(&job(&["self-hosted", "arm64"])).is_match());
+        assert_eq!(
+            profile.as_registration_labels(),
+            vec!["rm-box-linux-x64", "gpu", "linux", "self-hosted", "x64"]
+        );
+        let tally = profile.tally(&[job(&["self-hosted", "gpu"])]);
+        assert!(tally.excluded.is_empty());
+    }
+
+    #[test]
+    fn an_unusable_or_conflicting_exclusion_is_unsatisfiable_not_demand() {
+        for bad in ["not-", "not-not-wsl", "NOT-Not-x"] {
+            let got = job(&["linux", bad]).required_labels();
+            assert!(
+                matches!(&got, Err(UnresolvableRunsOn::InvalidExclusion { .. })),
+                "{bad}: {got:?}"
+            );
+            assert!(got.unwrap_err().is_unsatisfiable_exclusion());
+        }
+        let conflict = job(&["linux", "WSL", "not-wsl"]).required_labels();
+        assert_eq!(
+            conflict,
+            Err(UnresolvableRunsOn::ConflictingExclusion {
+                label: label("wsl")
+            })
+        );
+        let tally = linux_profile(&[]).tally(&[job(&["linux", "wsl", "not-wsl"])]);
+        assert_eq!((tally.matched, tally.unresolvable.len()), (0, 1));
+        // An expression is not an exclusion problem.
+        assert!(
+            !job(&["${{ matrix.os }}"])
+                .required_labels()
+                .unwrap_err()
+                .is_unsatisfiable_exclusion()
+        );
+    }
+
+    #[test]
+    fn a_tally_collects_what_its_matched_jobs_exclude() {
+        let profile = linux_profile(&[]);
+        let tally = profile.tally(&[
+            job(&["linux", "not-wsl"]),
+            job(&["linux", "not-gpu", "not-wsl"]),
+            job(&["linux"]),
+            // Not matched: its exclusion is not this runner's to register.
+            job(&["windows", "not-docker"]),
+        ]);
+        assert_eq!(tally.matched, 3);
+        assert_eq!(
+            tally.excluded.iter().map(Label::as_str).collect::<Vec<_>>(),
+            vec!["gpu", "wsl"]
+        );
+    }
+
+    #[test]
+    fn excluding_adds_only_exclusions_of_labels_the_profile_lacks() {
+        let profile = linux_profile(&["gpu"]);
+        let excluded = [label("wsl"), label("gpu")];
+        let registered = profile.excluding(&excluded).as_registration_labels();
+        assert!(registered.contains(&"not-wsl".to_string()));
+        assert!(!registered.contains(&"not-gpu".to_string()));
+        // The stored profile is unchanged.
+        assert!(!profile.contains(&label("not-wsl")));
+    }
+
+    #[test]
+    fn host_traits_give_wsl_or_not_wsl_and_nothing_when_unknown() {
+        assert!(HostTraits::default().labels().is_empty());
+        assert_eq!(HostTraits::wsl(true).labels(), vec![label("wsl")]);
+        assert_eq!(HostTraits::wsl(false).labels(), vec![label("not-wsl")]);
+        let wanted = job(&["linux", "not-wsl"]);
+        let base = linux_profile(&[]);
+        assert!(
+            !base
+                .with_labels(HostTraits::wsl(true).labels())
+                .matches(&wanted)
+                .is_match()
+        );
+        let native = base.with_labels(HostTraits::wsl(false).labels());
+        assert!(native.matches(&wanted).is_match());
+        assert!(
+            native
+                .as_registration_labels()
+                .contains(&"not-wsl".to_string())
+        );
+    }
+
+    #[test]
+    fn a_profile_label_that_contradicts_another_is_refused() {
+        let mut policy = autoscale_policy(
+            ScaleTarget::repository("o/r").unwrap(),
+            HostId::from_u128(9),
+            2,
+        );
+        policy.add_routing_label(label("wsl")).unwrap();
+        assert_eq!(
+            policy.add_routing_label(label("not-wsl")),
+            Err(PolicyError::ContradictoryExclusion {
+                label: label("not-wsl"),
+                carried: label("wsl"),
+            })
+        );
+        let mut other = autoscale_policy(
+            ScaleTarget::repository("o/r").unwrap(),
+            HostId::from_u128(9),
+            2,
+        );
+        other.add_routing_label(label("not-gpu")).unwrap();
+        assert!(matches!(
+            other.add_routing_label(label("GPU")),
+            Err(PolicyError::ContradictoryExclusion { .. })
+        ));
+        assert!(matches!(
+            other.add_routing_label(label("not-")),
+            Err(PolicyError::InvalidExclusion { .. })
+        ));
+        assert_eq!(other.add_routing_label(label("docker")), Ok(true));
+    }
+
+    #[test]
+    fn runtime_labels_change_a_copy_and_leave_the_revision() {
+        let policy = autoscale_policy(
+            ScaleTarget::repository("o/r").unwrap(),
+            HostId::from_u128(9),
+            2,
+        );
+        let copy = policy.with_runtime_labels(|labels| labels.with_labels([label("wsl")]));
+        assert!(copy.routing_labels().unwrap().contains(&label("wsl")));
+        assert!(!policy.routing_labels().unwrap().contains(&label("wsl")));
+        assert_eq!(copy.revision(), policy.revision());
+        assert_eq!(copy.id, policy.id);
     }
 }

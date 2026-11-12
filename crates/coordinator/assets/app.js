@@ -426,7 +426,16 @@
   const numCell = (label, text) => td(label, 'c-num', h('span', { class: 'num', text }));
   function chips(labels) {
     const list = Array.isArray(labels) ? labels : labels ? String(labels).split(',') : [];
-    return h('span', { class: 'chips' }, list.map((l) => h('span', { class: `chip${l === 'self-hosted' ? ' chip-dim' : ''}`, text: l })));
+    return h('span', { class: 'chips' }, list.map(chip));
+  }
+  // `not-wsl` is an exclusion: the job avoids machines carrying `wsl`.
+  function chip(l) {
+    const excludes = /^not-./i.test(l) ? l.slice(4) : null;
+    return h('span', {
+      class: `chip${l === 'self-hosted' ? ' chip-dim' : ''}${excludes ? ' chip-not' : ''}`,
+      title: excludes ? `Excludes machines labelled ${excludes}` : null,
+      text: l,
+    });
   }
   function table(caption, heads, rows) {
     return h('table', { class: 'tbl' },
@@ -1390,7 +1399,7 @@
           type: 'button', class: 'chip-del', 'aria-label': `Remove label ${l}`, title: 'Remove label', 'data-fk': `${key}:del:${l}`,
           onclick: (e) => run(key, repoArgv(p, 'remove-label', '--label', l), e.currentTarget),
         }, xIcon(12)))
-        : h('span', { class: 'chip', text: l }))),
+        : chip(l))),
       !p.host_label && !extra.length ? h('span', { class: 'kv-text muted', text: 'None while monitor only' }) : null);
     if (!can || !p.host_label) return chipList;
     const input = h('input', {
