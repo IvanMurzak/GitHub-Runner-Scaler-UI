@@ -155,7 +155,14 @@ impl AppState {
                     "dashboard sessions of logins no longer allowed were ended"
                 );
             }
-            crate::dashboard::Dashboard::new(auth, config.update_status.clone())
+            let dashboard = crate::dashboard::Dashboard::new(auth, config.update_status.clone());
+            crate::dashboard::restore_activity(
+                &dashboard,
+                &store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            dashboard
         });
         Arc::new(Self {
             dashboard,
@@ -264,6 +271,7 @@ pub async fn serve(
     counters.abort();
     collect_wakes(&state);
     state.statistics.flush();
+    crate::dashboard::save_activity(&state);
     served
 }
 
@@ -789,6 +797,16 @@ async fn serve_host(
                         // A slot freed (a host sends a heartbeat right after
                         // an attempt ends): pending pool jobs are placed now,
                         // not at the next tick.
+                        // Only the dashboard reads the runners, and only from
+                        // the host's current connection: a late heartbeat of a
+                        // replaced one would drop jobs started since.
+                        let mut heartbeat = heartbeat;
+                        if let (Some(dashboard), Some(runners)) =
+                            (&state.dashboard, heartbeat.runners.take())
+                            && state.registry.is_current(host_id, connection)
+                        {
+                            dashboard.activity.host_runners(host_id, &runners);
+                        }
                         if state.registry.set_heartbeat(host_id, connection, heartbeat)
                             || dropped > 0
                         {

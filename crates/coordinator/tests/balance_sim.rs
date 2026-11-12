@@ -815,6 +815,8 @@ impl Sim {
             unfit: false,
             draining: false,
             versions: None,
+            disk_total_bytes: None,
+            runners: None,
             open_leases: Some(
                 self.runners
                     .iter()

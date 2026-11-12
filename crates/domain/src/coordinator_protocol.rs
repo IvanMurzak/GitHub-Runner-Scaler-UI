@@ -283,6 +283,16 @@ pub struct Heartbeat {
     /// older host.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub versions: Option<HostVersions>,
+    /// From 0.4.66: the size of the runner root's volume, beside
+    /// [`Self::disk_free_bytes`]. `None` from an older host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_total_bytes: Option<u64>,
+    /// From 0.4.66: the GitHub runner names of this host's attempts not
+    /// cleaned yet, known from the moment each runner is started, so the
+    /// dashboard can tell which machine a job runs on as soon as a webhook
+    /// names the runner. `None` from an older host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runners: Option<Vec<String>>,
 }
 
 /// The runner-manager builds on a host, as its service reports them.
@@ -1590,6 +1600,8 @@ mod tests {
                 open_leases: Some(vec!["l1".into()]),
                 disk_free_bytes: Some(20 << 30),
                 versions: None,
+                disk_total_bytes: Some(500 << 30),
+                runners: Some(vec!["runner-manager-1".into()]),
             }),
         ];
         let attempts = [

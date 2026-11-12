@@ -1265,14 +1265,22 @@ fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy
 /// allocator counts them: a repository removed while its runners finish has
 /// no policy any more, and its runners still hold their slots.
 fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
-    let busy = ports
-        .store
-        .uncleaned_attempts()
-        .map(|attempts| active_count(attempts.iter()))
-        .unwrap_or(0);
+    let attempts = ports.store.uncleaned_attempts().ok();
+    let busy = attempts
+        .as_ref()
+        .map_or(0, |attempts| active_count(attempts.iter()));
+    // Unknown when the store could not be read: an empty list would tell the
+    // coordinator that every job running here has ended.
+    let runners = attempts.map(|attempts| {
+        attempts
+            .iter()
+            .map(|attempt| runner_manager_agent::lifecycle::runner_name(attempt.id))
+            .collect()
+    });
     // A launch with no runner yet has a slot spoken for: said here, the
     // coordinator offers what this host can really start.
     let spoken_for = ports.launches.unstarted();
+    let disk = runner_manager_platform::host_fitness::disk_space(&ports.runner_root);
     Heartbeat {
         free_slots: u32::from(
             ports
@@ -1289,8 +1297,10 @@ fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
         unfit: ports.unfit.load(Ordering::Relaxed),
         draining: ports.draining.load(Ordering::Relaxed),
         open_leases,
-        disk_free_bytes: runner_manager_platform::host_fitness::free_disk_bytes(&ports.runner_root),
+        disk_free_bytes: disk.map(|(free, _)| free),
         versions: super::versions::report(&ports.paths),
+        disk_total_bytes: disk.map(|(_, total)| total),
+        runners,
     }
 }
 

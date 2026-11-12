@@ -120,7 +120,14 @@ pub fn available_memory_bytes() -> Option<u64> {
 /// Free space on the volume holding `path`, in bytes, for this account.
 #[must_use]
 pub fn free_disk_bytes(path: &Path) -> Option<u64> {
-    sys::free_disk_bytes(path)
+    sys::disk_space(path).map(|(free, _)| free)
+}
+
+/// `(free for this account, volume size)` of the volume holding `path`, in
+/// bytes, from one read.
+#[must_use]
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    sys::disk_space(path)
 }
 
 /// How busy the CPUs are: the share of all logical CPUs' time spent busy
@@ -873,25 +880,27 @@ mod sys {
         memory_status().map(|status| status.ullAvailPhys)
     }
 
-    pub(super) fn free_disk_bytes(path: &Path) -> Option<u64> {
+    /// `(free for this account, volume size)`.
+    pub(super) fn disk_space(path: &Path) -> Option<(u64, u64)> {
         let wide: Vec<u16> = path
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let mut free = 0u64;
-        // SAFETY: `wide` is NUL-terminated and outlives the call; `free` is a
-        // live `u64` owned by this frame; the other outputs are not requested.
+        let (mut free, mut total) = (0u64, 0u64);
+        // SAFETY: `wide` is NUL-terminated and outlives the call; `free` and
+        // `total` are live `u64`s owned by this frame; the last output is not
+        // requested.
         unsafe {
             windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
                 PCWSTR(wide.as_ptr()),
                 Some(&raw mut free),
-                None,
+                Some(&raw mut total),
                 None,
             )
         }
         .ok()?;
-        Some(free)
+        Some((free, total))
     }
 
     /// Cumulative `(idle, total)` CPU time from `GetSystemTimes`, in 100 ns
@@ -1300,7 +1309,8 @@ mod sys {
         meminfo_bytes("MemAvailable:")
     }
 
-    pub(super) fn free_disk_bytes(path: &Path) -> Option<u64> {
+    /// `(free for this account, volume size)`.
+    pub(super) fn disk_space(path: &Path) -> Option<(u64, u64)> {
         use std::os::unix::ffi::OsStrExt as _;
         let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
         // SAFETY: `statvfs` is plain old data; zeroed is a valid value.
@@ -1311,7 +1321,17 @@ mod sys {
             return None;
         }
         #[allow(clippy::useless_conversion, reason = "the field widths differ per OS")]
-        u64::from(stats.f_bavail).checked_mul(u64::from(stats.f_frsize))
+        let (available, free, blocks, size) = (
+            u64::from(stats.f_bavail),
+            u64::from(stats.f_bfree),
+            u64::from(stats.f_blocks),
+            u64::from(stats.f_frsize),
+        );
+        // The blocks reserved for root are neither free to this account nor
+        // used: left out of the size, so used plus free is the size, as `df`
+        // shows it.
+        let usable = blocks.saturating_sub(free).checked_add(available)?;
+        Some((available.checked_mul(size)?, usable.checked_mul(size)?))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1549,6 +1569,14 @@ mod tests {
         let free = available_memory_bytes().expect("free memory");
         let total = physical_memory_bytes().expect("total memory");
         assert!(free > 0 && free <= total, "{free} of {total}");
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_disk_is_reported_with_its_size() {
+        let here = std::env::current_dir().expect("current directory");
+        let (free, total) = disk_space(&here).expect("disk space");
+        assert!(total > 0 && free <= total, "{free} of {total}");
     }
 
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]

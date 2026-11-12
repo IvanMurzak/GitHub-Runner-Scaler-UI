@@ -773,9 +773,26 @@ below the dashboard does not exist: its paths answer 404.
 
 The page loads nothing from elsewhere (GitHub avatars aside) and is served with a strict
 Content-Security-Policy. History is a sample a minute per machine, kept 7 days in the same
-database (schema 6, from 0.4.58). The job lists are built from the `workflow_job` webhooks and
-kept in memory, so after a restart they fill again as jobs move. Without a proxy in front, forward
-`/`, `/assets/*`, `/auth/*` and `/api/*` as well as the four endpoints in [Deploy](#deploy).
+database (schema 6, from 0.4.58). On a wide range the charts average the samples into fewer
+points (about 90 per line, 48 columns), aligned to whole periods so a refresh does not reshape the
+past: jobs and busy slots as stacked columns, CPU as a row per machine with its average and peak,
+memory as a line per machine.
+
+The job lists are built from the `workflow_job` webhooks. From 0.4.66 they are saved every minute
+and at shutdown, and restored at start when the save is under an hour old, so an update no longer
+empties them. What the restart missed is settled afterwards: a restored queued job the sweep no
+longer lists left the queue, and a running job whose runner its machine no longer lists ended. A
+machine on 0.4.66 or later lists its runners in every heartbeat from the moment each starts, so
+the Running list names the machine as soon as a job starts (before, it waited for the machine to
+notice the job, and a job of a few seconds often never got a machine). Such a machine also reports
+its disk's size, shown as used / total.
+
+A Windows machine's card names the version of the WSL distribution it manages: the one its own
+WSL host runs when exactly one WSL host shares the machine's name, else what `wsl install` last put
+there (which an update inside the distribution leaves behind).
+
+Without a proxy in front, forward `/`, `/assets/*`, `/auth/*` and `/api/*` as well as the four
+endpoints in [Deploy](#deploy).
 
 ## Remote management
 

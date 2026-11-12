@@ -20,7 +20,7 @@
 //!
 //! [`RestDemand`]: runner_manager_github::demand::RestDemand
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,7 @@ use runner_manager_domain::model::{Label, OwnerRepo};
 use runner_manager_github::demand::DemandGateway;
 use runner_manager_github::rest::{ActivityScope, CancelToken, InventoryError};
 
+use crate::dashboard::activity::Activity;
 use crate::github_app::{AppError, GithubApp};
 use crate::placement::{Placement, SweptQueue};
 use crate::registry::{Coverage, Inventory, Registry, is_pool_job};
@@ -133,6 +134,9 @@ pub struct Sweeper {
     /// Told which workflow each run it lists belongs to, and asks for the ones
     /// webhooks named before a sweep listed them.
     workflows: Arc<RunWorkflows>,
+    /// The dashboard's job lists: told every repository's queued jobs, so a
+    /// restored one that left the queue during a restart is forgotten.
+    activity: Option<Arc<Activity>>,
 }
 
 impl Sweeper {
@@ -148,7 +152,16 @@ impl Sweeper {
             inventory_tried_at: None,
             placement: None,
             workflows: Arc::new(RunWorkflows::default()),
+            activity: None,
         }
+    }
+
+    /// Also tells the dashboard's job lists, when there are any, what each
+    /// repository has queued.
+    #[must_use]
+    pub fn with_activity(mut self, activity: Option<Arc<Activity>>) -> Self {
+        self.activity = activity;
+        self
     }
 
     /// Shares what is known of runs' workflows with the webhook's statistics.
@@ -333,6 +346,7 @@ impl Sweeper {
         report: &mut SweepReport,
     ) -> Result<(), InventoryError> {
         let read_at = crate::clock::now();
+        let read_at_unix = chrono::Utc::now().timestamp();
         let demand = installation
             .demand
             .queued_demand(
@@ -348,7 +362,15 @@ impl Sweeper {
             }
         }
         let mut pool: HashMap<BTreeSet<Label>, SweptQueue> = HashMap::new();
+        let mut listed = HashSet::new();
+        let mut complete = !demand.is_truncated(repository);
         for (job, identity) in demand.identified_jobs_for(repository) {
+            match identity.as_ref().and_then(|identity| identity.id) {
+                Some(id) => {
+                    listed.insert(id);
+                }
+                None => complete = false,
+            }
             let Ok(required) = job.required_labels() else {
                 continue;
             };
@@ -376,6 +398,11 @@ impl Sweeper {
                 self.registry
                     .wake_for(&name, &required, WakeReason::Reconcile, SWEEP_DELIVERY);
             report.wakes += u32::try_from(woken).unwrap_or(u32::MAX);
+        }
+        if let Some(activity) = &self.activity
+            && complete
+        {
+            activity.swept(&name, &listed, read_at_unix);
         }
         if let Some(placement) = &self.placement {
             let floor = demand.is_truncated(repository);
