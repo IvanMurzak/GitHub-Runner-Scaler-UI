@@ -18,7 +18,7 @@ the version being prepared rather than the version in `Cargo.toml`.
   so jobs that ended during the restart do not linger.
 - A machine lists its runners in every heartbeat, from the moment each starts.
   The Running and Recent lists name the machine as soon as a job starts; before,
-  a job showed "—" until the machine noticed it, and a short job often never got
+  a job showed no machine until the machine noticed it, and a short job often never got
   a machine.
 - A machine reports its disk's size: the card shows the disk as used / total with
   a meter, where it showed only the free space.
