@@ -15,7 +15,8 @@ the version being prepared rather than the version in `Cargo.toml`.
   from read-only to it, so the daily update and the one the coordinator starts
   failed with "Read-only file system" after downloading the release; now a
   transient systemd unit copies the verified binary into place. A host on an
-  older release has to be updated once by hand (`sudo runner-manager update`).
+  older release has to be updated once by hand (`sudo runner-manager update`,
+  or without `sudo` for a service started at login).
 - A macOS service installed through npm or Homebrew updates itself. launchd
   gives it a `PATH` without `/opt/homebrew/bin`, so the update failed with "npm
   is not on this PATH"; the package manager is now also looked for beside the

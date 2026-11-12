@@ -245,10 +245,12 @@ update (and the update a coordinator starts) replaces: `install.sh` puts it in
 verifies the release, stages the binary in its state directory, and has a
 transient unit (`systemd-run --wait`, in the account's own manager for a login
 unit) copy it into place with one rename. That unit only copies the staged file
-over that one binary; the sandbox stays as it is, so the jobs the service runs
-still cannot write there. Before 0.4.67 the update failed with "Read-only file
-system", and a Linux service never updated itself: update such a host once by
-hand (`sudo runner-manager update`).
+over that one binary; the sandbox stays as it is, so a job running as a runner
+pool account still cannot write there, nor start such a unit for `root`. (A job
+of a login unit runs as the service's own account and could always start one.)
+Before 0.4.67 the update failed with "Read-only file system", and a Linux service
+never updated itself: update such a host once by hand (`sudo runner-manager
+update` for a boot unit, `runner-manager update` for a login unit).
 
 A login unit drops every capability. A boot unit's daemon keeps exactly these,
 all to run its jobs as a separate account (next section):

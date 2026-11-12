@@ -1694,23 +1694,34 @@ fn read_only_to_this_process(directory: &Path) -> bool {
 /// coordinator starts, downloaded and verified the release and then failed
 /// with "Read-only file system", and no Linux service ever updated itself.
 ///
-/// Widening the sandbox would let every workflow the service runs replace
-/// that binary too. Instead the verified binary is staged in the service's
-/// state directory and a unit of its own, which systemd starts for the
-/// service's account and which only copies it into place, makes the swap:
-/// the write the operator's `runner-manager update` would have made, and no
-/// other. A runner's account cannot start such a unit for the service's.
+/// Widening the sandbox would let every job the service runs as another
+/// account (a boot unit's runner pool) replace that binary too. Instead the
+/// verified binary is staged in the service's state directory and a unit of
+/// its own, which systemd starts for the service's account and which only
+/// copies it into place, makes the swap: the write the operator's
+/// `runner-manager update` would have made, and no other. A pool account
+/// cannot start a unit for `root`. A job that runs as the service's own
+/// account (a login unit's) could always start one, this changes nothing
+/// there.
 fn install_outside_the_sandbox(
     new_binary: &Path,
     destination: &Path,
     state_dir: &Path,
 ) -> Result<(), CliError> {
+    let user = !runner_manager_platform::host_fitness::is_elevated();
+    // `sudo` would leave a login unit's binary owned by `root`.
+    let remedy = if user {
+        "runner-manager update".to_owned()
+    } else {
+        runner_manager_platform::service::sudo_command("update")
+    };
     let failed = |what: String| {
+        let remedy = remedy.clone();
         move |error: std::io::Error| {
             CliError::with_remedy(
                 Failure::LocalState,
                 format!("cannot {what}: {error}"),
-                runner_manager_platform::service::sudo_command("update"),
+                remedy,
             )
         }
     };
@@ -1720,20 +1731,20 @@ fn install_outside_the_sandbox(
         "stage the new binary in {}",
         display_path(state_dir)
     )))?;
-    let user = !runner_manager_platform::host_fitness::is_elevated();
     let unit = format!("runner-manager-update-{}", &id[..12]);
-    let result = (|| {
-        let program = systemd_run().ok_or_else(|| {
+    let result = systemd_run()
+        .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "systemd-run is not on this PATH",
             )
-        })?;
-        Command::new(program)
-            .args(sandbox_exit_arguments(&unit, user, &staged, destination))
-            .stdin(std::process::Stdio::null())
-            .output()
-    })();
+        })
+        .and_then(|program| {
+            Command::new(program)
+                .args(sandbox_exit_arguments(&unit, user, &staged, destination))
+                .stdin(std::process::Stdio::null())
+                .output()
+        });
     let _ = std::fs::remove_file(&staged);
     let output = result.map_err(failed(format!(
         "start a unit to replace {} outside the service's sandbox",
@@ -1747,15 +1758,21 @@ fn install_outside_the_sandbox(
     } else {
         format!("journalctl -u {unit}")
     };
+    // systemd-run's own complaint (a refused start); the unit's output is in
+    // its journal.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let said = match stderr.trim() {
+        "" => String::new(),
+        said => format!(": {said}"),
+    };
     Err(CliError::with_remedy(
         Failure::LocalState,
         format!(
-            "the unit that replaces {} outside the service's sandbox failed ({}): {} `{journal}`              says why.",
+            "the unit that replaces {} outside the service's sandbox failed ({}){said}.              `{journal}` says why.",
             display_path(destination),
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim(),
         ),
-        runner_manager_platform::service::sudo_command("update"),
+        remedy,
     ))
 }
 
@@ -1997,14 +2014,18 @@ fn resolve_program(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
 /// `node` beside it through the same `PATH`. Appended, so the operator's own
 /// order still decides when both have one.
 fn search_path(beside: Option<&Path>) -> std::ffi::OsString {
-    let inherited = std::env::var_os("PATH").unwrap_or_default();
-    let mut directories: Vec<PathBuf> = std::env::split_paths(&inherited).collect();
+    let mut path = std::env::var_os("PATH").unwrap_or_default();
     if let Some(beside) = beside
-        && !directories.iter().any(|directory| directory == beside)
+        && !std::env::split_paths(&path).any(|directory| directory == beside)
     {
-        directories.push(beside.to_path_buf());
+        // Appended as text: `join_paths` refuses a whole `PATH` over one entry
+        // it cannot write back, such as a quoted Windows directory.
+        if !path.is_empty() {
+            path.push(if cfg!(windows) { ";" } else { ":" });
+        }
+        path.push(beside);
     }
-    std::env::join_paths(&directories).unwrap_or(inherited)
+    path
 }
 
 /// Where the package manager that owns the copy at `binary` lives: an npm
