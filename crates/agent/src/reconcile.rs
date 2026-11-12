@@ -2831,6 +2831,9 @@ pub struct Reconciler {
     /// [`HostTraits::labels`]: every profile of this host carries them, in
     /// matching and in what its runners register with. Never stored.
     host_labels: Vec<Label>,
+    /// Every exclusion a job of each policy named while this process runs.
+    /// See [`Self::start_runners`].
+    seen_exclusions: Mutex<BTreeMap<PolicyId, BTreeSet<Label>>>,
 }
 
 impl Reconciler {
@@ -2858,6 +2861,7 @@ impl Reconciler {
             launch_side: None,
             memory: Arc::new(NoMemoryGate),
             host_labels: Vec::new(),
+            seen_exclusions: Mutex::default(),
         }
     }
 
@@ -3424,8 +3428,9 @@ impl Reconciler {
     /// At most `limit` runners: one, when the caller decides who is next.
     ///
     /// Each registers with the policy's labels, this host's
-    /// [`HostTraits`] labels, and `not-X` for every `X` in `excluded`: what the
-    /// jobs it is started for exclude, which GitHub otherwise never hands it.
+    /// [`HostTraits`] labels, and `not-X` for every `X` in `excluded` (what the
+    /// jobs it is started for exclude, which GitHub otherwise never hands it)
+    /// and in every earlier pass's.
     async fn start_runners(
         &self,
         policy: &ScalePolicy,
@@ -3435,10 +3440,22 @@ impl Reconciler {
         report: &mut ReconcileReport,
         reserved: &mut Vec<Reserved>,
     ) {
+        // Exclusions are kept for the policy's later runners too: a runner
+        // already waiting counts as supply for the next job that names one,
+        // and it can take that job only if it carries it.
+        let excluded = {
+            let mut seen = self
+                .seen_exclusions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let kept = seen.entry(policy.id).or_default();
+            kept.extend(excluded.iter().cloned());
+            kept.clone()
+        };
         let registered = policy.with_runtime_labels(|labels| {
             labels
                 .with_labels(self.host_labels.iter().cloned())
-                .excluding(excluded)
+                .excluding(&excluded)
         });
         let policy = &registered;
         // A lock-free pre-check, for one reason only: the host-wide lock should
@@ -3980,8 +3997,16 @@ fn route_demand(
     for job in jobs {
         if let Err(unresolvable) = job.required_labels() {
             // `demand_for` already preserves this as unresolvable for each
-            // profile; an exclusion no runner can satisfy is also said.
+            // profile; an exclusion no runner can satisfy is also said, when
+            // the job is otherwise meant for one of these profiles.
             if unresolvable.is_unsatisfiable_exclusion() {
+                let meant = job.plain_labels();
+                if !owners
+                    .iter()
+                    .any(|(_, labels)| meant.iter().all(|label| labels.contains(label)))
+                {
+                    continue;
+                }
                 *refusals
                     .entry(RoutingRefusal::UnsatisfiableExclusion)
                     .or_default() += 1;
@@ -7239,6 +7264,22 @@ mod tests {
             );
         }
 
+        // Kept for the policy's later runners: one already waiting can then
+        // take the next job that names the exclusion.
+        native.demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("o/r"),
+            fixtures::queued_jobs(&[HOST_LABEL], 4),
+        )));
+        native.launcher.registered.lock().unwrap().clear();
+        native.reconciler.reconcile(&[policy(1, "o/r", 6)]).await;
+        let later = native.launcher.registered.lock().unwrap().clone();
+        assert!(!later.is_empty());
+        assert!(
+            later
+                .iter()
+                .all(|labels| labels.contains(&"not-gpu".to_string()))
+        );
+
         // Inside WSL: the excluding job is not this host's, the other is.
         let mut wsl = Harness::simple(4, 0, "o/r");
         wsl.reconciler = wsl.reconciler.with_host_traits(HostTraits::wsl(true));
@@ -7279,7 +7320,11 @@ mod tests {
         let mut harness = Harness::simple(4, 0, "o/r");
         harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
             repo("o/r"),
-            [fixtures::queued_job(&[HOST_LABEL, "wsl", "not-wsl"])],
+            [
+                fixtures::queued_job(&[HOST_LABEL, "not-"]),
+                // Another machine's job: not this host's to report.
+                fixtures::queued_job(&["rm-other-linux-x64", "gpu", "not-gpu"]),
+            ],
         )));
         let report = harness.reconciler.reconcile(&[policy(1, "o/r", 4)]).await;
         assert_eq!(report.started, 0);
@@ -7295,7 +7340,7 @@ mod tests {
             event,
             LifecycleEvent::DemandObserved {
                 demand: 0,
-                unresolvable: 1,
+                unresolvable: 2,
                 ..
             }
         )));

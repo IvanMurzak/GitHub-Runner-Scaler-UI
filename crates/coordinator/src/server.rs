@@ -409,11 +409,7 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                 .map(|identity| identity.in_workflow(workflows.of(run_id).as_deref()));
             if action == "queued" {
                 if required.is_none() {
-                    warn_if_unsatisfiable(
-                        repository,
-                        job.workflow_job.id,
-                        &job.workflow_job.labels,
-                    );
+                    warn_if_unsatisfiable(delivery, job.workflow_job.id, &job.workflow_job.labels);
                 }
                 let woken = required.as_ref().map_or(0, |required| {
                     state
@@ -972,16 +968,16 @@ impl RateLimiter {
 
 /// A queued job no runner can take because of its exclusions (`wsl` with
 /// `not-wsl`, or `not-` alone) is said so, rather than waiting unexplained.
-fn warn_if_unsatisfiable(repository: &str, job_id: u64, labels: &[String]) {
+fn warn_if_unsatisfiable(delivery: &str, job_id: u64, labels: &[String]) {
     if let Err(reason) =
         runner_manager_domain::policy::RunsOn::from_job_labels(labels.iter().cloned())
             .required_labels()
-        && reason.is_unsatisfiable_exclusion()
+        && let Some(kind) = reason.exclusion_kind()
     {
         tracing::warn!(
-            repository,
+            %delivery,
             job_id,
-            %reason,
+            reason = kind,
             "a queued job's labels can never be satisfied; no host is woken for it"
         );
     }

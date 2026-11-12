@@ -245,7 +245,13 @@ pub enum Exclusion {
 pub fn excluded_label(label: &Label) -> Option<Exclusion> {
     let rest = label.as_str().strip_prefix(EXCLUSION_PREFIX)?;
     Some(match Label::new(rest) {
-        Ok(excluded) if !excluded.as_str().starts_with(EXCLUSION_PREFIX) => Exclusion::Of(excluded),
+        // `not- wsl` is not `not-wsl`: the runner would register a label the
+        // job does not name.
+        Ok(excluded)
+            if excluded.as_str() == rest && !excluded.as_str().starts_with(EXCLUSION_PREFIX) =>
+        {
+            Exclusion::Of(excluded)
+        }
         _ => Exclusion::Invalid,
     })
 }
@@ -843,10 +849,18 @@ impl UnresolvableRunsOn {
     /// `runs-on` only GitHub can evaluate.
     #[must_use]
     pub const fn is_unsatisfiable_exclusion(&self) -> bool {
-        matches!(
-            self,
-            Self::InvalidExclusion { .. } | Self::ConflictingExclusion { .. }
-        )
+        self.exclusion_kind().is_some()
+    }
+
+    /// A fixed name for an unsatisfiable exclusion, for logs that must not
+    /// carry the job's own labels.
+    #[must_use]
+    pub const fn exclusion_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::InvalidExclusion { .. } => Some("invalid_exclusion"),
+            Self::ConflictingExclusion { .. } => Some("conflicting_exclusion"),
+            _ => None,
+        }
     }
 }
 
@@ -909,6 +923,18 @@ impl RunsOn {
             RunsOn::Grouped { group, .. } => group.as_deref(),
             _ => None,
         }
+    }
+
+    /// The usable ordinary labels this job names, exclusions and anything
+    /// unusable left out: which machines it is meant for, even when
+    /// [`Self::required_labels`] refuses it.
+    #[must_use]
+    pub fn plain_labels(&self) -> Vec<Label> {
+        self.raw_labels()
+            .iter()
+            .filter_map(|raw| Label::new(raw).ok())
+            .filter(|label| excluded_label(label).is_none())
+            .collect()
     }
 
     fn raw_labels(&self) -> &[String] {
@@ -3710,7 +3736,7 @@ mod tests {
 
     #[test]
     fn an_unusable_or_conflicting_exclusion_is_unsatisfiable_not_demand() {
-        for bad in ["not-", "not-not-wsl", "NOT-Not-x"] {
+        for bad in ["not-", "not-not-wsl", "NOT-Not-x", "not- wsl"] {
             let got = job(&["linux", bad]).required_labels();
             assert!(
                 matches!(&got, Err(UnresolvableRunsOn::InvalidExclusion { .. })),
@@ -3718,6 +3744,10 @@ mod tests {
             );
             assert!(got.unwrap_err().is_unsatisfiable_exclusion());
         }
+        assert_eq!(
+            job(&["linux", "not- wsl", "not-gpu"]).plain_labels(),
+            vec![label("linux")]
+        );
         let conflict = job(&["linux", "WSL", "not-wsl"]).required_labels();
         assert_eq!(
             conflict,

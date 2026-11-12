@@ -17,12 +17,15 @@ the version being prepared rather than the version in `Cargo.toml`.
   `<label>`", on the host's own demand and in the coordinator's placement
   alike: a profile carrying `<label>` never serves the job, and the runner
   started for it registers with `not-<label>` so GitHub hands it the job.
-  A job without a `not-` label is matched exactly as before.
+  A job without a `not-` label is matched exactly as before, except that a
+  profile label already starting with `not-` is now read as an exclusion.
 - Every runner of a machine running inside WSL now carries the label `wsl`,
   and every runner of any other machine `not-wsl`, without configuration.
   `runs-on: [.., not-wsl]` keeps jobs whose wall-clock time matters off WSL
   machines. `status` lists them as derived labels, and the coordinator's
-  dashboard marks exclusions among a job's or a profile's labels.
+  dashboard marks exclusions among a job's or a profile's labels. A profile
+  inside WSL that was told apart from a sibling only by a hand-added `wsl`
+  label now overlaps it: remove one of them.
 - A job asking for a label and for `not-` that label, or for `not-` alone,
   is never counted as demand, and the host (`routing_refused`,
   `unsatisfiable_exclusion`) and the coordinator say so in their logs.
@@ -30,9 +33,9 @@ the version being prepared rather than the version in `Cargo.toml`.
 - Coordinator protocol: a host says it understands exclusions
   (`hello.label_exclusions`); a `launch` names its job's `exclusions`; a host
   refuses one its profile cannot honour with `excluded`. A coordinator places
-  a pool job naming an exclusion only on such a host, so upgrade hosts before
-  writing `not-` labels into pool jobs (`not-wsl` works with older
-  coordinators too).
+  a pool job naming an exclusion only on such a host, so upgrade the hosts
+  and the coordinator before writing `not-` labels into pool jobs (`not-wsl`
+  works with an older coordinator too).
 
 ## 0.4.64
 

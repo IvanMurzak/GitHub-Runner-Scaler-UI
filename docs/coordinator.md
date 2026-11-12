@@ -263,9 +263,12 @@ understands exclusions (`hello.label_exclusions`, 0.4.65): an older host would r
 without `not-X`, which GitHub never hands the job. The `launch` names the job's exclusions
 (`exclusions`), the host registers the runner with them, and it refuses with `excluded` a launch
 whose profile carries what it excludes. Every host of 0.4.65 or later advertises `wsl` or `not-wsl`
-on all its profiles, so even an older coordinator places `not-wsl` jobs correctly. A job asking for
-a label and its exclusion together is never placed (`a queued job's labels can never be satisfied`
-in the coordinator's log).
+on all its profiles, so even an older coordinator places `not-wsl` jobs correctly. For any other
+exclusion, a runner of the profile that was already waiting idle may be counted toward the launch
+without carrying `not-X`; the job then waits until that runner exits idle (or the lease expires
+and the job is placed again). A job asking for a label and its exclusion together is never placed
+(`a queued job's labels can never be satisfied` in the coordinator's log, for the `queued`
+webhook).
 
 ### How a host is chosen
 

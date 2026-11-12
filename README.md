@@ -846,15 +846,23 @@ jobs:
   and `runs-on: [self-hosted, linux, wsl]` sends a job only to them.
 - Any other label works the same way: `not-gpu` avoids profiles carrying `gpu`, and
   `not-rm-home-linux-x64` avoids one machine's selector. A runner registers with such an
-  exclusion when the queued jobs it is started for name it; a runner already waiting idle when
-  such a job is queued does not carry it and leaves the job to the next runner. `not-wsl` never
-  has that wait, because every runner carries it from the start.
-- A job that asks for `X` and `not-X` together, or for `not-` alone (or `not-not-X`), can never
-  be served: it is not counted as demand, and the service logs `routing_refused` with reason
-  `unsatisfiable_exclusion` (the coordinator logs it too).
-- `add-label` refuses a label that contradicts one the profile already carries (`not-gpu` beside
+  exclusion once a queued job of its profile has named it, and every later runner of the profile
+  keeps it while the service runs. A runner that was already waiting idle when the first such job
+  was queued does not carry it: that job waits for the runner to exit idle, or for the next one.
+  `not-wsl` never has that wait, because every runner carries it from the start; neither does a
+  `not-X` added to the profile with `add-label`.
+- A job that asks for `X` and `not-X` together, or for `not-` alone (or `not-not-X`, or
+  `not- X` with a space), can never be served: it is not counted as demand, and the service logs
+  `routing_refused` with reason `unsatisfiable_exclusion` (the coordinator logs it for the
+  `queued` webhook).
+- `add-label` refuses a label that contradicts one the profile already stores (`not-gpu` beside
   `gpu`, either way round). Adding `not-X` by hand to a profile is allowed and makes its runners
-  answer `not-X` jobs from the start, without the wait above.
+  answer `not-X` jobs from the start, without the wait above. A stored `wsl` wins over the derived
+  `not-wsl` (the machine is then treated as WSL), and a stored `not-wsl` on a WSL machine is never
+  registered.
+- A profile label that already started with `not-` before 0.4.65 is now an exclusion too: a job
+  asking for `not-foo` matches every profile that lacks `foo`, not only the one that carried the
+  literal label, which can make two profiles of one repository overlap.
 
 With the [coordinator](docs/coordinator.md#shared-pools), pool jobs work the same way
 (`runs-on: [rm-pool-linux, not-wsl]`): the coordinator places a job naming an exclusion only on a
