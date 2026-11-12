@@ -7,6 +7,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DAY: u64 = 24 * 60 * 60;
+/// How soon a check that found the release not on npm yet runs again.
+const NOT_PUBLISHED_RETRY: u64 = 15 * 60;
+/// How many such checks in a row run that soon: two hours' worth. A release
+/// npm never gets is then checked daily again, and its report stays.
+const NOT_PUBLISHED_RETRIES: u32 = 8;
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
@@ -88,6 +93,22 @@ fn tick_with(
     let result = update(enabled, &mut report);
     if let Err(error) = &result {
         let _ = writeln!(report, "Update failed: {error}");
+    }
+    // The release is on GitHub and not yet on npm: try again soon, not a day
+    // later, by dating the attempt back, a bounded number of times.
+    let retries_file = context.paths().state_dir().join("update-npm-retries");
+    if String::from_utf8_lossy(&report).contains(super::update::NOT_ON_NPM_YET) {
+        let retries: u32 = std::fs::read_to_string(&retries_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        if retries < NOT_PUBLISHED_RETRIES {
+            let retry_at = now.saturating_sub(DAY - NOT_PUBLISHED_RETRY);
+            std::fs::write(&stamp, retry_at.to_string()).map_err(failure)?;
+            std::fs::write(&retries_file, (retries + 1).to_string()).map_err(failure)?;
+        }
+    } else {
+        let _ = std::fs::remove_file(&retries_file);
     }
     std::fs::write(
         context.paths().state_dir().join("update-status.txt"),
@@ -192,6 +213,59 @@ mod tests {
                 .contains("offline")
         );
     }
+    /// The release was on GitHub minutes before npm had it: a macOS npm
+    /// copy found no such version and then waited a whole day.
+    #[test]
+    fn a_release_not_on_npm_yet_is_checked_again_soon() {
+        let (dir, context) = fixture();
+        tick_with(&context, |_, report| {
+            writeln!(
+                report,
+                "The release {}: try later.",
+                super::super::update::NOT_ON_NPM_YET
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let stamp: u64 =
+            std::fs::read_to_string(context.paths().state_dir().join("update-last-check"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(!due(now, Some(stamp)), "not at once");
+        assert!(
+            due(now + NOT_PUBLISHED_RETRY, Some(stamp)),
+            "within a quarter of an hour"
+        );
+
+        // A release npm never gets: soon only so many times, then daily.
+        let stamp_file = context.paths().state_dir().join("update-last-check");
+        let not_yet = |_: bool, report: &mut Vec<u8>| -> Result<(), CliError> {
+            writeln!(report, "x {}", super::super::update::NOT_ON_NPM_YET).unwrap();
+            Ok(())
+        };
+        for _ in 1..NOT_PUBLISHED_RETRIES {
+            std::fs::remove_file(&stamp_file).unwrap();
+            tick_with(&context, not_yet).unwrap();
+        }
+        std::fs::remove_file(&stamp_file).unwrap();
+        tick_with(&context, not_yet).unwrap();
+        let stamp: u64 = std::fs::read_to_string(&stamp_file)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            !due(now + NOT_PUBLISHED_RETRY + 60, Some(stamp)),
+            "past the bound, the next check is a day away"
+        );
+        drop(dir);
+    }
+
     #[test]
     fn held_update_lock_prevents_checks_without_consuming_schedule() {
         let (_dir, context) = fixture();
