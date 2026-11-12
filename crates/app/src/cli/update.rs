@@ -1792,7 +1792,7 @@ fn systemd_run() -> Option<PathBuf> {
 /// the daemon watching `$3` never runs a partial file. The paths are
 /// arguments, never part of the script.
 const SANDBOX_EXIT_SCRIPT: &str =
-    r#"set -e; trap 'rm -f -- "$2"' EXIT; cp -- "$1" "$2"; chmod 0755 -- "$2"; mv -f -- "$2" "$3""#;
+    r#"set -e; trap 'rm -f -- "$2"' EXIT; cp -- "$1" "$2"; chmod 0755 "$2"; mv -f -- "$2" "$3""#;
 
 /// The `systemd-run` arguments that run [`SANDBOX_EXIT_SCRIPT`] as `unit` and
 /// wait for it: in the account's own manager for a service that is not
