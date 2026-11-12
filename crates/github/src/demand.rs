@@ -274,10 +274,25 @@ pub const MAX_JOB_PAGES_PER_RUN: usize = 3;
 /// projection.
 #[must_use]
 pub const fn max_demand_requests_per_repository_per_poll() -> u32 {
-    // The two run listings, then one job listing per run each cap admits.
+    // The two run listings, then one job listing per run each cap admits, and
+    // one per expected run the listings left out.
     2 + (MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL as u32)
         + (MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL as u32)
+        + (MAX_EXPECTED_RUNS_PER_REPOSITORY_PER_POLL as u32)
 }
+
+/// The most expected runs ([`RestDemand::expect_run`]) one reading of a
+/// repository reads by their id. Spent only on runs the listings left out,
+/// which is no run at all while GitHub's index is right.
+pub const MAX_EXPECTED_RUNS_PER_REPOSITORY_PER_POLL: usize = 4;
+
+/// How many expected runs a repository keeps, the newest.
+const MAX_EXPECTED_RUNS_REMEMBERED: usize = 32;
+
+/// How long a run stays expected. A job waits in the queue at most a day
+/// before GitHub cancels it, and a runner usually takes it within minutes; a
+/// run still queued after this is read again once a webhook names it again.
+pub const EXPECTED_RUN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 // A poll that costs nothing is a poll that issued no request, and a budget line
 // of zero would let `f2` admit an unbounded number of targets.
@@ -702,6 +717,11 @@ pub trait DemandGateway: fmt::Debug + Send + Sync {
         Ok(None)
     }
 
+    /// Reads `run_id`'s jobs in every reading of `repository` until none of
+    /// them is queued, whether or not the run listing shows it. See
+    /// [`RestDemand::expect_run`].
+    fn expect_run(&self, _repository: &OwnerRepo, _run_id: u64) {}
+
     /// The instant a reading is stamped with.
     fn now(&self) -> Timestamp;
 }
@@ -726,6 +746,10 @@ impl<T: DemandGateway + ?Sized> DemandGateway for Arc<T> {
         cancel: &CancelToken,
     ) -> Result<Option<String>, InventoryError> {
         (**self).run_workflow(repository, run_id, cancel).await
+    }
+
+    fn expect_run(&self, repository: &OwnerRepo, run_id: u64) {
+        (**self).expect_run(repository, run_id);
     }
 
     fn now(&self) -> Timestamp {
@@ -779,6 +803,11 @@ pub struct RestDemand {
     /// The host-wide quiet period after GitHub said "rate limited".
     hold: Mutex<Option<RateLimitHold>>,
     stats: PollCounters,
+    /// Runs a webhook said were queued, read by their id. See
+    /// [`RestDemand::expect_run`].
+    /// Keyed by the repository's lower-cased name: a webhook's spelling and a
+    /// target's can differ in case.
+    expected: Mutex<BTreeMap<String, BTreeMap<u64, ExpectedRun>>>,
 }
 
 /// A repository's reading, handed to every target that asks for it within a
@@ -872,6 +901,7 @@ impl RestDemand {
             },
             hold: Mutex::new(None),
             stats: PollCounters::default(),
+            expected: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -909,6 +939,91 @@ impl RestDemand {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(repository);
+    }
+
+    /// Reads `run_id`'s jobs in every reading of `repository` until none of
+    /// them is queued, for at most [`EXPECTED_RUN_TTL`].
+    ///
+    /// # Why the run listing is not enough
+    ///
+    /// GitHub's `GET …/actions/runs?status=queued` is an index that can leave
+    /// a queued run out, and not for a moment: a run whose two jobs waited
+    /// half an hour was in no `status=` listing at all while `GET
+    /// …/actions/runs/{id}` said `queued`. Every host woken for it read zero
+    /// demand and started nothing, and so did the coordinator's sweep. The
+    /// `workflow_job` webhook names the run, so a run named that way is read
+    /// by its id as well.
+    pub fn expect_run(&self, repository: &OwnerRepo, run_id: u64) {
+        let mut expected = lock(&self.expected);
+        let runs = expected.entry(expected_key(repository)).or_default();
+        let now = std::time::Instant::now();
+        runs.entry(run_id)
+            .and_modify(|run| run.named = now)
+            .or_insert(ExpectedRun {
+                named: now,
+                read: None,
+            });
+        // The longest unnamed go first: a burst of webhooks must not grow this
+        // without bound.
+        while runs.len() > MAX_EXPECTED_RUNS_REMEMBERED {
+            let Some(oldest) = runs
+                .iter()
+                .min_by_key(|(_, run)| run.named)
+                .map(|(run_id, _)| *run_id)
+            else {
+                break;
+            };
+            runs.remove(&oldest);
+        }
+    }
+
+    /// The expected runs of `repository` to read now: not `listed`, not past
+    /// [`EXPECTED_RUN_TTL`], at most [`MAX_EXPECTED_RUNS_PER_REPOSITORY_PER_POLL`],
+    /// the longest unread first so every one is read in turn. A listed run is
+    /// read as listed, and no longer expected. The flag says some were left for
+    /// a later reading.
+    fn expected_runs(&self, repository: &OwnerRepo, listed: &BTreeSet<u64>) -> (Vec<u64>, bool) {
+        let key = expected_key(repository);
+        let mut expected = lock(&self.expected);
+        let Some(runs) = expected.get_mut(&key) else {
+            return (Vec::new(), false);
+        };
+        runs.retain(|run_id, run| {
+            run.named.elapsed() < EXPECTED_RUN_TTL && !listed.contains(run_id)
+        });
+        let mut order: Vec<(Option<std::time::Instant>, u64)> = runs
+            .iter()
+            .map(|(run_id, run)| (run.read, *run_id))
+            .collect();
+        order.sort_unstable();
+        let now = std::time::Instant::now();
+        let chosen: Vec<u64> = order
+            .iter()
+            .take(MAX_EXPECTED_RUNS_PER_REPOSITORY_PER_POLL)
+            .map(|(_, run_id)| *run_id)
+            .collect();
+        for run_id in &chosen {
+            if let Some(run) = runs.get_mut(run_id) {
+                run.read = Some(now);
+            }
+        }
+        let left = order.len() > chosen.len();
+        if runs.is_empty() {
+            expected.remove(&key);
+        }
+        (chosen, left)
+    }
+
+    /// `run_id` holds no queued job any more, or cannot be seen.
+    fn forget_expected_run(&self, repository: &OwnerRepo, run_id: u64) {
+        let key = expected_key(repository);
+        let mut expected = lock(&self.expected);
+        if let Some(runs) = expected.get_mut(&key) {
+            runs.remove(&run_id);
+            if runs.is_empty() {
+                expected.remove(&key);
+            }
+        }
     }
 
     /// The window readings are shared for.
@@ -1183,6 +1298,47 @@ impl RestDemand {
             }
         }
 
+        // The runs a webhook named that the listings left out: see
+        // `expect_run`. A listed one is read above, and is no longer expected.
+        let (expected, left) = self.expected_runs(repository, &resolved);
+        exact &= !left;
+        for run_id in expected {
+            let run = match self.queued_jobs_of_run(repository, run_id, cancel).await {
+                Ok(run) => run,
+                Err(error) if is_repository_local_failure(&error) => {
+                    // A deleted run, or one this credential cannot see: not
+                    // demand, and no reason to fail the whole reading.
+                    tracing::debug!(%repository, run_id, %error, "an expected run cannot be read");
+                    self.forget_expected_run(repository, run_id);
+                    continue;
+                }
+                Err(error @ (InventoryError::RateLimited(_) | InventoryError::Cancelled)) => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    // A passing failure: still expected, and this count a floor.
+                    tracing::debug!(%repository, run_id, %error, "an expected run could not be read");
+                    exact = false;
+                    continue;
+                }
+            };
+            resolved.insert(run_id);
+            if run.jobs.is_empty() {
+                self.forget_expected_run(repository, run_id);
+                continue;
+            }
+            tracing::info!(
+                %repository,
+                run_id,
+                queued = run.jobs.len(),
+                "GitHub's run listing left out a queued run a webhook named; its jobs were read by \
+                 its id"
+            );
+            exact &= run.complete;
+            changed |= run.changed;
+            jobs.extend(run.jobs);
+        }
+
         self.stats.reads.fetch_add(1, Ordering::SeqCst);
         if !changed {
             self.stats.unchanged_reads.fetch_add(1, Ordering::SeqCst);
@@ -1411,6 +1567,7 @@ impl RestDemand {
                                 id: job.id,
                                 name: job.name,
                                 workflow: None,
+                                run_id: Some(run_id),
                             },
                         )
                     }),
@@ -1521,9 +1678,32 @@ impl DemandGateway for RestDemand {
         Ok(run.path)
     }
 
+    fn expect_run(&self, repository: &OwnerRepo, run_id: u64) {
+        RestDemand::expect_run(self, repository, run_id);
+    }
+
     fn now(&self) -> Timestamp {
         self.clock.now()
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A run [`RestDemand::expect_run`] was told of.
+#[derive(Debug, Clone, Copy)]
+struct ExpectedRun {
+    /// When a webhook last named it.
+    named: std::time::Instant,
+    /// When a reading last read it by its id.
+    read: Option<std::time::Instant>,
+}
+
+fn expected_key(repository: &OwnerRepo) -> String {
+    repository.to_string().to_ascii_lowercase()
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,6 +1721,8 @@ pub struct QueuedJobIdentity {
     /// Its run's workflow file (`.github/workflows/ci.yml`), which, unlike the
     /// title, does not change between dispatches.
     pub workflow: Option<String>,
+    /// Its run.
+    pub run_id: Option<u64>,
 }
 
 /// One repository's queued jobs, and whether that set is the whole truth.
@@ -1818,6 +2000,146 @@ mod tests {
         );
     }
 
+    /// Two jobs of a run waited half an hour while GitHub's `status=queued`
+    /// listing, and every other `status=`, left the run out. The webhook named
+    /// the run: it is read by its id until none of its jobs is queued.
+    #[tokio::test]
+    async fn an_expected_run_the_listing_leaves_out_is_read_by_its_id() {
+        let server = MockServer::start().await;
+        mount_idle(&server, &repo()).await;
+        mount_jobs(&server, &repo(), 77, jobs_body(&["self-hosted"], 2, 0)).await;
+        let gateway = gateway(&server);
+        let scope = ActivityScope::repository(repo());
+
+        let unexpected = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a reading");
+        assert_eq!(unexpected.total(), 0, "nothing names the run yet");
+
+        gateway.expect_run(&repo(), 77);
+        let demand = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a reading");
+        assert_eq!(demand.total(), 2);
+        let runs: Vec<_> = demand
+            .identified_jobs_for(&repo())
+            .map(|(_, identity)| identity.and_then(|identity| identity.run_id))
+            .collect();
+        assert_eq!(runs, [Some(77), Some(77)]);
+
+        // A runner took both: the run is no longer expected, and costs nothing.
+        server.reset().await;
+        mount_idle(&server, &repo()).await;
+        mount_jobs(&server, &repo(), 77, jobs_body(&["self-hosted"], 0, 2)).await;
+        let taken = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a reading");
+        assert_eq!(taken.total(), 0);
+        assert!(lock(&gateway.expected).is_empty());
+    }
+
+    /// The coordinator's sweep holds its gateway as `Arc<dyn DemandGateway>`:
+    /// the expectation must reach the gateway through the trait, and in any
+    /// spelling of the repository's name. More expected runs than one reading
+    /// reads are read in turn, and the reading says it is a floor until then.
+    #[tokio::test]
+    async fn expected_runs_reach_through_the_trait_and_are_read_in_turn() {
+        let server = MockServer::start().await;
+        mount_idle(&server, &repo()).await;
+        let runs: Vec<u64> = (0..6).map(|i| 300 + i).collect();
+        for id in &runs {
+            mount_jobs(&server, &repo(), *id, jobs_body(&["self-hosted"], 1, 0)).await;
+        }
+        let concrete = Arc::new(gateway(&server));
+        let gateway: Arc<dyn DemandGateway> = Arc::clone(&concrete) as Arc<dyn DemandGateway>;
+        let shouted = OwnerRepo::parse(repo().to_string().to_ascii_uppercase()).expect("repo");
+        for id in &runs {
+            gateway.expect_run(&shouted, *id);
+        }
+        let scope = ActivityScope::repository(repo());
+
+        let first = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a reading");
+        assert_eq!(
+            first.total(),
+            MAX_EXPECTED_RUNS_PER_REPOSITORY_PER_POLL as u32
+        );
+        assert!(!first.is_complete(), "two expected runs were left unread");
+        let second = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a reading");
+        let read: BTreeSet<u64> = first
+            .identified_jobs_for(&repo())
+            .chain(second.identified_jobs_for(&repo()))
+            .filter_map(|(_, identity)| identity.and_then(|identity| identity.run_id))
+            .collect();
+        assert_eq!(
+            read,
+            runs.iter().copied().collect(),
+            "every run is read in turn"
+        );
+    }
+
+    /// A passing failure keeps the run expected: the webhook named it once.
+    #[tokio::test]
+    async fn an_expected_run_survives_a_passing_failure() {
+        let server = MockServer::start().await;
+        mount_idle(&server, &repo()).await;
+        Mock::given(method("GET"))
+            .and(path(jobs_path(&repo(), 79)))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+        let gateway = gateway(&server);
+        gateway.expect_run(&repo(), 79);
+        let scope = ActivityScope::repository(repo());
+        let failed = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a reading");
+        assert_eq!(failed.total(), 0);
+        assert!(!failed.is_complete());
+
+        server.reset().await;
+        mount_idle(&server, &repo()).await;
+        mount_jobs(&server, &repo(), 79, jobs_body(&["self-hosted"], 1, 0)).await;
+        let demand = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a reading");
+        assert_eq!(demand.total(), 1);
+    }
+
+    /// An expected run that cannot be read (deleted) is not demand and does
+    /// not fail the reading.
+    #[tokio::test]
+    async fn an_expected_run_that_is_gone_is_forgotten() {
+        let server = MockServer::start().await;
+        mount_one_queued_run(&server, &repo(), &["rm-home-win-x64"], 1, 0).await;
+        Mock::given(method("GET"))
+            .and(path(jobs_path(&repo(), 78)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let gateway = gateway(&server);
+        gateway.expect_run(&repo(), 78);
+        // A listed run is read once, as listed.
+        gateway.expect_run(&repo(), 100);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a reading");
+        assert_eq!(demand.total(), 1);
+        assert!(lock(&gateway.expected).is_empty());
+    }
+
     /// A job that already has a runner is not demand.
     ///
     /// The run-level mistake one level down: `status=in_progress` work already
@@ -2082,11 +2404,13 @@ mod tests {
                     id: Some(8),
                     name: Some("build (linux, 3.12)".into()),
                     workflow: None,
+                    run_id: Some(200),
                 },
                 QueuedJobIdentity {
                     id: Some(9),
                     name: Some("older".into()),
                     workflow: None,
+                    run_id: Some(200),
                 },
             ]
         );
@@ -2395,10 +2719,15 @@ mod tests {
             runs_body(&running),
         )
         .await;
-        for id in queued.iter().chain(running.iter()) {
+        // And more runs a webhook named than a reading reads by their id.
+        let expected: Vec<u64> = (0..10).map(|i| 900 + i).collect();
+        for id in queued.iter().chain(running.iter()).chain(expected.iter()) {
             mount_jobs(&server, &repo(), *id, jobs_body(&["rm-home-win-x64"], 2, 0)).await;
         }
         let gateway = gateway(&server);
+        for id in &expected {
+            gateway.expect_run(&repo(), *id);
+        }
 
         let demand = gateway
             .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
@@ -2414,7 +2743,8 @@ mod tests {
         assert_eq!(
             demand.total(),
             2 * (MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL
-                + MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL) as u32
+                + MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL
+                + MAX_EXPECTED_RUNS_PER_REPOSITORY_PER_POLL) as u32
         );
         assert!(!demand.is_complete());
     }

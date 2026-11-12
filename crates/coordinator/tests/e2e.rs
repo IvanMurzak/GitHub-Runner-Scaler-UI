@@ -355,6 +355,8 @@ async fn a_queued_job_wakes_the_enrolled_host_that_serves_it() {
             repository: "octo/app".into(),
             reason: WakeReason::JobQueued,
             delivery_id: "d-1".into(),
+            // The webhook's run, which the host reads by its id.
+            run_id: Some(2),
         }
     );
     // The same delivery again is acknowledged and not acted on.

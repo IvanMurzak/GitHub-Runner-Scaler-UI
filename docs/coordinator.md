@@ -128,6 +128,11 @@ What the sweep does, every `COORDINATOR_RECONCILE_INTERVAL` (2 minutes by defaul
   queued jobs in them, with conditional requests: an unchanged listing is a `304`, free against
   the installation's hourly quota. A rate-limited installation is left alone until the time
   GitHub names.
+- From 0.4.67 it also reads by its id each run a `queued` webhook named, until none of its jobs is
+  queued (at most 4 such runs per repository per sweep, in turn, for at most 6 hours). GitHub's
+  `status=queued` run listing can leave a queued run out for good; its jobs then waited with
+  every host idle. A wake carries the run too, and a host on 0.4.67 or later reads that run by
+  its id the same way.
 - For each queued job that no wake was sent for within the interval (by the webhook or an
   earlier sweep), it wakes the hosts whose enabled profiles can take it. A job is identified by
   its repository and required labels.

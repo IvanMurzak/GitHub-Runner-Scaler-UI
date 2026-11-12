@@ -406,6 +406,12 @@ pub struct Wake {
     pub reason: WakeReason,
     /// GitHub's `X-GitHub-Delivery`, for correlating logs on both sides.
     pub delivery_id: String,
+    /// From 0.4.67: the run of the queued job, when the coordinator knows it.
+    /// The host reads that run's jobs by its id until none of them is queued,
+    /// because GitHub's `status=queued` run listing can leave a queued run out
+    /// for good, and then no listing ever shows its jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,6 +1673,7 @@ mod tests {
                 repository: "octo/app".into(),
                 reason: WakeReason::JobQueued,
                 delivery_id: "d-1".into(),
+                run_id: Some(42),
             }),
             ServerMessage::Launch(Launch {
                 target: TargetRef {
@@ -2075,6 +2082,7 @@ mod tests {
             repository: "a/b".into(),
             reason: WakeReason::Reconcile,
             delivery_id: "reconcile".into(),
+            run_id: None,
         })
         .encode();
         assert!(wake.contains(r#""reason":"reconcile""#), "{wake}");

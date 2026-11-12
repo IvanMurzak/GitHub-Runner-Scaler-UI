@@ -419,10 +419,19 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                 if required.is_none() {
                     warn_if_unsatisfiable(delivery, job.workflow_job.id, &job.workflow_job.labels);
                 }
+                // The sweep reads this run by its id too: GitHub's run
+                // listing can leave it out. Not for a job no host can serve.
+                if required.is_some() {
+                    state.registry.expect_run(repository, run_id);
+                }
                 let woken = required.as_ref().map_or(0, |required| {
-                    state
-                        .registry
-                        .wake_for(repository, required, WakeReason::JobQueued, delivery)
+                    state.registry.wake_for(
+                        repository,
+                        required,
+                        WakeReason::JobQueued,
+                        delivery,
+                        Some(run_id),
+                    )
                 });
                 let placed = required
                     .and_then(|required| {
