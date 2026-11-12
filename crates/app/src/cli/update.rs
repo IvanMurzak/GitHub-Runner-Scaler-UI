@@ -1032,13 +1032,18 @@ pub(super) fn perform(
     }
 
     writeln!(out).map_err(failed)?;
+    let beside = package_manager_directory(&installation.channel, &installation.path);
     match installation.channel {
         Channel::Archive => {
+            // The service's sandbox may keep it from writing the binary it
+            // updates; its state directory is where it can stage one.
+            let service_state = (caller != Caller::Operator).then(|| context.paths().state_dir());
             runtime.block_on(replace_from_archive(
                 &source,
                 &published,
                 target,
                 &installation.path,
+                service_state,
                 out,
             ))?;
         }
@@ -1052,6 +1057,7 @@ pub(super) fn perform(
             run_package_manager(
                 "npm",
                 &["install", "--global", "--prefix", &prefix, &package],
+                beside.as_deref(),
                 format!("npm install --global --prefix \"{prefix}\" {package}"),
                 out,
             )?;
@@ -1069,6 +1075,7 @@ pub(super) fn perform(
             if let Err(problem) = run_package_manager(
                 "brew",
                 &["update"],
+                beside.as_deref(),
                 "brew update && brew upgrade IvanMurzak/tap/runner-manager",
                 out,
             ) {
@@ -1077,6 +1084,7 @@ pub(super) fn perform(
             run_package_manager(
                 "brew",
                 &["upgrade", BREW_FORMULA],
+                beside.as_deref(),
                 "brew upgrade IvanMurzak/tap/runner-manager",
                 out,
             )?;
@@ -1111,6 +1119,7 @@ pub(super) fn perform(
                     "--locked",
                     "--force",
                 ],
+                beside.as_deref(),
                 "cargo install runner-manager --locked",
                 out,
             )?;
@@ -1221,6 +1230,7 @@ async fn replace_from_archive(
     published: &PublishedArchive,
     target: HostTarget,
     destination: &Path,
+    service_state: Option<&Path>,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let failed = write_failed("this update");
@@ -1294,7 +1304,15 @@ async fn replace_from_archive(
         install_over(&unpacked_supervisor, &supervisor_destination)?;
     }
 
-    install_over(&unpacked, destination)?;
+    match service_state {
+        Some(state_dir)
+            if cfg!(target_os = "linux")
+                && destination.parent().is_some_and(read_only_to_this_process) =>
+        {
+            install_outside_the_sandbox(&unpacked, destination, state_dir)?;
+        }
+        _ => install_over(&unpacked, destination)?,
+    }
     writeln!(
         out,
         "Installed runner-manager {} to {}",
@@ -1654,6 +1672,214 @@ fn install_over(new_binary: &Path, destination: &Path) -> Result<(), CliError> {
     })
 }
 
+/// Whether this process cannot write in `directory` because its file system
+/// is mounted read-only to it, as a systemd unit's `ProtectSystem=strict`
+/// mounts everything outside the unit's own directories.
+fn read_only_to_this_process(directory: &Path) -> bool {
+    tempfile::Builder::new()
+        .prefix(".runner-manager.update-probe")
+        .tempfile_in(directory)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::ReadOnlyFilesystem)
+}
+
+/// Replaces `destination` from a transient systemd unit, outside the
+/// service's sandbox.
+///
+/// # Why the service cannot do it itself
+///
+/// The Linux unit's `ProtectSystem=strict` leaves the service only its own
+/// directories to write (see `systemd_unit`), and the binary it was installed
+/// from and upgrades itself from is not in them: `install.sh` puts it in
+/// `/usr/local/bin` or `~/.local/bin`. So the daily update, and the one the
+/// coordinator starts, downloaded and verified the release and then failed
+/// with "Read-only file system", and no Linux service ever updated itself.
+///
+/// Widening the sandbox would let every workflow the service runs replace
+/// that binary too. Instead the verified binary is staged in the service's
+/// state directory and a unit of its own, which systemd starts for the
+/// service's account and which only copies it into place, makes the swap:
+/// the write the operator's `runner-manager update` would have made, and no
+/// other. A runner's account cannot start such a unit for the service's.
+fn install_outside_the_sandbox(
+    new_binary: &Path,
+    destination: &Path,
+    state_dir: &Path,
+) -> Result<(), CliError> {
+    let failed = |what: String| {
+        move |error: std::io::Error| {
+            CliError::with_remedy(
+                Failure::LocalState,
+                format!("cannot {what}: {error}"),
+                runner_manager_platform::service::sudo_command("update"),
+            )
+        }
+    };
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let staged = state_dir.join(format!(".runner-manager.update-{id}"));
+    std::fs::copy(new_binary, &staged).map_err(failed(format!(
+        "stage the new binary in {}",
+        display_path(state_dir)
+    )))?;
+    let user = !runner_manager_platform::host_fitness::is_elevated();
+    let unit = format!("runner-manager-update-{}", &id[..12]);
+    let result = (|| {
+        let program = systemd_run().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "systemd-run is not on this PATH",
+            )
+        })?;
+        Command::new(program)
+            .args(sandbox_exit_arguments(&unit, user, &staged, destination))
+            .stdin(std::process::Stdio::null())
+            .output()
+    })();
+    let _ = std::fs::remove_file(&staged);
+    let output = result.map_err(failed(format!(
+        "start a unit to replace {} outside the service's sandbox",
+        display_path(destination)
+    )))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let journal = if user {
+        format!("journalctl --user -u {unit}")
+    } else {
+        format!("journalctl -u {unit}")
+    };
+    Err(CliError::with_remedy(
+        Failure::LocalState,
+        format!(
+            "the unit that replaces {} outside the service's sandbox failed ({}): {} `{journal}`              says why.",
+            display_path(destination),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ),
+        runner_manager_platform::service::sudo_command("update"),
+    ))
+}
+
+/// `systemd-run`, from `PATH` or where systemd installs it.
+fn systemd_run() -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .and_then(|path| runner_manager_platform::host_fitness::find_on_path("systemd-run", &path))
+        .or_else(|| {
+            ["/usr/bin/systemd-run", "/bin/systemd-run"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|candidate| candidate.exists())
+        })
+}
+
+/// Copies `$1` beside `$3` as `$2`, then renames it over `$3`: one rename, so
+/// the daemon watching `$3` never runs a partial file. The paths are
+/// arguments, never part of the script.
+const SANDBOX_EXIT_SCRIPT: &str =
+    r#"set -e; trap 'rm -f -- "$2"' EXIT; cp -- "$1" "$2"; chmod 0755 -- "$2"; mv -f -- "$2" "$3""#;
+
+/// The `systemd-run` arguments that run [`SANDBOX_EXIT_SCRIPT`] as `unit` and
+/// wait for it: in the account's own manager for a service that is not
+/// `root`'s.
+fn sandbox_exit_arguments(
+    unit: &str,
+    user: bool,
+    staged: &Path,
+    destination: &Path,
+) -> Vec<std::ffi::OsString> {
+    let beside = destination.with_file_name(".runner-manager.update-tmp");
+    let mut arguments: Vec<std::ffi::OsString> = Vec::new();
+    if user {
+        arguments.push("--user".into());
+    }
+    for argument in [
+        format!("--unit={unit}"),
+        "--description=runner-manager update".to_owned(),
+        "--wait".to_owned(),
+        "--collect".to_owned(),
+        "--quiet".to_owned(),
+        "--".to_owned(),
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        SANDBOX_EXIT_SCRIPT.to_owned(),
+        "sh".to_owned(),
+    ] {
+        arguments.push(argument.into());
+    }
+    arguments.extend([
+        staged.as_os_str().to_owned(),
+        beside.into_os_string(),
+        destination.as_os_str().to_owned(),
+    ]);
+    arguments
+}
+
+#[cfg(test)]
+mod sandbox_exit_tests {
+    use super::*;
+
+    #[test]
+    fn the_unit_is_waited_for_and_given_the_paths_as_arguments() {
+        let staged = Path::new("/var/lib/runner-manager/state/.runner-manager.update-1");
+        let destination = Path::new("/usr/local/bin/runner-manager");
+        let arguments =
+            sandbox_exit_arguments("runner-manager-update-1", false, staged, destination);
+        let arguments: Vec<&str> = arguments.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(arguments[0], "--unit=runner-manager-update-1");
+        assert!(arguments.contains(&"--wait"));
+        let beside = destination.with_file_name(".runner-manager.update-tmp");
+        assert_eq!(
+            arguments[arguments.len() - 4..],
+            [
+                "sh",
+                staged.to_str().unwrap(),
+                beside.to_str().unwrap(),
+                "/usr/local/bin/runner-manager",
+            ]
+        );
+        let user = sandbox_exit_arguments("u", true, staged, destination);
+        assert_eq!(user[0], "--user");
+    }
+
+    #[test]
+    fn a_read_only_directory_is_told_from_a_writable_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!read_only_to_this_process(dir.path()));
+        // A missing directory is not a read-only one: `install_over` reports it.
+        assert!(!read_only_to_this_process(&dir.path().join("missing")));
+    }
+
+    /// The script the unit runs, run here by `sh` directly.
+    #[test]
+    #[cfg(unix)]
+    fn the_script_replaces_the_binary_and_leaves_nothing_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        let destination = dir.path().join("bin dir/runner-manager");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"new").unwrap();
+        std::fs::write(&destination, b"old").unwrap();
+        let arguments = sandbox_exit_arguments("u", false, &staged, &destination);
+        let script = arguments.iter().position(|a| a == "/bin/sh").unwrap();
+        let status = Command::new("/bin/sh")
+            .args(&arguments[script + 1..])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        let left: Vec<_> = std::fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, [std::ffi::OsString::from("runner-manager")]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The package-manager channels
 // ---------------------------------------------------------------------------
@@ -1667,17 +1893,23 @@ fn install_over(new_binary: &Path, destination: &Path) -> Result<(), CliError> {
 fn run_package_manager(
     program: &str,
     arguments: &[&str],
+    beside: Option<&Path>,
     remedy: impl Into<String>,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let failed = write_failed("this update");
     let remedy: String = remedy.into();
+    let search = search_path(beside);
     let not_on_path = || {
         CliError::with_remedy(
             Failure::UpdateUnsupported,
             format!(
-                "this copy was installed by {program}, and {program} is not on this PATH{}, so it \
-                 cannot be asked to update it.",
+                "this copy was installed by {program}, and {program} is not on this PATH{}{}, so \
+                 it cannot be asked to update it.",
+                beside.map_or_else(String::new, |directory| format!(
+                    " nor in {}",
+                    display_path(directory)
+                )),
                 if cfg!(windows) {
                     format!(" (searched for {program} with each PATHEXT extension)")
                 } else {
@@ -1687,7 +1919,7 @@ fn run_package_manager(
             remedy.clone(),
         )
     };
-    let executable = resolve_program(program).ok_or_else(not_on_path)?;
+    let executable = resolve_program(program, &search).ok_or_else(not_on_path)?;
     writeln!(
         out,
         "Running: {} {}",
@@ -1704,6 +1936,7 @@ fn run_package_manager(
     // quote safely, CVE-2024-24576) -- so no command line is assembled here.
     let status = Command::new(&executable)
         .args(arguments)
+        .env("PATH", &search)
         .stdin(std::process::Stdio::null())
         .output()
         .and_then(|output| {
@@ -1737,21 +1970,65 @@ fn run_package_manager(
     }
 }
 
-/// The file to spawn for a package manager named `name`.
-///
-/// # Why Windows needs its own search
+/// The file to spawn for a package manager named `name`, searched on `path`
+/// the way a shell would.
 ///
 /// `Command::new("npm")` on Windows looks only for `npm.exe`: the standard
 /// library appends `.exe` to a bare name and ignores `PATHEXT`. npm ships as
 /// `npm.cmd`, so a machine with Node.js on its `PATH` read as "npm is not on
-/// this PATH". Elsewhere `Command` searches `PATH` itself and the name is
-/// returned as it is.
-fn resolve_program(name: &str) -> Option<PathBuf> {
-    if cfg!(windows) {
-        runner_manager_platform::host_fitness::find_on_path(name, &std::env::var_os("PATH")?)
-    } else {
-        Some(PathBuf::from(name))
+/// this PATH". [`find_on_path`] tries each `PATHEXT` extension.
+///
+/// [`find_on_path`]: runner_manager_platform::host_fitness::find_on_path
+fn resolve_program(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    runner_manager_platform::host_fitness::find_on_path(name, path)
+}
+
+/// This process's `PATH`, with `beside` after it: what a package manager is
+/// looked for on and run with.
+///
+/// # Why `PATH` is not enough
+///
+/// A service does not get the operator's shell `PATH`. launchd starts a
+/// macOS service with `/usr/bin:/bin:/usr/sbin:/sbin`, so for the daily update
+/// and the coordinator's, the npm and Homebrew that installed a copy under
+/// `/opt/homebrew` were "not on this PATH", and no such service ever updated
+/// itself. The directory of the package manager that owns this copy is
+/// known from the copy's own path, and npm's `#!/usr/bin/env node` finds the
+/// `node` beside it through the same `PATH`. Appended, so the operator's own
+/// order still decides when both have one.
+fn search_path(beside: Option<&Path>) -> std::ffi::OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut directories: Vec<PathBuf> = std::env::split_paths(&inherited).collect();
+    if let Some(beside) = beside
+        && !directories.iter().any(|directory| directory == beside)
+    {
+        directories.push(beside.to_path_buf());
     }
+    std::env::join_paths(&directories).unwrap_or(inherited)
+}
+
+/// Where the package manager that owns the copy at `binary` lives: an npm
+/// prefix's `bin` (the prefix itself on Windows), a Homebrew prefix's `bin`,
+/// `$CARGO_HOME/bin`. Without the `\\?\` prefix of a canonical Windows path,
+/// which `cmd.exe` does not search.
+fn package_manager_directory(channel: &Channel, binary: &Path) -> Option<PathBuf> {
+    let directory = match channel {
+        Channel::Npm => npm_global_prefix(binary, cfg!(windows)).map(|prefix| {
+            if cfg!(windows) {
+                prefix
+            } else {
+                prefix.join("bin")
+            }
+        }),
+        Channel::Homebrew => binary
+            .ancestors()
+            .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new("Cellar")))
+            .and_then(Path::parent)
+            .map(|prefix| prefix.join("bin")),
+        Channel::Cargo => Some(cargo_bin()),
+        _ => None,
+    };
+    directory.map(|directory| PathBuf::from(display_path(&directory)))
 }
 
 /// Says whether npm really replaced the copy this process is, by running it.

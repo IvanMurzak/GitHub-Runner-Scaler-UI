@@ -738,6 +738,52 @@ fn an_npm_copy_is_updated_by_the_npm_on_path_in_its_own_prefix() {
     );
 }
 
+/// A macOS service failed its daily update with "npm is not on this PATH":
+/// launchd gives a service `/usr/bin:/bin:/usr/sbin:/sbin`, and the npm that
+/// installed the copy sat in `/opt/homebrew/bin`. The npm beside the prefix
+/// holding the copy is found with nothing on `PATH`, and runs with its own
+/// directory on `PATH`, where npm's `#!/usr/bin/env node` finds `node`.
+#[test]
+fn an_npm_copy_is_updated_by_the_npm_of_its_prefix_when_none_is_on_path() {
+    let fixtures = tempfile::tempdir().expect("a temporary directory");
+    let newer = one_release_newer();
+    let release = build_release(fixtures.path(), &newer);
+    let installed = Installed::npm_global();
+    let prefix = PathBuf::from(installed.npm_prefix());
+    let tools = if cfg!(windows) {
+        prefix.clone()
+    } else {
+        prefix.join("bin")
+    };
+    // Only shell builtins: nothing else is on this PATH.
+    write_script(
+        &tools,
+        "npm",
+        "for %%a in (%*) do >>\"%~dp0npm-arguments.txt\" echo %%~a\r\n>\"%~dp0npm-path.txt\" echo %PATH%",
+        "for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"${0%/*}/npm-arguments.txt\"; done\nprintf '%s\\n' \"$PATH\" > \"${0%/*}/npm-path.txt\"",
+    );
+    let empty = fixtures.path().join("empty");
+    std::fs::create_dir_all(&empty).expect("an empty directory");
+
+    let outcome = installed.update_with_path(&release.assets, &[], Some(empty.as_os_str()));
+    assert_eq!(outcome.code, 0, "output was:\n{}", outcome.both());
+    let arguments = std::fs::read_to_string(tools.join("npm-arguments.txt"))
+        .unwrap_or_else(|error| panic!("npm was never run ({error}):\n{}", outcome.both()));
+    assert!(
+        arguments
+            .lines()
+            .map(str::trim)
+            .any(|line| line == installed.npm_prefix()),
+        "{arguments}"
+    );
+    let path = std::fs::read_to_string(tools.join("npm-path.txt")).expect("the PATH npm saw");
+    let path = std::ffi::OsString::from(path.trim());
+    assert!(
+        std::env::split_paths(&path).any(|directory| directory == tools),
+        "npm ran with PATH {path:?}"
+    );
+}
+
 fn modified(path: &Path) -> std::time::SystemTime {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
