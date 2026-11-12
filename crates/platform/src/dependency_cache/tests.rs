@@ -119,7 +119,55 @@ fn the_default_variables_are_these_on_each_platform() {
     unix.extend(after_electron);
     unix.extend(["CP_CACHE_DIR", "CCACHE_DIR"]);
     assert_eq!(names_on(MACOS, &config), unix);
-    assert_eq!(names_on(LINUX, &config), unix);
+    // pnpm copies out of the shared store on Linux, where each runner is its
+    // own account.
+    let mut linux = unix.clone();
+    let store = linux
+        .iter()
+        .position(|name| *name == "PNPM_CONFIG_STORE_DIR")
+        .expect("pnpm's store");
+    linux.splice(
+        store + 1..store + 1,
+        [
+            "npm_config_package_import_method",
+            "PNPM_CONFIG_PACKAGE_IMPORT_METHOD",
+        ],
+    );
+    assert_eq!(names_on(LINUX, &config), linux);
+}
+
+/// Each concurrent Linux runner is its own account, and a package pnpm
+/// hard-links out of the shared store stays owned by the account that stored
+/// it: pnpm's `chmod` of its bin then fails for every other account with
+/// `ERR_PNPM_CMD_SHIM_CHMOD`. Wherever the store is shared on Linux, pnpm
+/// copies; one variable without the other is never set.
+#[test]
+fn pnpm_copies_out_of_the_shared_store_on_linux_and_only_there() {
+    let pnpm = TOOLS
+        .iter()
+        .find(|tool| tool.id == "pnpm")
+        .expect("the pnpm tool");
+    assert_eq!(pnpm.sharing, Sharing::Namespace);
+    for platform in PLATFORMS {
+        let variables: Vec<_> = pnpm.variables_on(platform).collect();
+        let copies = variables.iter().any(|variable| {
+            variable.name == "PNPM_CONFIG_PACKAGE_IMPORT_METHOD"
+                && variable.value == VarValue::Literal("copy")
+        });
+        assert!(
+            variables
+                .iter()
+                .any(|variable| variable.name == "PNPM_CONFIG_STORE_DIR")
+        );
+        assert_eq!(copies, platform == LINUX, "{platform:?}");
+        assert_eq!(
+            variables
+                .iter()
+                .any(|variable| variable.name == "npm_config_package_import_method"),
+            platform == LINUX,
+            "pnpm 9 and 10 read only the npm_config_ spelling ({platform:?})"
+        );
+    }
 }
 
 #[test]

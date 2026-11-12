@@ -1010,7 +1010,7 @@ it until its attempt is cleaned up.
 | `tool-cache` | `RUNNER_TOOL_CACHE`, `AGENT_TOOLSDIRECTORY` | all | per runner | on | actions/runner `HostContext.cs`; @actions/tool-cache `_getCacheDirectory` |
 | `dotnet` | `DOTNET_INSTALL_DIR` | all | per runner | on | actions/setup-dotnet `installer.ts` |
 | `npm` | `npm_config_cache` | all | yes | on | npm config docs; `@npmcli/config` `loadEnv` |
-| `pnpm` | `npm_config_store_dir` (pnpm 9, 10), `PNPM_CONFIG_STORE_DIR` (pnpm 11+) | all | yes | on | `@pnpm/npm-conf`; pnpm 11 release notes |
+| `pnpm` | `npm_config_store_dir` (pnpm 9, 10), `PNPM_CONFIG_STORE_DIR` (pnpm 11+); on Linux also `npm_config_package_import_method`, `PNPM_CONFIG_PACKAGE_IMPORT_METHOD` = `copy` | all | yes | on | `@pnpm/npm-conf`; pnpm 11 release notes; pnpm `package-import-method` docs |
 | `yarn` | `YARN_GLOBAL_FOLDER` | all | yes | on | Yarn configuration docs; berry `Configuration.ts` |
 | `bun` | `BUN_INSTALL_CACHE_DIR` | all | yes | on | Bun global cache docs |
 | `deno` | `DENO_DIR` | all | yes | on | Deno `deno_dir.rs` |
@@ -1048,7 +1048,11 @@ Some choices are deliberate:
   instead.
 - **pnpm**: npm 12 prints `Unknown env config "store-dir"` because of `npm_config_store_dir`,
   which pnpm 9 and 10 need. Turn `pnpm` off for a repository that does not use pnpm if the
-  warning bothers you.
+  warning bothers you. On Linux, where each concurrent runner is its own account (0.4.57), pnpm
+  copies packages out of the shared store (`package-import-method` `copy`) instead of hard-linking
+  them: a hard-linked file stays owned by the account that stored it, and pnpm's `chmod` of a
+  package's bin failed for every other account with `ERR_PNPM_CMD_SHIM_CHMOD` (from 0.4.68). The
+  store still saves the downloads; a job's own `env:` still overrides the method.
 - **setup-python on macOS** ignores the tool cache and installs under
   `/Users/runner/hostedtoolcache`. Create that directory once for the runner account if
   workflows use it; on Linux and Windows `AGENT_TOOLSDIRECTORY` covers it.
