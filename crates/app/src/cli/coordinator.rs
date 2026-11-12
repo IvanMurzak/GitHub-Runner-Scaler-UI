@@ -1265,11 +1265,12 @@ fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy
 /// allocator counts them: a repository removed while its runners finish has
 /// no policy any more, and its runners still hold their slots.
 fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
-    let busy = ports
-        .store
-        .uncleaned_attempts()
-        .map(|attempts| active_count(attempts.iter()))
-        .unwrap_or(0);
+    let attempts = ports.store.uncleaned_attempts().unwrap_or_default();
+    let busy = active_count(attempts.iter());
+    let runners = attempts
+        .iter()
+        .map(|attempt| runner_manager_agent::lifecycle::runner_name(attempt.id))
+        .collect();
     // A launch with no runner yet has a slot spoken for: said here, the
     // coordinator offers what this host can really start.
     let spoken_for = ports.launches.unstarted();
@@ -1291,6 +1292,10 @@ fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
         open_leases,
         disk_free_bytes: runner_manager_platform::host_fitness::free_disk_bytes(&ports.runner_root),
         versions: super::versions::report(&ports.paths),
+        disk_total_bytes: runner_manager_platform::host_fitness::total_disk_bytes(
+            &ports.runner_root,
+        ),
+        runners: Some(runners),
     }
 }
 

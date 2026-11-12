@@ -1,16 +1,20 @@
 //! What the dashboard shows of the jobs: the queued ones, the running ones and
 //! the last ones to finish, as GitHub's `workflow_job` webhooks describe them,
-//! and which host each runner belongs to, as the hosts' `attempt_started`
-//! reports say.
+//! and which host each runner belongs to, as the hosts' heartbeats (0.4.66)
+//! and `attempt_started` reports say.
 //!
 //! Only jobs for self-hosted runners are kept: a repository's jobs on GitHub's
-//! own runners are not this fleet's work. Everything is in memory; after a
-//! restart the lists fill again from the next webhooks.
+//! own runners are not this fleet's work. The lists live in memory and are
+//! saved every minute and at shutdown ([`Activity::saved`]), so a restart
+//! (every coordinator update is one) does not empty them. What a restart
+//! missed is settled afterwards: a running job whose runner its host no
+//! longer lists ended, and a restored queued job the sweep no longer lists
+//! left the queue.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::stats::JobTimes;
 use crate::webhook::WorkflowJobEvent;
@@ -25,9 +29,12 @@ const MAX_RUNNERS: usize = 4000;
 /// `completed`), as is a running one in [`RUNNING_FOR`].
 const QUEUED_FOR: i64 = 24 * 60 * 60;
 const RUNNING_FOR: i64 = 3 * 24 * 60 * 60;
+/// Saved lists older than this are not restored: the coordinator was down
+/// for longer than they could still be right.
+pub const MAX_RESTORED_AGE: i64 = 60 * 60;
 
 /// A job in the queue or running.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveJob {
     pub id: u64,
     pub run_id: u64,
@@ -38,10 +45,13 @@ pub struct ActiveJob {
     pub queued_at: i64,
     pub started_at: Option<i64>,
     pub runner_name: Option<String>,
+    /// Restored from the last save and not moved on by a webhook since.
+    #[serde(skip)]
+    pub restored: bool,
 }
 
 /// A job that finished.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinishedJob {
     pub id: u64,
     pub run_id: u64,
@@ -61,6 +71,20 @@ struct Inner {
     /// Runner name to host id, and the order they came in.
     runners: HashMap<String, String>,
     runner_order: VecDeque<String>,
+    /// Each host's runners as its last heartbeat listed them (0.4.66):
+    /// a running job whose runner its host no longer lists has ended.
+    live: HashMap<String, HashSet<String>>,
+}
+
+/// What [`Activity::saved`] keeps across a restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Saved {
+    pub jobs: Vec<ActiveJob>,
+    /// Newest first.
+    pub recent: Vec<FinishedJob>,
+    /// Runner name and host id, oldest first.
+    pub runners: Vec<(String, String)>,
 }
 
 /// The dashboard's view of the jobs.
@@ -125,7 +149,9 @@ impl Activity {
                     queued_at: unix(times.created_at).unwrap_or(now),
                     started_at: None,
                     runner_name: None,
+                    restored: false,
                 });
+                entry.restored = false;
                 if action == "in_progress" {
                     entry.started_at = unix(times.started_at).or(Some(now));
                     entry.runner_name.clone_from(&job.runner_name);
@@ -172,7 +198,21 @@ impl Activity {
     /// A host said one of its runners took a job.
     pub fn runner_started(&self, host_id: &str, runner_name: &str) {
         let mut inner = self.lock();
-        let key = runner_key(runner_name);
+        Self::remember_runner(&mut inner, runner_key(runner_name), host_id);
+    }
+
+    /// A host's heartbeat listed its runners (0.4.66): known from the moment
+    /// each starts, before any job webhook names it.
+    pub fn host_runners(&self, host_id: &str, runners: &[String]) {
+        let mut inner = self.lock();
+        let keys: HashSet<String> = runners.iter().map(|name| runner_key(name)).collect();
+        for key in &keys {
+            Self::remember_runner(&mut inner, key.clone(), host_id);
+        }
+        inner.live.insert(host_id.to_owned(), keys);
+    }
+
+    fn remember_runner(inner: &mut Inner, key: String, host_id: &str) {
         if inner
             .runners
             .insert(key.clone(), host_id.to_owned())
@@ -184,6 +224,52 @@ impl Activity {
                     inner.runners.remove(&old);
                 }
             }
+        }
+    }
+
+    /// The sweep listed `listed`, every queued job of `repository`, reading
+    /// from `read_at` (Unix seconds) on. A restored queued job it did not
+    /// list left the queue while this coordinator was down: its webhooks were
+    /// missed, so it is forgotten. Call only with a complete listing.
+    pub fn swept(&self, repository: &str, listed: &HashSet<u64>, read_at: i64) {
+        self.lock().jobs.retain(|id, job| {
+            !(job.restored
+                && job.started_at.is_none()
+                && job.queued_at < read_at
+                && job.repository.eq_ignore_ascii_case(repository)
+                && !listed.contains(id))
+        });
+    }
+
+    /// The lists and the runners' hosts, to be saved.
+    #[must_use]
+    pub fn saved(&self) -> Saved {
+        let inner = self.lock();
+        Saved {
+            jobs: inner.jobs.values().cloned().collect(),
+            recent: inner.recent.iter().cloned().collect(),
+            runners: inner
+                .runner_order
+                .iter()
+                .filter_map(|key| Some((key.clone(), inner.runners.get(key)?.clone())))
+                .collect(),
+        }
+    }
+
+    /// Takes back what [`Self::saved`] kept, before any webhook arrives.
+    pub fn restore(&self, saved: Saved) {
+        let mut inner = self.lock();
+        for mut job in saved.jobs.into_iter().take(MAX_JOBS) {
+            job.restored = true;
+            inner.jobs.entry(job.id).or_insert(job);
+        }
+        for done in saved.recent.into_iter().take(RECENT) {
+            if !inner.recent.iter().any(|known| known.id == done.id) {
+                inner.recent.push_back(done);
+            }
+        }
+        for (key, host_id) in saved.runners {
+            Self::remember_runner(&mut inner, runner_key(&key), &host_id);
         }
     }
 
@@ -206,10 +292,33 @@ impl Activity {
     }
 
     fn forget_stale(inner: &mut Inner, now: i64) {
-        inner.jobs.retain(|_, job| match job.started_at {
-            Some(started) => now - started < RUNNING_FOR,
+        let Inner {
+            jobs,
+            runners,
+            live,
+            ..
+        } = inner;
+        jobs.retain(|_, job| match job.started_at {
+            Some(started) => now - started < RUNNING_FOR && !Self::runner_gone(runners, live, job),
             None => now - job.queued_at < QUEUED_FOR,
         });
+    }
+
+    /// The job's runner is one a host listed, and that host's last
+    /// heartbeat no longer lists it: the attempt was cleaned, so the job
+    /// ended and its `completed` webhook was missed.
+    fn runner_gone(
+        runners: &HashMap<String, String>,
+        live: &HashMap<String, HashSet<String>>,
+        job: &ActiveJob,
+    ) -> bool {
+        let Some(key) = job.runner_name.as_deref().map(runner_key) else {
+            return false;
+        };
+        runners
+            .get(&key)
+            .and_then(|host| live.get(host))
+            .is_some_and(|listed| !listed.contains(&key))
     }
 
     /// The jobs now, forgetting the ones no webhook moved on for too long.
@@ -333,5 +442,99 @@ mod tests {
         );
         assert_eq!(activity.snapshot(now).queued.len(), 1);
         assert!(activity.snapshot(now + QUEUED_FOR).queued.is_empty());
+    }
+
+    fn at(text: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .timestamp()
+    }
+
+    #[test]
+    fn a_heartbeat_names_the_machine_before_the_job_starts() {
+        let activity = Activity::default();
+        let now = at("2026-11-10T10:00:30Z");
+        activity.host_runners(
+            "host-1",
+            &["runner-manager-A".into(), "runner-manager-b".into()],
+        );
+        feed(
+            &activity,
+            &event("in_progress", 1, &["self-hosted"], Some("runner-manager-a")),
+            now,
+        );
+        assert_eq!(
+            activity.host_of("runner-manager-a").as_deref(),
+            Some("host-1")
+        );
+        assert_eq!(activity.snapshot(now).running.len(), 1);
+    }
+
+    #[test]
+    fn a_running_job_whose_runner_its_host_dropped_ended() {
+        let activity = Activity::default();
+        let now = at("2026-11-10T10:00:30Z");
+        activity.host_runners("host-1", &["rm-a".into()]);
+        feed(
+            &activity,
+            &event("in_progress", 1, &["self-hosted"], Some("rm-a")),
+            now,
+        );
+        feed(
+            &activity,
+            &event("in_progress", 2, &["self-hosted"], Some("other")),
+            now,
+        );
+        activity.host_runners("host-1", &["rm-a".into()]);
+        assert_eq!(activity.counts(now), (0, 2));
+        // Its attempt was cleaned and the `completed` webhook never came.
+        activity.host_runners("host-1", &[]);
+        let snapshot = activity.snapshot(now);
+        assert_eq!(snapshot.running.len(), 1, "a runner no host listed is kept");
+        assert_eq!(snapshot.running[0].id, 2);
+    }
+
+    #[test]
+    fn the_lists_survive_a_restart() {
+        let before = Activity::default();
+        let now = at("2026-11-10T10:00:30Z");
+        before.host_runners("host-1", &["rm-a".into()]);
+        feed(&before, &event("queued", 1, &["self-hosted"], None), now);
+        feed(
+            &before,
+            &event("in_progress", 2, &["self-hosted"], Some("rm-a")),
+            now,
+        );
+        feed(
+            &before,
+            &event("completed", 3, &["self-hosted"], Some("rm-a")),
+            now,
+        );
+        let saved: Saved =
+            serde_json::from_str(&serde_json::to_string(&before.saved()).unwrap()).unwrap();
+
+        let after = Activity::default();
+        after.restore(saved);
+        let snapshot = after.snapshot(now);
+        assert_eq!(
+            (
+                snapshot.queued.len(),
+                snapshot.running.len(),
+                snapshot.recent.len()
+            ),
+            (1, 1, 1)
+        );
+        assert!(snapshot.queued[0].restored);
+        assert_eq!(after.host_of("rm-a").as_deref(), Some("host-1"));
+
+        // The sweep no longer lists the restored queued job: it left the queue
+        // while the coordinator was down. A job queued since is kept.
+        feed(&after, &event("queued", 4, &["self-hosted"], None), now);
+        after.swept("ivanmurzak/APP", &HashSet::new(), now + 60);
+        let snapshot = after.snapshot(now);
+        assert_eq!(
+            snapshot.queued.iter().map(|job| job.id).collect::<Vec<_>>(),
+            [4]
+        );
     }
 }

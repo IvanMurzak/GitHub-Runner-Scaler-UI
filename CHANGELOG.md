@@ -7,6 +7,34 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.66
+
+### Added
+
+- The coordinator's dashboard keeps its Queue, Running and Recent lists across a
+  restart (every coordinator update is one): they are saved every minute and at
+  shutdown, and restored at start. A restored queued job the sweep no longer
+  lists, and a running job whose runner its machine no longer lists, are dropped,
+  so jobs that ended during the restart do not linger.
+- A machine lists its runners in every heartbeat, from the moment each starts.
+  The Running and Recent lists name the machine as soon as a job starts; before,
+  a job showed "—" until the machine noticed it, and a short job often never got
+  a machine.
+- A machine reports its disk's size: the card shows the disk as used / total with
+  a meter, where it showed only the free space.
+- The machine card's history shows memory beside CPU.
+
+### Changed
+
+- Activity charts read better on wide ranges: points are averaged into fewer,
+  period-aligned groups; jobs and busy slots are stacked columns, CPU is a row per
+  machine with its average and peak, memory a smoothed line per machine.
+- The summary tiles show jobs as running / queued in one tile.
+- Meters turn yellow from 50%, orange from 75% and red from 90%.
+- A Windows machine's card shows the version its WSL host actually runs, not
+  what `wsl install` last installed there (stale once the distribution updated
+  itself).
+
 ## 0.4.65
 
 ### Added

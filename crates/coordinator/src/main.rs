@@ -446,6 +446,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         )
                         .with_placement(Arc::clone(&state.placement))
                         .with_workflows(state.statistics.run_workflows())
+                        .with_activity(
+                            state
+                                .dashboard
+                                .as_ref()
+                                .map(|dashboard| Arc::clone(&dashboard.activity)),
+                        )
                         .run(),
                     );
                 } else {

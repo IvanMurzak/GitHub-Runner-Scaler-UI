@@ -295,7 +295,7 @@
 
   function meterBar(pct, extra) {
     const p = isNum(pct) ? clamp(pct, 0, 100) : 0;
-    const level = !isNum(pct) ? 'none' : p >= 95 ? 'err' : p >= 80 ? 'warn' : 'ok';
+    const level = !isNum(pct) ? 'none' : p >= 90 ? 'err' : p >= 75 ? 'high' : p >= 50 ? 'warn' : 'ok';
     return h('span', { class: `bar bar-${level} ${extra || ''}`, role: 'presentation', vars: { '--pct': `${p}%` } });
   }
 
@@ -316,10 +316,10 @@
       kpi('Machines online', h('span', { class: 'num' }, fmtInt(sm.hosts_online), h('small', { text: ` / ${fmtInt(sm.hosts_total)}` }))),
       kpi('Runner slots busy', h('span', { class: 'num' }, fmtInt(sm.slots_busy), h('small', { text: ` / ${fmtInt(sm.slots_total)}` })),
         isNum(pct) ? `${Math.round(pct)}% utilised` : null, meterBar(pct, 'kpi-bar')),
-      kpi('Jobs queued', h('span', { class: 'num' }, fmtInt(sm.jobs_queued)),
-        oldest ? h('span', {}, 'oldest ', since(oldest.queued_at)) : 'nothing waiting'),
-      kpi('Jobs running', h('span', { class: 'num' }, fmtInt(sm.jobs_running)),
-        runHosts ? `on ${runHosts} machine${runHosts === 1 ? '' : 's'}` : sm.jobs_running ? null : 'all idle'),
+      kpi('Jobs running / queued', h('span', { class: 'num' }, fmtInt(sm.jobs_running), h('small', { text: ` / ${fmtInt(sm.jobs_queued)}` })),
+        h('span', {},
+          runHosts ? `on ${runHosts} machine${runHosts === 1 ? '' : 's'}` : sm.jobs_running ? null : 'all idle',
+          oldest ? h('span', {}, ' · oldest waits ', since(oldest.queued_at)) : null)),
       kpi('Queue wait p50', h('span', { class: 'num', text: fmtDur(sm.p50_queue_wait_secs) }),
         h('span', {}, 'p90 ', h('b', { class: 'num', text: fmtDur(sm.p90_queue_wait_secs) }))),
     );
@@ -357,17 +357,25 @@
   function sparkline(hostId) {
     const m = state.metrics;
     const mh = m && (m.hosts || []).find((x) => x.id === hostId);
-    if (!mh || !Array.isArray(mh.cpu) || mh.cpu.length < 2) return h('div', { class: 'spark spark-empty', text: 'No CPU history yet' });
-    const n = mh.cpu.length, W = 120, H = 32;
-    const pts = mh.cpu.map((v, i) => (isNum(v) ? [(i / (n - 1)) * W, H - (clamp(v, 0, 100) / 100) * (H - 2) - 1] : null));
-    const vals = mh.cpu.filter(isNum);
-    const peak = vals.length ? Math.max(...vals) : null;
-    const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+    if (!mh || !Array.isArray(mh.cpu) || mh.cpu.filter(isNum).length < 2) return h('div', { class: 'spark spark-empty', text: 'No CPU history yet' });
+    const ram = (mh.ram_used || []).map((u, i) => {
+      const total = (mh.ram_total || [])[i];
+      return isNum(u) && isNum(total) && total > 0 ? (u / total) * 100 : null;
+    });
+    const g = regroup(m.t || [], m.step_secs || 60, groupOf(mh.cpu.length, SPARK_POINTS), [mh.cpu, ram]);
+    const [cpu, mem] = g.series;
+    const n = cpu.length, W = 120, H = 32;
+    const toPts = (vals) => vals.map((v, i) => (isNum(v) ? [(i / Math.max(1, n - 1)) * W, H - (clamp(v, 0, 100) / 100) * (H - 2) - 1] : null));
+    const peak = (vals) => { const v = vals.filter(isNum); return v.length ? Math.max(...v) : null; };
+    const cpuPts = toPts(cpu);
     return h('div', { class: 'spark' },
-      s('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', role: 'img', 'aria-label': `CPU over the ${RANGE_LABEL[m.range] || m.range}: average ${fmtPct(avg)}, peak ${fmtPct(peak)}` },
-        s('path', { class: 'spark-area', d: areaPath(pts, H) }),
-        s('path', { class: 'spark-line', d: linePath(pts), 'vector-effect': 'non-scaling-stroke' })),
-      h('span', { class: 'spark-cap' }, `CPU · ${m.range}`, h('span', { class: 'num', text: `peak ${fmtPct(peak)}` })));
+      s('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', role: 'img', 'aria-label': `CPU and memory over the ${RANGE_LABEL[m.range] || m.range}: CPU peak ${fmtPct(peak(cpu))}, memory peak ${fmtPct(peak(mem))}` },
+        s('path', { class: 'spark-area', d: areaPath(cpuPts, H, true) }),
+        s('path', { class: 'spark-line spark-ram', d: linePath(toPts(mem), true), 'vector-effect': 'non-scaling-stroke' }),
+        s('path', { class: 'spark-line', d: linePath(cpuPts, true), 'vector-effect': 'non-scaling-stroke' })),
+      h('span', { class: 'spark-cap' },
+        h('span', {}, h('i', { class: 'spark-key', 'aria-hidden': 'true' }), 'CPU', h('i', { class: 'spark-key spark-key-ram', 'aria-hidden': 'true' }), `RAM · ${m.range}`),
+        h('span', { class: 'num', text: `peak ${fmtPct(peak(cpu))} · ${fmtPct(peak(mem))}` })));
   }
 
   function hostCard(x) {
@@ -395,9 +403,19 @@
       sparkline(x.id),
       versionLine(x),
       h('footer', { class: 'host-foot' },
-        h('span', {}, 'Disk free ', h('b', { class: 'num', text: fmtBytes(x.disk_free_bytes) })),
+        diskLine(x),
         !x.online ? h('span', {}, 'Last seen ', ago(x.last_seen_at))
           : isNum(x.connected_since) ? h('span', {}, 'Up ', since(x.connected_since)) : null));
+  }
+
+  // `Disk 176 GiB / 1.5 TiB` with a meter, from 0.4.66; free space before.
+  function diskLine(x) {
+    const total = x.disk_total_bytes, free = x.disk_free_bytes;
+    if (!isNum(total) || total <= 0 || !isNum(free)) return h('span', {}, 'Disk free ', h('b', { class: 'num', text: fmtBytes(free) }));
+    const used = Math.max(0, total - free);
+    return h('span', { class: 'disk', title: `${fmtBytes(free)} free` },
+      h('span', {}, 'Disk ', h('b', { class: 'num', text: `${fmtBytes(used)} / ${fmtBytes(total)}` })),
+      meterBar((used / total) * 100));
   }
 
   function renderHosts(ov) {
@@ -521,29 +539,51 @@
   }
 
   // ---------------------------------------------------------------- charts
-  function linePath(pts) {
-    let d = '', pen = false;
-    for (const p of pts) {
-      if (!p) { pen = false; continue; }
-      d += `${pen ? 'L' : 'M'}${p[0].toFixed(1)} ${p[1].toFixed(1)}`;
-      if (!pen) d += 'l0 0';
-      pen = true;
+  // A wide range has more points than a plot has room for. They are averaged
+  // in groups first, to about LINE_POINTS points for a line and COLUMN_COUNT
+  // columns, so a chart reads the same at 1h and at 7d. Groups are aligned to
+  // whole multiples of their width, so a refresh does not reshape the past.
+  const LINE_POINTS = 90, COLUMN_COUNT = 48, SPARK_POINTS = 60;
+
+  // `series` (arrays over `t`, one point per `step` seconds) averaged into
+  // groups of `k` steps; a group with no value stays empty.
+  function regroup(t, step, k, series) {
+    if (k <= 1 || !t.length) return { t, step, series };
+    const width = step * k;
+    const slot = new Map(), keys = [];
+    const at = t.map((tt) => {
+      const g = Math.floor(tt / width) * width;
+      if (!slot.has(g)) { slot.set(g, keys.length); keys.push(g); }
+      return slot.get(g);
+    });
+    return {
+      t: keys, step: width,
+      series: series.map((vals) => {
+        const sum = new Array(keys.length).fill(0), cnt = new Array(keys.length).fill(0);
+        vals.forEach((v, i) => { if (isNum(v)) { sum[at[i]] += v; cnt[at[i]]++; } });
+        return sum.map((x, g) => (cnt[g] ? x / cnt[g] : null));
+      }),
+    };
+  }
+  const groupOf = (n, target) => Math.max(1, Math.ceil(n / target));
+
+  const f1 = (v) => v.toFixed(1);
+  // Fritsch–Carlson monotone cubic: smooth, and never overshoots a value.
+  function curve(p, smooth) {
+    if (p.length === 1) return `M${f1(p[0][0])} ${f1(p[0][1])}l0 0`;
+    if (!smooth || p.length < 3) return 'M' + p.map((q) => `${f1(q[0])} ${f1(q[1])}`).join('L');
+    const n = p.length, dx = [], m = [], tg = [];
+    for (let i = 0; i < n - 1; i++) { dx[i] = p[i + 1][0] - p[i][0]; m[i] = (p[i + 1][1] - p[i][1]) / (dx[i] || 1); }
+    tg[0] = m[0]; tg[n - 1] = m[n - 2];
+    for (let i = 1; i < n - 1; i++) {
+      tg[i] = m[i - 1] * m[i] <= 0 ? 0 : (3 * (dx[i - 1] + dx[i])) / ((2 * dx[i] + dx[i - 1]) / m[i - 1] + (dx[i] + 2 * dx[i - 1]) / m[i]);
+    }
+    let d = `M${f1(p[0][0])} ${f1(p[0][1])}`;
+    for (let i = 0; i < n - 1; i++) {
+      const third = dx[i] / 3;
+      d += `C${f1(p[i][0] + third)} ${f1(p[i][1] + tg[i] * third)} ${f1(p[i + 1][0] - third)} ${f1(p[i + 1][1] - tg[i + 1] * third)} ${f1(p[i + 1][0])} ${f1(p[i + 1][1])}`;
     }
     return d;
-  }
-  // Area under a line down to a fixed baseline, one closed shape per run of values.
-  function areaPath(pts, base) {
-    return runs(pts.map((p, i) => (p ? i : null))).map(([a, b]) =>
-      `M${pts[a][0].toFixed(1)} ${base}` + pts.slice(a, b + 1).map((p) => `L${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join('') + `L${pts[b][0].toFixed(1)} ${base}Z`).join('');
-  }
-  // Area between two point lists (top over bottom), split into runs where top exists.
-  function bandPath(top, bottom) {
-    return runs(top.map((p, i) => (p ? i : null))).map(([a, b]) => {
-      let d = `M${top[a][0].toFixed(1)} ${top[a][1].toFixed(1)}`;
-      for (let i = a + 1; i <= b; i++) d += `L${top[i][0].toFixed(1)} ${top[i][1].toFixed(1)}`;
-      for (let i = b; i >= a; i--) d += `L${bottom[i][0].toFixed(1)} ${bottom[i][1].toFixed(1)}`;
-      return `${d}Z`;
-    }).join('');
   }
   function runs(idx) {
     const out = []; let start = null;
@@ -553,6 +593,11 @@
     });
     return out;
   }
+  const runsOf = (pts) => runs(pts.map((p, i) => (p ? i : null))).map(([a, b]) => pts.slice(a, b + 1));
+  const linePath = (pts, smooth) => runsOf(pts).map((r) => curve(r, smooth)).join('');
+  // Area under a line down to a fixed baseline, one closed shape per run of values.
+  const areaPath = (pts, base, smooth) => runsOf(pts).map((r) =>
+    `${curve(r, smooth)}L${f1(r[r.length - 1][0])} ${f1(base)}L${f1(r[0][0])} ${f1(base)}Z`).join('');
 
   function yScale(maxV, fixed, integer) {
     const top0 = fixed || (maxV > 0 ? maxV : 1);
@@ -598,6 +643,8 @@
   }
   const hideAllTips = () => charts.forEach(hideTip);
 
+  // cfg.kind: 'lines' (smooth, one per series), 'columns' (stacked) or
+  // 'strips' (a row per series, each 0..yMax).
   function drawChart(c) {
     const { plot, cfg } = c;
     if (!cfg) return;
@@ -612,51 +659,92 @@
       return;
     }
     const narrow = W < 420;
-    const P = { l: narrow ? 30 : 38, r: 8, t: 8, b: 22 };
+    const strips = cfg.kind === 'strips';
+    const P = { l: strips ? (narrow ? 74 : 96) : narrow ? 30 : 38, r: 8, t: 8, b: 22 };
     const pw = W - P.l - P.r, ph = H - P.t - P.b;
-    // Stacked series are drawn from cumulative values; tooltips still read raw ones.
+    const step = cfg.step;
+    const t0 = t[0], t1 = t[n - 1] + step;
+    const X = (tv) => P.l + ((tv - t0) / (t1 - t0 || 1)) * pw;
+    const xAt = (i) => X(t[i] + step / 2);
+
+    // Columns stack: drawn from cumulative values; tooltips read raw ones.
     let tops = cfg.series.map((sr) => sr.values);
     let bases = null;
-    if (cfg.stacked) {
+    if (cfg.kind === 'columns') {
       const acc = new Array(n).fill(0);
-      const anyAt = t.map((_, i) => cfg.series.some((sr) => isNum(sr.values[i])));
       bases = []; tops = [];
       for (const sr of cfg.series) {
-        bases.push(acc.map((v, i) => (anyAt[i] ? v : null)));
+        bases.push(acc.slice());
         for (let i = 0; i < n; i++) if (isNum(sr.values[i])) acc[i] += sr.values[i];
-        tops.push(acc.map((v, i) => (anyAt[i] ? v : null)));
+        tops.push(acc.slice());
       }
     }
     let maxV = 0;
     for (const vals of tops) for (const v of vals) if (isNum(v) && v > maxV) maxV = v;
     const ys = yScale(maxV, cfg.yMax, cfg.integer);
-    const t0 = t[0], t1 = t[n - 1];
-    const X = (i) => P.l + ((t[i] - t0) / (t1 - t0 || 1)) * pw;
     const Y = (v) => P.t + (1 - v / ys.top) * ph;
-    const toPts = (vals) => vals.map((v, i) => (isNum(v) ? [X(i), Y(v)] : null));
 
     const svg = s('svg', { class: 'chart-svg', viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: 'img', 'aria-label': cfg.summary });
     const grid = s('g', { class: 'grid', 'aria-hidden': 'true' });
-    for (const v of ys.ticks) {
-      const y = Y(v).toFixed(1);
-      grid.append(s('line', { x1: P.l, x2: W - P.r, y1: y, y2: y, class: v === 0 ? 'baseline' : null }));
-      grid.append(s('text', { x: P.l - 6, y, class: 'ytick', dy: '0.32em', text: cfg.fmtTick(v) }));
+    if (!strips) {
+      for (const v of ys.ticks) {
+        const y = Y(v).toFixed(1);
+        grid.append(s('line', { x1: P.l, x2: W - P.r, y1: y, y2: y, class: v === 0 ? 'baseline' : null }));
+        grid.append(s('text', { x: P.l - 6, y, class: 'ytick', dy: '0.32em', text: cfg.fmtTick(v) }));
+      }
     }
     const tt = timeTicks(t0, t1, Math.max(2, Math.floor(pw / (narrow ? 64 : 84))));
     for (const tv of tt.ticks) {
-      const x = P.l + ((tv - t0) / (t1 - t0)) * pw;
+      const x = X(tv);
       if (x < P.l + 14 || x > W - P.r - 14) continue;
       grid.append(s('text', { x: x.toFixed(1), y: H - 6, class: 'xtick', text: tt.step >= 86400 ? fmtDay(tv) : fmtClock(tv) }));
     }
     svg.append(grid);
 
     const marks = s('g', { class: 'marks' });
-    cfg.series.forEach((sr, k) => {
-      const top = toPts(tops[k]);
-      if (cfg.stacked) marks.append(s('path', { class: 'area', d: bandPath(top, toPts(bases[k])), vars: { '--c': sr.color } }));
-      else if (cfg.series.length === 1 || cfg.fill) marks.append(s('path', { class: 'area area-soft', d: areaPath(top, Y(0)), vars: { '--c': sr.color } }));
-      marks.append(s('path', { class: 'line', d: linePath(top), vars: { '--c': sr.color } }));
-    });
+    let dotY;
+    if (strips) {
+      const m = cfg.series.length, gap = 5;
+      const rowH = Math.max(12, (ph - gap * (m - 1)) / m);
+      const top = cfg.yMax || 100;
+      const rowY = (k, v) => P.t + k * (rowH + gap) + rowH - (clamp(v, 0, top) / top) * (rowH - 2);
+      cfg.series.forEach((sr, k) => {
+        const y0 = P.t + k * (rowH + gap);
+        const pts = sr.values.map((v, i) => (isNum(v) ? [xAt(i), rowY(k, v)] : null));
+        marks.append(s('rect', { class: 'strip-bg', x: P.l, y: f1(y0), width: pw, height: f1(rowH), rx: 3 }));
+        marks.append(s('path', { class: 'strip-area', d: areaPath(pts, y0 + rowH, true), vars: { '--c': sr.color } }));
+        marks.append(s('path', { class: 'strip-line', d: linePath(pts, true), vars: { '--c': sr.color } }));
+        const vals = sr.values.filter(isNum);
+        const two = rowH >= 26 && vals.length;
+        marks.append(s('text', { class: 'strip-name', x: 2, y: f1(y0 + rowH / 2 - (two ? 6 : 0)), dy: '0.32em', text: sr.name }));
+        if (two) {
+          const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+          marks.append(s('text', { class: 'strip-val', x: 2, y: f1(y0 + rowH / 2 + 8), dy: '0.32em', text: `avg ${cfg.fmtVal(avg)} · max ${cfg.fmtVal(Math.max(...vals))}` }));
+        }
+      });
+      dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? rowY(k, cfg.series[k].values[i]) : null);
+    } else if (cfg.kind === 'columns') {
+      const bw = (step / (t1 - t0)) * pw;
+      const pad = Math.max(1, bw * 0.22);
+      const cw = Math.max(1, bw - pad);
+      cfg.series.forEach((sr, k) => {
+        const g = s('g', { class: 'col', vars: { '--c': sr.color } });
+        for (let i = 0; i < n; i++) {
+          if (!isNum(sr.values[i]) || sr.values[i] <= 0) continue;
+          const y1 = Y(tops[k][i]), y0 = Y(bases[k][i]);
+          g.append(s('rect', { x: f1(xAt(i) - cw / 2), y: f1(y1), width: f1(cw), height: f1(Math.max(0.5, y0 - y1)), rx: cw > 5 ? 1.5 : 0 }));
+        }
+        marks.append(g);
+      });
+      dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? Y(tops[k][i]) : null);
+    } else {
+      cfg.series.forEach((sr) => {
+        const pts = sr.values.map((v, i) => (isNum(v) ? [xAt(i), Y(v)] : null));
+        if (cfg.series.length === 1 || cfg.fill) marks.append(s('path', { class: 'area area-soft', d: areaPath(pts, Y(0), true), vars: { '--c': sr.color } }));
+        marks.append(s('path', { class: 'line', d: linePath(pts, true), vars: { '--c': sr.color } }));
+      });
+      dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? Y(cfg.series[k].values[i]) : null);
+    }
     svg.append(marks);
 
     const cross = s('g', { class: 'cross', 'aria-hidden': 'true' });
@@ -667,39 +755,39 @@
 
     const tip = h('div', { class: 'tip', role: 'status', 'aria-live': 'off' });
     plot.replaceChildren(svg, tip);
-    c.geo = { W, H, P, pw, X, Y, tops, cross, dots, tip };
+    c.geo = { W, P, pw, t0, t1, xAt, dotY, cross, dots, tip };
   }
 
   function hover(c, e) {
     if (!c.geo || !c.cfg) return;
     if (e.type === 'pointerdown') charts.forEach((o) => o !== c && hideTip(o));
     const r = c.plot.getBoundingClientRect();
-    const { P, pw } = c.geo;
-    const t = c.cfg.t, n = t.length;
-    const tx = t[0] + clamp((e.clientX - r.left - P.l) / pw, 0, 1) * (t[n - 1] - t[0]);
-    let lo = 0, hi = n - 1;
-    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (t[mid] < tx) lo = mid; else hi = mid; }
-    showTip(c, tx - t[lo] < t[hi] - tx ? lo : hi);
+    const { P, pw, t0, t1 } = c.geo;
+    const t = c.cfg.t;
+    const tx = t0 + clamp((e.clientX - r.left - P.l) / pw, 0, 1) * (t1 - t0);
+    showTip(c, clamp(Math.floor((tx - t[0]) / c.cfg.step), 0, t.length - 1));
   }
 
   function showTip(c, i) {
     const g = c.geo, cfg = c.cfg;
     if (!g) return;
     c.idx = i;
-    const x = g.X(i);
+    const x = g.xAt(i);
     g.cross.classList.add('on');
     const line = g.cross.firstChild;
     line.setAttribute('x1', x.toFixed(1)); line.setAttribute('x2', x.toFixed(1));
     g.dots.forEach((d, k) => {
-      const v = g.tops[k][i];
-      d.classList.toggle('off', !isNum(v));
-      if (isNum(v)) { d.setAttribute('cx', x.toFixed(1)); d.setAttribute('cy', g.Y(v).toFixed(1)); }
+      const y = g.dotY(k, i);
+      d.classList.toggle('off', y == null);
+      if (y != null) { d.setAttribute('cx', x.toFixed(1)); d.setAttribute('cy', y.toFixed(1)); }
     });
     const rows = cfg.series.map((sr) => h('div', { class: 'tip-row' },
       h('span', { class: 'tip-key', 'aria-hidden': 'true', vars: { '--c': sr.color } }),
       h('b', { class: 'num', text: sr.fmtAt ? sr.fmtAt(i) : cfg.fmtVal(sr.values[i]) }),
       h('span', { class: 'tip-name', text: sr.name })));
-    const head = cfg.t[cfg.t.length - 1] - cfg.t[0] > 86400 ? fmtStamp(cfg.t[i]) : fmtClock(cfg.t[i]);
+    const from = cfg.t[i], to = from + cfg.step;
+    const wide = cfg.t[cfg.t.length - 1] - cfg.t[0] > 86400;
+    const head = `${wide ? fmtStamp(from) : fmtClock(from)}${cfg.step > 60 ? `–${fmtClock(to)}` : ''}${cfg.step > 60 ? ' · average' : ''}`;
     g.tip.replaceChildren(h('div', { class: 'tip-time', text: head }), ...rows, ...(cfg.total ? [cfg.total(i)] : []));
     g.tip.classList.add('on');
     const tw = g.tip.offsetWidth;
@@ -713,9 +801,9 @@
     c.geo.tip.classList.remove('on');
   }
 
-  function legend(fig, series) {
-    $('.legend', fig).replaceChildren(...series.map((sr) =>
-      h('li', {}, h('span', { class: 'legend-key', 'aria-hidden': 'true', vars: { '--c': sr.color } }), sr.name)));
+  function legend(fig, series, show) {
+    $('.legend', fig).replaceChildren(...(show ? series.map((sr) =>
+      h('li', {}, h('span', { class: 'legend-key', 'aria-hidden': 'true', vars: { '--c': sr.color } }), sr.name)) : []));
   }
 
   function summarize(title, series, fmt) {
@@ -729,8 +817,15 @@
 
   function setChart(c, cfg) {
     c.cfg = cfg;
-    legend(c.fig, cfg.series);
+    legend(c.fig, cfg.series, cfg.kind !== 'strips');
     drawChart(c);
+  }
+
+  // `average per 20 min`, `per 2 h`.
+  function per(secs) {
+    if (secs < 3600) return `${Math.round(secs / 60)} min`;
+    const hrs = secs / 3600;
+    return `${Number.isInteger(hrs) ? hrs : hrs.toFixed(1)} h`;
   }
 
   let chartRefs = null;
@@ -739,40 +834,57 @@
     const m = state.metrics || {};
     assignHostColors();
     const t = m.t || [];
+    const step = m.step_secs || 60;
     const hosts = m.hosts || [];  // sorted by name
     const hostSeries = (x) => ({ name: x.name || x.id, color: hostColor(x.id) });
     const pctTick = (v) => `${v}%`;
     const intTick = (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+    const fmtAvg = (v) => (isNum(v) ? (v >= 10 || Number.isInteger(v) ? String(Math.round(v)) : v.toFixed(1)) : '—');
+    const kCol = groupOf(t.length, COLUMN_COUNT), kLine = groupOf(t.length, LINE_POINTS);
 
+    const jg = regroup(t, step, kCol, [m.running || [], m.queued || []]);
     const jobs = [
-      { name: 'Running', color: 'var(--s1)', values: m.running || [] },
-      { name: 'Queued', color: 'var(--s2)', values: m.queued || [] },
+      { name: 'Running', color: 'var(--s1)', values: jg.series[0] },
+      { name: 'Queued', color: 'var(--s2)', values: jg.series[1] },
     ];
-    setChart(chartRefs.jobs, { t, series: jobs, integer: true, fill: true, fmtVal: fmtInt, fmtTick: intTick, summary: summarize('Jobs queued and running', jobs, fmtInt) });
+    setChart(chartRefs.jobs, {
+      kind: 'columns', t: jg.t, step: jg.step, series: jobs, integer: true, fmtVal: fmtAvg, fmtTick: intTick,
+      summary: summarize('Jobs running and queued', jobs, fmtAvg),
+    });
+    $('#jobs-sub').textContent = jg.step > step ? `Average per ${per(jg.step)}, stacked` : 'Running and queued, stacked';
 
-    const cpu = hosts.map((x) => ({ ...hostSeries(x), values: x.cpu || [] }));
-    setChart(chartRefs.cpu, { t, series: cpu, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('CPU per machine', cpu, fmtPct) });
+    const cg = regroup(t, step, kLine, hosts.map((x) => x.cpu || []));
+    const cpu = hosts.map((x, k) => ({ ...hostSeries(x), values: cg.series[k] }));
+    setChart(chartRefs.cpu, { kind: 'strips', t: cg.t, step: cg.step, series: cpu, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('CPU per machine', cpu, fmtPct) });
+    $('#cpu-sub').textContent = cg.step > step ? `A row per machine · average per ${per(cg.step)}` : 'A row per machine';
 
-    const busy = hosts.map((x) => {
-      const values = x.busy || [], slots = x.slots || [];
-      return { ...hostSeries(x), values, fmtAt: (i) => (isNum(values[i]) ? `${values[i]}${isNum(slots[i]) ? ` / ${slots[i]}` : ''}` : '—') };
+    const bg = regroup(t, step, kCol, [...hosts.map((x) => x.busy || []), ...hosts.map((x) => x.slots || [])]);
+    const busy = hosts.map((x, k) => {
+      const values = bg.series[k], slots = bg.series[hosts.length + k];
+      return { ...hostSeries(x), values, fmtAt: (i) => (isNum(values[i]) ? `${fmtAvg(values[i])}${isNum(slots[i]) ? ` / ${fmtAvg(slots[i])}` : ''}` : '—') };
     });
     setChart(chartRefs.busy, {
-      t, series: busy, stacked: true, integer: true, fmtVal: fmtInt, fmtTick: intTick, summary: summarize('Busy runner slots per machine, stacked', busy, fmtInt),
+      kind: 'columns', t: bg.t, step: bg.step, series: busy, integer: true, fmtVal: fmtAvg, fmtTick: intTick, summary: summarize('Busy runner slots per machine, stacked', busy, fmtAvg),
       total: (i) => {
         const sum = busy.reduce((a, sr) => a + (isNum(sr.values[i]) ? sr.values[i] : 0), 0);
-        return h('div', { class: 'tip-row tip-total' }, h('span', { class: 'tip-key tip-key-none' }), h('b', { class: 'num', text: String(sum) }), h('span', { class: 'tip-name', text: 'Total busy' }));
+        return h('div', { class: 'tip-row tip-total' }, h('span', { class: 'tip-key tip-key-none' }), h('b', { class: 'num', text: fmtAvg(sum) }), h('span', { class: 'tip-name', text: 'Total busy' }));
       },
     });
+    $('#busy-sub').textContent = bg.step > step ? `Average per ${per(bg.step)}, stacked per machine` : 'Stacked per machine';
 
-    const ram = hosts.map((x) => {
-      const used = x.ram_used || [], total = x.ram_total || [];
-      const values = used.map((u, i) => (isNum(u) && isNum(total[i]) && total[i] > 0 ? (u / total[i]) * 100 : null));
+    const ramPct = (x) => (x.ram_used || []).map((u, i) => {
+      const total = (x.ram_total || [])[i];
+      return isNum(u) && isNum(total) && total > 0 ? (u / total) * 100 : null;
+    });
+    const rg = regroup(t, step, kLine, [...hosts.map(ramPct), ...hosts.map((x) => x.ram_used || [])]);
+    const ram = hosts.map((x, k) => {
+      const values = rg.series[k], used = rg.series[hosts.length + k];
       return { ...hostSeries(x), values, fmtAt: (i) => (isNum(values[i]) ? `${fmtPct(values[i])} · ${fmtBytes(used[i])}` : '—') };
     });
-    setChart(chartRefs.ram, { t, series: ram, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('Memory used per machine', ram, fmtPct) });
+    setChart(chartRefs.ram, { kind: 'lines', t: rg.t, step: rg.step, series: ram, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('Memory used per machine', ram, fmtPct) });
+    $('#ram-sub').textContent = rg.step > step ? `Used per machine · average per ${per(rg.step)}` : 'Used per machine';
 
-    $('#charts-sub').textContent = m.step_secs ? `${RANGE_LABEL[state.range]} · ${m.step_secs % 60 ? `${m.step_secs}s` : `${m.step_secs / 60} min`} steps` : RANGE_LABEL[state.range];
+    $('#charts-sub').textContent = m.step_secs ? `${RANGE_LABEL[state.range]} · ${m.step_secs % 60 ? `${m.step_secs}s` : `${m.step_secs / 60} min`} samples` : RANGE_LABEL[state.range];
   }
 
   function buildRangeSwitch() {
@@ -900,6 +1012,19 @@
       && String(y.hostname || '').toLowerCase() === name) || null;
   }
 
+  // The service a managed WSL distribution runs, from its own host: what
+  // `wsl install` last put there (the record) is stale once it updates
+  // itself. Only when this machine manages one distribution and one WSL host
+  // shares its name, so the match is not a guess.
+  function wslVersion(x) {
+    const v = x.versions;
+    if (!v || (v.wsl || []).length !== 1) return null;
+    const name = String(x.hostname || '').toLowerCase();
+    const guests = ((state.ov && state.ov.hosts) || []).filter((y) => y.id !== x.id && y.versions && y.versions.wsl_guest
+      && String(y.hostname || '').toLowerCase() === name);
+    return guests.length === 1 && guests[0].versions.service ? guests[0].versions.service : null;
+  }
+
   function versionLine(x) {
     const v = x.versions;
     if (!v) return x.online ? h('p', { class: 'host-ver', title: 'Machines report their versions from runner-manager 0.4.64' }, h('span', { class: 'muted', text: justConnected(x) ? 'Reading versions…' : 'Version unknown (before 0.4.64)' })) : null;
@@ -909,7 +1034,11 @@
       v.wsl_guest ? h('span', { class: 'badge badge-dim', title: 'Runs inside a WSL distribution of a Windows machine', text: 'WSL' }) : null,
       h('span', { title: 'The build the service runs' }, 'Service ', h('b', { class: 'num', text: `v${v.service}` })),
       appDiffers ? h('span', { title: `The installed app the service upgrades from${v.app_source ? ` (${v.app_source})` : ''}` }, 'App ', h('b', { class: 'num', text: `v${v.app}` })) : null,
-      (v.wsl || []).map((w) => h('span', { title: `WSL ${w.distribution}: the runner-manager this machine last installed in it` }, `WSL ${w.distribution} `, h('b', { class: 'num', text: `v${w.installed_version}` }))),
+      (v.wsl || []).map((w) => {
+        const live = wslVersion(x);
+        return h('span', { title: live ? `WSL ${w.distribution}: the service its own host runs` : `WSL ${w.distribution}: the runner-manager this machine last installed in it` },
+          `WSL ${w.distribution} `, h('b', { class: 'num', text: `v${live || w.installed_version}` }));
+      }),
       st ? h('span', { class: `badge badge-${st.cls}`, text: st.text }) : null);
   }
 
@@ -957,7 +1086,11 @@
         v ? h('dl', { class: 'ver-list' },
           row('Service', v.service, 'running now'),
           row('App', v.app, v.app_source ? `· ${v.app_source}` : null),
-          (v.wsl || []).map((w) => row(`WSL ${w.distribution}`, w.installed_version, '· installed by this machine; updated through its own host')),
+          (v.wsl || []).map((w) => {
+            const live = wslVersion(x);
+            return live ? row(`WSL ${w.distribution}`, live, '· its own host’s service; updated through that host')
+              : row(`WSL ${w.distribution}`, w.installed_version, '· installed by this machine; updated through its own host');
+          }),
           parent ? h('div', { class: 'ver-row' }, h('dt', { text: 'Runs on' }), h('dd', { text: `${parent.name || parent.hostname} (WSL)` })) : null) : null,
         u ? h('p', { class: `ver-progress ${u.state === 'failed' ? 'text-err' : 'muted'}` },
           u.state === 'running' ? 'Update started ' : u.state === 'failed' ? 'Update failed ' : 'Update finished ', ago(u.at), u.message ? ` · ${u.message}` : '') : null),

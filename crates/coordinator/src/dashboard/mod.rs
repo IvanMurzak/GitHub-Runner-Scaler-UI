@@ -56,7 +56,8 @@ pub const UPDATE_STATUS: &str = "/run/coordinator-update/status.json";
 #[derive(Debug)]
 pub struct Dashboard {
     pub auth: AuthConfig,
-    pub activity: Activity,
+    /// Shared with the sweep, which settles what a restart missed.
+    pub activity: Arc<Activity>,
     /// CLI sign-ins waiting for a person to approve them.
     pub cli: cli::CliSignIns,
     http: reqwest::Client,
@@ -69,7 +70,7 @@ impl Dashboard {
     pub fn new(auth: AuthConfig, update_status: PathBuf) -> Self {
         Self {
             auth,
-            activity: Activity::default(),
+            activity: Arc::new(Activity::default()),
             cli: cli::CliSignIns::default(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
@@ -423,6 +424,8 @@ struct HostView {
     free_ram_bytes: Option<u64>,
     cpu_load_percent: Option<u32>,
     disk_free_bytes: Option<u64>,
+    /// The volume's size, from its heartbeat (0.4.66).
+    disk_total_bytes: Option<u64>,
     busy_slots: Option<u32>,
     free_slots: Option<u32>,
     unfit: bool,
@@ -493,6 +496,9 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
                     .and_then(|live| live.cpu_load_percent)
                     .map(metrics::cpu_share),
                 disk_free_bytes: live.and_then(|live| live.disk_free_bytes),
+                disk_total_bytes: link
+                    .and_then(|host| host.heartbeat.as_ref())
+                    .and_then(|heartbeat| heartbeat.disk_total_bytes),
                 busy_slots: live.map(|live| live.busy_slots),
                 free_slots: live.map(|live| live.free_slots),
                 unfit: live.is_some_and(|live| live.unfit),
@@ -632,11 +638,57 @@ pub fn sample(state: &AppState, dashboard: &Dashboard, now: i64) -> Vec<MetricSa
     samples
 }
 
-/// Saves this minute's [`sample`]; called by the server's minute loop.
+/// Takes back the job lists the last run saved, unless they are older than
+/// anything they could still show.
+pub fn restore_activity(dashboard: &Dashboard, store: &crate::store::Store) {
+    let (saved_at, body) = match store.activity() {
+        Ok(Some(saved)) => saved,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "the dashboard's saved job lists could not be read");
+            return;
+        }
+    };
+    if Utc::now().timestamp() - saved_at > activity::MAX_RESTORED_AGE {
+        return;
+    }
+    match serde_json::from_str::<activity::Saved>(&body) {
+        Ok(saved) => {
+            tracing::info!(
+                jobs = saved.jobs.len(),
+                recent = saved.recent.len(),
+                "the dashboard's job lists were restored"
+            );
+            dashboard.activity.restore(saved);
+        }
+        Err(error) => tracing::warn!(%error, "the dashboard's saved job lists were not readable"),
+    }
+}
+
+/// Saves the dashboard's job lists: every minute, and at shutdown.
+pub fn save_activity(state: &AppState) {
+    let Some(dashboard) = &state.dashboard else {
+        return;
+    };
+    let body = match serde_json::to_string(&dashboard.activity.saved()) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!(%error, "the dashboard's job lists could not be written out");
+            return;
+        }
+    };
+    if let Err(error) = state.store().save_activity(&body, Utc::now().timestamp()) {
+        tracing::warn!(%error, "the dashboard's job lists were not saved");
+    }
+}
+
+/// Saves this minute's [`sample`] and the job lists; called by the server's
+/// minute loop.
 pub fn record_minute(state: &AppState) {
     let Some(dashboard) = &state.dashboard else {
         return;
     };
+    save_activity(state);
     let now = Utc::now().timestamp();
     let samples = sample(state, dashboard, now);
     if let Err(error) = state

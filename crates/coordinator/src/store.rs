@@ -257,6 +257,15 @@ impl Store {
             }
             connection.pragma_update(None, "user_version", 8)?;
         }
+        // 0.4.66: the dashboard's job lists across a restart. Without a
+        // version of its own, so an older build rolled back to ignores it.
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS dashboard_activity (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                saved_at INTEGER NOT NULL,
+                body TEXT NOT NULL
+            );",
+        )?;
         Ok(Self { connection })
     }
 
@@ -763,6 +772,34 @@ impl SessionKind {
 }
 
 impl Store {
+    /// Keeps `body`, the dashboard's job lists, in place of the last one.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn save_activity(&mut self, body: &str, at: i64) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO dashboard_activity (id, saved_at, body) VALUES (1, ?1, ?2)
+             ON CONFLICT (id) DO UPDATE SET saved_at = excluded.saved_at, body = excluded.body",
+            params![at, body],
+        )?;
+        Ok(())
+    }
+
+    /// The dashboard's job lists as last saved, and when.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn activity(&self) -> Result<Option<(i64, String)>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT saved_at, body FROM dashboard_activity WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// Records one minute's samples and drops every one older than `oldest`
     /// (Unix seconds).
     ///
