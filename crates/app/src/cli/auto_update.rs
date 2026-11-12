@@ -7,6 +7,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DAY: u64 = 24 * 60 * 60;
+/// How soon a check that found the release not on npm yet runs again.
+const NOT_PUBLISHED_RETRY: u64 = 15 * 60;
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
@@ -88,6 +90,12 @@ fn tick_with(
     let result = update(enabled, &mut report);
     if let Err(error) = &result {
         let _ = writeln!(report, "Update failed: {error}");
+    }
+    // The release is on GitHub and not yet on npm: try again soon, not a day
+    // later, by dating the attempt back.
+    if String::from_utf8_lossy(&report).contains(super::update::NOT_ON_NPM_YET) {
+        let retry_at = now.saturating_sub(DAY - NOT_PUBLISHED_RETRY);
+        std::fs::write(&stamp, retry_at.to_string()).map_err(failure)?;
     }
     std::fs::write(
         context.paths().state_dir().join("update-status.txt"),
@@ -192,6 +200,38 @@ mod tests {
                 .contains("offline")
         );
     }
+    /// The release was on GitHub minutes before npm had it: a macOS npm
+    /// copy found no such version and then waited a whole day.
+    #[test]
+    fn a_release_not_on_npm_yet_is_checked_again_soon() {
+        let (dir, context) = fixture();
+        tick_with(&context, |_, report| {
+            writeln!(
+                report,
+                "The release {}: try later.",
+                super::super::update::NOT_ON_NPM_YET
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let stamp: u64 =
+            std::fs::read_to_string(context.paths().state_dir().join("update-last-check"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(!due(now, Some(stamp)), "not at once");
+        assert!(
+            due(now + NOT_PUBLISHED_RETRY, Some(stamp)),
+            "within a quarter of an hour"
+        );
+        drop(dir);
+    }
+
     #[test]
     fn held_update_lock_prevents_checks_without_consuming_schedule() {
         let (_dir, context) = fixture();

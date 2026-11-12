@@ -1192,13 +1192,33 @@ pub(super) fn perform(
             // it could not delete the old one).
             let prefix = installation.npm_prefix()?;
             let package = format!("{NPM_PACKAGE}@{}", published.version);
-            run_package_manager(
+            // `--prefer-online`: npm answers from its cached copy of the
+            // package's metadata for minutes, so a retry soon after a release
+            // still found no such version.
+            let installed = run_package_manager(
                 "npm",
-                &["install", "--global", "--prefix", &prefix, &package],
+                &[
+                    "install",
+                    "--global",
+                    "--prefer-online",
+                    "--prefix",
+                    &prefix,
+                    &package,
+                ],
                 beside.as_deref(),
                 format!("npm install --global --prefix \"{prefix}\" {package}"),
                 out,
-            )?;
+            );
+            match installed {
+                // The release puts the archives on GitHub minutes before it
+                // publishes to npm: not a failure, and the daily check tries
+                // again soon (`NOT_ON_NPM_YET`).
+                Err(problem) if problem.message().contains(NOT_ON_NPM_YET) => {
+                    writeln!(out, "\n{}", problem.message()).map_err(failed)?;
+                    return Ok(());
+                }
+                installed => installed?,
+            }
             confirm_npm_copy(&installation.path, &published.version, out)?;
         }
         Channel::Homebrew => {
@@ -2089,6 +2109,7 @@ fn run_package_manager(
     // A resolved `.cmd` or `.bat` is run by the standard library through
     // `cmd.exe`, which quotes every argument for it (and refuses one it cannot
     // quote safely, CVE-2024-24576) -- so no command line is assembled here.
+    let mut not_published = false;
     let status = Command::new(&executable)
         .args(arguments)
         .env("PATH", &search)
@@ -2097,10 +2118,25 @@ fn run_package_manager(
         .and_then(|output| {
             out.write_all(&output.stdout)?;
             out.write_all(&output.stderr)?;
+            // npm's own code for "the registry has no such version".
+            not_published = program == "npm"
+                && [&output.stdout, &output.stderr].iter().any(|text| {
+                    let text = String::from_utf8_lossy(text);
+                    text.contains("ETARGET") || text.contains("notarget")
+                });
             Ok(output.status)
         });
     match status {
         Ok(status) if status.success() => Ok(()),
+        Ok(_) if not_published => Err(CliError::with_remedy(
+            Failure::UpdateFailed,
+            format!(
+                "The release {NOT_ON_NPM_YET}: the release workflow publishes to npm a few \
+                 minutes after GitHub. Nothing was changed; the daily check tries again in a \
+                 quarter of an hour."
+            ),
+            remedy,
+        )),
         Ok(status) => Err(CliError::with_remedy(
             Failure::UpdateFailed,
             match status.code() {
@@ -2124,6 +2160,10 @@ fn run_package_manager(
         )),
     }
 }
+
+/// Said when npm has no package of the release yet. The daily check looks
+/// for it in its report and tries again soon instead of a day later.
+pub(super) const NOT_ON_NPM_YET: &str = "is not on npm yet";
 
 /// The file to spawn for a package manager named `name`, searched on `path`
 /// the way a shell would.

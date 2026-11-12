@@ -722,6 +722,7 @@ fn an_npm_copy_is_updated_by_the_npm_on_path_in_its_own_prefix() {
         [
             "install",
             "--global",
+            "--prefer-online",
             "--prefix",
             installed.npm_prefix().as_str(),
             package.as_str()
@@ -782,6 +783,33 @@ fn an_npm_copy_is_updated_by_the_npm_of_its_prefix_when_none_is_on_path() {
         std::env::split_paths(&path).any(|directory| directory == tools),
         "npm ran with PATH {path:?}"
     );
+}
+
+/// macm6 asked npm for the release in the minutes between its GitHub release
+/// and its npm publication: `ETARGET`. That is not a failed update, and says
+/// so; nothing is changed.
+#[test]
+fn a_release_not_on_npm_yet_is_said_and_changes_nothing() {
+    let fixtures = tempfile::tempdir().expect("a temporary directory");
+    let release = build_release(fixtures.path(), &one_release_newer());
+    let installed = Installed::npm_global();
+    let before = installed.bytes();
+    let tools = fixtures.path().join("tools");
+    write_script(
+        &tools,
+        "npm",
+        "echo npm error code ETARGET 1>&2\r\nexit /b 1",
+        "echo 'npm error code ETARGET' >&2\nexit 1",
+    );
+
+    let outcome = installed.update_with_path(&release.assets, &[], Some(&path_with_first(&tools)));
+    assert_eq!(outcome.code, 0, "output was:\n{}", outcome.both());
+    assert!(
+        outcome.stdout.contains("is not on npm yet"),
+        "output was:\n{}",
+        outcome.both()
+    );
+    assert_eq!(installed.bytes(), before);
 }
 
 fn modified(path: &Path) -> std::time::SystemTime {

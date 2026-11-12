@@ -11,6 +11,13 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 ### Fixed
 
+- An npm copy no longer fails its update in the minutes after a release.
+  The release is on GitHub minutes before it is on npm, and a host that came
+  between got `ETARGET` ("No matching version found"); npm then answered from
+  its cached metadata for minutes more, and the daily check waited a whole
+  day. `update` now asks npm with `--prefer-online`, says the release is not
+  on npm yet without counting it a failure, and the daily check tries again in
+  15 minutes.
 - `sudo runner-manager update` no longer updates an npm, Homebrew or
   `cargo install` copy that another account installed (the account that owns
   the npm prefix's `node_modules`, the `Cellar`, the cargo `bin`). npm run as
