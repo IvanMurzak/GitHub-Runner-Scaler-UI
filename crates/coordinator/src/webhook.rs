@@ -5,7 +5,7 @@ use std::collections::{HashSet, VecDeque};
 
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use runner_manager_domain::model::Label;
-use runner_manager_domain::policy::RunsOn;
+use runner_manager_domain::policy::{RunsOn, label_satisfied};
 use serde::Deserialize;
 use sha2::Sha256;
 
@@ -133,8 +133,10 @@ pub fn action_name(action: &str) -> &'static str {
 ///
 /// The same rule the host applies to its own demand (`RoutingLabels::matches`
 /// over `RunsOn::required_labels`): every label the job requires must be one
-/// of the profile's, compared case-insensitively. A job whose labels cannot
-/// be resolved (an expression, no labels at all) matches nothing.
+/// of the profile's, compared case-insensitively, and an exclusion `not-X`
+/// holds when `X` is not. A job whose labels cannot be resolved (an
+/// expression, no labels at all, an exclusion no runner can satisfy) matches
+/// nothing.
 #[must_use]
 pub fn labels_cover(profile: &[String], job: &[String]) -> bool {
     required_labels(job).is_some_and(|required| profile_covers(profile, &required))
@@ -150,14 +152,16 @@ pub fn required_labels(job: &[String]) -> Option<Vec<Label>> {
 }
 
 /// Whether a profile registered with `profile` labels has every label in
-/// `required`.
+/// `required`, and none that an exclusion in it (`not-wsl`) excludes.
 #[must_use]
 pub fn profile_covers(profile: &[String], required: &[Label]) -> bool {
     let offered: Vec<Label> = profile
         .iter()
         .filter_map(|label| Label::new(label).ok())
         .collect();
-    required.iter().all(|label| offered.contains(label))
+    required
+        .iter()
+        .all(|label| label_satisfied(|offer| offered.contains(offer), label))
 }
 
 #[cfg(test)]
@@ -239,6 +243,29 @@ mod tests {
         // Unresolvable: no labels, or an expression.
         assert!(!labels_cover(&profile, &[]));
         assert!(!labels_cover(&profile, &strings(&["${{ matrix.os }}"])));
+    }
+
+    #[test]
+    fn a_profile_covers_an_exclusion_only_when_it_lacks_what_is_excluded() {
+        let native = strings(&["rm-box-linux-x64", "self-hosted", "linux", "not-wsl"]);
+        let wsl = strings(&["rm-guest-linux-x64", "self-hosted", "linux", "wsl"]);
+        // An older host advertising neither: lacking `wsl`, it is covered.
+        let older = strings(&["rm-old-linux-x64", "self-hosted", "linux"]);
+        let job = strings(&["self-hosted", "linux", "not-wsl"]);
+        assert!(labels_cover(&native, &job));
+        assert!(!labels_cover(&wsl, &job));
+        assert!(labels_cover(&older, &job));
+        // A profile carrying both is never taken for the exclusion.
+        let both = strings(&["self-hosted", "linux", "wsl", "not-wsl"]);
+        assert!(!labels_cover(&both, &job));
+        // Unsatisfiable jobs cover nothing.
+        assert!(!labels_cover(
+            &native,
+            &strings(&["linux", "wsl", "not-wsl"])
+        ));
+        assert!(!labels_cover(&native, &strings(&["linux", "not-"])));
+        // Without exclusions, as before.
+        assert!(labels_cover(&wsl, &strings(&["self-hosted", "linux"])));
     }
 
     #[test]

@@ -74,6 +74,7 @@ use runner_manager_domain::coordinator_protocol::{
     PlacementDecision, RefusalReason, ServerMessage, is_managed_runner_name,
 };
 use runner_manager_domain::model::Label;
+use runner_manager_domain::policy::excluded_label;
 use tokio::sync::oneshot;
 
 use crate::registry::{Candidate, Registry, is_pool_job};
@@ -1409,6 +1410,12 @@ impl Placement {
             lease_id: lease_id.clone(),
             expires_at: chrono::Utc::now().timestamp() + i64::from(ttl_secs),
             ttl_secs,
+            exclusions: key
+                .labels
+                .iter()
+                .filter(|label| excluded_label(label).is_some())
+                .map(ToString::to_string)
+                .collect(),
         };
         Some((lease_id, chosen.host_id, launch))
     }
@@ -1704,6 +1711,7 @@ mod tests {
                     }],
                 }],
                 remote_changes: false,
+                label_exclusions: true,
             },
         );
         registry.set_heartbeat(
@@ -1816,6 +1824,41 @@ mod tests {
             seen.push(launches(&host.await.expect("host")));
         }
         assert_eq!(seen, vec![0, 1, 0], "the host with the most free RAM, once");
+    }
+
+    #[tokio::test]
+    async fn a_launch_names_its_jobs_exclusions_and_goes_where_they_hold() {
+        let (registry, placement) = setup();
+        let guest = connect(
+            &registry,
+            "guest",
+            LAUNCH_VERSION,
+            &["rm-pool-linux", "wsl"],
+            2,
+            64 << 30,
+        );
+        let native = connect(&registry, "native", LAUNCH_VERSION, POOL, 2, 8 << 30);
+        let hosts = [
+            answer(&placement, "guest", guest, Answer::Accept),
+            answer(&placement, "native", native, Answer::Accept),
+        ];
+        let key = placement
+            .queued("octo/app", &required(&["rm-pool-linux", "not-wsl"]), 7)
+            .expect("a pool job");
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+
+        let mut sent = Vec::new();
+        for host in hosts {
+            sent.push(host.await.expect("host"));
+        }
+        assert_eq!(launches(&sent[0]), 0, "the WSL host carries `wsl`");
+        let Some(launch) = sent[1].iter().find_map(|message| match message {
+            ServerMessage::Launch(launch) => Some(launch),
+            _ => None,
+        }) else {
+            panic!("the native host gets the launch: {sent:?}");
+        };
+        assert_eq!(launch.exclusions, vec!["not-wsl".to_string()]);
     }
 
     #[tokio::test]
@@ -2364,6 +2407,7 @@ mod tests {
                     }],
                 }],
                 remote_changes: false,
+                label_exclusions: false,
             },
         );
         let beat = |free| Heartbeat {
@@ -3077,6 +3121,7 @@ mod tests {
                     }],
                 }],
                 remote_changes: false,
+                label_exclusions: false,
             },
         );
         registry.set_heartbeat(
@@ -3195,6 +3240,7 @@ mod tests {
                     }],
                 }],
                 remote_changes: false,
+                label_exclusions: false,
             },
         );
         registry.set_heartbeat(

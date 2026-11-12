@@ -148,11 +148,14 @@ async fn run_generation(
         // Still linked, so the coordinator sees this host; it serves nothing,
         // so nothing is ever woken.
         let coordination = super::coordinator::coordination();
-        let launches = Arc::new(super::launches::Launches::new(
-            Arc::clone(&store) as Arc<dyn Store>,
-            host.clone(),
-            coordination.subscribe(),
-        ));
+        let launches = Arc::new(
+            super::launches::Launches::new(
+                Arc::clone(&store) as Arc<dyn Store>,
+                host.clone(),
+                coordination.subscribe(),
+            )
+            .with_host_traits(super::coordinator::host_traits()),
+        );
         let memory = Arc::new(super::memory::HostMemory::new(
             context.paths().clone(),
             Arc::clone(&store) as Arc<dyn Store>,
@@ -379,7 +382,8 @@ async fn run_generation(
             host.clone(),
             coordination.subscribe(),
         )
-        .with_memory(Arc::clone(&memory)),
+        .with_memory(Arc::clone(&memory))
+        .with_host_traits(super::coordinator::host_traits()),
     );
     let routes = Arc::new(routes);
     // What each attempt uses: for the coordinator's statistics and for
@@ -525,12 +529,14 @@ async fn run_generation(
                 launch_side: Some(
                     Reconciler::new(host.clone(), ports.clone())
                         .with_director(Arc::clone(&director))
-                        .with_memory_gate(Arc::clone(&memory)),
+                        .with_memory_gate(Arc::clone(&memory))
+                        .with_host_traits(super::coordinator::host_traits()),
                 ),
                 reconciler: Reconciler::new(host.clone(), ports)
                     .with_director(director)
                     .with_memory_gate(memory)
-                    .with_launch_side(Arc::clone(&signals.launch)),
+                    .with_launch_side(Arc::clone(&signals.launch))
+                    .with_host_traits(super::coordinator::host_traits()),
                 cancel,
                 polling: Arc::clone(&polling),
                 wake: signals.wake,

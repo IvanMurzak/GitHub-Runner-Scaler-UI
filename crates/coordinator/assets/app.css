@@ -289,6 +289,7 @@ button { font: inherit; color: inherit; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip { font-size: 11.5px; padding: 1px 7px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
 .chip-dim { background: var(--surface-2); color: var(--muted); }
+.chip-not { background: var(--warn-soft); color: var(--warn); }
 .badge { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 550; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
 .badge-ok { color: var(--ok); background: var(--ok-soft); }
 .badge-err { color: var(--err); background: var(--err-soft); }

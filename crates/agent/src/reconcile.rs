@@ -121,11 +121,12 @@ use runner_manager_domain::attempt::{
 };
 use runner_manager_domain::capacity::{Allocation, HostAllocator, LimitingFactor};
 use runner_manager_domain::memory::{MemoryFigures, MemoryVerdict};
+use runner_manager_domain::model::Label;
 use runner_manager_domain::model::{
     AttemptId, Clock, Host, IdlePollInterval, Org, OwnerRepo, PolicyId, RefreshInterval,
     ScaleTarget, Timestamp,
 };
-use runner_manager_domain::policy::{DemandTally, ScalePolicy};
+use runner_manager_domain::policy::{DemandTally, HostTraits, ScalePolicy};
 use runner_manager_github::demand::{DemandGateway, QueuedDemand, demand_requests_per_poll};
 use runner_manager_github::rest::{
     ActivityScope, CancelToken, InventoryError, RateLimitKind, RefreshState,
@@ -1837,6 +1838,9 @@ pub const fn failure_reason_kind(reason: &FailureReason) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RoutingRefusal {
     OverlappingProfiles,
+    /// A job asks for a label and for its exclusion (`wsl` with `not-wsl`),
+    /// or for `not-` alone: no runner can take it.
+    UnsatisfiableExclusion,
 }
 
 impl RoutingRefusal {
@@ -1844,6 +1848,7 @@ impl RoutingRefusal {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OverlappingProfiles => "overlapping_profile_matches",
+            Self::UnsatisfiableExclusion => "unsatisfiable_exclusion",
         }
     }
 }
@@ -1853,6 +1858,10 @@ impl fmt::Display for RoutingRefusal {
         f.write_str(match self {
             Self::OverlappingProfiles => {
                 "repair overlapping profile labels or require a unique profile selector"
+            }
+            Self::UnsatisfiableExclusion => {
+                "a job asks for a label and for not-<that label>, or for `not-` alone; fix its \
+                 runs-on: no runner can take it"
             }
         })
     }
@@ -2411,6 +2420,12 @@ pub trait DemandDirector: fmt::Debug + Send + Sync {
     /// `None`: its own reading, as without a coordinator.
     fn directed_demand(&self, policy: &ScalePolicy) -> Option<u32>;
 
+    /// What the jobs of `policy`'s launches still without a runner exclude
+    /// (`wsl` for `not-wsl`): their runners register with those exclusions.
+    fn directed_exclusions(&self, _policy: &ScalePolicy) -> BTreeSet<Label> {
+        BTreeSet::new()
+    }
+
     /// A runner was started for `policy` (as soon as it exists, whether or
     /// not its demand was directed).
     fn launched(&self, policy: &ScalePolicy, attempt: AttemptId);
@@ -2813,6 +2828,12 @@ pub struct Reconciler {
     /// does: see [`Self::with_launch_side`].
     launch_side: Option<Arc<tokio::sync::Notify>>,
     memory: Arc<dyn MemoryGate>,
+    /// [`HostTraits::labels`]: every profile of this host carries them, in
+    /// matching and in what its runners register with. Never stored.
+    host_labels: Vec<Label>,
+    /// Every exclusion a job of each policy named while this process runs.
+    /// See [`Self::start_runners`].
+    seen_exclusions: Mutex<BTreeMap<PolicyId, BTreeSet<Label>>>,
 }
 
 impl Reconciler {
@@ -2839,7 +2860,17 @@ impl Reconciler {
             director: Arc::new(OwnDemand),
             launch_side: None,
             memory: Arc::new(NoMemoryGate),
+            host_labels: Vec::new(),
+            seen_exclusions: Mutex::default(),
         }
+    }
+
+    /// Gives every profile this host's derived labels: `wsl` inside WSL,
+    /// `not-wsl` elsewhere. See [`HostTraits`].
+    #[must_use]
+    pub fn with_host_traits(mut self, traits: HostTraits) -> Self {
+        self.host_labels = traits.labels();
+        self
     }
 
     /// Checks every start against the host's memory. See [`MemoryGate`].
@@ -3030,7 +3061,8 @@ impl Reconciler {
             {
                 *most = directed.max(*most);
                 let mut reserved = Vec::new();
-                self.start_runners(policy, directed, 1, report, &mut reserved)
+                let excluded = self.director.directed_exclusions(policy);
+                self.start_runners(policy, directed, &excluded, 1, report, &mut reserved)
                     .await;
                 if let Some(next) = reserved.pop() {
                     *served += 1;
@@ -3113,7 +3145,7 @@ impl Reconciler {
                 .copied()
                 .filter(|policy| &policy.target == target)
                 .collect();
-            let (tallies, refusals) = route_demand(policies, &profiles, reading);
+            let (tallies, refusals) = route_demand(policies, &profiles, reading, &self.host_labels);
             if let Some(first) = profiles.first() {
                 for (reason, count) in refusals {
                     self.events.emit(LifecycleEvent::RoutingRefused {
@@ -3181,8 +3213,16 @@ impl Reconciler {
             // whether it could read at all).
             if let Some(directed) = self.director.directed_demand(policy) {
                 let Some(launch_side) = &self.launch_side else {
-                    self.start_runners(policy, directed, u16::MAX, &mut report, &mut reserved)
-                        .await;
+                    let excluded = self.director.directed_exclusions(policy);
+                    self.start_runners(
+                        policy,
+                        directed,
+                        &excluded,
+                        u16::MAX,
+                        &mut report,
+                        &mut reserved,
+                    )
+                    .await;
                     continue;
                 };
                 match self.allocate_only(policy, directed, &reserved).await {
@@ -3223,8 +3263,15 @@ impl Reconciler {
                         unresolvable: u32::try_from(tally.unresolvable.len()).unwrap_or(u32::MAX),
                         complete: demand.is_complete(),
                     });
-                    self.start_runners(policy, count, u16::MAX, &mut report, &mut reserved)
-                        .await;
+                    self.start_runners(
+                        policy,
+                        count,
+                        &tally.excluded,
+                        u16::MAX,
+                        &mut report,
+                        &mut reserved,
+                    )
+                    .await;
                 }
             }
         }
@@ -3379,14 +3426,38 @@ impl Reconciler {
     /// every input being well behaved.
     ///
     /// At most `limit` runners: one, when the caller decides who is next.
+    ///
+    /// Each registers with the policy's labels, this host's
+    /// [`HostTraits`] labels, and `not-X` for every `X` in `excluded` (what the
+    /// jobs it is started for exclude, which GitHub otherwise never hands it)
+    /// and in every earlier pass's.
     async fn start_runners(
         &self,
         policy: &ScalePolicy,
         demand: u32,
+        excluded: &BTreeSet<Label>,
         limit: u16,
         report: &mut ReconcileReport,
         reserved: &mut Vec<Reserved>,
     ) {
+        // Exclusions are kept for the policy's later runners too: a runner
+        // already waiting counts as supply for the next job that names one,
+        // and it can take that job only if it carries it.
+        let excluded = {
+            let mut seen = self
+                .seen_exclusions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let kept = seen.entry(policy.id).or_default();
+            kept.extend(excluded.iter().cloned());
+            kept.clone()
+        };
+        let registered = policy.with_runtime_labels(|labels| {
+            labels
+                .with_labels(self.host_labels.iter().cloned())
+                .excluding(&excluded)
+        });
+        let policy = &registered;
         // A lock-free pre-check, for one reason only: the host-wide lock should
         // not be taken by a policy that is going to be granted nothing. On an
         // idle host with P policies that was P lock acquisitions per poll --
@@ -3874,7 +3945,7 @@ impl Reconciler {
 /// merely unlikely. It returns an empty tally instead of unwrapping, because a
 /// panic in the reconciliation loop would take the daemon down over a policy
 /// that was only ever going to start nothing.
-fn demand_for(policy: &ScalePolicy, reading: &QueuedDemand) -> DemandTally {
+fn demand_for(policy: &ScalePolicy, reading: &QueuedDemand, host_labels: &[Label]) -> DemandTally {
     let Some(labels) = policy.routing_labels() else {
         debug_assert!(
             false,
@@ -3882,6 +3953,7 @@ fn demand_for(policy: &ScalePolicy, reading: &QueuedDemand) -> DemandTally {
         );
         return DemandTally::default();
     };
+    let labels = labels.with_labels(host_labels.iter().cloned());
 
     match &policy.target {
         ScaleTarget::Repository(repository) => labels.tally(reading.jobs_for(repository)),
@@ -3896,40 +3968,55 @@ fn route_demand(
     all_policies: &[ScalePolicy],
     profiles: &[&ScalePolicy],
     reading: &QueuedDemand,
+    host_labels: &[Label],
 ) -> (
     BTreeMap<PolicyId, DemandTally>,
     BTreeMap<RoutingRefusal, u32>,
 ) {
     let mut tallies: BTreeMap<PolicyId, DemandTally> = profiles
         .iter()
-        .map(|policy| (policy.id, demand_for(policy, reading)))
+        .map(|policy| (policy.id, demand_for(policy, reading, host_labels)))
         .collect();
     let mut refusals: BTreeMap<RoutingRefusal, u32> = BTreeMap::new();
     let Some(first) = profiles.first() else {
         return (tallies, refusals);
     };
+    // Each owner's labels as its runners carry them, host traits included.
     let owners: Vec<_> = all_policies
         .iter()
         .filter(|policy| policy.target == first.target && policy.host_id == first.host_id)
-        .filter(|policy| policy.owns_runners())
+        .filter_map(|policy| {
+            let labels = policy.routing_labels()?;
+            Some((policy.id, labels.with_labels(host_labels.iter().cloned())))
+        })
         .collect();
     let jobs: Vec<&runner_manager_domain::policy::RunsOn> = match &first.target {
         ScaleTarget::Repository(repository) => reading.jobs_for(repository).iter().collect(),
         ScaleTarget::Organization(_) => reading.jobs().collect(),
     };
     for job in jobs {
-        let Ok(_) = job.required_labels() else {
-            // `demand_for` already preserves this as unresolvable for each profile.
+        if let Err(unresolvable) = job.required_labels() {
+            // `demand_for` already preserves this as unresolvable for each
+            // profile; an exclusion no runner can satisfy is also said, when
+            // the job is otherwise meant for one of these profiles.
+            if unresolvable.is_unsatisfiable_exclusion() {
+                let meant = job.plain_labels();
+                if !owners
+                    .iter()
+                    .any(|(_, labels)| meant.iter().all(|label| labels.contains(label)))
+                {
+                    continue;
+                }
+                *refusals
+                    .entry(RoutingRefusal::UnsatisfiableExclusion)
+                    .or_default() += 1;
+            }
             continue;
-        };
+        }
         let matched: Vec<PolicyId> = owners
             .iter()
-            .filter(|policy| {
-                policy
-                    .routing_labels()
-                    .is_some_and(|labels| labels.matches(job).is_match())
-            })
-            .map(|policy| policy.id)
+            .filter(|(_, labels)| labels.matches(job).is_match())
+            .map(|(id, _)| *id)
             .collect();
         if matched.len() > 1 {
             *refusals
@@ -4083,7 +4170,7 @@ mod tests {
     }
 
     /// An `active`, enabled autoscale policy on the fixture host.
-    use runner_manager_domain::policy::RunsOn;
+    use runner_manager_domain::policy::{RoutingLabels, RunsOn};
 
     fn policy(id: u128, target: &str, max: u16) -> ScalePolicy {
         fixtures::policy()
@@ -4136,6 +4223,8 @@ mod tests {
         /// loud about.
         clean_fails: bool,
         replacements: Mutex<Vec<ReplacementIntent>>,
+        /// The labels each launch's runner registers with, in launch order.
+        registered: Mutex<Vec<Vec<String>>>,
     }
 
     impl FakeLauncher {
@@ -4255,6 +4344,13 @@ mod tests {
                 request.policy.id,
                 "runtime/p/a",
                 request.host.created_at,
+            );
+            self.registered.lock().unwrap().push(
+                request
+                    .policy
+                    .routing_labels()
+                    .map(RoutingLabels::as_registration_labels)
+                    .unwrap_or_default(),
             );
             self.launches.fetch_add(1, Ordering::SeqCst);
             if let Some(capacity) = self.capacity_after_launch.lock().unwrap().take() {
@@ -7143,6 +7239,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_exclusion_starts_a_runner_registered_with_it_only_where_it_holds() {
+        let queued = || {
+            PollOutcome::Ready(QueuedDemand::of(
+                repo("o/r"),
+                [
+                    fixtures::queued_job(&[HOST_LABEL, "not-wsl", "not-gpu"]),
+                    fixtures::queued_job(&[HOST_LABEL]),
+                ],
+            ))
+        };
+
+        // A machine outside WSL: both jobs are demand, and the runners carry
+        // `not-wsl` (its own) and `not-gpu` (what a job excludes).
+        let mut native = Harness::simple(4, 0, "o/r");
+        native.reconciler = native.reconciler.with_host_traits(HostTraits::wsl(false));
+        native.demand.set(queued());
+        let report = native.reconciler.reconcile(&[policy(1, "o/r", 4)]).await;
+        assert_eq!(report.started, 2);
+        for labels in native.launcher.registered.lock().unwrap().iter() {
+            assert_eq!(
+                labels,
+                &vec![HOST_LABEL.to_string(), "not-gpu".into(), "not-wsl".into()]
+            );
+        }
+
+        // Kept for the policy's later runners: one already waiting can then
+        // take the next job that names the exclusion.
+        native.demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("o/r"),
+            fixtures::queued_jobs(&[HOST_LABEL], 4),
+        )));
+        native.launcher.registered.lock().unwrap().clear();
+        native.reconciler.reconcile(&[policy(1, "o/r", 6)]).await;
+        let later = native.launcher.registered.lock().unwrap().clone();
+        assert!(!later.is_empty());
+        assert!(
+            later
+                .iter()
+                .all(|labels| labels.contains(&"not-gpu".to_string()))
+        );
+
+        // Inside WSL: the excluding job is not this host's, the other is.
+        let mut wsl = Harness::simple(4, 0, "o/r");
+        wsl.reconciler = wsl.reconciler.with_host_traits(HostTraits::wsl(true));
+        wsl.demand.set(queued());
+        let report = wsl.reconciler.reconcile(&[policy(1, "o/r", 4)]).await;
+        assert_eq!(report.started, 1);
+        assert_eq!(
+            wsl.launcher.registered.lock().unwrap().as_slice(),
+            [vec![HOST_LABEL.to_string(), "wsl".into()]]
+        );
+
+        // A profile carrying `gpu` serves neither the exclusion nor registers it.
+        let mut gpu = Harness::simple(4, 0, "o/r");
+        gpu.demand.set(queued());
+        let mut carrying = policy(1, "o/r", 4);
+        carrying.add_routing_label(fixtures::label("gpu")).unwrap();
+        let report = gpu.reconciler.reconcile(&[carrying]).await;
+        assert_eq!(report.started, 1);
+        assert_eq!(
+            gpu.launcher.registered.lock().unwrap().as_slice(),
+            [vec![HOST_LABEL.to_string(), "gpu".into()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_exclusions_or_traits_a_runner_registers_exactly_its_profile_labels() {
+        let mut harness = Harness::simple(4, 2, "o/r");
+        let report = harness.reconciler.reconcile(&[policy(1, "o/r", 4)]).await;
+        assert_eq!(report.started, 2);
+        assert_eq!(
+            harness.launcher.registered.lock().unwrap().as_slice(),
+            [vec![HOST_LABEL.to_string()], vec![HOST_LABEL.to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_no_runner_can_satisfy_is_refused_by_name_not_counted() {
+        let mut harness = Harness::simple(4, 0, "o/r");
+        harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("o/r"),
+            [
+                fixtures::queued_job(&[HOST_LABEL, "not-"]),
+                // Another machine's job: not this host's to report.
+                fixtures::queued_job(&["rm-other-linux-x64", "gpu", "not-gpu"]),
+            ],
+        )));
+        let report = harness.reconciler.reconcile(&[policy(1, "o/r", 4)]).await;
+        assert_eq!(report.started, 0);
+        assert!(harness.events.events().iter().any(|event| matches!(
+            event,
+            LifecycleEvent::RoutingRefused {
+                reason: RoutingRefusal::UnsatisfiableExclusion,
+                count: 1,
+                ..
+            }
+        )));
+        assert!(harness.events.events().iter().any(|event| matches!(
+            event,
+            LifecycleEvent::DemandObserved {
+                demand: 0,
+                unresolvable: 2,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
     async fn missing_required_selector_labels_do_not_match_and_overlaps_show_remedies() {
         let mut harness = Harness::simple(4, 0, "o/r");
         harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
@@ -7882,7 +8086,7 @@ mod tests {
             ],
         );
 
-        let tally = demand_for(&policy, &reading);
+        let tally = demand_for(&policy, &reading, &[]);
 
         assert_eq!(
             tally.demand(),
@@ -7912,7 +8116,7 @@ mod tests {
 
         let repository_policy = policy(1, "acme/left", 10);
         assert_eq!(
-            demand_for(&repository_policy, &reading).demand(),
+            demand_for(&repository_policy, &reading, &[]).demand(),
             3,
             "a repository target reads its own repository's queue and not the aggregate"
         );
@@ -7924,7 +8128,7 @@ mod tests {
             .active()
             .build();
         assert_eq!(
-            demand_for(&org_policy, &reading).demand(),
+            demand_for(&org_policy, &reading, &[]).demand(),
             7,
             "an organization policy serves any repository in its scope, so its demand is \
              the whole aggregate's"

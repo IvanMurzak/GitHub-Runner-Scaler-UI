@@ -78,7 +78,7 @@ use runner_manager_domain::coordinator_protocol::{
     sign_challenge, signing_key_from_seed,
 };
 use runner_manager_domain::model::{OwnerRepo, ScaleTarget, StartMode};
-use runner_manager_domain::policy::ScalePolicy;
+use runner_manager_domain::policy::{HostTraits, ScalePolicy};
 use runner_manager_domain::store::Store;
 use runner_manager_github::demand::RestDemand;
 use runner_manager_platform::coordinator::{self as records, CoordinatorConfig, LinkRecord};
@@ -900,9 +900,17 @@ pub fn coordination() -> Arc<Coordination> {
     Arc::new(watch::Sender::new(LinkView::default()))
 }
 
-/// The targets and profiles this host advertises: its autoscale policies.
+/// What this host is, as labels every profile carries: `wsl` or `not-wsl`.
 #[must_use]
-pub fn advertised_targets(policies: &[ScalePolicy]) -> Vec<Target> {
+pub fn host_traits() -> HostTraits {
+    HostTraits::wsl(runner_manager_platform::wsl::running_inside_wsl())
+}
+
+/// The targets and profiles this host advertises: its autoscale policies,
+/// each with the labels its runners register with, [`host_traits`]
+/// included.
+#[must_use]
+pub fn advertised_targets(policies: &[ScalePolicy], traits: HostTraits) -> Vec<Target> {
     let mut targets: Vec<Target> = Vec::new();
     for policy in policies {
         let Some(labels) = policy.routing_labels() else {
@@ -911,7 +919,7 @@ pub fn advertised_targets(policies: &[ScalePolicy]) -> Vec<Target> {
         let TargetRef { scope, name } = target_ref(&policy.target);
         let profile = Profile {
             name: policy.profile_name().to_string(),
-            labels: labels.as_registration_labels(),
+            labels: labels.with_labels(traits.labels()).as_registration_labels(),
             enabled: policy.may_start_runners(),
             warm: policy.workspace_policy().is_persistent(),
         };
@@ -1247,8 +1255,9 @@ fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy
             .unwrap_or(1),
         ram_bytes: runner_manager_platform::host_fitness::physical_memory_bytes(),
         disk_free_bytes: runner_manager_platform::host_fitness::free_disk_bytes(&ports.runner_root),
-        targets: advertised_targets(policies),
+        targets: advertised_targets(policies, host_traits()),
         remote_changes: super::remote::changes_allowed(&ports.paths),
+        label_exclusions: true,
     }
 }
 
@@ -1469,7 +1478,7 @@ async fn serve(
     recorder: &mut Recorder,
 ) -> SessionEnd {
     let policies = ports.store.policies().unwrap_or_default();
-    let mut described = advertised_targets(&policies);
+    let mut described = advertised_targets(&policies, host_traits());
     let mut described_changes = super::remote::changes_allowed(&ports.paths);
     // Commands the coordinator relays run on threads of their own: one may
     // ask GitHub, and some start a runtime of their own, which a task on this
@@ -1597,7 +1606,7 @@ async fn serve(
                 // Described again only when what it serves changed; the
                 // hardware figures that drift belong to the heartbeat.
                 let policies = ports.store.policies().unwrap_or_default();
-                let current = advertised_targets(&policies);
+                let current = advertised_targets(&policies, host_traits());
                 let changes = super::remote::changes_allowed(&ports.paths);
                 if current != described || changes != described_changes {
                     described = current;
@@ -2140,6 +2149,7 @@ mod tests {
             lease_id: lease.into(),
             expires_at: 0,
             ttl_secs: 300,
+            exclusions: Vec::new(),
         };
         let refused = launches.decide(&launch("second"), false, false);
         assert_eq!(refused.reason, Some(RefusalReason::MaxCapacity));

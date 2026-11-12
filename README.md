@@ -824,6 +824,51 @@ time it comes back after a wait has ended. `host show` prints
 what polling actually cost: full and `304` responses per hour, the busiest minute against
 GitHub's 900-a-minute secondary limit, and what is left of the hourly limit.
 
+### Keep a job off some machines: `not-<label>`
+
+GitHub matches `runs-on` labels positively only: a runner takes a job when it carries every label
+the job names, and nothing in a workflow can say "anything but". runner-manager reads a label
+written `not-<label>` as that missing negation:
+
+```yaml
+jobs:
+  benchmark:
+    # Any self-hosted Linux x64 machine that is not a WSL distribution.
+    runs-on: [self-hosted, linux, x64, not-wsl]
+```
+
+- A profile serves a job asking for `not-X` only when it does **not** carry `X`, and the runner it
+  starts for that job registers with `not-X` as well, so GitHub hands it the job. A profile that
+  carries `X` never serves it, even if `not-X` is among its own labels.
+- Every runner of a machine running inside WSL carries `wsl`, and every runner of any other
+  machine carries `not-wsl`, without configuration (from 0.4.65; `status` lists them as
+  *derived labels*). So `not-wsl` keeps jobs whose wall-clock time matters off WSL machines,
+  and `runs-on: [self-hosted, linux, wsl]` sends a job only to them.
+- Any other label works the same way: `not-gpu` avoids profiles carrying `gpu`, and
+  `not-rm-home-linux-x64` avoids one machine's selector. A runner registers with such an
+  exclusion once a queued job of its profile has named it, and every later runner of the profile
+  keeps it while the service runs. A runner that was already waiting idle when the first such job
+  was queued does not carry it: that job waits for the runner to exit idle, or for the next one.
+  `not-wsl` never has that wait, because every runner carries it from the start; neither does a
+  `not-X` added to the profile with `add-label`.
+- A job that asks for `X` and `not-X` together, or for `not-` alone (or `not-not-X`, or
+  `not- X` with a space), can never be served: it is not counted as demand, and the service logs
+  `routing_refused` with reason `unsatisfiable_exclusion` (the coordinator logs it for the
+  `queued` webhook).
+- `add-label` refuses a label that contradicts one the profile already stores (`not-gpu` beside
+  `gpu`, either way round). Adding `not-X` by hand to a profile is allowed and makes its runners
+  answer `not-X` jobs from the start, without the wait above. A stored `wsl` wins over the derived
+  `not-wsl` (the machine is then treated as WSL), and a stored `not-wsl` on a WSL machine is never
+  registered.
+- A profile label that already started with `not-` before 0.4.65 is now an exclusion too: a job
+  asking for `not-foo` matches every profile that lacks `foo`, not only the one that carried the
+  literal label, which can make two profiles of one repository overlap.
+
+With the [coordinator](docs/coordinator.md#shared-pools), pool jobs work the same way
+(`runs-on: [rm-pool-linux, not-wsl]`): the coordinator places a job naming an exclusion only on a
+0.4.65 or later host whose profile lacks what it excludes, and the host's runner registers with
+the exclusion.
+
 ### Keep heavy jobs from crowding one machine
 
 Before it starts any runner (for a repository or organization label, a selector, or a launch the

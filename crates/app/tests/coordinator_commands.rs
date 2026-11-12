@@ -468,6 +468,7 @@ impl Coordinator {
                 disk_free_bytes: None,
                 targets: Vec::new(),
                 remote_changes: false,
+                label_exclusions: false,
             },
         );
         let state = Arc::clone(&self.state);

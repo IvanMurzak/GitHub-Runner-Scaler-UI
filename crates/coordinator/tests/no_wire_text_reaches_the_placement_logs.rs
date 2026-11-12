@@ -68,6 +68,7 @@ fn connect(registry: &Registry, id: &str, ram: u64) -> tokio::sync::mpsc::Receiv
                 }],
             }],
             remote_changes: false,
+            label_exclusions: false,
         },
     );
     registry.set_heartbeat(

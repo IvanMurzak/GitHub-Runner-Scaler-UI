@@ -776,6 +776,7 @@ mod tests {
                     }],
                 }],
                 remote_changes: false,
+                label_exclusions: false,
             },
         );
         rx

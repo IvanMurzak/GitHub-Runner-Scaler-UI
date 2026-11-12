@@ -17,7 +17,7 @@ use runner_manager_domain::model::{
 };
 use runner_manager_domain::policy::{
     NamedProfileSpec, PolicyMode, PolicyState, RoutingLabels, ScalePolicy, any_pool_label,
-    check_pool_label, in_pool_namespace, is_any_pool_label, pool_label,
+    check_exclusion_label, check_pool_label, in_pool_namespace, is_any_pool_label, pool_label,
 };
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::WorkspaceKind;
@@ -920,6 +920,7 @@ fn record_policy_with_id(
         Some(maximum) => {
             let mut labels = RoutingLabels::derive(&host_label, host.os, host.architecture);
             for label in extra {
+                check_exclusion_label(&labels, &label).map_err(invalid)?;
                 labels.add(label);
             }
             PolicyMode::autoscale(labels, 0, maximum).map_err(invalid)?
