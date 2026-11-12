@@ -246,16 +246,16 @@ impl Sweeper {
         });
         // Runs webhooks named as queued, read by their id as well as listed.
         for (repository, run_id) in self.registry.take_expected_runs() {
-            let installation = installations.iter().find(|installation| {
+            // The installation's spelling of the repository, which the
+            // reading uses, not the webhook's.
+            if let Some((installation, known)) = installations.iter().find_map(|installation| {
                 installation
                     .repositories
                     .iter()
-                    .any(|known| known.to_string().eq_ignore_ascii_case(&repository))
-            });
-            if let (Some(installation), Ok(owner_repo)) =
-                (installation, OwnerRepo::parse(&repository))
-            {
-                installation.demand.expect_run(&owner_repo, run_id);
+                    .find(|known| known.to_string().eq_ignore_ascii_case(&repository))
+                    .map(|known| (installation, known))
+            }) {
+                installation.demand.expect_run(known, run_id);
             }
         }
         let advertised = self.registry.advertised();
@@ -395,8 +395,14 @@ impl Sweeper {
                 match identity.and_then(|identity| Some((identity.id?, identity))) {
                     Some((id, identity)) => queue.jobs.push((
                         id,
-                        JobIdentity::new(&name, identity.name.as_deref())
-                            .map(|named| named.in_workflow(identity.workflow.as_deref()).key()),
+                        JobIdentity::new(&name, identity.name.as_deref()).map(|named| {
+                            // A run read by its id was not listed, so its
+                            // workflow is the one the webhook asked for.
+                            let workflow = identity.workflow.clone().or_else(|| {
+                                identity.run_id.and_then(|run_id| self.workflows.of(run_id))
+                            });
+                            named.in_workflow(workflow.as_deref()).key()
+                        }),
                     )),
                     None => queue.unnamed += 1,
                 }
