@@ -223,6 +223,11 @@ impl Platforms {
         macos: true,
         linux: true,
     };
+    pub const LINUX: Self = Self {
+        windows: false,
+        macos: false,
+        linux: true,
+    };
 
     #[must_use]
     pub const fn includes(self, platform: RunnerPlatform) -> bool {
@@ -282,6 +287,14 @@ const fn unix(name: &'static str, value: VarValue) -> CacheVariable {
     }
 }
 
+const fn linux(name: &'static str, value: VarValue) -> CacheVariable {
+    CacheVariable {
+        name,
+        value,
+        platforms: Platforms::LINUX,
+    }
+}
+
 /// One tool, or one family of variables that is switched on and off together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheTool {
@@ -311,6 +324,11 @@ impl CacheTool {
         self.variables_on(platform).next().is_some()
     }
 }
+
+/// How pnpm imports a package out of the shared store on Linux, under both
+/// spellings: never a hard link, which stays owned by the account that stored
+/// the file. See the `pnpm` entry of [`TOOLS`].
+const PNPM_IMPORT_METHOD: VarValue = VarValue::Literal("clone-or-copy");
 
 /// Every cache this module knows. Adding a tool is one entry.
 ///
@@ -372,9 +390,23 @@ pub const TOOLS: &[CacheTool] = &[
         variables: &[
             all("npm_config_store_dir", VarValue::Dir),
             all("PNPM_CONFIG_STORE_DIR", VarValue::Dir),
+            // On Linux each concurrent runner is its own account and the
+            // store is shared between them. pnpm hard-links a package out of
+            // the store by default, so the file in `node_modules` stays owned
+            // by the account that stored it, and pnpm's `chmod` of a bin then
+            // fails for any other (`ERR_PNPM_CMD_SHIM_CHMOD`): `chmod` needs
+            // the owner or `CAP_FOWNER`, which a group ACL never grants. A
+            // copy, or a reflink where the file system has them (btrfs,
+            // XFS), belongs to the job's account; the downloads stay shared.
+            // A hard link would also let one job's edit of `node_modules`
+            // change the store under every other.
+            linux("npm_config_package_import_method", PNPM_IMPORT_METHOD),
+            linux("PNPM_CONFIG_PACKAGE_IMPORT_METHOD", PNPM_IMPORT_METHOD),
         ],
         note: "the content-addressed store: pnpm 9 and 10 read npm_config_store_dir, pnpm 11 and \
-               later PNPM_CONFIG_STORE_DIR; npm 12 warns that store-dir is unknown",
+               later PNPM_CONFIG_STORE_DIR; npm 12 warns that store-dir is unknown. On Linux \
+               packages are cloned or copied out of it (package-import-method clone-or-copy), \
+               since each runner account owns only what it made",
     },
     CacheTool {
         id: "yarn",
