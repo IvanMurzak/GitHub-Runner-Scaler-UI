@@ -317,12 +317,19 @@
       kpi('Runner slots busy', h('span', { class: 'num' }, fmtInt(sm.slots_busy), h('small', { text: ` / ${fmtInt(sm.slots_total)}` })),
         isNum(pct) ? `${Math.round(pct)}% utilised` : null, meterBar(pct, 'kpi-bar')),
       kpi('Jobs running / queued', h('span', { class: 'num' }, fmtInt(sm.jobs_running), h('small', { text: ` / ${fmtInt(sm.jobs_queued)}` })),
-        h('span', {},
-          runHosts ? `on ${runHosts} machine${runHosts === 1 ? '' : 's'}` : sm.jobs_running ? null : 'all idle',
-          oldest ? h('span', {}, ' · oldest waits ', since(oldest.queued_at)) : null)),
+        jobsSub(sm, runHosts, oldest)),
       kpi('Queue wait p50', h('span', { class: 'num', text: fmtDur(sm.p50_queue_wait_secs) }),
         h('span', {}, 'p90 ', h('b', { class: 'num', text: fmtDur(sm.p90_queue_wait_secs) }))),
     );
+  }
+
+  // `on 3 machines · oldest waits 1m 12s`, or `all idle`.
+  function jobsSub(sm, runHosts, oldest) {
+    const parts = [
+      runHosts ? `on ${runHosts} machine${runHosts === 1 ? '' : 's'}` : sm.jobs_running ? null : 'all idle',
+      oldest ? h('span', {}, 'oldest waits ', since(oldest.queued_at)) : null,
+    ].filter(Boolean);
+    return parts.length ? h('span', {}, ...parts.flatMap((part, i) => (i ? [' · ', part] : [part]))) : null;
   }
 
   // ---------------------------------------------------------------- hosts
@@ -354,6 +361,8 @@
       meterBar(pct));
   }
 
+  const peakOf = (vals) => { const v = (vals || []).filter(isNum); return v.length ? Math.max(...v) : null; };
+
   // A machine's memory used, as a percent of its total, per sample.
   function ramPct(x) {
     return (x.ram_used || []).map((u, i) => {
@@ -366,20 +375,22 @@
     const m = state.metrics;
     const mh = m && (m.hosts || []).find((x) => x.id === hostId);
     if (!mh || !Array.isArray(mh.cpu) || mh.cpu.filter(isNum).length < 2) return h('div', { class: 'spark spark-empty', text: 'No CPU history yet' });
-    const g = regroup(m.t || [], m.step_secs || 60, groupOf(mh.cpu.length, SPARK_POINTS), [mh.cpu, ramPct(mh)]);
+    const rawRam = ramPct(mh);
+    const g = regroup(m.t || [], m.step_secs || 60, groupOf(mh.cpu.length, SPARK_POINTS), [mh.cpu, rawRam]);
     const [cpu, mem] = g.series;
     const n = cpu.length, W = 120, H = 32;
     const toPts = (vals) => vals.map((v, i) => (isNum(v) ? [(i / Math.max(1, n - 1)) * W, H - (clamp(v, 0, 100) / 100) * (H - 2) - 1] : null));
-    const peak = (vals) => { const v = vals.filter(isNum); return v.length ? Math.max(...v) : null; };
     const cpuPts = toPts(cpu);
+    // Peaks from the samples: an averaged group hides a short spike.
+    const cpuPeak = peakOf(mh.cpu), ramPeak = peakOf(rawRam);
     return h('div', { class: 'spark' },
-      s('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', role: 'img', 'aria-label': `CPU and memory over the ${RANGE_LABEL[m.range] || m.range}: CPU peak ${fmtPct(peak(cpu))}, memory peak ${fmtPct(peak(mem))}` },
+      s('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', role: 'img', 'aria-label': `CPU and memory over the ${RANGE_LABEL[m.range] || m.range}: CPU peak ${fmtPct(cpuPeak)}, memory peak ${fmtPct(ramPeak)}` },
         s('path', { class: 'spark-area', d: areaPath(cpuPts, H, true) }),
         s('path', { class: 'spark-line spark-ram', d: linePath(toPts(mem), true), 'vector-effect': 'non-scaling-stroke' }),
         s('path', { class: 'spark-line', d: linePath(cpuPts, true), 'vector-effect': 'non-scaling-stroke' })),
       h('span', { class: 'spark-cap' },
         h('span', {}, h('i', { class: 'spark-key', 'aria-hidden': 'true' }), 'CPU', h('i', { class: 'spark-key spark-key-ram', 'aria-hidden': 'true' }), `RAM · ${m.range}`),
-        h('span', { class: 'num', text: `peak ${fmtPct(peak(cpu))} · ${fmtPct(peak(mem))}` })));
+        h('span', { class: 'num', text: `peak ${fmtPct(cpuPeak)} · ${fmtPct(ramPeak)}` })));
   }
 
   function hostCard(x) {
@@ -709,8 +720,8 @@
     const marks = s('g', { class: 'marks' });
     let dotY;
     if (strips) {
-      const m = cfg.series.length, gap = 5;
-      const rowH = Math.max(12, (ph - gap * (m - 1)) / m);
+      const m = cfg.series.length, gap = m > 8 ? 2 : 5;
+      const rowH = Math.max(2, (ph - gap * (m - 1)) / m);
       const top = cfg.yMax || 100;
       const rowY = (k, v) => P.t + k * (rowH + gap) + rowH - (clamp(v, 0, top) / top) * (rowH - 2);
       cfg.series.forEach((sr, k) => {
@@ -724,7 +735,7 @@
         marks.append(s('text', { class: 'strip-name', x: 2, y: f1(y0 + rowH / 2 - (two ? 6 : 0)), dy: '0.32em', text: sr.name }));
         if (two) {
           const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-          marks.append(s('text', { class: 'strip-val', x: 2, y: f1(y0 + rowH / 2 + 8), dy: '0.32em', text: `avg ${cfg.fmtVal(avg)} · max ${cfg.fmtVal(Math.max(...vals))}` }));
+          marks.append(s('text', { class: 'strip-val', x: 2, y: f1(y0 + rowH / 2 + 8), dy: '0.32em', text: `avg ${cfg.fmtVal(avg)} · max ${cfg.fmtVal(peakOf(sr.raw || vals))}` }));
         }
       });
       dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? rowY(k, cfg.series[k].values[i]) : null);
@@ -745,7 +756,7 @@
     } else {
       cfg.series.forEach((sr) => {
         const pts = sr.values.map((v, i) => (isNum(v) ? [xAt(i), Y(v)] : null));
-        if (cfg.series.length === 1 || cfg.fill) marks.append(s('path', { class: 'area area-soft', d: areaPath(pts, Y(0), true), vars: { '--c': sr.color } }));
+        if (cfg.series.length === 1) marks.append(s('path', { class: 'area area-soft', d: areaPath(pts, Y(0), true), vars: { '--c': sr.color } }));
         marks.append(s('path', { class: 'line', d: linePath(pts, true), vars: { '--c': sr.color } }));
       });
       dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? Y(cfg.series[k].values[i]) : null);
@@ -790,7 +801,8 @@
       h('span', { class: 'tip-key', 'aria-hidden': 'true', vars: { '--c': sr.color } }),
       h('b', { class: 'num', text: sr.fmtAt ? sr.fmtAt(i) : cfg.fmtVal(sr.values[i]) }),
       h('span', { class: 'tip-name', text: sr.name })));
-    const from = cfg.t[i], to = from + cfg.step;
+    // The first and last groups can reach past the samples: said as they are.
+    const from = Math.max(cfg.t[i], cfg.from), to = Math.min(cfg.t[i] + cfg.step, cfg.to);
     const wide = cfg.t[cfg.t.length - 1] - cfg.t[0] > 86400;
     const head = `${wide ? fmtStamp(from) : fmtClock(from)}${cfg.step > 60 ? `–${fmtClock(to)} · average` : ''}`;
     g.tip.replaceChildren(h('div', { class: 'tip-time', text: head }), ...rows, ...(cfg.total ? [cfg.total(i)] : []));
@@ -815,7 +827,7 @@
     const parts = series.map((sr) => {
       const vals = sr.values.filter(isNum);
       if (!vals.length) return `${sr.name}: no data`;
-      return `${sr.name}: latest ${fmt(vals[vals.length - 1])}, peak ${fmt(Math.max(...vals))}`;
+      return `${sr.name}: latest ${fmt(vals[vals.length - 1])}, peak ${fmt(peakOf(sr.raw || vals))}`;
     });
     return `${title}, ${RANGE_LABEL[state.range] || state.range}. ${parts.join('; ')}.`;
   }
@@ -846,6 +858,7 @@
     const intTick = (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
     const fmtAvg = (v) => (isNum(v) ? (v >= 10 || Number.isInteger(v) ? String(Math.round(v)) : v.toFixed(1)) : '—');
     const kCol = groupOf(t.length, COLUMN_COUNT), kLine = groupOf(t.length, LINE_POINTS);
+    const span = { from: t[0], to: t.length ? t[t.length - 1] + step : 0 };
 
     const jg = regroup(t, step, kCol, [m.running || [], m.queued || []]);
     const jobs = [
@@ -853,14 +866,14 @@
       { name: 'Queued', color: 'var(--s2)', values: jg.series[1] },
     ];
     setChart(chartRefs.jobs, {
-      kind: 'columns', t: jg.t, step: jg.step, series: jobs, integer: true, fmtVal: fmtAvg, fmtTick: intTick,
+      ...span, kind: 'columns', t: jg.t, step: jg.step, series: jobs, integer: true, fmtVal: fmtAvg, fmtTick: intTick,
       summary: summarize('Jobs running and queued', jobs, fmtAvg),
     });
     $('#jobs-sub').textContent = jg.step > step ? `Average per ${per(jg.step)}, stacked` : 'Running and queued, stacked';
 
     const cg = regroup(t, step, kLine, hosts.map((x) => x.cpu || []));
-    const cpu = hosts.map((x, k) => ({ ...hostSeries(x), values: cg.series[k] }));
-    setChart(chartRefs.cpu, { kind: 'strips', t: cg.t, step: cg.step, series: cpu, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('CPU per machine', cpu, fmtPct) });
+    const cpu = hosts.map((x, k) => ({ ...hostSeries(x), values: cg.series[k], raw: x.cpu }));
+    setChart(chartRefs.cpu, { ...span, kind: 'strips', t: cg.t, step: cg.step, series: cpu, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('CPU per machine', cpu, fmtPct) });
     $('#cpu-sub').textContent = cg.step > step ? `A row per machine · average per ${per(cg.step)}` : 'A row per machine';
 
     const bg = regroup(t, step, kCol, [...hosts.map((x) => x.busy || []), ...hosts.map((x) => x.slots || [])]);
@@ -869,7 +882,7 @@
       return { ...hostSeries(x), values, fmtAt: (i) => (isNum(values[i]) ? `${fmtAvg(values[i])}${isNum(slots[i]) ? ` / ${fmtAvg(slots[i])}` : ''}` : '—') };
     });
     setChart(chartRefs.busy, {
-      kind: 'columns', t: bg.t, step: bg.step, series: busy, integer: true, fmtVal: fmtAvg, fmtTick: intTick, summary: summarize('Busy runner slots per machine, stacked', busy, fmtAvg),
+      ...span, kind: 'columns', t: bg.t, step: bg.step, series: busy, integer: true, fmtVal: fmtAvg, fmtTick: intTick, summary: summarize('Busy runner slots per machine, stacked', busy, fmtAvg),
       total: (i) => {
         const sum = busy.reduce((a, sr) => a + (isNum(sr.values[i]) ? sr.values[i] : 0), 0);
         return h('div', { class: 'tip-row tip-total' }, h('span', { class: 'tip-key tip-key-none' }), h('b', { class: 'num', text: fmtAvg(sum) }), h('span', { class: 'tip-name', text: 'Total busy' }));
@@ -880,9 +893,9 @@
     const rg = regroup(t, step, kLine, [...hosts.map(ramPct), ...hosts.map((x) => x.ram_used || [])]);
     const ram = hosts.map((x, k) => {
       const values = rg.series[k], used = rg.series[hosts.length + k];
-      return { ...hostSeries(x), values, fmtAt: (i) => (isNum(values[i]) ? `${fmtPct(values[i])} · ${fmtBytes(used[i])}` : '—') };
+      return { ...hostSeries(x), values, raw: ramPct(x), fmtAt: (i) => (isNum(values[i]) ? `${fmtPct(values[i])} · ${fmtBytes(used[i])}` : '—') };
     });
-    setChart(chartRefs.ram, { kind: 'lines', t: rg.t, step: rg.step, series: ram, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('Memory used per machine', ram, fmtPct) });
+    setChart(chartRefs.ram, { ...span, kind: 'lines', t: rg.t, step: rg.step, series: ram, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('Memory used per machine', ram, fmtPct) });
     $('#ram-sub').textContent = rg.step > step ? `Used per machine · average per ${per(rg.step)}` : 'Used per machine';
 
     $('#charts-sub').textContent = m.step_secs ? `${RANGE_LABEL[state.range]} · ${m.step_secs % 60 ? `${m.step_secs}s` : `${m.step_secs / 60} min`} samples` : RANGE_LABEL[state.range];
@@ -1021,6 +1034,7 @@
     const v = x.versions;
     if (!v || (v.wsl || []).length !== 1) return null;
     const name = String(x.hostname || '').toLowerCase();
+    if (!name) return null;
     const guests = ((state.ov && state.ov.hosts) || []).filter((y) => y.id !== x.id && y.versions && y.versions.wsl_guest
       && String(y.hostname || '').toLowerCase() === name);
     return guests.length === 1 && guests[0].versions.service ? guests[0].versions.service : null;

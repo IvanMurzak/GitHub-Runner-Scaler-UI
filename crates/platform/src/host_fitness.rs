@@ -1321,12 +1321,17 @@ mod sys {
             return None;
         }
         #[allow(clippy::useless_conversion, reason = "the field widths differ per OS")]
-        let (available, blocks, size) = (
+        let (available, free, blocks, size) = (
             u64::from(stats.f_bavail),
+            u64::from(stats.f_bfree),
             u64::from(stats.f_blocks),
             u64::from(stats.f_frsize),
         );
-        Some((available.checked_mul(size)?, blocks.checked_mul(size)?))
+        // The blocks reserved for root are neither free to this account nor
+        // used: left out of the size, so used plus free is the size, as `df`
+        // shows it.
+        let usable = blocks.saturating_sub(free).checked_add(available)?;
+        Some((available.checked_mul(size)?, usable.checked_mul(size)?))
     }
 
     #[cfg(not(target_os = "macos"))]

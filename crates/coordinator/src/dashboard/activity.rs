@@ -45,6 +45,10 @@ pub struct ActiveJob {
     pub queued_at: i64,
     pub started_at: Option<i64>,
     pub runner_name: Option<String>,
+    /// Its last webhook said `waiting` (a deployment approval): the
+    /// sweep, which lists only `queued` jobs, does not list it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting: bool,
     /// Restored from the last save and not moved on by a webhook since.
     #[serde(skip)]
     pub restored: bool,
@@ -149,9 +153,11 @@ impl Activity {
                     queued_at: unix(times.created_at).unwrap_or(now),
                     started_at: None,
                     runner_name: None,
+                    waiting: false,
                     restored: false,
                 });
                 entry.restored = false;
+                entry.waiting = action == "waiting";
                 if action == "in_progress" {
                     entry.started_at = unix(times.started_at).or(Some(now));
                     entry.runner_name.clone_from(&job.runner_name);
@@ -234,6 +240,7 @@ impl Activity {
     pub fn swept(&self, repository: &str, listed: &HashSet<u64>, read_at: i64) {
         self.lock().jobs.retain(|id, job| {
             !(job.restored
+                && !job.waiting
                 && job.started_at.is_none()
                 && job.queued_at < read_at
                 && job.repository.eq_ignore_ascii_case(repository)
@@ -528,13 +535,16 @@ mod tests {
         assert_eq!(after.host_of("rm-a").as_deref(), Some("host-1"));
 
         // The sweep no longer lists the restored queued job: it left the queue
-        // while the coordinator was down. A job queued since is kept.
+        // while the coordinator was down. A job queued since is kept, and so is
+        // a restored one waiting for an approval, which the sweep never lists.
         feed(&after, &event("queued", 4, &["self-hosted"], None), now);
+        let waiting = Activity::default();
+        feed(&waiting, &event("waiting", 5, &["self-hosted"], None), now);
+        after.restore(waiting.saved());
         after.swept("ivanmurzak/APP", &HashSet::new(), now + 60);
         let snapshot = after.snapshot(now);
-        assert_eq!(
-            snapshot.queued.iter().map(|job| job.id).collect::<Vec<_>>(),
-            [4]
-        );
+        let mut ids: Vec<u64> = snapshot.queued.iter().map(|job| job.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [4, 5]);
     }
 }

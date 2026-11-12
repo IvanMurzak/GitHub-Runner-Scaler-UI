@@ -506,6 +506,14 @@ impl Registry {
     /// Records `host_id`'s load; `true` when it reports more free slots than
     /// its last heartbeat (or is its first): placement may now fit a queued
     /// job there.
+    /// Whether `connection` is `host_id`'s current one.
+    #[must_use]
+    pub fn is_current(&self, host_id: &str, connection: u64) -> bool {
+        self.lock()
+            .get(host_id)
+            .is_some_and(|current| current.connection == connection)
+    }
+
     pub fn set_heartbeat(&self, host_id: &str, connection: u64, heartbeat: Heartbeat) -> bool {
         let mut hosts = self.lock();
         let Some(current) = hosts

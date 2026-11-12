@@ -1265,12 +1265,18 @@ fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy
 /// allocator counts them: a repository removed while its runners finish has
 /// no policy any more, and its runners still hold their slots.
 fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
-    let attempts = ports.store.uncleaned_attempts().unwrap_or_default();
-    let busy = active_count(attempts.iter());
-    let runners = attempts
-        .iter()
-        .map(|attempt| runner_manager_agent::lifecycle::runner_name(attempt.id))
-        .collect();
+    let attempts = ports.store.uncleaned_attempts().ok();
+    let busy = attempts
+        .as_ref()
+        .map_or(0, |attempts| active_count(attempts.iter()));
+    // Unknown when the store could not be read: an empty list would tell the
+    // coordinator that every job running here has ended.
+    let runners = attempts.map(|attempts| {
+        attempts
+            .iter()
+            .map(|attempt| runner_manager_agent::lifecycle::runner_name(attempt.id))
+            .collect()
+    });
     // A launch with no runner yet has a slot spoken for: said here, the
     // coordinator offers what this host can really start.
     let spoken_for = ports.launches.unstarted();
@@ -1294,7 +1300,7 @@ fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
         disk_free_bytes: disk.map(|(free, _)| free),
         versions: super::versions::report(&ports.paths),
         disk_total_bytes: disk.map(|(_, total)| total),
-        runners: Some(runners),
+        runners,
     }
 }
 
