@@ -226,12 +226,7 @@ pub struct Candidate {
     pub heartbeat_at: Instant,
 }
 
-/// Whether a job requiring `required` asks for a shared pool: an OS pool or
-/// `rm-pool-any`.
-#[must_use]
-pub fn is_pool_job(required: &[Label]) -> bool {
-    required.iter().any(|label| is_pool_label(label.as_str()))
-}
+pub use runner_manager_domain::policy::is_pool_job;
 
 /// A connected host, as `hosts list` would describe it.
 #[derive(Debug, Clone, PartialEq, Eq)]

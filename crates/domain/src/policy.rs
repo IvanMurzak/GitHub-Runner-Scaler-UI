@@ -183,6 +183,15 @@ pub fn is_pool_label(label: &str) -> bool {
             .any(|os| pool_label(*os).as_str().eq_ignore_ascii_case(label))
 }
 
+/// Whether a job requiring `required` asks for a shared pool (an OS pool or
+/// `rm-pool-any`): the jobs a coordinator places on one host. The host and the
+/// coordinator both decide it here, so neither leaves to the other a job the
+/// other does not take.
+#[must_use]
+pub fn is_pool_job(required: &[Label]) -> bool {
+    required.iter().any(|label| is_pool_label(label.as_str()))
+}
+
 /// The one pool label a host running `os` may carry: `rm-pool-windows`,
 /// `rm-pool-linux` or `rm-pool-macos`.
 #[must_use]
@@ -725,6 +734,9 @@ impl RoutingLabels {
                 RunsOnMatch::Match { .. } => {
                     tally.matched += 1;
                     if let Ok(required) = job.required_labels() {
+                        if is_pool_job(&required) {
+                            tally.pool_matched += 1;
+                        }
                         tally.excluded.extend(exclusions_in(&required));
                     }
                 }
@@ -758,12 +770,23 @@ pub struct DemandTally {
     /// a runner started for them registers with `not-X` for each, or GitHub
     /// would never hand it those jobs.
     pub excluded: BTreeSet<Label>,
+    /// How many of `matched` ask for a pool label (`rm-pool-…`): the jobs a
+    /// coordinator places. Never more than `matched`.
+    pub pool_matched: u32,
 }
 
 impl DemandTally {
     #[must_use]
     pub fn demand(&self) -> u32 {
         self.matched
+    }
+
+    /// The matched jobs that ask for no pool label. A pool profile the
+    /// coordinator directs starts runners for these from its own reading, as
+    /// without a coordinator: no coordinator places them.
+    #[must_use]
+    pub fn non_pool_demand(&self) -> u32 {
+        self.matched.saturating_sub(self.pool_matched)
     }
 
     #[must_use]
@@ -2090,6 +2113,27 @@ mod tests {
             PolicyMode::autoscale(host_labels("home"), 0, nz(max)).unwrap(),
             CachePolicy::default(),
         )
+    }
+
+    #[test]
+    fn a_tally_counts_the_matched_pool_jobs_apart() {
+        let labels = host_labels("home").with_labels([label("rm-pool-windows")]);
+        let jobs = [
+            RunsOn::from_job_labels(["rm-home-win-x64", "rm-pool-windows"]),
+            RunsOn::from_job_labels(["rm-home-win-x64", "RM-POOL-windows"]),
+            RunsOn::from_job_labels(["rm-home-win-x64"]),
+            RunsOn::from_job_labels(["rm-home-win-x64", "rm-pool-linux"]),
+        ];
+        let tally = labels.tally(&jobs);
+        assert_eq!(tally.matched, 3);
+        assert_eq!(tally.pool_matched, 2);
+        assert_eq!(tally.non_pool_demand(), 1);
+        let required = |job: &RunsOn| job.required_labels().expect("a static runs-on");
+        assert!(
+            is_pool_job(&required(&jobs[3])),
+            "a pool job this profile does not match"
+        );
+        assert!(!is_pool_job(&required(&jobs[2])));
     }
 
     #[test]

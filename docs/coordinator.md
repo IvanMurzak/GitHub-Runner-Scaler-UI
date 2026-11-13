@@ -345,9 +345,14 @@ in the log (`a pool queue is not placed`, with `reason` and, for a refusal, `ref
 
 ### On the host
 
-A pool profile is **directed** while its target is `coordinated` on a version-3 link: it starts
-runners only for the launches it accepted, never from its own reading of the queue (which every
-host of the pool sees the same way). It accepts a launch only when its own allocator, over its
+A pool profile is **directed** while its target is `coordinated` on a version-3 link: for pool
+jobs it starts runners only for the launches it accepted, never from its own reading of the queue
+(which every host of the pool sees the same way). A job the profile covers that asks for no pool
+label (`runs-on: [self-hosted, macOS]` on a profile that also carries `rm-pool-macos`) is not placed
+by the coordinator, which only wakes every host serving it; the profile serves such jobs from its own
+reading, in the pass that read them, as every host carrying those labels does (0.4.70; before, they
+waited in the queue with every host of the pool idle). Move a workflow's jobs to the pool label to
+have them placed. It accepts a launch only when its own allocator, over its
 own attempts and ceilings, grants one more runner, counting the launches its other profiles hold
 open: slots are the host's. A launch it can no longer start (another profile's runner took the
 slot since) is dropped, newest first, and the next heartbeat, sent at once, closes its lease; so is

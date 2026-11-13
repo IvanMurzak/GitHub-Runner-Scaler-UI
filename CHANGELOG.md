@@ -7,6 +7,19 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.70
+
+### Fixed
+
+- A pool profile no longer leaves the jobs that ask for no pool label in the
+  queue. While its target is `coordinated`, a profile carrying `rm-pool-macos`
+  (or another pool label) started runners only for the coordinator's launches,
+  and the coordinator places only jobs that ask for a pool label: a job such as
+  `runs-on: [self-hosted, macOS, ARM64]` that the profile covers waited with
+  every host of the pool idle. The profile now serves those jobs from its own
+  reading, as without a coordinator, beside its launches. A workflow can
+  therefore move its jobs to `rm-pool-…` one at a time.
+
 ## 0.4.69
 
 ### Fixed
