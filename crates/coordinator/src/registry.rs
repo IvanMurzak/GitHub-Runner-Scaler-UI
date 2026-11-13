@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 
 use runner_manager_domain::coordinator_protocol::{
     CLOSE_REPLACED, ConnectedHostStats, HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck,
-    LAUNCH_VERSION, ServerMessage, Target, TargetRef, TargetScope, Wake, WakeReason,
+    LAUNCH_VERSION, Profile, ServerMessage, Target, TargetRef, TargetScope, Wake, WakeReason,
 };
-use runner_manager_domain::model::Label;
-use runner_manager_domain::policy::{excluded_label, is_pool_label};
+use runner_manager_domain::model::{Label, Os};
+use runner_manager_domain::policy::{excluded_label, is_pool_label, may_carry_pool};
 use tokio::sync::{Notify, mpsc};
 
 use crate::webhook::{profile_covers, required_labels};
@@ -66,6 +66,63 @@ impl Connected {
     fn launch_mode(&self, coverage: &Coverage, target: &TargetRef) -> bool {
         self.version >= LAUNCH_VERSION && coverage.covers(target)
     }
+
+    /// The target and enabled pool profile through which this host may be
+    /// sent a launch for `job` of `repository`, if any: it has said hello and
+    /// sent a heartbeat, the target is in launch mode, and the host can honour
+    /// the job (its exclusions; for a job without a pool label, that it leaves
+    /// such jobs to placement, or a launch would start a second runner).
+    fn launch_profile<'a>(
+        &'a self,
+        coverage: &Coverage,
+        repository: &str,
+        job: &JobShape<'_>,
+    ) -> Option<(TargetRef, &'a Profile)> {
+        let hello = self.hello.as_ref()?;
+        self.heartbeat.as_ref()?;
+        // A host older than exclusions would register the runner without
+        // them: GitHub would never hand it the job.
+        if (job.excludes && !hello.label_exclusions) || (!job.pool && !hello.plain_placement) {
+            return None;
+        }
+        // The host directs only a profile carrying its own OS's pool label
+        // or `rm-pool-any`: a stored label for another OS's pool makes no pool
+        // profile there, and a launch to it would be refused.
+        let os = hello.os.parse::<Os>().ok();
+        let pool_label_here = |raw: &String| match (os, Label::new(raw.as_str())) {
+            (Some(os), Ok(label)) => may_carry_pool(&label, os),
+            _ => is_pool_label(raw),
+        };
+        hello.targets.iter().find_map(|target| {
+            let reference = target.reference();
+            if !reference.covers(repository) || !self.launch_mode(coverage, &reference) {
+                return None;
+            }
+            let profile = target.profiles.iter().find(|profile| {
+                profile.enabled
+                    && profile.labels.iter().any(pool_label_here)
+                    && profile_covers(&profile.labels, job.required)
+            })?;
+            Some((reference, profile))
+        })
+    }
+}
+
+/// What placement asks of a job's labels, read once.
+struct JobShape<'a> {
+    required: &'a [Label],
+    pool: bool,
+    excludes: bool,
+}
+
+impl<'a> JobShape<'a> {
+    fn of(required: &'a [Label]) -> Self {
+        Self {
+            required,
+            pool: is_pool_job(required),
+            excludes: required.iter().any(|label| excluded_label(label).is_some()),
+        }
+    }
 }
 
 /// What the reconciliation sweep reads: repositories by name, and the
@@ -105,6 +162,7 @@ impl Coverage {
                 .filter(|target| self.covers(target))
                 .collect(),
             any_pool: true,
+            plain_placement: true,
         }
     }
 }
@@ -351,43 +409,25 @@ impl Registry {
     pub fn launch_candidates(&self, repository: &str, required: &[Label]) -> Vec<Candidate> {
         let coverage = self.coverage();
         let hosts = self.lock();
-        let mut candidates = Vec::new();
-        // A host older than exclusions would register the runner without
-        // them: GitHub would never hand it the job.
-        let excludes = required.iter().any(|label| excluded_label(label).is_some());
-        for (host_id, connected) in hosts.iter() {
-            let (Some(hello), Some(heartbeat)) = (&connected.hello, &connected.heartbeat) else {
-                continue;
-            };
-            if excludes && !hello.label_exclusions {
-                continue;
-            }
-            for target in &hello.targets {
-                let reference = target.reference();
-                if !reference.covers(repository) || !connected.launch_mode(&coverage, &reference) {
-                    continue;
-                }
-                if let Some(profile) = target.profiles.iter().find(|profile| {
-                    profile.enabled
-                        && profile.labels.iter().any(|label| is_pool_label(label))
-                        && profile_covers(&profile.labels, required)
-                }) {
-                    candidates.push(Candidate {
-                        host_id: host_id.clone(),
-                        target: reference,
-                        profile: profile.name.clone(),
-                        warm: profile.warm,
-                        ram_bytes: hello.ram_bytes,
-                        cores: hello.cores,
-                        disk_free_bytes: connected.disk_free_bytes(),
-                        heartbeat: heartbeat.clone(),
-                        heartbeat_at: connected.heartbeat_at,
-                    });
-                    break;
-                }
-            }
-        }
-        candidates
+        let job = JobShape::of(required);
+        hosts
+            .iter()
+            .filter_map(|(host_id, connected)| {
+                let (target, profile) = connected.launch_profile(&coverage, repository, &job)?;
+                let (hello, heartbeat) = (connected.hello.as_ref()?, connected.heartbeat.as_ref()?);
+                Some(Candidate {
+                    host_id: host_id.clone(),
+                    target,
+                    profile: profile.name.clone(),
+                    warm: profile.warm,
+                    ram_bytes: hello.ram_bytes,
+                    cores: hello.cores,
+                    disk_free_bytes: connected.disk_free_bytes(),
+                    heartbeat: heartbeat.clone(),
+                    heartbeat_at: connected.heartbeat_at,
+                })
+            })
+            .collect()
     }
 
     /// Records what a host said about itself and, to a version-2 host,
@@ -615,6 +655,24 @@ impl Registry {
         })
     }
 
+    /// Whether placement decides where a job requiring `required` runs: it
+    /// asks for a pool label, or a host's pool profile covers it on a host that
+    /// leaves such jobs to placement ([`Hello::plain_placement`]). Every other
+    /// job only wakes the hosts that serve it.
+    #[must_use]
+    pub fn is_placed(&self, repository: &str, required: &[Label]) -> bool {
+        if is_pool_job(required) {
+            return true;
+        }
+        let coverage = self.coverage();
+        let job = JobShape::of(required);
+        self.lock().values().any(|connected| {
+            connected
+                .launch_profile(&coverage, repository, &job)
+                .is_some()
+        })
+    }
+
     /// [`Self::wake_for_job`] for a job whose required labels are resolved.
     /// A wake that reached a host is recorded in [`Self::wakes`].
     pub fn wake_for(
@@ -625,7 +683,7 @@ impl Registry {
         delivery_id: &str,
         run_id: Option<u64>,
     ) -> usize {
-        let pool = is_pool_job(required);
+        let job = JobShape::of(required);
         let coverage = self.coverage();
         let hosts = self.lock();
         let mut woken = 0;
@@ -639,7 +697,14 @@ impl Registry {
             };
             // A pool job reaches a host in launch mode as a `launch` to one
             // of them (see `crate::placement`), never as a wake to all.
-            if pool && connected.launch_mode(&coverage, &target) {
+            // A job without a pool label, on the hosts that leave it to
+            // placement; the others still read it themselves and are woken.
+            if (job.pool && connected.launch_mode(&coverage, &target))
+                || (!job.pool
+                    && connected
+                        .launch_profile(&coverage, repository, &job)
+                        .is_some())
+            {
                 continue;
             }
             let wake = Wake {
@@ -756,6 +821,7 @@ mod tests {
             }],
             remote_changes: false,
             label_exclusions: false,
+            plain_placement: false,
         }
     }
 
@@ -851,6 +917,7 @@ mod tests {
             new_rx.try_recv(),
             Ok(Outbound::Send(ServerMessage::HelloAck(HelloAck {
                 any_pool: true,
+                plain_placement: true,
                 ..HelloAck::default()
             })))
         );

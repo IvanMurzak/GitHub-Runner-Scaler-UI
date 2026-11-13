@@ -7,6 +7,23 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.71
+
+### Added
+
+- The coordinator places the jobs a pool profile covers even when they ask for
+  no pool label. Give each machine's profile its pool label
+  (`repo profile set-pool OWNER/REPO --pool on`) and a job such as
+  `runs-on: [self-hosted, macOS, ARM64]` starts on ONE of those machines, chosen
+  by the job's measured speed, memory and CPU like an `rm-pool-macos` job,
+  instead of on whichever machine's idle runner asked GitHub first. Workflows
+  need no change. A host that does not take part in the pool for that job (no
+  pool label on its profile) is still woken and serves it from its own reading.
+  Both sides must run 0.4.71: a host says it leaves such jobs to placement
+  (`hello.plain_placement`), the coordinator says it places them
+  (`hello_ack.plain_placement`); with an older peer on either side, nothing
+  changes from 0.4.70.
+
 ## 0.4.70
 
 ### Fixed

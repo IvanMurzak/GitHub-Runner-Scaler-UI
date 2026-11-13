@@ -469,6 +469,7 @@ impl Coordinator {
                 targets: Vec::new(),
                 remote_changes: false,
                 label_exclusions: false,
+                plain_placement: false,
             },
         );
         let state = Arc::clone(&self.state);

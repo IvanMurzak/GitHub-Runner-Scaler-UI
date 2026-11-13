@@ -653,7 +653,8 @@ impl Placement {
     // -- Events --------------------------------------------------------------
 
     /// A webhook announced a queued job; its key, or `None` (nothing
-    /// recorded) for a job that asks for no pool.
+    /// recorded) for a job placement does not decide
+    /// ([`Registry::is_placed`]).
     pub fn queued(&self, repository: &str, required: &[Label], job_id: u64) -> Option<JobKey> {
         self.queued_job(repository, required, job_id, None)
     }
@@ -667,7 +668,7 @@ impl Placement {
         job_id: u64,
         job_key: Option<String>,
     ) -> Option<JobKey> {
-        if !is_pool_job(required) {
+        if !self.registry.is_placed(repository, required) {
             return None;
         }
         let key = JobKey::new(repository, required);
@@ -704,12 +705,16 @@ impl Placement {
         job_id: u64,
         runner: Option<&str>,
     ) -> Option<JobKey> {
-        if !is_pool_job(required) {
-            return None;
-        }
         let key = JobKey::new(repository, required);
         let now = crate::clock::now();
         let mut state = self.state();
+        // A job without a pool label was placed only if its queue is known.
+        if !is_pool_job(required)
+            && !state.queues.contains_key(&key)
+            && !state.leases.values().any(|lease| lease.key == key)
+        {
+            return None;
+        }
         state.touched.insert(key.clone(), now);
         let mut estimate = None;
         if let Some(queue) = state.queues.get_mut(&key) {
@@ -1687,6 +1692,23 @@ mod tests {
         ram: u64,
         total: Option<u64>,
     ) -> FakeHost {
+        connect_hello(registry, id, version, labels, (free, ram, total), false)
+    }
+
+    /// [`connect`] for a host that leaves the jobs its pool profile covers
+    /// without a pool label to placement (`plain_placement`).
+    fn connect_plain(registry: &Registry, id: &str, labels: &[&str], ram: u64) -> FakeHost {
+        connect_hello(registry, id, LAUNCH_VERSION, labels, (2, ram, None), true)
+    }
+
+    fn connect_hello(
+        registry: &Registry,
+        id: &str,
+        version: u32,
+        labels: &[&str],
+        (free, ram, total): (u32, u64, Option<u64>),
+        plain_placement: bool,
+    ) -> FakeHost {
         let (tx, rx) = mpsc::channel(64);
         let connection = registry.register(id, version, tx);
         registry.set_hello(
@@ -1712,6 +1734,7 @@ mod tests {
                 }],
                 remote_changes: false,
                 label_exclusions: true,
+                plain_placement,
             },
         );
         registry.set_heartbeat(
@@ -1824,6 +1847,119 @@ mod tests {
             seen.push(launches(&host.await.expect("host")));
         }
         assert_eq!(seen, vec![0, 1, 0], "the host with the most free RAM, once");
+    }
+
+    /// A job asking for no pool label (`[self-hosted, linux]`) that the pool
+    /// profiles of hosts leaving such jobs to placement cover is placed on one
+    /// of them, like a pool job, and none of them is woken for it.
+    #[tokio::test]
+    async fn a_job_without_a_pool_label_is_placed_on_one_host_of_the_pool() {
+        let (registry, placement) = setup();
+        let labels = &["rm-pool-linux", "self-hosted", "linux"];
+        let small = connect_plain(&registry, "small", labels, 8 << 30);
+        let big = connect_plain(&registry, "big", labels, 64 << 30);
+        let hosts = [
+            answer(&placement, "small", small, Answer::Accept),
+            answer(&placement, "big", big, Answer::Accept),
+        ];
+        let plain = &["self-hosted", "linux"];
+
+        assert!(registry.is_placed("octo/app", &required(plain)));
+        assert_eq!(
+            registry.wake_for_job("octo/app", &["self-hosted".into(), "linux".into()], "d"),
+            0
+        );
+        let key = placement
+            .queued("octo/app", &required(plain), 7)
+            .expect("placed");
+        assert_eq!(
+            placement.rebalance(&key).await,
+            Rebalanced {
+                accepted: 1,
+                ..Rebalanced::default()
+            }
+        );
+        let mut seen = Vec::new();
+        for host in hosts {
+            seen.push(launches(&host.await.expect("host")));
+        }
+        assert_eq!(seen, vec![0, 1], "the host with the most free RAM, once");
+    }
+
+    /// A host that does not say `plain_placement` serves such a job from its
+    /// own reading: it is woken, and placement leaves the job alone, or the
+    /// host would start a second runner for it.
+    #[tokio::test]
+    async fn a_job_without_a_pool_label_is_only_woken_for_on_older_hosts() {
+        let (registry, placement) = setup();
+        let _old = connect(
+            &registry,
+            "old",
+            LAUNCH_VERSION,
+            &["rm-pool-linux", "self-hosted", "linux"],
+            2,
+            8 << 30,
+        );
+        let plain = &["self-hosted", "linux"];
+
+        assert!(!registry.is_placed("octo/app", &required(plain)));
+        assert!(placement.queued("octo/app", &required(plain), 7).is_none());
+        assert_eq!(
+            registry.wake_for_job("octo/app", &["self-hosted".into(), "linux".into()], "d"),
+            1
+        );
+        assert!(
+            placement
+                .dequeued("octo/app", &required(plain), 7)
+                .is_none(),
+            "a job never placed leaves nothing behind"
+        );
+    }
+
+    /// A stored label for another OS's pool makes no pool profile on this
+    /// host (`os: linux` carrying `rm-pool-macos`): the host would refuse the
+    /// launch, so it is no candidate and is woken instead.
+    #[tokio::test]
+    async fn another_oss_pool_label_makes_no_candidate() {
+        let (registry, _placement) = setup();
+        let _linux = connect_plain(
+            &registry,
+            "linux",
+            &["rm-pool-macos", "self-hosted"],
+            8 << 30,
+        );
+
+        assert!(!registry.is_placed("octo/app", &required(&["self-hosted"])));
+        assert!(
+            registry
+                .launch_candidates("octo/app", &required(&["rm-pool-macos"]))
+                .is_empty()
+        );
+        assert_eq!(
+            registry.wake_for_job("octo/app", &["self-hosted".into()], "d"),
+            1
+        );
+    }
+
+    /// Hosts whose profile serving the job is no pool profile still read it
+    /// themselves, so they are woken while the pool's hosts are placed.
+    #[tokio::test]
+    async fn a_host_outside_the_pool_is_still_woken_for_a_placed_job() {
+        let (registry, _placement) = setup();
+        let _pool = connect_plain(
+            &registry,
+            "pool",
+            &["rm-pool-linux", "self-hosted"],
+            8 << 30,
+        );
+        let _other = connect_plain(&registry, "other", &["self-hosted"], 8 << 30);
+
+        assert!(registry.is_placed("octo/app", &required(&["self-hosted"])));
+        assert_eq!(
+            registry.wake_for_job("octo/app", &["self-hosted".into()], "d"),
+            1,
+            "only the host outside the pool"
+        );
     }
 
     #[tokio::test]
@@ -2408,6 +2544,7 @@ mod tests {
                 }],
                 remote_changes: false,
                 label_exclusions: false,
+                plain_placement: false,
             },
         );
         let beat = |free| Heartbeat {
@@ -3122,6 +3259,7 @@ mod tests {
                 }],
                 remote_changes: false,
                 label_exclusions: false,
+                plain_placement: false,
             },
         );
         registry.set_heartbeat(
@@ -3241,6 +3379,7 @@ mod tests {
                 }],
                 remote_changes: false,
                 label_exclusions: false,
+                plain_placement: false,
             },
         );
         registry.set_heartbeat(

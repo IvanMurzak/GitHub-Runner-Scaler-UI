@@ -712,6 +712,17 @@ impl DemandDirector for Launches {
         Some(self.open_for(policy.id))
     }
 
+    /// Only while the link is up: in the moments after it drops the profile is
+    /// still directed, but the coordinator no longer counts this host among the
+    /// candidates for those jobs, and would leave them to the next sweep.
+    fn places_plain_jobs(&self, policy: &ScalePolicy) -> bool {
+        let placed = {
+            let view = self.view.borrow();
+            view.connected && view.ack.as_ref().is_some_and(|ack| ack.plain_placement)
+        };
+        placed && self.is_directed(policy)
+    }
+
     fn directed_exclusions(&self, policy: &ScalePolicy) -> BTreeSet<Label> {
         self.book()
             .open
@@ -957,6 +968,17 @@ mod tests {
         version: u32,
         any_pool: bool,
     ) -> watch::Receiver<LinkView> {
+        placing_view(policy, version, any_pool, false)
+    }
+
+    /// [`directed_view`], from a coordinator that says whether it places the
+    /// jobs a pool profile covers without a pool label.
+    fn placing_view(
+        policy: &ScalePolicy,
+        version: u32,
+        any_pool: bool,
+        plain_placement: bool,
+    ) -> watch::Receiver<LinkView> {
         let (_sender, receiver) = watch::channel(LinkView {
             configured: true,
             connected: true,
@@ -965,6 +987,7 @@ mod tests {
                 reconcile_interval_secs: Some(120),
                 covered: vec![target_ref(&policy.target)],
                 any_pool,
+                plain_placement,
             }),
             version: Some(version),
         });
@@ -1090,6 +1113,42 @@ mod tests {
         );
     }
 
+    /// A directed pool profile leaves the jobs it covers without a pool label
+    /// to launches only when the coordinator says it places them.
+    #[test]
+    fn plain_jobs_are_left_to_launches_only_by_a_coordinator_that_places_them() {
+        let (store, policy, older) = setup(LAUNCH_VERSION);
+        assert!(older.is_directed(&policy));
+        assert!(!older.places_plain_jobs(&policy));
+
+        let host = store
+            .host(policy.host_id)
+            .expect("store")
+            .expect("the host");
+        let current = Launches::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            host,
+            placing_view(&policy, LAUNCH_VERSION, true, true),
+        );
+        assert!(current.places_plain_jobs(&policy));
+
+        // The link just dropped: still directed for a while, but the
+        // coordinator no longer counts this host, so it reads them itself.
+        let mut down = placing_view(&policy, LAUNCH_VERSION, true, true)
+            .borrow()
+            .clone();
+        down.connected = false;
+        down.down_since = Some(tokio::time::Instant::now());
+        let (_sender, view) = watch::channel(down);
+        let host = store
+            .host(policy.host_id)
+            .expect("store")
+            .expect("the host");
+        let dropped = Launches::new(Arc::clone(&store) as Arc<dyn Store>, host, view);
+        assert!(dropped.is_directed(&policy), "within the grace");
+        assert!(!dropped.places_plain_jobs(&policy));
+    }
+
     #[test]
     fn an_any_pool_profile_is_directed_only_by_a_coordinator_that_places_that_pool() {
         let host = fixtures::host().build();
@@ -1171,6 +1230,7 @@ mod tests {
                 reconcile_interval_secs: Some(120),
                 covered: vec![target_ref(&policy.target), target_ref(&other.target)],
                 any_pool: true,
+                plain_placement: false,
             }),
             version: Some(LAUNCH_VERSION),
         });

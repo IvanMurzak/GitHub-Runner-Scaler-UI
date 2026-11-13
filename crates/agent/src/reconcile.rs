@@ -2442,6 +2442,14 @@ pub trait DemandDirector: fmt::Debug + Send + Sync {
         None
     }
 
+    /// Whether the coordinator also places the jobs `policy` covers without a
+    /// pool label (`hello_ack.plain_placement`): a directed policy then starts
+    /// runners only for its launches. `false`: it serves those jobs from its
+    /// own reading, beside its launches.
+    fn places_plain_jobs(&self, _policy: &ScalePolicy) -> bool {
+        false
+    }
+
     /// How many launches of other targets of this host are older than
     /// `policy`'s oldest without a runner and may yet reserve: `policy`'s
     /// launch lets them go first.
@@ -3211,18 +3219,23 @@ impl Reconciler {
             // Coordinated placement: the launches the coordinator placed
             // here are the demand of the pool jobs, whatever this host's own
             // reading says (or whether it could read at all). The coordinator
-            // places only jobs that ask for a pool label, so a job this profile
-            // covers without one (`[self-hosted, macOS]` on a profile that also
-            // carries `rm-pool-macos`) is served from this host's own reading,
-            // as without a coordinator; otherwise it would wait in the queue
-            // with every host of the pool idle.
+            // places a job this profile covers without a pool label
+            // (`[self-hosted, macOS]` on a profile that also carries
+            // `rm-pool-macos`) only when it says so (`plain_placement`); an
+            // older one only wakes hosts for it, so it is served from this
+            // host's own reading, as without a coordinator; otherwise it would
+            // wait in the queue with every host of the pool idle.
             if let Some(directed) = self.director.directed_demand(policy) {
                 let own = match readings.get(&policy.target) {
-                    Some(PollOutcome::Ready(reading)) => routed
-                        .get(&policy.target)
-                        .and_then(|tallies| tallies.get(&policy.id))
-                        .filter(|tally| tally.non_pool_demand() > 0)
-                        .map(|tally| (tally, reading)),
+                    Some(PollOutcome::Ready(reading))
+                        if !self.director.places_plain_jobs(policy) =>
+                    {
+                        routed
+                            .get(&policy.target)
+                            .and_then(|tallies| tallies.get(&policy.id))
+                            .filter(|tally| tally.non_pool_demand() > 0)
+                            .map(|tally| (tally, reading))
+                    }
                     _ => None,
                 };
                 if own.is_some() || self.launch_side.is_none() {
@@ -8224,6 +8237,8 @@ mod tests {
         passed_over: AtomicUsize,
         /// Each policy's place among the launches.
         orders: Mutex<BTreeMap<PolicyId, u64>>,
+        /// What `places_plain_jobs` answers.
+        places_plain: AtomicBool,
     }
 
     impl DemandDirector for FixedDirector {
@@ -8241,6 +8256,10 @@ mod tests {
 
         fn next_waiting(&self, policy: &ScalePolicy) -> Option<u64> {
             self.orders.lock().unwrap().get(&policy.id).copied()
+        }
+
+        fn places_plain_jobs(&self, _policy: &ScalePolicy) -> bool {
+            self.places_plain.load(Ordering::SeqCst)
         }
 
         fn older_waiting(&self, _policy: &ScalePolicy) -> usize {
@@ -8584,6 +8603,23 @@ mod tests {
             report.started, 3,
             "one runner for the launch, one for each job that asks for no pool"
         );
+    }
+
+    /// A coordinator that places the jobs asking for no pool label too
+    /// (`plain_placement`) sends a launch for them: the host's own reading of
+    /// them starts nothing, or every host of the pool would start a runner.
+    #[tokio::test]
+    async fn a_coordinator_that_places_plain_jobs_leaves_them_to_its_launches() {
+        let (profile, demand) = (pool_profile(1, 5), pool_queue(0, 2));
+        let fake = Arc::new(FakeLauncher::new());
+        let director = Arc::new(FixedDirector::default());
+        director.directed.lock().unwrap().insert(profile.id, 1);
+        director.places_plain.store(true, Ordering::SeqCst);
+        let mut reconciler = reconciler_reading(demand, Arc::clone(&fake), director);
+
+        let report = reconciler.reconcile(std::slice::from_ref(&profile)).await;
+
+        assert_eq!(report.started, 1, "the launch's runner only");
     }
 
     /// A pool job is still the coordinator's to place: the host's own reading

@@ -201,6 +201,7 @@ fn hello(version: u32, host_id: &str) -> HostMessage {
         }],
         remote_changes: false,
         label_exclusions: false,
+        plain_placement: false,
     })
 }
 
@@ -262,6 +263,7 @@ async fn a_version_two_host_is_told_its_coverage_and_woken() {
         next(&mut socket).await,
         ServerMessage::HelloAck(HelloAck {
             any_pool: true,
+            plain_placement: true,
             ..HelloAck::default()
         })
     );

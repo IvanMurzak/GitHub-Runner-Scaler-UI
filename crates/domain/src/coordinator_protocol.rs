@@ -254,6 +254,13 @@ pub struct Hello {
     /// host.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub label_exclusions: bool,
+    /// From 0.4.71: this host leaves to a coordinator that places them (its
+    /// [`HelloAck::plain_placement`]) the jobs its pool profiles cover without
+    /// asking for a pool label (`[self-hosted, macOS]`). A coordinator places
+    /// such a job only on hosts that say so: any other host of the pool serves
+    /// it from its own reading, and would start a second runner.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plain_placement: bool,
 }
 
 /// A host's periodic load report.
@@ -439,6 +446,13 @@ pub struct HelloAck {
     /// profile then counts its own demand.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub any_pool: bool,
+    /// From 0.4.71: this coordinator also places the jobs a pool profile
+    /// covers without a pool label, on the hosts that said
+    /// [`Hello::plain_placement`]. Such a host's directed pool profile then
+    /// starts runners only for launches; with an older coordinator it serves
+    /// those jobs from its own reading.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub plain_placement: bool,
 }
 
 impl HelloAck {
@@ -1576,6 +1590,7 @@ mod tests {
             }],
             remote_changes: false,
             label_exclusions: false,
+            plain_placement: false,
         }
     }
 
@@ -1660,6 +1675,7 @@ mod tests {
                     name: "octo/app".into(),
                 }],
                 any_pool: true,
+                plain_placement: false,
             }),
             ServerMessage::Welcome {
                 protocol_version: PROTOCOL_VERSION,

@@ -4405,6 +4405,7 @@ mod tests {
                     name: "acme/repo".into(),
                 }],
                 any_pool: true,
+                plain_placement: false,
             }),
             version: Some(4),
         });
@@ -4498,6 +4499,7 @@ mod tests {
                     name: "acme/repo".into(),
                 }],
                 any_pool: true,
+                plain_placement: false,
             }),
             version: Some(4),
         };
@@ -4742,6 +4744,7 @@ mod tests {
                 name: "acme/repo".into(),
             }],
             any_pool: true,
+            plain_placement: false,
         };
         link.send_replace(LinkView {
             configured: true,
@@ -4827,6 +4830,7 @@ mod tests {
                     name: "acme/repo".into(),
                 }],
                 any_pool: true,
+                plain_placement: false,
             }),
         });
         target.coordination = Some(view);
