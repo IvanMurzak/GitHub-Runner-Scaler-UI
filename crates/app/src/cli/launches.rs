@@ -967,6 +967,17 @@ mod tests {
         version: u32,
         any_pool: bool,
     ) -> watch::Receiver<LinkView> {
+        placing_view(policy, version, any_pool, false)
+    }
+
+    /// [`directed_view`], from a coordinator that says whether it places the
+    /// jobs a pool profile covers without a pool label.
+    fn placing_view(
+        policy: &ScalePolicy,
+        version: u32,
+        any_pool: bool,
+        plain_placement: bool,
+    ) -> watch::Receiver<LinkView> {
         let (_sender, receiver) = watch::channel(LinkView {
             configured: true,
             connected: true,
@@ -975,7 +986,7 @@ mod tests {
                 reconcile_interval_secs: Some(120),
                 covered: vec![target_ref(&policy.target)],
                 any_pool,
-                plain_placement: false,
+                plain_placement,
             }),
             version: Some(version),
         });
@@ -1109,23 +1120,15 @@ mod tests {
         assert!(older.is_directed(&policy));
         assert!(!older.places_plain_jobs(&policy));
 
-        let (_sender, view) = watch::channel(LinkView {
-            configured: true,
-            connected: true,
-            down_since: None,
-            ack: Some(HelloAck {
-                reconcile_interval_secs: Some(120),
-                covered: vec![target_ref(&policy.target)],
-                any_pool: true,
-                plain_placement: true,
-            }),
-            version: Some(LAUNCH_VERSION),
-        });
         let host = store
             .host(policy.host_id)
             .expect("store")
             .expect("the host");
-        let current = Launches::new(Arc::clone(&store) as Arc<dyn Store>, host, view);
+        let current = Launches::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            host,
+            placing_view(&policy, LAUNCH_VERSION, true, true),
+        );
         assert!(current.places_plain_jobs(&policy));
     }
 
