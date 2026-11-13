@@ -32,7 +32,7 @@ use runner_manager_github::rest::{ActivityScope, CancelToken, InventoryError};
 use crate::dashboard::activity::Activity;
 use crate::github_app::{AppError, GithubApp};
 use crate::placement::{Placement, SweptQueue};
-use crate::registry::{Coverage, Inventory, Registry, is_pool_job};
+use crate::registry::{Coverage, Inventory, Registry};
 use crate::stats::{JobIdentity, RunWorkflows};
 
 /// The shortest sweep interval accepted.
@@ -390,7 +390,7 @@ impl Sweeper {
                 continue;
             };
             report.queued += 1;
-            if is_pool_job(&required) {
+            if self.registry.is_placed(&name, &required) {
                 let queue = pool.entry(required.iter().cloned().collect()).or_default();
                 match identity.and_then(|identity| Some((identity.id?, identity))) {
                     Some((id, identity)) => queue.jobs.push((
@@ -832,6 +832,7 @@ mod tests {
                 }],
                 remote_changes: false,
                 label_exclusions: false,
+                plain_placement: false,
             },
         );
         rx

@@ -712,6 +712,16 @@ impl DemandDirector for Launches {
         Some(self.open_for(policy.id))
     }
 
+    fn places_plain_jobs(&self, policy: &ScalePolicy) -> bool {
+        self.is_directed(policy)
+            && self
+                .view
+                .borrow()
+                .ack
+                .as_ref()
+                .is_some_and(|ack| ack.plain_placement)
+    }
+
     fn directed_exclusions(&self, policy: &ScalePolicy) -> BTreeSet<Label> {
         self.book()
             .open
@@ -965,6 +975,7 @@ mod tests {
                 reconcile_interval_secs: Some(120),
                 covered: vec![target_ref(&policy.target)],
                 any_pool,
+                plain_placement: false,
             }),
             version: Some(version),
         });
@@ -1090,6 +1101,34 @@ mod tests {
         );
     }
 
+    /// A directed pool profile leaves the jobs it covers without a pool label
+    /// to launches only when the coordinator says it places them.
+    #[test]
+    fn plain_jobs_are_left_to_launches_only_by_a_coordinator_that_places_them() {
+        let (store, policy, older) = setup(LAUNCH_VERSION);
+        assert!(older.is_directed(&policy));
+        assert!(!older.places_plain_jobs(&policy));
+
+        let (_sender, view) = watch::channel(LinkView {
+            configured: true,
+            connected: true,
+            down_since: None,
+            ack: Some(HelloAck {
+                reconcile_interval_secs: Some(120),
+                covered: vec![target_ref(&policy.target)],
+                any_pool: true,
+                plain_placement: true,
+            }),
+            version: Some(LAUNCH_VERSION),
+        });
+        let host = store
+            .host(policy.host_id)
+            .expect("store")
+            .expect("the host");
+        let current = Launches::new(Arc::clone(&store) as Arc<dyn Store>, host, view);
+        assert!(current.places_plain_jobs(&policy));
+    }
+
     #[test]
     fn an_any_pool_profile_is_directed_only_by_a_coordinator_that_places_that_pool() {
         let host = fixtures::host().build();
@@ -1171,6 +1210,7 @@ mod tests {
                 reconcile_interval_secs: Some(120),
                 covered: vec![target_ref(&policy.target), target_ref(&other.target)],
                 any_pool: true,
+                plain_placement: false,
             }),
             version: Some(LAUNCH_VERSION),
         });

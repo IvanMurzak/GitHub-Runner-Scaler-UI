@@ -725,8 +725,9 @@ refused, and so is a second profile of the same target carrying the same pool la
 carry both its OS pool label and `rm-pool-any`. While the target is `coordinated`, that profile starts runners for
 pool jobs only when the coordinator places one on it, and only within its own `max_capacity`, host capacity and
 `host doctor` fitness; in `fallback` or `standalone` it serves its own demand as before. A job it covers that
-asks for no pool label (`runs-on: [self-hosted, macOS]`) is never placed, so the profile serves it from its own
-reading in every mode, as every host carrying those labels does.
+asks for no pool label (`runs-on: [self-hosted, macOS]`) is placed the same way, on one of the hosts whose profile
+carries the pool label (0.4.71 on host and coordinator), so a workflow needs no pool label for the coordinator to
+choose the machine; hosts serving that job without a pool profile are woken and read it themselves.
 
 **Job statistics.** A joined host samples the process tree of each native runner every 2 seconds
 (off its reconcile loop) and reports, when the attempt ends, its peak memory and its average and

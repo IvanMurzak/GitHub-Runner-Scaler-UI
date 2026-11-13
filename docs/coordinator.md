@@ -277,6 +277,10 @@ webhook).
 
 ### How a host is chosen
 
+A **pool job** here is a job that asks for a pool label, or (0.4.71) one an enabled pool profile
+covers on a host that said `plain_placement`: `runs-on: [self-hosted, macOS, ARM64]` is placed among
+the Macs whose profile for the repository carries `rm-pool-macos`, with no label in the workflow.
+
 When a pool job is queued (webhook `queued`, or counted by the sweep), the coordinator picks one
 **candidate**: a connected version-3 host whose target serving the repository is covered by the
 sweep, with an enabled pool profile whose labels cover the job, not unfit, not draining, and with
@@ -348,11 +352,13 @@ in the log (`a pool queue is not placed`, with `reason` and, for a refusal, `ref
 A pool profile is **directed** while its target is `coordinated` on a version-3 link: for pool
 jobs it starts runners only for the launches it accepted, never from its own reading of the queue
 (which every host of the pool sees the same way). A job the profile covers that asks for no pool
-label (`runs-on: [self-hosted, macOS]` on a profile that also carries `rm-pool-macos`) is not placed
-by the coordinator, which only wakes every host serving it; the profile serves such jobs from its own
-reading, in the pass that read them, as every host carrying those labels does (0.4.70; before, they
-waited in the queue with every host of the pool idle). Move a workflow's jobs to the pool label to
-have them placed. It accepts a launch only when its own allocator, over its
+label (`runs-on: [self-hosted, macOS]` on a profile that also carries `rm-pool-macos`) is placed
+too, from 0.4.71 on both sides: the host says so in its `hello` (`plain_placement`), and a coordinator
+that places such jobs says so in its `hello_ack`. The coordinator then sends one launch for the job
+to one such host, chosen as for a pool job, and wakes only the hosts that serve the job some other
+way (a profile without a pool label, or an older host). With an older coordinator or host, the
+profile serves such jobs from its own reading, in the pass that read them, as every host carrying
+those labels does (0.4.70; before, they waited in the queue with every host of the pool idle). It accepts a launch only when its own allocator, over its
 own attempts and ceilings, grants one more runner, counting the launches its other profiles hold
 open: slots are the host's. A launch it can no longer start (another profile's runner took the
 slot since) is dropped, newest first, and the next heartbeat, sent at once, closes its lease; so is

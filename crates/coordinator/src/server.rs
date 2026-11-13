@@ -35,7 +35,6 @@ use secrecy::{ExposeSecret as _, SecretString};
 use tokio::sync::mpsc;
 
 use crate::placement::{CLAIM_GRACE, Placement};
-use crate::registry::is_pool_job;
 use crate::registry::{OUTBOUND_QUEUE, Outbound, Registry};
 use crate::stats::{JobIdentity, JobTimes, LiveState, Statistics, StatsConfig};
 use crate::store::{EnrollError, Store};
@@ -404,7 +403,9 @@ async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             let workflows = state.statistics.run_workflows();
             let run_id = job.workflow_job.run_id;
             // Worth a request only for a job this coordinator keeps figures on.
-            let measured = required.as_deref().is_some_and(is_pool_job)
+            let measured = required
+                .as_deref()
+                .is_some_and(|required| state.registry.is_placed(repository, required))
                 || job
                     .workflow_job
                     .runner_name

@@ -105,6 +105,7 @@ impl Coverage {
                 .filter(|target| self.covers(target))
                 .collect(),
             any_pool: true,
+            plain_placement: true,
         }
     }
 }
@@ -355,11 +356,17 @@ impl Registry {
         // A host older than exclusions would register the runner without
         // them: GitHub would never hand it the job.
         let excludes = required.iter().any(|label| excluded_label(label).is_some());
+        let pool = is_pool_job(required);
         for (host_id, connected) in hosts.iter() {
             let (Some(hello), Some(heartbeat)) = (&connected.hello, &connected.heartbeat) else {
                 continue;
             };
             if excludes && !hello.label_exclusions {
+                continue;
+            }
+            // A host that does not leave its plain jobs to placement serves
+            // them itself: a launch would start a second runner.
+            if !pool && !hello.plain_placement {
                 continue;
             }
             for target in &hello.targets {
@@ -615,6 +622,15 @@ impl Registry {
         })
     }
 
+    /// Whether placement decides where a job requiring `required` runs: it
+    /// asks for a pool label, or a host's pool profile covers it on a host that
+    /// leaves such jobs to placement ([`Hello::plain_placement`]). Every other
+    /// job only wakes the hosts that serve it.
+    #[must_use]
+    pub fn is_placed(&self, repository: &str, required: &[Label]) -> bool {
+        is_pool_job(required) || !self.launch_candidates(repository, required).is_empty()
+    }
+
     /// [`Self::wake_for_job`] for a job whose required labels are resolved.
     /// A wake that reached a host is recorded in [`Self::wakes`].
     pub fn wake_for(
@@ -626,6 +642,16 @@ impl Registry {
         run_id: Option<u64>,
     ) -> usize {
         let pool = is_pool_job(required);
+        // A job without a pool label is placed on the hosts that leave it to
+        // placement; the others still read it themselves and are woken.
+        let placed: BTreeSet<String> = if pool {
+            BTreeSet::new()
+        } else {
+            self.launch_candidates(repository, required)
+                .into_iter()
+                .map(|candidate| candidate.host_id)
+                .collect()
+        };
         let coverage = self.coverage();
         let hosts = self.lock();
         let mut woken = 0;
@@ -639,7 +665,7 @@ impl Registry {
             };
             // A pool job reaches a host in launch mode as a `launch` to one
             // of them (see `crate::placement`), never as a wake to all.
-            if pool && connected.launch_mode(&coverage, &target) {
+            if (pool && connected.launch_mode(&coverage, &target)) || placed.contains(host_id) {
                 continue;
             }
             let wake = Wake {
@@ -756,6 +782,7 @@ mod tests {
             }],
             remote_changes: false,
             label_exclusions: false,
+            plain_placement: false,
         }
     }
 
@@ -851,6 +878,7 @@ mod tests {
             new_rx.try_recv(),
             Ok(Outbound::Send(ServerMessage::HelloAck(HelloAck {
                 any_pool: true,
+                plain_placement: true,
                 ..HelloAck::default()
             })))
         );

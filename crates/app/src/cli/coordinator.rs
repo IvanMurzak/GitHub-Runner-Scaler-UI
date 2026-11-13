@@ -1262,6 +1262,7 @@ fn hello(ports: &LinkPorts, host_id: &str, version: u32, policies: &[ScalePolicy
         targets: advertised_targets(policies, host_traits()),
         remote_changes: super::remote::changes_allowed(&ports.paths),
         label_exclusions: true,
+        plain_placement: true,
     }
 }
 
