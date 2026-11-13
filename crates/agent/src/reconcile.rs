@@ -126,7 +126,7 @@ use runner_manager_domain::model::{
     AttemptId, Clock, Host, IdlePollInterval, Org, OwnerRepo, PolicyId, RefreshInterval,
     ScaleTarget, Timestamp,
 };
-use runner_manager_domain::policy::{DemandTally, HostTraits, ScalePolicy};
+use runner_manager_domain::policy::{DemandTally, HostTraits, ScalePolicy, is_pool_job};
 use runner_manager_github::demand::{DemandGateway, QueuedDemand, demand_requests_per_poll};
 use runner_manager_github::rest::{
     ActivityScope, CancelToken, InventoryError, RateLimitKind, RefreshState,
@@ -3062,7 +3062,7 @@ impl Reconciler {
                 *most = directed.max(*most);
                 let mut reserved = Vec::new();
                 let excluded = self.director.directed_exclusions(policy);
-                self.start_runners(policy, directed, &excluded, 1, report, &mut reserved)
+                self.start_runners(policy, directed, 0, &excluded, 1, report, &mut reserved)
                     .await;
                 if let Some(next) = reserved.pop() {
                     *served += 1;
@@ -3218,34 +3218,32 @@ impl Reconciler {
             // with every host of the pool idle.
             if let Some(directed) = self.director.directed_demand(policy) {
                 let own = match readings.get(&policy.target) {
-                    Some(PollOutcome::Ready(_)) => routed
+                    Some(PollOutcome::Ready(reading)) => routed
                         .get(&policy.target)
-                        .and_then(|tallies| tallies.get(&policy.id)),
+                        .and_then(|tallies| tallies.get(&policy.id))
+                        .filter(|tally| tally.non_pool_demand() > 0)
+                        .map(|tally| (tally, reading)),
                     _ => None,
-                }
-                .filter(|tally| tally.non_pool_demand() > 0);
-                if let Some(tally) = own {
+                };
+                if own.is_some() || self.launch_side.is_none() {
                     // Started here, from the reading just taken: the launch
                     // side holds no reading, and one kept for it would go
                     // stale once a runner took the job. The same allocator
                     // counts every runner of the profile against the sum, so
-                    // a launch's runner already up is not started twice.
-                    let own_demand = tally.non_pool_demand();
-                    self.events.emit(LifecycleEvent::DemandObserved {
-                        policy: policy.id,
-                        demand: own_demand,
-                        not_matched: tally.not_matched,
-                        unresolvable: u32::try_from(tally.unresolvable.len()).unwrap_or(u32::MAX),
-                        complete: readings
-                            .get(&policy.target)
-                            .and_then(PollOutcome::reading)
-                            .is_some_and(QueuedDemand::is_complete),
-                    });
+                    // a launch's runner already up is not started twice; one
+                    // not up yet is brought up here too, which holds this
+                    // pass only while a job that asks for no pool waits.
                     let mut excluded = self.director.directed_exclusions(policy);
-                    excluded.extend(tally.excluded.iter().cloned());
+                    let own_demand = own.map_or(0, |(tally, reading)| {
+                        let count = tally.non_pool_demand();
+                        self.observe_demand(policy, tally, count, reading);
+                        excluded.extend(tally.excluded.iter().cloned());
+                        count
+                    });
                     self.start_runners(
                         policy,
-                        directed.saturating_add(own_demand),
+                        directed,
+                        own_demand,
                         &excluded,
                         u16::MAX,
                         &mut report,
@@ -3255,16 +3253,6 @@ impl Reconciler {
                     continue;
                 }
                 let Some(launch_side) = &self.launch_side else {
-                    let excluded = self.director.directed_exclusions(policy);
-                    self.start_runners(
-                        policy,
-                        directed,
-                        &excluded,
-                        u16::MAX,
-                        &mut report,
-                        &mut reserved,
-                    )
-                    .await;
                     continue;
                 };
                 match self.allocate_only(policy, directed, &reserved).await {
@@ -3298,16 +3286,11 @@ impl Reconciler {
                         .and_then(|tallies| tallies.get(&policy.id))
                         .expect("every pollable profile has a routed tally");
                     let count = tally.demand();
-                    self.events.emit(LifecycleEvent::DemandObserved {
-                        policy: policy.id,
-                        demand: count,
-                        not_matched: tally.not_matched,
-                        unresolvable: u32::try_from(tally.unresolvable.len()).unwrap_or(u32::MAX),
-                        complete: demand.is_complete(),
-                    });
+                    self.observe_demand(policy, tally, count, demand);
                     self.start_runners(
                         policy,
                         count,
+                        0,
                         &tally.excluded,
                         u16::MAX,
                         &mut report,
@@ -3469,14 +3452,21 @@ impl Reconciler {
     ///
     /// At most `limit` runners: one, when the caller decides who is next.
     ///
+    /// The demand is `demand` plus `own`: for a directed policy `demand` is its
+    /// launches, re-read when this waited its turn, and `own` the jobs of this
+    /// pass's reading that ask for no pool, which the coordinator never places.
+    /// Every other caller passes `own` 0.
+    ///
     /// Each registers with the policy's labels, this host's
     /// [`HostTraits`] labels, and `not-X` for every `X` in `excluded` (what the
     /// jobs it is started for exclude, which GitHub otherwise never hands it)
     /// and in every earlier pass's.
+    #[allow(clippy::too_many_arguments)]
     async fn start_runners(
         &self,
         policy: &ScalePolicy,
         demand: u32,
+        own: u32,
         excluded: &BTreeSet<Label>,
         limit: u16,
         report: &mut ReconcileReport,
@@ -3511,7 +3501,10 @@ impl Reconciler {
         // thing it can get wrong in the other direction is refusing a grant that
         // headroom freed a moment later would have allowed, which the next poll
         // picks up.
-        let intent = match self.allocate_only(policy, demand, reserved).await {
+        let intent = match self
+            .allocate_only(policy, demand.saturating_add(own), reserved)
+            .await
+        {
             Ok(intent) => intent,
             Err(failure) => {
                 self.report_allocation_failure(report, &failure);
@@ -3525,12 +3518,6 @@ impl Reconciler {
         // pre-check stands in only when no hold was ever obtained.
         let mut decided: Option<Allocation> = None;
         let mut budget = intent.to_start.min(limit);
-        // What the caller added to the launches from this host's own reading
-        // (the jobs a directed pool profile serves that ask for no pool).
-        let own = self
-            .director
-            .directed_demand(policy)
-            .map_or(0, |directed| demand.saturating_sub(directed));
 
         while budget > 0 {
             let order_wait = self.let_older_launches_reserve(policy).await;
@@ -3538,10 +3525,9 @@ impl Reconciler {
             let demand = if order_wait.is_zero() {
                 demand
             } else {
-                self.director
-                    .directed_demand(policy)
-                    .map_or(demand, |directed| directed.saturating_add(own))
-            };
+                self.director.directed_demand(policy).unwrap_or(demand)
+            }
+            .saturating_add(own);
             let waiting_since = std::time::Instant::now();
             let guard = match self.lock.acquire().await {
                 Ok(guard) => guard,
@@ -3662,6 +3648,24 @@ impl Reconciler {
         let allocation = decided.unwrap_or(intent);
         self.emit_allocation(&allocation);
         report.allocations.push(allocation);
+    }
+
+    /// Says what `policy`'s reading in this pass asks of it: `demand` of the
+    /// `tally`'s jobs.
+    fn observe_demand(
+        &self,
+        policy: &ScalePolicy,
+        tally: &DemandTally,
+        demand: u32,
+        reading: &QueuedDemand,
+    ) {
+        self.events.emit(LifecycleEvent::DemandObserved {
+            policy: policy.id,
+            demand,
+            not_matched: tally.not_matched,
+            unresolvable: u32::try_from(tally.unresolvable.len()).unwrap_or(u32::MAX),
+            complete: reading.is_complete(),
+        });
     }
 
     /// Oldest first across targets: `policy`'s launch reserves after the older
@@ -4072,7 +4076,9 @@ fn route_demand(
             *refusals
                 .entry(RoutingRefusal::OverlappingProfiles)
                 .or_default() += 1;
-            let pool = job.is_pool_job();
+            let pool = job
+                .required_labels()
+                .is_ok_and(|required| is_pool_job(&required));
             for id in matched {
                 if let Some(tally) = tallies.get_mut(&id) {
                     tally.matched -= 1;
@@ -4224,7 +4230,7 @@ mod tests {
     }
 
     /// An `active`, enabled autoscale policy on the fixture host.
-    use runner_manager_domain::policy::{RoutingLabels, RunsOn};
+    use runner_manager_domain::policy::{RoutingLabels, RunsOn, pool_label};
 
     fn policy(id: u128, target: &str, max: u16) -> ScalePolicy {
         fixtures::policy()
@@ -8515,17 +8521,10 @@ mod tests {
         );
     }
 
-    /// A pool profile (`rm-pool-windows` beside its own labels) and a reconciler
-    /// whose queue holds `pool` jobs asking for the pool and `plain` jobs that
-    /// ask only for labels the profile carries.
-    fn pool_profile_reading(pool: usize, plain: usize) -> (ScalePolicy, Arc<FakeDemand>) {
-        (pool_profile(1, 5), pool_queue(pool, plain))
-    }
-
     /// A profile of `acme/app` carrying `rm-pool-windows` beside its own labels.
     fn pool_profile(id: u128, max: u16) -> ScalePolicy {
         let labels = fixtures::routing_labels("home")
-            .with_labels([Label::new("rm-pool-windows").expect("a valid label")]);
+            .with_labels([pool_label(runner_manager_domain::model::Os::Windows)]);
         fixtures::policy()
             .id(PolicyId::from_u128(id))
             .repository("acme/app")
@@ -8574,7 +8573,7 @@ mod tests {
     /// the queue with every host of the pool idle.
     #[tokio::test]
     async fn a_directed_pool_profile_serves_the_jobs_that_ask_for_no_pool() {
-        let (profile, demand) = pool_profile_reading(1, 2);
+        let (profile, demand) = (pool_profile(1, 5), pool_queue(1, 2));
         let fake = Arc::new(FakeLauncher::new());
         let director = Arc::new(FixedDirector::default());
         director.directed.lock().unwrap().insert(profile.id, 1);
@@ -8591,7 +8590,7 @@ mod tests {
     /// of it starts nothing, or every host of the pool would start a runner.
     #[tokio::test]
     async fn a_directed_pool_profile_leaves_pool_jobs_to_the_launches() {
-        let (profile, demand) = pool_profile_reading(2, 0);
+        let (profile, demand) = (pool_profile(1, 5), pool_queue(2, 0));
         let fake = Arc::new(FakeLauncher::new());
         let director = Arc::new(FixedDirector::default());
         director.directed.lock().unwrap().insert(profile.id, 0);
@@ -8607,7 +8606,7 @@ mod tests {
     /// the launch side holds no reading of the queue.
     #[tokio::test]
     async fn a_pass_with_a_launch_side_starts_the_non_pool_jobs_runner() {
-        let (profile, demand) = pool_profile_reading(0, 1);
+        let (profile, demand) = (pool_profile(1, 5), pool_queue(0, 1));
         let fake = Arc::new(FakeLauncher::new());
         let director = Arc::new(FixedDirector::default());
         director.directed.lock().unwrap().insert(profile.id, 0);

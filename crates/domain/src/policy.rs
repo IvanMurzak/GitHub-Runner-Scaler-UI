@@ -183,6 +183,15 @@ pub fn is_pool_label(label: &str) -> bool {
             .any(|os| pool_label(*os).as_str().eq_ignore_ascii_case(label))
 }
 
+/// Whether a job requiring `required` asks for a shared pool (an OS pool or
+/// `rm-pool-any`): the jobs a coordinator places on one host. The host and the
+/// coordinator both decide it here, so neither leaves to the other a job the
+/// other does not take.
+#[must_use]
+pub fn is_pool_job(required: &[Label]) -> bool {
+    required.iter().any(|label| is_pool_label(label.as_str()))
+}
+
 /// The one pool label a host running `os` may carry: `rm-pool-windows`,
 /// `rm-pool-linux` or `rm-pool-macos`.
 #[must_use]
@@ -724,10 +733,10 @@ impl RoutingLabels {
             match self.matches(job) {
                 RunsOnMatch::Match { .. } => {
                     tally.matched += 1;
-                    if job.is_pool_job() {
-                        tally.pool_matched += 1;
-                    }
                     if let Ok(required) = job.required_labels() {
+                        if is_pool_job(&required) {
+                            tally.pool_matched += 1;
+                        }
                         tally.excluded.extend(exclusions_in(&required));
                     }
                 }
@@ -937,16 +946,6 @@ impl RunsOn {
             RunsOn::Grouped { group, .. } => group.as_deref(),
             _ => None,
         }
-    }
-
-    /// Whether this job asks for a pool label (`rm-pool-…`), which makes it a
-    /// job a coordinator places on one host rather than one every host serving
-    /// it reads from the queue.
-    #[must_use]
-    pub fn is_pool_job(&self) -> bool {
-        self.raw_labels()
-            .iter()
-            .any(|raw| is_pool_label(raw.trim()))
     }
 
     /// The usable ordinary labels this job names, exclusions and anything
@@ -2129,11 +2128,12 @@ mod tests {
         assert_eq!(tally.matched, 3);
         assert_eq!(tally.pool_matched, 2);
         assert_eq!(tally.non_pool_demand(), 1);
+        let required = |job: &RunsOn| job.required_labels().expect("a static runs-on");
         assert!(
-            jobs[3].is_pool_job(),
+            is_pool_job(&required(&jobs[3])),
             "a pool job this profile does not match"
         );
-        assert!(!jobs[2].is_pool_job());
+        assert!(!is_pool_job(&required(&jobs[2])));
     }
 
     #[test]
