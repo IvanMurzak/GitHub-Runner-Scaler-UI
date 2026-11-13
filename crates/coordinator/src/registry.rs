@@ -15,8 +15,8 @@ use runner_manager_domain::coordinator_protocol::{
     CLOSE_REPLACED, ConnectedHostStats, HELLO_ACK_VERSION, Heartbeat, Hello, HelloAck,
     LAUNCH_VERSION, Profile, ServerMessage, Target, TargetRef, TargetScope, Wake, WakeReason,
 };
-use runner_manager_domain::model::Label;
-use runner_manager_domain::policy::{excluded_label, is_pool_label};
+use runner_manager_domain::model::{Label, Os};
+use runner_manager_domain::policy::{excluded_label, is_pool_label, may_carry_pool};
 use tokio::sync::{Notify, mpsc};
 
 use crate::webhook::{profile_covers, required_labels};
@@ -85,6 +85,14 @@ impl Connected {
         if (job.excludes && !hello.label_exclusions) || (!job.pool && !hello.plain_placement) {
             return None;
         }
+        // The host directs only a profile carrying its own OS's pool label
+        // or `rm-pool-any`: a stored label for another OS's pool makes no pool
+        // profile there, and a launch to it would be refused.
+        let os = hello.os.parse::<Os>().ok();
+        let pool_label_here = |raw: &String| match (os, Label::new(raw.as_str())) {
+            (Some(os), Ok(label)) => may_carry_pool(&label, os),
+            _ => is_pool_label(raw),
+        };
         hello.targets.iter().find_map(|target| {
             let reference = target.reference();
             if !reference.covers(repository) || !self.launch_mode(coverage, &reference) {
@@ -92,7 +100,7 @@ impl Connected {
             }
             let profile = target.profiles.iter().find(|profile| {
                 profile.enabled
-                    && profile.labels.iter().any(|label| is_pool_label(label))
+                    && profile.labels.iter().any(pool_label_here)
                     && profile_covers(&profile.labels, job.required)
             })?;
             Some((reference, profile))

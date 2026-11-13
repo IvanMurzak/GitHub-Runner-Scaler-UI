@@ -712,14 +712,15 @@ impl DemandDirector for Launches {
         Some(self.open_for(policy.id))
     }
 
+    /// Only while the link is up: in the moments after it drops the profile is
+    /// still directed, but the coordinator no longer counts this host among the
+    /// candidates for those jobs, and would leave them to the next sweep.
     fn places_plain_jobs(&self, policy: &ScalePolicy) -> bool {
-        self.is_directed(policy)
-            && self
-                .view
-                .borrow()
-                .ack
-                .as_ref()
-                .is_some_and(|ack| ack.plain_placement)
+        let placed = {
+            let view = self.view.borrow();
+            view.connected && view.ack.as_ref().is_some_and(|ack| ack.plain_placement)
+        };
+        placed && self.is_directed(policy)
     }
 
     fn directed_exclusions(&self, policy: &ScalePolicy) -> BTreeSet<Label> {
@@ -1130,6 +1131,22 @@ mod tests {
             placing_view(&policy, LAUNCH_VERSION, true, true),
         );
         assert!(current.places_plain_jobs(&policy));
+
+        // The link just dropped: still directed for a while, but the
+        // coordinator no longer counts this host, so it reads them itself.
+        let mut down = placing_view(&policy, LAUNCH_VERSION, true, true)
+            .borrow()
+            .clone();
+        down.connected = false;
+        down.down_since = Some(tokio::time::Instant::now());
+        let (_sender, view) = watch::channel(down);
+        let host = store
+            .host(policy.host_id)
+            .expect("store")
+            .expect("the host");
+        let dropped = Launches::new(Arc::clone(&store) as Arc<dyn Store>, host, view);
+        assert!(dropped.is_directed(&policy), "within the grace");
+        assert!(!dropped.places_plain_jobs(&policy));
     }
 
     #[test]

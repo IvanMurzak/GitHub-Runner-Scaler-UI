@@ -1916,6 +1916,31 @@ mod tests {
         );
     }
 
+    /// A stored label for another OS's pool makes no pool profile on this
+    /// host (`os: linux` carrying `rm-pool-macos`): the host would refuse the
+    /// launch, so it is no candidate and is woken instead.
+    #[tokio::test]
+    async fn another_oss_pool_label_makes_no_candidate() {
+        let (registry, _placement) = setup();
+        let _linux = connect_plain(
+            &registry,
+            "linux",
+            &["rm-pool-macos", "self-hosted"],
+            8 << 30,
+        );
+
+        assert!(!registry.is_placed("octo/app", &required(&["self-hosted"])));
+        assert!(
+            registry
+                .launch_candidates("octo/app", &required(&["rm-pool-macos"]))
+                .is_empty()
+        );
+        assert_eq!(
+            registry.wake_for_job("octo/app", &["self-hosted".into()], "d"),
+            1
+        );
+    }
+
     /// Hosts whose profile serving the job is no pool profile still read it
     /// themselves, so they are woken while the pool's hosts are placed.
     #[tokio::test]

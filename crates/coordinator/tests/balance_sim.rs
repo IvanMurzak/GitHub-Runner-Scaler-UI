@@ -416,9 +416,18 @@ fn scenarios() -> Vec<Scenario> {
             hosts: vec![
                 host("linux-64", 64, 8, 1.0, LINUX),
                 host("wsl-23", 23, 4, 0.9, LINUX),
-                host("windows-64", 64, 8, 1.0, WINDOWS),
-                host("mac-m6-24", 24, 4, 1.4, MACOS),
-                host("mac-m1-8", 8, 1, 0.7, MACOS),
+                HostSpec {
+                    os: "windows",
+                    ..host("windows-64", 64, 8, 1.0, WINDOWS)
+                },
+                HostSpec {
+                    os: "macos",
+                    ..host("mac-m6-24", 24, 4, 1.4, MACOS)
+                },
+                HostSpec {
+                    os: "macos",
+                    ..host("mac-m1-8", 8, 1, 0.7, MACOS)
+                },
             ],
             rounds: 4,
             jobs: owner_fleet,
