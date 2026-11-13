@@ -3209,9 +3209,51 @@ impl Reconciler {
                 continue;
             }
             // Coordinated placement: the launches the coordinator placed
-            // here are the demand, whatever this host's own reading says (or
-            // whether it could read at all).
+            // here are the demand of the pool jobs, whatever this host's own
+            // reading says (or whether it could read at all). The coordinator
+            // places only jobs that ask for a pool label, so a job this profile
+            // covers without one (`[self-hosted, macOS]` on a profile that also
+            // carries `rm-pool-macos`) is served from this host's own reading,
+            // as without a coordinator; otherwise it would wait in the queue
+            // with every host of the pool idle.
             if let Some(directed) = self.director.directed_demand(policy) {
+                let own = match readings.get(&policy.target) {
+                    Some(PollOutcome::Ready(_)) => routed
+                        .get(&policy.target)
+                        .and_then(|tallies| tallies.get(&policy.id)),
+                    _ => None,
+                }
+                .filter(|tally| tally.non_pool_demand() > 0);
+                if let Some(tally) = own {
+                    // Started here, from the reading just taken: the launch
+                    // side holds no reading, and one kept for it would go
+                    // stale once a runner took the job. The same allocator
+                    // counts every runner of the profile against the sum, so
+                    // a launch's runner already up is not started twice.
+                    let own_demand = tally.non_pool_demand();
+                    self.events.emit(LifecycleEvent::DemandObserved {
+                        policy: policy.id,
+                        demand: own_demand,
+                        not_matched: tally.not_matched,
+                        unresolvable: u32::try_from(tally.unresolvable.len()).unwrap_or(u32::MAX),
+                        complete: readings
+                            .get(&policy.target)
+                            .and_then(PollOutcome::reading)
+                            .is_some_and(QueuedDemand::is_complete),
+                    });
+                    let mut excluded = self.director.directed_exclusions(policy);
+                    excluded.extend(tally.excluded.iter().cloned());
+                    self.start_runners(
+                        policy,
+                        directed.saturating_add(own_demand),
+                        &excluded,
+                        u16::MAX,
+                        &mut report,
+                        &mut reserved,
+                    )
+                    .await;
+                    continue;
+                }
                 let Some(launch_side) = &self.launch_side else {
                     let excluded = self.director.directed_exclusions(policy);
                     self.start_runners(
@@ -3483,6 +3525,12 @@ impl Reconciler {
         // pre-check stands in only when no hold was ever obtained.
         let mut decided: Option<Allocation> = None;
         let mut budget = intent.to_start.min(limit);
+        // What the caller added to the launches from this host's own reading
+        // (the jobs a directed pool profile serves that ask for no pool).
+        let own = self
+            .director
+            .directed_demand(policy)
+            .map_or(0, |directed| demand.saturating_sub(directed));
 
         while budget > 0 {
             let order_wait = self.let_older_launches_reserve(policy).await;
@@ -3490,7 +3538,9 @@ impl Reconciler {
             let demand = if order_wait.is_zero() {
                 demand
             } else {
-                self.director.directed_demand(policy).unwrap_or(demand)
+                self.director
+                    .directed_demand(policy)
+                    .map_or(demand, |directed| directed.saturating_add(own))
             };
             let waiting_since = std::time::Instant::now();
             let guard = match self.lock.acquire().await {
@@ -4022,10 +4072,14 @@ fn route_demand(
             *refusals
                 .entry(RoutingRefusal::OverlappingProfiles)
                 .or_default() += 1;
+            let pool = job.is_pool_job();
             for id in matched {
                 if let Some(tally) = tallies.get_mut(&id) {
                     tally.matched -= 1;
                     tally.not_matched += 1;
+                    if pool {
+                        tally.pool_matched = tally.pool_matched.saturating_sub(1);
+                    }
                 }
             }
         }
@@ -8461,6 +8515,116 @@ mod tests {
         );
     }
 
+    /// A pool profile (`rm-pool-windows` beside its own labels) and a reconciler
+    /// whose queue holds `pool` jobs asking for the pool and `plain` jobs that
+    /// ask only for labels the profile carries.
+    fn pool_profile_reading(pool: usize, plain: usize) -> (ScalePolicy, Arc<FakeDemand>) {
+        (pool_profile(1, 5), pool_queue(pool, plain))
+    }
+
+    /// A profile of `acme/app` carrying `rm-pool-windows` beside its own labels.
+    fn pool_profile(id: u128, max: u16) -> ScalePolicy {
+        let labels = fixtures::routing_labels("home")
+            .with_labels([Label::new("rm-pool-windows").expect("a valid label")]);
+        fixtures::policy()
+            .id(PolicyId::from_u128(id))
+            .repository("acme/app")
+            .autoscale("home", max)
+            .routing_labels(labels)
+            .active()
+            .build()
+    }
+
+    /// `acme/app`'s queue: `pool` jobs asking for `rm-pool-windows`, `plain`
+    /// jobs asking only for this host's own label.
+    fn pool_queue(pool: usize, plain: usize) -> Arc<FakeDemand> {
+        let mut queue = fixtures::queued_jobs(&[HOST_LABEL, "rm-pool-windows"], pool);
+        queue.extend(fixtures::queued_jobs(&[HOST_LABEL], plain));
+        let demand = Arc::new(FakeDemand::default());
+        demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("acme/app"),
+            queue,
+        )));
+        demand
+    }
+
+    fn reconciler_reading(
+        demand: Arc<FakeDemand>,
+        launcher: Arc<FakeLauncher>,
+        director: Arc<FixedDirector>,
+    ) -> Reconciler {
+        Reconciler::new(
+            host_with(10),
+            ReconcilerPorts {
+                demand,
+                launcher,
+                lock: Arc::new(InProcessAllocationLock::new()),
+                directory: Arc::new(FakeDirectory::default()),
+                clock: Arc::new(FakeClock::default()),
+                jitter: Arc::new(NoJitter),
+                events: Arc::new(NoEvents),
+            },
+        )
+        .with_director(director as Arc<dyn DemandDirector>)
+    }
+
+    /// The coordinator places only jobs that ask for a pool label. A job the
+    /// pool profile covers without one (`[self-hosted, windows]`) is served
+    /// from this host's own reading, beside the launches; before, it waited in
+    /// the queue with every host of the pool idle.
+    #[tokio::test]
+    async fn a_directed_pool_profile_serves_the_jobs_that_ask_for_no_pool() {
+        let (profile, demand) = pool_profile_reading(1, 2);
+        let fake = Arc::new(FakeLauncher::new());
+        let director = Arc::new(FixedDirector::default());
+        director.directed.lock().unwrap().insert(profile.id, 1);
+        let mut reconciler = reconciler_reading(demand, Arc::clone(&fake), director);
+
+        let report = reconciler.reconcile(std::slice::from_ref(&profile)).await;
+        assert_eq!(
+            report.started, 3,
+            "one runner for the launch, one for each job that asks for no pool"
+        );
+    }
+
+    /// A pool job is still the coordinator's to place: the host's own reading
+    /// of it starts nothing, or every host of the pool would start a runner.
+    #[tokio::test]
+    async fn a_directed_pool_profile_leaves_pool_jobs_to_the_launches() {
+        let (profile, demand) = pool_profile_reading(2, 0);
+        let fake = Arc::new(FakeLauncher::new());
+        let director = Arc::new(FixedDirector::default());
+        director.directed.lock().unwrap().insert(profile.id, 0);
+        let mut reconciler = reconciler_reading(demand, Arc::clone(&fake), director);
+
+        let report = reconciler.reconcile(std::slice::from_ref(&profile)).await;
+
+        assert_eq!(report.started, 0);
+        assert_eq!(fake.live_count(), 0);
+    }
+
+    /// With a launch side the pass starts the non-pool job's runner itself:
+    /// the launch side holds no reading of the queue.
+    #[tokio::test]
+    async fn a_pass_with_a_launch_side_starts_the_non_pool_jobs_runner() {
+        let (profile, demand) = pool_profile_reading(0, 1);
+        let fake = Arc::new(FakeLauncher::new());
+        let director = Arc::new(FixedDirector::default());
+        director.directed.lock().unwrap().insert(profile.id, 0);
+        let mut reconciler = reconciler_reading(demand, Arc::clone(&fake), director)
+            .with_launch_side(Arc::new(tokio::sync::Notify::new()));
+
+        let report = reconciler.reconcile(std::slice::from_ref(&profile)).await;
+
+        assert_eq!(report.started, 1);
+        assert_eq!(fake.live_count(), 1);
+
+        // Its runner is up and waiting: the next pass starts no second one.
+        let report = reconciler.reconcile(std::slice::from_ref(&profile)).await;
+        assert_eq!(report.started, 0);
+        assert_eq!(fake.live_count(), 1);
+    }
+
     /// One that never reserves costs one wait, then nothing: a loop that cannot
     /// reserve holds no launch up for long, and not every later one again.
     #[tokio::test(start_paused = true)]
@@ -8706,10 +8870,10 @@ mod tests {
 
     /// Coordinated placement: a directed policy starts runners for the
     /// coordinator's launches only, through every ceiling, whatever its own
-    /// reading says; an undirected one keeps its own demand.
+    /// reading of the pool jobs says; an undirected one keeps its own demand.
     #[tokio::test]
     async fn a_directed_policy_starts_only_what_it_was_directed_to_within_its_ceilings() {
-        let demand = Arc::new(FakeDemand::ready(5, &repo("acme/app")));
+        let demand = pool_queue(5, 0);
         let launcher = Arc::new(FakeLauncher::new());
         let director = Arc::new(FixedDirector::default());
         let mut reconciler = Reconciler::new(
@@ -8725,7 +8889,7 @@ mod tests {
             },
         )
         .with_director(Arc::clone(&director) as Arc<dyn DemandDirector>);
-        let pool = policy(1, "acme/app", 2);
+        let pool = pool_profile(1, 2);
 
         // Five queued jobs on the poll, but no launch placed here: nothing.
         director.directed.lock().unwrap().insert(pool.id, 0);
@@ -8767,7 +8931,7 @@ mod tests {
             },
         )
         .with_director(Arc::clone(&director) as Arc<dyn DemandDirector>);
-        let wide = policy(2, "acme/app", 6);
+        let wide = pool_profile(2, 6);
         director.directed.lock().unwrap().insert(wide.id, 6);
         let report = starter.start_directed(std::slice::from_ref(&wide)).await;
         assert_eq!(report.started, 6, "six launches, one call");

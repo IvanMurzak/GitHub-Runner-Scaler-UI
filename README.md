@@ -722,9 +722,11 @@ Give each host's serving profile its pool label with
 `repo profile set-pool OWNER/REPO [--profile NAME] --pool on [--any]` or
 `org set-pool ORG --pool on [--any]` (`profile list`/`show` print `pool=`); another OS's pool label is
 refused, and so is a second profile of the same target carrying the same pool label. One profile may
-carry both its OS pool label and `rm-pool-any`. While the target is `coordinated`, that profile starts runners only
-when the coordinator places one on it, and only within its own `max_capacity`, host capacity and
-`host doctor` fitness; in `fallback` or `standalone` it serves its own demand as before.
+carry both its OS pool label and `rm-pool-any`. While the target is `coordinated`, that profile starts runners for
+pool jobs only when the coordinator places one on it, and only within its own `max_capacity`, host capacity and
+`host doctor` fitness; in `fallback` or `standalone` it serves its own demand as before. A job it covers that
+asks for no pool label (`runs-on: [self-hosted, macOS]`) is never placed, so the profile serves it from its own
+reading in every mode, as every host carrying those labels does.
 
 **Job statistics.** A joined host samples the process tree of each native runner every 2 seconds
 (off its reconcile loop) and reports, when the attempt ends, its peak memory and its average and
