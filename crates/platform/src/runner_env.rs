@@ -486,6 +486,36 @@ pub const WINDOWS_PROFILE_VARIABLES: [&str; 4] = ["USERPROFILE", "HOME", "APPDAT
 /// Creating them creates the profile directory above them too.
 pub const DIRECTORY_VARIABLES: [&str; 3] = ["HOME", "APPDATA", "LOCALAPPDATA"];
 
+/// The XDG base directories, relative to `HOME`, that a Linux home from
+/// [`platform_defaults`] starts with, as a login account's does. .NET's
+/// `Environment.GetFolderPath` answers an empty string for one that does not
+/// exist, and a tool that joins onto that answer then writes relative to its
+/// working directory: Unreal Build Tool's `ApplicationData/Epic` landed in a
+/// read-only engine directory and failed every build.
+pub const LINUX_HOME_DIRECTORIES: [&str; 3] = [".config", ".local/share", ".cache"];
+
+/// The directories the caller creates before starting a runner on `platform`
+/// with `defaults`: each of [`DIRECTORY_VARIABLES`], and on Linux the
+/// [`LINUX_HOME_DIRECTORIES`] inside the home.
+#[must_use]
+pub fn directories_to_create(
+    platform: RunnerPlatform,
+    defaults: &[(&'static str, OsString)],
+) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    for (name, value) in defaults {
+        if !DIRECTORY_VARIABLES.contains(name) {
+            continue;
+        }
+        let directory = PathBuf::from(value);
+        if platform == RunnerPlatform::Linux && *name == "HOME" {
+            directories.extend(LINUX_HOME_DIRECTORIES.map(|sub| directory.join(sub)));
+        }
+        directories.push(directory);
+    }
+    directories
+}
+
 /// The variables `platform` sets for a runner whose attempt directory is
 /// `runtime`, before `runner.env` is applied.
 ///
@@ -821,6 +851,36 @@ mod tests {
         assert_eq!(
             defaults(RunnerPlatform::Linux, &writable),
             [telemetry_optout()]
+        );
+    }
+
+    #[test]
+    fn a_linux_home_starts_with_the_xdg_base_directories() {
+        let home = Path::new("/rman/a1").join(RUNNER_HOME_DIR);
+        let linux = defaults(RunnerPlatform::Linux, &Inherited::default());
+        assert_eq!(
+            directories_to_create(RunnerPlatform::Linux, &linux),
+            [
+                home.join(".config"),
+                home.join(".local/share"),
+                home.join(".cache"),
+                home.clone(),
+            ]
+        );
+        let writable = Inherited {
+            home_writable: true,
+            ..Inherited::default()
+        };
+        let own_home = defaults(RunnerPlatform::Linux, &writable);
+        assert!(directories_to_create(RunnerPlatform::Linux, &own_home).is_empty());
+        let windows = defaults(RunnerPlatform::Windows, &Inherited::default());
+        assert_eq!(
+            directories_to_create(RunnerPlatform::Windows, &windows),
+            [
+                home.clone(),
+                home.join("AppData").join("Roaming"),
+                home.join("AppData").join("Local"),
+            ]
         );
     }
 
