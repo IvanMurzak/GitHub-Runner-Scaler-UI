@@ -7,6 +7,18 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.72
+
+### Fixed
+
+- A Linux runner that gets its own home (the daemon runs as the systemd
+  service, whose `HOME` cannot be written) now finds `~/.config`,
+  `~/.local/share` and `~/.cache` in it, as in a login account's home. The home
+  used to be empty, and .NET answers an empty path for a missing
+  `~/.config`: Unreal Build Tool then tried to create `Epic/` in its working
+  directory, the read-only engine mount, and every Unreal job failed with
+  `Read-only file system`. No configuration change is needed.
+
 ## 0.4.71
 
 ### Added
