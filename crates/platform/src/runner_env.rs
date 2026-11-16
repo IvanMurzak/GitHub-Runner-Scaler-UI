@@ -484,7 +484,7 @@ pub const WINDOWS_PROFILE_VARIABLES: [&str; 4] = ["USERPROFILE", "HOME", "APPDAT
 
 /// The [`platform_defaults`] that name a directory the caller must create.
 /// Creating them creates the profile directory above them too.
-pub const DIRECTORY_VARIABLES: [&str; 3] = ["HOME", "APPDATA", "LOCALAPPDATA"];
+pub(crate) const DIRECTORY_VARIABLES: [&str; 3] = ["HOME", "APPDATA", "LOCALAPPDATA"];
 
 /// The XDG base directories, relative to `HOME`, that a Linux home from
 /// [`platform_defaults`] starts with, as a login account's does. .NET's
@@ -492,7 +492,7 @@ pub const DIRECTORY_VARIABLES: [&str; 3] = ["HOME", "APPDATA", "LOCALAPPDATA"];
 /// exist, and a tool that joins onto that answer then writes relative to its
 /// working directory: Unreal Build Tool's `ApplicationData/Epic` landed in a
 /// read-only engine directory and failed every build.
-pub const LINUX_HOME_DIRECTORIES: [&str; 3] = [".config", ".local/share", ".cache"];
+pub(crate) const LINUX_HOME_DIRECTORIES: [&str; 3] = [".config", ".local/share", ".cache"];
 
 /// The directories the caller creates before starting a runner on `platform`
 /// with `defaults`: each of [`DIRECTORY_VARIABLES`], and on Linux the

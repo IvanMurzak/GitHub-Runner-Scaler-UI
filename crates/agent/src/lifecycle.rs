@@ -123,8 +123,9 @@ fn runner_listener_spec(
 ) -> SpawnSpec {
     let tmp = runtime.join("tmp");
     let _ = std::fs::create_dir_all(&tmp);
+    let platform = RunnerPlatform::current();
     let defaults = runner_env::platform_defaults(
-        RunnerPlatform::current(),
+        platform,
         runtime,
         &runner_env::Inherited::current(),
         Path::exists,
@@ -132,7 +133,7 @@ fn runner_listener_spec(
     // The Windows profile, or the Linux home, the defaults point at. Created
     // even when `runner.env` overrides part of it: it is inside the attempt, so
     // it costs nothing and goes with the attempt.
-    for dir in runner_env::directories_to_create(RunnerPlatform::current(), &defaults) {
+    for dir in runner_env::directories_to_create(platform, &defaults) {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut spec = SpawnSpec::new(program)
