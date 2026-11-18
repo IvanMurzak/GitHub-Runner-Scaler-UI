@@ -612,7 +612,7 @@ impl Installation {
 
     /// Why the service (its daily check, or the coordinator) must not update
     /// this binary, decided before anything is downloaded.
-    pub(crate) fn service_refusal(&self) -> Option<CliError> {
+    fn service_refusal(&self) -> Option<CliError> {
         match self.channel {
             Channel::SourceBuild | Channel::Missing => self.refusal(),
             _ => self.foreign_to_root_service(),
@@ -702,7 +702,7 @@ pub(crate) fn service_source(
 /// Whether nothing is at `path`, following symlinks: a removed file, a
 /// dangling link, a directory that is gone. A path that cannot be read for
 /// another reason (permissions) is not called missing.
-pub(crate) fn is_missing(path: &Path) -> bool {
+fn is_missing(path: &Path) -> bool {
     std::fs::metadata(path).is_err_and(|error| {
         matches!(
             error.kind(),
@@ -1367,7 +1367,7 @@ pub(super) fn perform(
             )?;
             confirm_with_version(out)?;
         }
-        // Both were turned into a refusal above, before `--check` could
+        // Each was turned into a refusal above, before `--check` could
         // promise an update that would not happen.
         Channel::SourceBuild | Channel::ServiceCopy | Channel::Missing => {
             return Err(installation.refusal().unwrap_or_else(|| {
