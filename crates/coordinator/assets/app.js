@@ -51,6 +51,12 @@
     } catch (_) { return RS.defaults(); }
   }
   function storeLocal() { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(cfg)); } catch (_) { /* storage unavailable */ } }
+  // Set while this browser's copy holds a change the coordinator has not
+  // confirmed: a reload, or another tab, then sends it rather than taking
+  // the coordinator's older copy.
+  const UNSAVED_KEY = 'rm.settings.unsaved';
+  function markUnsaved(on) { try { if (on) localStorage.setItem(UNSAVED_KEY, '1'); else localStorage.removeItem(UNSAVED_KEY); } catch (_) { /* storage unavailable */ } }
+  function unsaved() { try { return localStorage.getItem(UNSAVED_KEY) === '1'; } catch (_) { return false; } }
 
   // ------------------------------------------------------------------ state
   const RANGES = RS.RANGES;
@@ -982,7 +988,15 @@
   const pinIcon = (n) => icon('M7.5 3.5h5M8.5 3.5v4.2L6 10.5v1.5h8v-1.5l-2.5-2.8V3.5M10 12v4.5', n || 14);
   function pinButton(cls) {
     const b = h('button', { type: 'button', class: `pin-btn ${cls}`, 'aria-pressed': 'false' }, pinIcon(15));
-    b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); if (b.dataset.host) togglePin(b.dataset.host); });
+    b.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!b.dataset.host) return;
+      const had = document.activeElement === b;
+      togglePin(b.dataset.host);
+      // Its card moved to its new place, which takes focus away.
+      if (had && b.isConnected) b.focus({ preventScroll: true });
+    });
     return b;
   }
   function setPin(b, id, name) {
@@ -2834,6 +2848,7 @@
 
   function saveSoon() {
     sync.dirty = true;
+    markUnsaved(true);
     setSync('pending');
     clearTimeout(sync.timer);
     sync.timer = setTimeout(pushSettings, SAVE_DELAY);
@@ -2841,7 +2856,9 @@
 
   async function pushSettings(keepalive) {
     clearTimeout(sync.timer);
-    if (sync.inflight) { sync.again = true; return; }
+    // The page is going: send now even beside a request on its way; the
+    // coordinator keeps whichever comes last, and both carry this copy.
+    if (sync.inflight && keepalive !== true) { sync.again = true; return; }
     sync.inflight = true;
     sync.dirty = false;
     setSync('saving');
@@ -2850,7 +2867,10 @@
     });
     sync.inflight = false;
     if (!r.ok) { sync.dirty = true; setSync('error', r.status === 401 ? '' : r.error || r.hint); }
-    else setSync(sync.dirty ? 'pending' : 'saved');
+    else {
+      if (!sync.dirty) markUnsaved(false);
+      setSync(sync.dirty ? 'pending' : 'saved');
+    }
     if (sync.again) { sync.again = false; if (sync.dirty) pushSettings(); }
   }
 
@@ -2861,6 +2881,8 @@
     const r = await call('/api/settings');
     if (!r.ok) { if (r.status !== 401) setSync('error', 'Your saved settings could not be loaded; these are this browser’s.'); return; }
     if (sync.dirty || sync.inflight) return;
+    // A change this browser kept but never got confirmed: it is newer.
+    if (unsaved()) { saveSoon(); return; }
     const remote = r.body && r.body.settings;
     if (remote) {
       replaceSettings(remote, 'server');
@@ -3047,8 +3069,10 @@
       return;
     }
     body.scrollTop = top;
-    const again = fk && $(`[data-fk="${CSS.escape(fk)}"]`, body);
-    if (again) again.focus({ preventScroll: true });
+    if (!fk) return;
+    // What had focus may be gone (an unpinned row): the panel keeps it.
+    const again = $(`[data-fk="${CSS.escape(fk)}"]`, body);
+    (again || body).focus({ preventScroll: true });
   }
 
   // ------------------------------------------------------------ controls
@@ -3129,7 +3153,7 @@
       'aria-labelledby': labelId, 'data-fk': path,
     });
     const set = (v) => {
-      const n = clamp(Math.round(Number(v)), min, max);
+      const n = String(v).trim() === '' ? NaN : clamp(Math.round(Number(v)), min, max);
       if (!isFinite(n)) { input.value = getPath(cfg, path); return; }
       update((c) => setPath(c, path, n));
       input.value = getPath(cfg, path);
@@ -3175,12 +3199,15 @@
     const commit = () => { spec.onOrder(keys()); syncMoves(); touched(ul); };
     const labelOf = (li) => byKey.get(li.dataset.key).label;
 
+    // `focus`: what keeps the keyboard focus (a move takes the row out of
+    // the document for a moment); a move button that is now disabled hands
+    // it to the other one.
     function moveBy(li, by, focus) {
       const all = rows(), i = all.indexOf(li), j = i + by;
       if (j < 0 || j >= all.length) return;
       flip(all, () => ul.insertBefore(li, by < 0 ? all[j] : all[j].nextSibling));
       commit();
-      if (focus) focus.focus({ preventScroll: false });
+      if (focus) (focus.disabled ? (focus === li._up ? li._down : li._up) : focus).focus({ preventScroll: false });
       announce(`${labelOf(li)}, position ${j + 1} of ${all.length}`);
     }
 
@@ -3230,7 +3257,7 @@
         li.style.transform = '';
         handle.focus({ preventScroll: true });
         if (motionOk() && Math.abs(dy) > 0.5) li.animate([{ transform: `translateY(${dy}px)` }, { transform: 'none' }], { duration: DUR.base, easing: EASE });
-        if (keys().join('\n') !== before) {
+        if (ul.isConnected && keys().join('\n') !== before) {
           commit();
           const all = rows();
           announce(`${labelOf(li)}, position ${all.indexOf(li) + 1} of ${all.length}`);
@@ -3249,8 +3276,8 @@
         title: 'Drag to reorder, or use the arrow keys',
       }, gripIcon());
       const li = h('li', { class: `ol-item${off ? ' is-off' : ''}`, 'data-key': it.key });
-      li._up = h('button', { type: 'button', class: 'ol-move', 'aria-label': `Move ${it.label} up`, 'data-fk': `${spec.fk}:${it.key}:up`, onclick: () => moveBy(li, -1, li._up.disabled ? li._down : null) }, upIcon());
-      li._down = h('button', { type: 'button', class: 'ol-move', 'aria-label': `Move ${it.label} down`, 'data-fk': `${spec.fk}:${it.key}:down`, onclick: () => moveBy(li, 1, li._down.disabled ? li._up : null) }, downIcon());
+      li._up = h('button', { type: 'button', class: 'ol-move', 'aria-label': `Move ${it.label} up`, 'data-fk': `${spec.fk}:${it.key}:up`, onclick: () => moveBy(li, -1, li._up) }, upIcon());
+      li._down = h('button', { type: 'button', class: 'ol-move', 'aria-label': `Move ${it.label} down`, 'data-fk': `${spec.fk}:${it.key}:down`, onclick: () => moveBy(li, 1, li._down) }, downIcon());
       handle.addEventListener('pointerdown', (e) => drag(e, li, handle));
       handle.addEventListener('keydown', (e) => {
         const by = { ArrowUp: -1, ArrowDown: 1 }[e.key];

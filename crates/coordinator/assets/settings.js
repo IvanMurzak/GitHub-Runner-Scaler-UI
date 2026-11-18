@@ -234,19 +234,20 @@
     const i = OS_ORDER.indexOf(os);
     return i >= 0 ? i : os ? OS_ORDER.length : OS_ORDER.length + 1;
   }
-  function compareBy(rule) {
+  // `dir` -1 reverses the rule; machines without its value stay last.
+  function compareBy(rule, dir) {
     const byName = (a, b) => nameOf(a).localeCompare(nameOf(b));
-    if (rule === 'name') return byName;
+    if (rule === 'name') return (a, b) => dir * byName(a, b);
     if (rule === 'status') {
       const rank = (x) => STATUS.findIndex((s) => s[0] === statusOf(x));
-      return (a, b) => rank(a) - rank(b) || byName(a, b);
+      return (a, b) => dir * (rank(a) - rank(b) || byName(a, b));
     }
-    if (rule === 'os') return (a, b) => osRank(osOf(a)) - osRank(osOf(b)) || osOf(a).localeCompare(osOf(b)) || byName(a, b);
+    if (rule === 'os') return (a, b) => dir * (osRank(osOf(a)) - osRank(osOf(b)) || osOf(a).localeCompare(osOf(b)) || byName(a, b));
     const value = SORT_VALUE[rule];
     return (a, b) => {
       const x = value(a), y = value(b);
       if (x == null || y == null) return (x == null) - (y == null) || byName(a, b);
-      return y - x || byName(a, b);
+      return dir * (y - x || byName(a, b));
     };
   }
 
@@ -259,10 +260,9 @@
     const hidden = new Set(ms.hidden);
     const list = hosts.filter((x) => !hidden.has(x.id) && (ms.showOffline || x.online || pinAt.has(x.id)));
     const pinned = list.filter((x) => pinAt.has(x.id)).sort((a, b) => pinAt.get(a.id) - pinAt.get(b.id));
-    const cmp = compareBy(ms.sort);
-    const dir = ms.reverse ? -1 : 1;
+    const cmp = compareBy(ms.sort, ms.reverse ? -1 : 1);
     const rest = list.filter((x) => !pinAt.has(x.id)).sort((a, b) =>
-      (ms.onlineFirst ? b.online - a.online : 0) || dir * cmp(a, b));
+      (ms.onlineFirst ? b.online - a.online : 0) || cmp(a, b));
     if (ms.group === 'none') return [{ key: 'all', label: null, hosts: [...pinned, ...rest] }];
     const groups = new Map();
     const keyOf = ms.group === 'os' ? (x) => osOf(x) || 'unknown' : statusOf;
