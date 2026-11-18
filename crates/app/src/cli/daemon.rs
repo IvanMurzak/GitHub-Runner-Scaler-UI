@@ -126,6 +126,18 @@ async fn run_generation(
     reset_launch_state(context);
     let store = Arc::new(context.store()?);
     let host = super::host::local_host_or_create(context, store.as_ref())?;
+    // `host reboot`: taken from here on, on this machine and from the
+    // coordinator. A drain a reboot left on the WSL guests is lifted: this is
+    // the first start after the restart, or the reboot did not happen.
+    let reboot = super::reboot::control();
+    reboot.attach(
+        host.service_start_mode,
+        super::reboot::is_wsl_guest(context.paths()),
+    );
+    super::reboot::GuestDrain::release_left_over(context.paths());
+    let _reboot_requests = AbortOnDrop(tokio::spawn(super::reboot::answer_requests(
+        context.paths().state_dir().to_path_buf(),
+    )));
     let targets = active_autoscale_targets(store.policies().map_err(local_store_failure)?);
     let failed = write_failed("the daemon state");
 
@@ -160,21 +172,19 @@ async fn run_generation(
             context.paths().clone(),
             Arc::clone(&store) as Arc<dyn Store>,
         ));
+        let idle_draining = Arc::new(AtomicBool::new(false));
         let _link = start_coordinator_link(
             context,
             &host,
             Arc::clone(&store) as Arc<dyn Store>,
             Arc::new(super::coordinator::WakeRoutes::default()),
-            (
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicBool::new(false)),
-            ),
+            (Arc::new(AtomicBool::new(false)), Arc::clone(&idle_draining)),
             (coordination, launches, memory),
         );
         let heartbeat_store = Arc::clone(&store) as Arc<dyn Store>;
         let heartbeat_paths = context.paths().clone();
         tokio::select! {
-            signal = wait_for_shutdown(service_shutdown) => {
+            signal = wait_for_shutdown(service_shutdown.clone()) => {
                 signal.map_err(signal_failure)?;
                 writeln!(out, "daemon stopped; no runner was terminated").map_err(failed)?;
                 return Ok(DaemonOutcome::Stopped);
@@ -191,6 +201,22 @@ async fn run_generation(
             _ = wait_for_policy_set_change(Arc::clone(&store) as Arc<dyn Store>, BTreeSet::new()) => {
                 writeln!(out, "a repository policy was added; reloading").map_err(failed)?;
                 return Ok(DaemonOutcome::Reload);
+            }
+            () = reboot.requested() => {
+                writeln!(out, "a reboot was asked; this host runs no job of its own")
+                    .map_err(failed)?;
+                let (shutdown, _) = tokio::sync::watch::channel(false);
+                let outcome = drain_then_reboot(
+                    &Serving::default(),
+                    &mut tokio::task::JoinSet::new(),
+                    &shutdown,
+                    RebootPorts::system(context, Arc::clone(&store) as Arc<dyn Store>, &idle_draining, service_shutdown.clone()),
+                )
+                .await?;
+                if outcome == DaemonOutcome::Reload {
+                    drop(instance);
+                }
+                return Ok(outcome);
             }
             () = maintain_idle_credential(context, host.service_start_mode) => {
                 unreachable!("credential maintenance runs until the daemon is stopped")
@@ -589,6 +615,7 @@ async fn run_generation(
     // registration made before copies existed, and then nothing is watched.
     let mut upgraded_to = None;
     let mut restart_reason: Option<&'static str> = None;
+    let mut reboot_asked = false;
     let heartbeat_store = Arc::clone(&store) as Arc<dyn Store>;
     let heartbeat_paths = context.paths().clone();
     let watchdog_paths = context.paths().clone();
@@ -614,6 +641,16 @@ async fn run_generation(
                 "a newer binary was installed; draining before restart"
             );
             upgraded_to = Some(version);
+            None
+        }
+        () = reboot.requested() => {
+            writeln!(
+                out,
+                "a reboot was asked; finishing every running job before restarting the machine"
+            )
+            .map_err(failed)?;
+            tracing::info!("a reboot was asked; draining before the restart");
+            reboot_asked = true;
             None
         }
         end = follow_policy_set(
@@ -670,6 +707,24 @@ async fn run_generation(
     // Told to the coordinator on the next heartbeat; the link stays up while
     // the loops drain.
     draining.store(true, Ordering::Relaxed);
+    if reboot_asked {
+        let outcome = drain_then_reboot(
+            &serving,
+            &mut loops,
+            &shutdown,
+            RebootPorts::system(
+                context,
+                Arc::clone(&store) as Arc<dyn Store>,
+                &draining,
+                service_shutdown.clone(),
+            ),
+        )
+        .await?;
+        if outcome == DaemonOutcome::Reload {
+            drop(instance);
+        }
+        return Ok(outcome);
+    }
     if upgraded_to.is_some() || restart_reason.is_some() {
         serving.drain_all();
         // Not `shutdown`: that one is bounded, and an upgrade must outlast any
@@ -726,6 +781,183 @@ async fn run_generation(
         })??;
     }
     writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
+    Ok(DaemonOutcome::Stopped)
+}
+
+/// How long a reboot waits, once every runner is done, before asking the
+/// system: two heartbeats, so the coordinator shows the restart coming.
+const REBOOT_GRACE: Duration = Duration::from_secs(30);
+/// How long a restart the system accepted may take to stop this service
+/// before it is reported as not having happened.
+const REBOOT_SETTLE: Duration = Duration::from_secs(10 * 60);
+/// How often a pending reboot says what it still waits for.
+const REBOOT_PROGRESS_EVERY: Duration = Duration::from_secs(5);
+
+/// What a reboot needs besides the loops: replaced in tests, which must never
+/// restart the machine running them.
+struct RebootPorts<'a> {
+    control: &'a super::reboot::Control,
+    rebooter: Arc<dyn runner_manager_platform::reboot::Rebooter>,
+    /// Told to the coordinator: it places nothing here from now on.
+    draining: &'a AtomicBool,
+    /// The runners this machine still runs, when the journal can be read.
+    runners: Box<dyn Fn() -> Option<u32> + Send + Sync + 'a>,
+    guests: super::reboot::GuestDrain,
+    /// The service is being stopped (by the restart itself, or a person).
+    stopped: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>>,
+}
+
+impl<'a> RebootPorts<'a> {
+    fn system(
+        context: &'a Context,
+        store: Arc<dyn Store>,
+        draining: &'a AtomicBool,
+        service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
+    ) -> Self {
+        Self {
+            control: super::reboot::control(),
+            rebooter: Arc::new(runner_manager_platform::reboot::SystemRebooter),
+            draining,
+            runners: Box::new(move || {
+                store
+                    .attempts()
+                    .ok()
+                    .map(|attempts| u32::from(active_count(&attempts)))
+            }),
+            guests: super::reboot::GuestDrain::of(context.paths()),
+            stopped: Box::pin(wait_for_shutdown(service_shutdown)),
+        }
+    }
+}
+
+/// A reboot was asked: drains every loop as an upgrade does (no new runner,
+/// no deadline), waits for the managed WSL guests, then asks the system to
+/// restart.
+///
+/// Ends in `Stopped` when the service is stopped (the restart itself, or a
+/// person), and in `Reload` when the reboot was cancelled or the system did
+/// not restart: the generation is rebuilt and serves again. A cancel ends the
+/// drain as a service stop does, so a runner still up is adopted by the next
+/// generation, never stopped.
+async fn drain_then_reboot(
+    serving: &Serving,
+    loops: &mut tokio::task::JoinSet<Result<(), CliError>>,
+    shutdown: &tokio::sync::watch::Sender<bool>,
+    mut ports: RebootPorts<'_>,
+) -> Result<DaemonOutcome, CliError> {
+    let control = ports.control;
+    ports.draining.store(true, Ordering::Relaxed);
+    control.waiting((ports.runners)(), None);
+    serving.drain_all();
+
+    // This machine's own runners, however long they take.
+    loop {
+        tokio::select! {
+            joined = loops.join_next() => match joined {
+                None => break,
+                Some(result) => result.map_err(|source| {
+                    CliError::new(
+                        Failure::LocalState,
+                        format!("a daemon target loop failed: {source}"),
+                    )
+                })??,
+            },
+            () = control.cancelled() => return resume_after_cancel(loops, shutdown, &ports.guests).await,
+            stopped = &mut ports.stopped => {
+                stopped.map_err(signal_failure)?;
+                return stop_during_reboot(loops, shutdown).await;
+            }
+            () = tokio::time::sleep(REBOOT_PROGRESS_EVERY) => control.waiting((ports.runners)(), None),
+        }
+    }
+
+    // Restarting Windows stops its WSL guests: theirs too.
+    ports.guests.request();
+    while let Some(waiting) = ports.guests.waiting() {
+        control.waiting(None, Some(waiting));
+        tokio::select! {
+            () = control.cancelled() => return resume_after_cancel(loops, shutdown, &ports.guests).await,
+            stopped = &mut ports.stopped => {
+                stopped.map_err(signal_failure)?;
+                return Ok(DaemonOutcome::Stopped);
+            }
+            () = tokio::time::sleep(REBOOT_PROGRESS_EVERY) => ports.guests.request(),
+        }
+    }
+
+    control.rebooting(format!(
+        "Every job has finished; restarting in {} seconds.",
+        REBOOT_GRACE.as_secs()
+    ));
+    tokio::select! {
+        () = tokio::time::sleep(REBOOT_GRACE) => {}
+        stopped = &mut ports.stopped => {
+            stopped.map_err(signal_failure)?;
+            return Ok(DaemonOutcome::Stopped);
+        }
+    }
+    let rebooter = Arc::clone(&ports.rebooter);
+    let asked = tokio::task::spawn_blocking(move || rebooter.reboot(super::reboot::REASON))
+        .await
+        .unwrap_or_else(|_| Err("the restart request stopped unexpectedly".to_owned()));
+    match asked {
+        Ok(command) => {
+            tracing::warn!(%command, "every job finished; the system was asked to restart");
+            control.rebooting(format!("The system accepted `{command}`; restarting."));
+        }
+        Err(why) => {
+            tracing::error!(%why, "the system refused to restart; serving again");
+            control.failed(&format!("The system refused to restart: {why}."));
+            ports.guests.release();
+            return Ok(DaemonOutcome::Reload);
+        }
+    }
+    tokio::select! {
+        stopped = &mut ports.stopped => {
+            stopped.map_err(signal_failure)?;
+            Ok(DaemonOutcome::Stopped)
+        }
+        () = tokio::time::sleep(REBOOT_SETTLE) => {
+            tracing::error!("the system accepted the restart but did not restart; serving again");
+            control.failed(&format!(
+                "The system accepted the restart but had not restarted after {} minutes (an \
+                 application may have refused to quit).",
+                REBOOT_SETTLE.as_secs() / 60
+            ));
+            ports.guests.release();
+            Ok(DaemonOutcome::Reload)
+        }
+    }
+}
+
+/// The reboot was cancelled: the loops end as for a service stop (bounded;
+/// a runner still up is the next generation's to adopt), the guests are let
+/// go, and the generation is rebuilt.
+async fn resume_after_cancel(
+    loops: &mut tokio::task::JoinSet<Result<(), CliError>>,
+    shutdown: &tokio::sync::watch::Sender<bool>,
+    guests: &super::reboot::GuestDrain,
+) -> Result<DaemonOutcome, CliError> {
+    tracing::info!("the reboot was cancelled; serving again");
+    guests.release();
+    let _ = stop_during_reboot(loops, shutdown).await?;
+    Ok(DaemonOutcome::Reload)
+}
+
+/// Ends the draining loops as a service stop does.
+async fn stop_during_reboot(
+    loops: &mut tokio::task::JoinSet<Result<(), CliError>>,
+    shutdown: &tokio::sync::watch::Sender<bool>,
+) -> Result<DaemonOutcome, CliError> {
+    let _ = shutdown.send(true);
+    while let Some(result) = loops.join_next().await {
+        result.map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("a daemon target loop failed: {source}"),
+            )
+        })??;
+    }
     Ok(DaemonOutcome::Stopped)
 }
 
@@ -3716,6 +3948,178 @@ mod tests {
             .expect("an unreadable target must not block an upgrade")
             .unwrap()
             .unwrap();
+    }
+
+    /// Stands in for the system: records when it was asked, and how many
+    /// passes the busy target had run by then. Never restarts anything.
+    struct FakeRebooter {
+        passes: Arc<AtomicUsize>,
+        asked_after: Mutex<Vec<usize>>,
+        refuse: bool,
+    }
+
+    impl runner_manager_platform::reboot::Rebooter for FakeRebooter {
+        fn reboot(&self, _reason: &str) -> Result<String, String> {
+            self.asked_after
+                .lock()
+                .unwrap()
+                .push(self.passes.load(Ordering::SeqCst));
+            if self.refuse {
+                Err("not permitted".into())
+            } else {
+                Ok("fake reboot".into())
+            }
+        }
+    }
+
+    struct RebootRig {
+        control: &'static super::super::reboot::Control,
+        rebooter: Arc<FakeRebooter>,
+        terminations: Arc<AtomicUsize>,
+        serving: Serving,
+        loops: tokio::task::JoinSet<Result<(), CliError>>,
+        shutdown: tokio::sync::watch::Sender<bool>,
+        draining: &'static AtomicBool,
+    }
+
+    /// One busy target serving, a reboot asked, and a system that accepts
+    /// (or refuses) the restart.
+    fn reboot_rig(refuse: bool) -> RebootRig {
+        let target = FakeTarget::busy_then_finished(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+        );
+        let rebooter = Arc::new(FakeRebooter {
+            passes: Arc::clone(&target.calls),
+            asked_after: Mutex::new(Vec::new()),
+            refuse,
+        });
+        let terminations = Arc::clone(&target.busy_was_terminated);
+        let control: &'static super::super::reboot::Control =
+            Box::leak(Box::new(super::super::reboot::Control::new()));
+        control.attach(StartMode::Boot, false);
+        control.request().unwrap();
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let contacts: Arc<dyn ContactRecorder> = Arc::new(CountingContacts::default());
+        let mut serving = Serving::default();
+        let mut loops = tokio::task::JoinSet::new();
+        serving.spawn(&mut loops, target, &shutdown, &contacts);
+        RebootRig {
+            control,
+            rebooter,
+            terminations,
+            serving,
+            loops,
+            shutdown,
+            draining: Box::leak(Box::new(AtomicBool::new(false))),
+        }
+    }
+
+    fn rig_ports(rig: &RebootRig) -> RebootPorts<'static> {
+        RebootPorts {
+            control: rig.control,
+            rebooter: Arc::clone(&rig.rebooter)
+                as Arc<dyn runner_manager_platform::reboot::Rebooter>,
+            draining: rig.draining,
+            runners: Box::new(|| Some(1)),
+            guests: super::super::reboot::GuestDrain::over(Vec::new(), std::path::Path::new(".")),
+            stopped: Box::pin(std::future::pending()),
+        }
+    }
+
+    async fn advance(secs: u64) {
+        for _ in 0..secs {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reboot_waits_for_every_running_job_and_only_then_restarts() {
+        let mut rig = reboot_rig(false);
+        let ports = rig_ports(&rig);
+        let rebooter = Arc::clone(&rig.rebooter);
+        let control = rig.control;
+        let draining = rig.draining;
+        let reboot = tokio::spawn(async move {
+            drain_then_reboot(&rig.serving, &mut rig.loops, &rig.shutdown, ports).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            draining.load(Ordering::Relaxed),
+            "the coordinator is told at once: it places nothing here"
+        );
+        assert_eq!(control.progress().unwrap().state, "pending");
+        // The job outlasts any shutdown deadline; nothing is restarted.
+        advance(1).await;
+        assert!(rebooter.asked_after.lock().unwrap().is_empty());
+        // The fake's job ends on its third pass; then the grace, then the ask.
+        advance(REBOOT_GRACE.as_secs() + 10).await;
+        // The ask runs on a blocking thread, outside the paused clock.
+        for _ in 0..500 {
+            if !rebooter.asked_after.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            tokio::task::yield_now().await;
+        }
+        let asked = rebooter.asked_after.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "asked exactly once");
+        assert!(
+            asked[0] >= 3,
+            "asked only after the job finished: {asked:?}"
+        );
+        assert_eq!(control.progress().unwrap().state, "rebooting");
+        // The system accepted but never stopped the service: reported, and
+        // the host serves again rather than staying drained.
+        advance(REBOOT_SETTLE.as_secs() + 1).await;
+        let outcome = reboot.await.unwrap().unwrap();
+        assert_eq!(outcome, DaemonOutcome::Reload);
+        assert_eq!(control.progress().unwrap().state, "failed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_restart_is_reported_and_the_host_serves_again() {
+        let mut rig = reboot_rig(true);
+        let ports = rig_ports(&rig);
+        let control = rig.control;
+        let terminations = Arc::clone(&rig.terminations);
+        let reboot = tokio::spawn(async move {
+            drain_then_reboot(&rig.serving, &mut rig.loops, &rig.shutdown, ports).await
+        });
+        advance(REBOOT_GRACE.as_secs() + 10).await;
+        assert_eq!(reboot.await.unwrap().unwrap(), DaemonOutcome::Reload);
+        let progress = control.progress().unwrap();
+        assert_eq!(progress.state, "failed");
+        assert!(progress.message.contains("not permitted"), "{progress:?}");
+        assert_eq!(terminations.load(Ordering::SeqCst), 0);
+        // No longer wanted: the next generation does not drain again.
+        assert!(
+            futures::FutureExt::now_or_never(control.requested()).is_none(),
+            "a failed reboot is not asked again by itself"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_reboot_serves_again_without_restarting_or_stopping_a_job() {
+        let mut rig = reboot_rig(false);
+        let ports = rig_ports(&rig);
+        let control = rig.control;
+        let rebooter = Arc::clone(&rig.rebooter);
+        let terminations = Arc::clone(&rig.terminations);
+        let reboot = tokio::spawn(async move {
+            drain_then_reboot(&rig.serving, &mut rig.loops, &rig.shutdown, ports).await
+        });
+        tokio::task::yield_now().await;
+        control.cancel().unwrap();
+        advance(DRAIN_DEADLINE.as_secs() + 5).await;
+        assert_eq!(reboot.await.unwrap().unwrap(), DaemonOutcome::Reload);
+        assert!(rebooter.asked_after.lock().unwrap().is_empty());
+        assert_eq!(terminations.load(Ordering::SeqCst), 0);
+        assert_eq!(control.progress().unwrap().state, "cancelled");
     }
 
     /// A rewrite of the *same* version is not an upgrade: restarting for it

@@ -61,6 +61,9 @@ const SURFACE: [(&str, &[&str]); 11] = [
             "set-runtime-root",
             "reset-runtime-root",
             "show",
+            // Owner decision 2026-11-17: restart the machine from the
+            // coordinator once every running job has finished.
+            "reboot",
             "isolation",
             "env",
             "doctor",

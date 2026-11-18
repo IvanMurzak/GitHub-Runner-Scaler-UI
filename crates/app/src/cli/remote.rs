@@ -88,8 +88,9 @@ pub fn remote_changes(
         "{}",
         if allow {
             "A person signed in to the coordinator may now change this host's repositories, labels, \
-             limits and workspaces, and update its runner-manager to the newest release (unless \
-             automatic updates are off here). Every change is recorded in remote-commands.jsonl here and on \
+             limits and workspaces, update its runner-manager to the newest release (unless \
+             automatic updates are off here), and restart this machine once its running jobs \
+             have finished. Every change is recorded in remote-commands.jsonl here and on \
              the coordinator. `runner-manager coordinator remote-changes deny` takes it back."
         } else {
             "The coordinator may only read this host's settings now."
@@ -135,7 +136,7 @@ pub fn access(cli: &Cli) -> Option<Access> {
             check: false,
             force: false,
         })
-        | Command::Host(HostCommand::SetCapacity(_))
+        | Command::Host(HostCommand::SetCapacity(_) | HostCommand::Reboot(_))
         | Command::Repo(
             RepoCommand::Add(_)
             | RepoCommand::Remove(_)
@@ -328,7 +329,8 @@ pub fn execute(context: &Context, command: &RunCommand) -> CommandResult {
             return refused(
                 Failure::InvalidArgument,
                 "this host does not run that command for the coordinator; only reading and \
-                 changing repositories, labels, limits and workspaces, and `update`",
+                 changing repositories, labels, limits and workspaces, `update` and \
+                 `host reboot`",
             );
         };
         let judged = |mut result: CommandResult| {
@@ -351,6 +353,14 @@ pub fn execute(context: &Context, command: &RunCommand) -> CommandResult {
         // Not run as typed, which would update the service's private copy.
         if matches!(cli.command, Command::Update(_)) {
             return judged(start_update(context, &command.request_id));
+        }
+        // Answered by this service itself, which is the one that reboots.
+        if let Command::Host(HostCommand::Reboot(args)) = &cli.command {
+            return judged(super::reboot::remote(
+                super::reboot::control(),
+                &command.request_id,
+                args,
+            ));
         }
         let result = |exit_code: u8, stdout: String, stderr: String| {
             let (stdout, stderr, truncated) = bounded(stdout, stderr);
@@ -479,6 +489,11 @@ mod tests {
         );
         assert_eq!(access(&parsed(&["host", "show"])), Some(Access::Read));
         assert_eq!(access(&parsed(&["update"])), Some(Access::Change));
+        assert_eq!(access(&parsed(&["host", "reboot"])), Some(Access::Change));
+        assert_eq!(
+            access(&parsed(&["host", "reboot", "--cancel"])),
+            Some(Access::Change)
+        );
         assert_eq!(
             access(&parsed(&[
                 "repo",
@@ -505,6 +520,7 @@ mod tests {
             &["update", "--check"],
             &["update", "--force"],
             &["--host", "wsl:Ubuntu", "update"],
+            &["--host", "wsl:Ubuntu", "host", "reboot"],
             &["host", "protect-path", "add", "/srv"],
             &["coordinator", "leave"],
             &["--host", "wsl:Ubuntu", "repo", "list"],
@@ -579,6 +595,42 @@ mod tests {
     }
 
     #[test]
+    fn a_reboot_needs_changes_allowed_and_a_service_serving_the_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = Context::resolve(Some(dir.path()), &mut Vec::new()).unwrap();
+        let command = RunCommand {
+            request_id: "r2".into(),
+            argv: vec!["host".into(), "reboot".into()],
+            by: "someone".into(),
+        };
+        let refused = execute(&context, &command);
+        assert_eq!(refused.exit_code, Failure::Conflict.code());
+        assert_eq!(refused.access.as_deref(), Some("change"));
+        assert!(
+            refused.stderr.contains("remote-changes allow"),
+            "{refused:?}"
+        );
+        let record =
+            std::fs::read_to_string(context.paths().state_dir().join(RECORD_FILE)).unwrap();
+        assert!(record.contains(r#""argv":["host","reboot"]"#), "{record}");
+
+        // Allowed: answered by this process's control, never by running the
+        // command; a test process serves no machine, so nothing is asked.
+        remote_changes(
+            &context,
+            &CoordinatorRemoteChangesArgs {
+                choice: RemoteChangesChoice::Allow,
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let unserved = execute(&context, &command);
+        assert_eq!(unserved.exit_code, Failure::Conflict.code());
+        assert!(unserved.stderr.contains("not serving"), "{unserved:?}");
+        assert_eq!(super::super::reboot::control().progress(), None);
+    }
+
+    #[test]
     fn output_is_cut_to_fit_one_frame_keeping_the_error() {
         let (stdout, stderr, truncated) =
             bounded("o".repeat(MAX_COMMAND_OUTPUT_BYTES), "error: why\n".into());
@@ -625,6 +677,7 @@ mod tests {
             (&["status"], &["json"]),
             (&["host", "show"], &[]),
             (&["host", "set-capacity"], &["capacity"]),
+            (&["host", "reboot"], &["cancel"]),
             (&["repo", "list"], &["json"]),
             (
                 &["repo", "add"],

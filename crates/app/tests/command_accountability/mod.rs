@@ -170,6 +170,8 @@ const LOCAL_CHAIN_MODEL: &str = "crates/app/tests/cli_chains_model.rs";
 const SURFACE_TESTS: &str = "crates/app/tests/cli_command_surface.rs";
 const DAEMON_UNIT: &str = "crates/app/src/cli/daemon.rs";
 const SERVICE_UNIT: &str = "crates/app/src/cli/service.rs";
+const REBOOT_UNIT: &str = "crates/app/src/cli/reboot.rs";
+const PLATFORM_REBOOT_UNIT: &str = "crates/platform/src/reboot.rs";
 const PRIVILEGED_SERVICE: &str = "crates/platform/tests/privileged_service_installer.rs";
 const PRIVILEGED_WSL: &str = "crates/platform/tests/privileged_wsl_lifecycle.rs";
 const TUI_SHELL: &str = "crates/app/src/tui/shell.rs";
@@ -670,6 +672,41 @@ pub const MANIFEST: &[Classification] = &[
     generated("host set-runtime-root"),
     generated("host reset-runtime-root"),
     generated("host show"),
+    Classification {
+        leaf: "host reboot",
+        coverage: Coverage::Dedicated,
+        evidence: &[
+            at(
+                DAEMON_UNIT,
+                "a_reboot_waits_for_every_running_job_and_only_then_restarts",
+            ),
+            at(
+                DAEMON_UNIT,
+                "a_cancelled_reboot_serves_again_without_restarting_or_stopping_a_job",
+            ),
+            at(
+                DAEMON_UNIT,
+                "a_refused_restart_is_reported_and_the_host_serves_again",
+            ),
+            at(
+                REBOOT_UNIT,
+                "a_reboot_is_asked_once_and_can_be_cancelled_until_it_begins",
+            ),
+            at(
+                PLATFORM_REBOOT_UNIT,
+                "linux_root_reboots_directly_and_a_user_never_waits_for_a_password",
+            ),
+        ],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::HostServiceManager,
+            reason: "It asks the running service to restart the machine once its jobs have \
+                     finished, which no CI leg may do to its host. The drain, the cancel and a \
+                     refused restart are unit-tested against a fake that never restarts \
+                     anything, the request handling and the WSL guests' drain against \
+                     temporary directories, and each system's restart commands as a pure \
+                     function.",
+        }),
+    },
     Classification {
         leaf: "host isolation status",
         coverage: Coverage::Dedicated,

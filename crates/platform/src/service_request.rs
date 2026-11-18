@@ -66,6 +66,18 @@ pub const GITHUB_DISCOVERY: Channel = Channel {
     slots: Slots::PerRequest("github-discovery"),
 };
 
+/// `host reboot`: restart this machine once every running job has finished.
+/// Only the service can, because only it knows when its runners are done; the
+/// answer says what it will do.
+pub const REBOOT: Channel = Channel {
+    slots: Slots::PerRequest("reboot"),
+};
+
+/// `host reboot --cancel`: keep this machine running after all.
+pub const REBOOT_CANCEL: Channel = Channel {
+    slots: Slots::PerRequest("reboot-cancel"),
+};
+
 /// How long a command waits on the service, and how often it looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Wait {
@@ -78,6 +90,13 @@ pub struct Wait {
 }
 
 impl Wait {
+    /// What `host reboot` uses: the service answers at once.
+    pub const REBOOT: Self = Self {
+        taken: Duration::from_secs(4 * POLL.as_secs()),
+        finished: Duration::from_secs(10),
+        poll: Duration::from_millis(250),
+    };
+
     /// What a command waiting on a GitHub request uses.
     pub const GITHUB: Self = Self {
         taken: Duration::from_secs(4 * POLL.as_secs()),
