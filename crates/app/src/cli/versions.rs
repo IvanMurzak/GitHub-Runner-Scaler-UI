@@ -18,7 +18,7 @@ use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::wsl::record::WslProviderRecord;
 
 use super::daemon::BinaryStamp;
-use super::update::{Installation, service_source};
+use super::update::{Channel, Installation, service_source};
 
 /// How old a reading may be before the next heartbeat asks for a new one.
 const REFRESH: Duration = Duration::from_secs(60);
@@ -31,6 +31,31 @@ struct Source {
     version: Option<String>,
     describe: &'static str,
     updatable: bool,
+    missing: bool,
+}
+
+impl Source {
+    /// Reads the service source at `path`, whose file is `stamp`.
+    fn read(paths: &AppPaths, path: PathBuf, stamp: Option<BinaryStamp>) -> Self {
+        let version = super::update::executable_version(&path);
+        let installation = Installation::of_source(paths, path.clone(), version.as_deref());
+        Self {
+            describe: installation.channel.describe(),
+            updatable: installation.refusal().is_none(),
+            missing: installation.channel == Channel::Missing,
+            path,
+            stamp,
+            version,
+        }
+    }
+
+    /// Puts what the heartbeat says of this source into `versions`.
+    fn report(&self, versions: &mut HostVersions) {
+        versions.app.clone_from(&self.version);
+        versions.app_source = Some(self.describe.to_owned());
+        versions.updatable = self.updatable;
+        versions.app_missing = self.missing.then(|| self.path.display().to_string());
+    }
 }
 
 #[derive(Default)]
@@ -123,27 +148,53 @@ fn refresh(paths: &AppPaths) {
         let stamp = BinaryStamp::of(&path);
         match previous {
             Some(source) if source.path == path && source.stamp == stamp => source,
-            _ => {
-                let version = super::update::executable_version(&path);
-                let installation = Installation::of_source(paths, path.clone(), version.as_deref());
-                Source {
-                    describe: installation.channel.describe(),
-                    updatable: installation.refusal().is_none(),
-                    path,
-                    stamp,
-                    version,
-                }
-            }
+            _ => Source::read(paths, path, stamp),
         }
     });
     if let Some(source) = &source {
-        versions.app.clone_from(&source.version);
-        versions.app_source = Some(source.describe.to_owned());
-        versions.updatable = source.updatable;
+        source.report(&mut versions);
     }
     let mut reading = reading();
     reading.versions = Some(versions);
     // Read before an update changed the binary: stale at once.
     reading.at = (GENERATION.load(Ordering::Acquire) == generation).then(Instant::now);
     reading.source = source;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A service source that is gone is reported missing, with its path, and
+    /// not updatable: the dashboard offers no Update that would fail.
+    #[test]
+    fn a_missing_service_source_is_not_updatable_and_names_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(dir.path());
+        let gone = dir.path().join("gone/target/release/runner-manager");
+        let mut versions = HostVersions::default();
+        Source::read(&paths, gone.clone(), BinaryStamp::of(&gone)).report(&mut versions);
+        assert!(!versions.updatable);
+        assert_eq!(versions.app, None);
+        assert_eq!(versions.app_source.as_deref(), Some("missing"));
+        assert_eq!(
+            versions.app_missing.as_deref(),
+            Some(gone.display().to_string().as_str())
+        );
+    }
+
+    /// A source that is there says nothing of being missing.
+    #[test]
+    fn a_present_service_source_is_not_called_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(dir.path());
+        let archive = dir.path().join("bin/runner-manager");
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(&archive, b"not a program").unwrap();
+        let mut versions = HostVersions::default();
+        Source::read(&paths, archive.clone(), BinaryStamp::of(&archive)).report(&mut versions);
+        assert!(versions.updatable);
+        assert_eq!(versions.app_source.as_deref(), Some("release archive"));
+        assert_eq!(versions.app_missing, None);
+    }
 }

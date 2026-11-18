@@ -1842,6 +1842,7 @@
   function versionState(v) {
     const u = v.update;
     if (u && u.state === 'running') return { cls: 'dim', text: 'Updating…' };
+    if (v.app_missing) return { cls: 'err', text: 'App missing' };
     if (v.app && cmpVer(v.app, v.service) > 0) return { cls: 'warn', text: `Restarts into v${v.app} after its jobs` };
     if (u && u.state === 'failed') return { cls: 'err', text: 'Update failed' };
     const newest = newestRelease();
@@ -1911,6 +1912,7 @@
     let hint;
     if (!x || !x.online) hint = 'Shown while the machine is connected.';
     else if (!v) hint = justConnected(x) ? 'Reading this machine’s versions…' : 'This machine runs a runner-manager older than 0.4.64, which does not report its versions or take updates from here. Update it on the machine once.';
+    else if (v.app_missing) hint = 'The binary its service was installed from no longer exists, so there is nothing to update. On the machine, install runner-manager again, then, while no job runs, register the service from it: runner-manager service uninstall, then runner-manager service install --start-at boot (or login, as it was installed; boot needs sudo off Windows). runner-manager update there names the exact commands.';
     else if (!x.remote_changes) hint = 'Updating from here needs changes through the coordinator allowed on the machine.';
     else if (!v.updatable) hint = `Its app is ${v.app_source || 'not known'}, which the service cannot update. Update it on the machine.`;
     else hint = 'Update installs the newest release the way the app was installed. The service finishes its running jobs first, then restarts into it.';
@@ -1928,7 +1930,9 @@
           }) : null),
         v ? h('dl', { class: 'ver-list' },
           row('Service', v.service, 'running now'),
-          row('App', v.app, v.app_source ? `· ${v.app_source}` : null),
+          v.app_missing ? h('div', { class: 'ver-row' }, h('dt', { text: 'App' }),
+            h('dd', {}, h('b', { class: 'text-err', text: 'missing' }), h('span', { class: 'muted', text: ` · ${v.app_missing}` })))
+            : row('App', v.app, v.app_source ? `· ${v.app_source}` : null),
           (v.wsl || []).map((w) => {
             const live = wslVersion(x);
             return live ? row(`WSL ${w.distribution}`, live, '· its own host’s service; updated through that host')

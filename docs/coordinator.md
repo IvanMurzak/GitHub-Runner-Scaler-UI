@@ -907,8 +907,22 @@ the package manager's output when it failed; the audit trail records only that i
 A host refuses, and says why, when its operator turned automatic updates off (`host
 set-auto-update false`), when its service was installed from a build in a checkout (a release
 binary that `update --force` put at such a path, with the copy it keeps beside it, is updated like
-the release archive), and when its service runs as root and the app belongs to another account (a
-Homebrew prefix, an nvm npm). A WSL distribution is updated through its own host.
+the release archive; a cargo build is told by `target/debug` or `target/release`, or, in any other
+target directory, by the `.fingerprint` directory or `CACHEDIR.TAG` cargo leaves there), and when
+its service runs as root and the app belongs to another account (a Homebrew prefix, an nvm npm). A
+WSL distribution is updated through its own host.
+
+From 0.4.74 a host whose service was installed from a binary that no longer exists (deleted, its
+package uninstalled, its volume gone) refuses before it downloads anything, and its heartbeat says
+so (`app_source` `missing`, `app_missing` the recorded path, `updatable` false): the panel shows
+the App as missing with that path and offers no Update. There is nothing to update in place. On
+the machine, install runner-manager again and, while no job is running, register the service from
+that copy: `runner-manager service uninstall`, then `runner-manager service install --start-at
+boot` (or `login`, the start mode it was installed with; under `sudo` for boot off Windows).
+`runner-manager update` run from the new copy names both commands exactly. The path is the
+`source_binary` in the `service.toml` of the service's data directory (for a Homebrew `Cellar` path,
+the `opt` link it leads to). An older host still offers Update there, and it fails after the
+download.
 
 ### Reboot a machine
 
@@ -1000,7 +1014,7 @@ old to take commands; the coordinator waits up to a minute for an answer.
 | `POST /auth/cli/approve` | a browser's session cookie, this origin | form `code`, `decision=approve\|deny` |
 | `POST /auth/cli/poll` | the CLI, `{"device_code"}` | `428 {"status":"pending"}`, `403 denied`, `410 expired`, or once `200 {"token", "login"}` |
 | `POST /auth/cli/logout` | `Authorization: Bearer` | `204` |
-| `GET /api/overview` | a session | hosts with `online`, `manageable`, `remote_changes`, and from 0.4.64 `versions` (`service`, `app`, `app_source`, `updatable`, `update`, `wsl`, `wsl_guest`, and from 0.4.73 `rebootable`, `starts_at_login`, `reboot`: `state` `pending`/`rebooting`/`failed`/`cancelled`, `at`, `message`, `runners`) |
+| `GET /api/overview` | a session | hosts with `online`, `manageable`, `remote_changes`, and from 0.4.64 `versions` (`service`, `app`, `app_source`, `updatable`, `update`, `wsl`, `wsl_guest`, from 0.4.73 `rebootable`, `starts_at_login`, `reboot`: `state` `pending`/`rebooting`/`failed`/`cancelled`, `at`, `message`, `runners`, and from 0.4.74 `app_missing`) |
 | `POST /api/hosts/{id}/command` | a session; a cookie also needs this origin | `{"argv": [...]}` to `{"request_id", "exit_code", "stdout", "stderr", "truncated"}`; `503` offline, `409` too old, `504` no answer |
 | `GET /api/hosts/{id}/config` | a session | the host's `repo list --json` and `remote_changes` |
 | `GET /api/audit` | a session | the last 100 remote commands |
