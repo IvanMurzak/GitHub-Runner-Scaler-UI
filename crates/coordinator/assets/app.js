@@ -2932,7 +2932,7 @@
 
   // ----------------------------------------------------------- the view
   const TABS = [['general', 'General'], ['layout', 'Layout'], ['machines', 'Machines'], ['charts', 'Charts'], ['kpis', 'Tiles']];
-  const st = { open: false, tab: 'general', closing: null, expanded: new Set(), undo: null, msg: null, confirm: false, seq: 0 };
+  const st = { open: false, tab: 'general', closing: null, expanded: new Set(), undo: null, msg: null, seq: 0 };
 
   function setupSettings() {
     const dlg = $('#settings');
@@ -2978,7 +2978,6 @@
   }
 
   function setConfirm(on) {
-    st.confirm = on;
     $('#st-actions').hidden = on;
     $('#st-confirm').hidden = !on;
     if (on) { $('#st-reset-no').focus(); fadeIn($('#st-confirm'), DUR.fast); }
@@ -3078,7 +3077,7 @@
     el.addEventListener('st-change', () => el._sync());
     return el;
   }
-  const changed = (from) => from.dispatchEvent(new Event('st-change', { bubbles: true }));
+  const touched = (from) => from.dispatchEvent(new Event('st-change', { bubbles: true }));
 
   // A setting: its name and hint, and its control (made by `make(labelId)`).
   function row(label, hint, make) {
@@ -3100,7 +3099,7 @@
         update((c) => setPath(c, path, v));
         press();
         segThumb(box);
-        changed(e.currentTarget);
+        touched(e.currentTarget);
         if (after) after();
       },
     })));
@@ -3118,7 +3117,7 @@
       const v = !getPath(cfg, path);
       update((c) => setPath(c, path, v));
       b.setAttribute('aria-checked', String(get()));
-      changed(b);
+      touched(b);
       if (after) after();
     });
     return b;
@@ -3135,7 +3134,7 @@
       update((c) => setPath(c, path, n));
       input.value = getPath(cfg, path);
       dec.disabled = n <= min; inc.disabled = n >= max;
-      changed(input);
+      touched(input);
     };
     const dec = h('button', { type: 'button', class: 'step-btn', 'aria-label': 'Fewer', text: '−', tabindex: -1, onclick: () => set(Number(input.value) - step) });
     const inc = h('button', { type: 'button', class: 'step-btn', 'aria-label': 'More', text: '+', tabindex: -1, onclick: () => set(Number(input.value) + step) });
@@ -3147,7 +3146,7 @@
   function selectCtl(path, options, labelId) {
     const sel = h('select', { class: 'input st-select', 'aria-labelledby': labelId, 'data-fk': path },
       options.map(([v, text]) => h('option', { value: v, text, selected: v === getPath(cfg, path) || null })));
-    sel.addEventListener('change', () => { update((c) => setPath(c, path, sel.value)); changed(sel); });
+    sel.addEventListener('change', () => { update((c) => setPath(c, path, sel.value)); touched(sel); });
     return sel;
   }
 
@@ -3173,7 +3172,7 @@
     const rows = () => $$(':scope > li', ul);
     const keys = () => rows().map((li) => li.dataset.key);
     const syncMoves = () => rows().forEach((li, i, all) => { li._up.disabled = i === 0; li._down.disabled = i === all.length - 1; });
-    const commit = () => { spec.onOrder(keys()); syncMoves(); changed(ul); };
+    const commit = () => { spec.onOrder(keys()); syncMoves(); touched(ul); };
     const labelOf = (li) => byKey.get(li.dataset.key).label;
 
     function moveBy(li, by, focus) {
@@ -3272,7 +3271,7 @@
           spec.onShow(it.key, on);
           show.setAttribute('aria-checked', String(on));
           li.classList.toggle('is-off', !on);
-          changed(show);
+          touched(show);
         });
       }
       append(li, [
@@ -3463,7 +3462,7 @@
           const now = c.charts.per[key].pick.filter((k) => k !== x.id);
           c.charts.per[key].pick = input.checked ? [...now, x.id] : now;
         });
-        changed(input);
+        touched(input);
       });
       return h('label', { class: 'check st-pick' }, input, hostDot(x.id), h('span', { text: x.name || x.hostname || x.id }));
     }));
