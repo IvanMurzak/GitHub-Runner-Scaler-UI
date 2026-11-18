@@ -1303,7 +1303,7 @@ fn heartbeat(ports: &LinkPorts, open_leases: Option<Vec<String>>) -> Heartbeat {
         draining: ports.draining.load(Ordering::Relaxed),
         open_leases,
         disk_free_bytes: disk.map(|(free, _)| free),
-        versions: super::versions::report(&ports.paths),
+        versions: super::versions::report(&ports.paths).map(Box::new),
         disk_total_bytes: disk.map(|(_, total)| total),
         runners,
     }

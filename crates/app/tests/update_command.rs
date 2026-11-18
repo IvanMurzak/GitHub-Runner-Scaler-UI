@@ -913,6 +913,8 @@ fn an_older_service_from_another_copy_is_told_to_hand_over_with_force() {
         "echo runner-manager 0.0.1",
     );
     let elsewhere = installed.data.join("another").join("runner-manager");
+    std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+    std::fs::write(&elsewhere, b"operator source").unwrap();
     write_install_record_for(&installed.data, Some(&elsewhere), &service);
     let before = modified(&installed.binary);
 
@@ -988,6 +990,8 @@ fn a_service_installed_from_another_binary_is_named_rather_than_assumed() {
     let release = build_release(fixtures.path(), &one_release_newer());
     let installed = Installed::new();
     let elsewhere = installed.data.join("another").join("runner-manager");
+    std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+    std::fs::write(&elsewhere, b"operator source").unwrap();
     write_install_record(&installed.data, Some(&elsewhere));
 
     let outcome = installed.update(&release.assets, &[]);
@@ -1000,6 +1004,54 @@ fn a_service_installed_from_another_binary_is_named_rather_than_assumed() {
     assert!(
         outcome.stdout.contains(&elsewhere.display().to_string()),
         "the report must name the other binary; output was:\n{}",
+        outcome.both()
+    );
+}
+
+/// The service's recorded source is gone (its volume removed, its package
+/// uninstalled): `update --force` would refuse to stage into it, so the
+/// report says to register the service again from this copy instead.
+#[test]
+fn a_service_whose_source_is_gone_is_told_to_register_again_not_to_force() {
+    let fixtures = tempfile::tempdir().expect("a temporary directory");
+    let release = build_release(fixtures.path(), RUNNING);
+    let installed = Installed::new();
+    let service = write_script(
+        &installed.data.join("state").join("bin"),
+        "runner-manager",
+        "echo runner-manager 0.0.1",
+        "echo runner-manager 0.0.1",
+    );
+    let gone = installed
+        .data
+        .join("removed-volume")
+        .join("target")
+        .join("release")
+        .join("runner-manager");
+    write_install_record_for(&installed.data, Some(&gone), &service);
+
+    let outcome = installed.update(&release.assets, &[]);
+    assert_eq!(outcome.code, 0, "output was:\n{}", outcome.both());
+    assert!(
+        outcome.stdout.contains("which no longer exists"),
+        "{}",
+        outcome.both()
+    );
+    assert!(
+        outcome.stdout.contains(&gone.display().to_string()),
+        "{}",
+        outcome.both()
+    );
+    assert!(
+        outcome
+            .stdout
+            .contains("runner-manager service uninstall && runner-manager service install"),
+        "{}",
+        outcome.both()
+    );
+    assert!(
+        !outcome.stdout.contains("update --force"),
+        "{}",
         outcome.both()
     );
 }

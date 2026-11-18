@@ -287,9 +287,10 @@ pub struct Heartbeat {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
     /// From 0.4.64: the runner-manager builds on this host. `None` from an
-    /// older host.
+    /// older host. Boxed, so a [`HostMessage`] is not the size of its
+    /// largest variant.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub versions: Option<HostVersions>,
+    pub versions: Option<Box<HostVersions>>,
     /// From 0.4.66: the size of the runner root's volume, beside
     /// [`Self::disk_free_bytes`]. `None` from an older host.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,6 +321,13 @@ pub struct HostVersions {
     /// installed it (a build in a checkout it cannot). The coordinator can
     /// then update the host where its operator allowed changes there.
     pub updatable: bool,
+    /// From 0.4.74: the path the service was installed from, when nothing is
+    /// there any more (the binary was removed, its package uninstalled, its
+    /// volume gone). [`Self::updatable`] is then `false`: the service has to
+    /// be registered again from a new installation. `None` otherwise, and
+    /// from an older host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_missing: Option<String>,
     /// The last update started through the coordinator, while this service
     /// runs.
     pub update: Option<UpdateProgress>,
@@ -362,6 +370,9 @@ impl HostVersions {
         cut(&mut self.service, MAX_VERSION_TEXT);
         for text in [&mut self.app, &mut self.app_source].into_iter().flatten() {
             cut(text, MAX_VERSION_TEXT);
+        }
+        if let Some(path) = &mut self.app_missing {
+            cut(path, MAX_UPDATE_MESSAGE);
         }
         if let Some(update) = &mut self.update {
             cut(&mut update.message, MAX_UPDATE_MESSAGE);
@@ -2021,6 +2032,7 @@ mod tests {
             app: Some("0.4.64".into()),
             app_source: Some("npm".into()),
             updatable: true,
+            app_missing: None,
             update: None,
             wsl: vec![ManagedWsl {
                 distribution: "Ubuntu".into(),
@@ -2037,7 +2049,7 @@ mod tests {
             }),
         };
         let sent = HostMessage::Heartbeat(Heartbeat {
-            versions: Some(versions.clone()),
+            versions: Some(Box::new(versions.clone())),
             ..Heartbeat::default()
         });
         assert_eq!(HostMessage::decode(&sent.encode()), Ok(sent));
@@ -2096,6 +2108,39 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_service_source_is_said_only_when_it_is_missing() {
+        // A 0.4.73 host says nothing of it: not missing.
+        let older: HostVersions =
+            serde_json::from_str(r#"{"service":"0.4.73","updatable":true}"#).unwrap();
+        assert_eq!(older.app_missing, None);
+        // A host whose source exists sends exactly what it sent before.
+        let quiet = serde_json::to_string(&HostVersions::default()).unwrap();
+        assert!(!quiet.contains("app_missing"), "{quiet}");
+        // A missing source travels, and an older coordinator still reads the
+        // rest, with `updatable` false.
+        let versions = HostVersions {
+            service: "0.4.74".into(),
+            app_source: Some("missing".into()),
+            app_missing: Some("/Volumes/gone/target/release/runner-manager".into()),
+            ..HostVersions::default()
+        };
+        let json = serde_json::to_string(&versions).unwrap();
+        assert_eq!(
+            serde_json::from_str::<HostVersions>(&json).unwrap(),
+            versions
+        );
+        #[derive(Deserialize)]
+        struct OlderCoordinator {
+            updatable: bool,
+        }
+        assert!(
+            !serde_json::from_str::<OlderCoordinator>(&json)
+                .unwrap()
+                .updatable
+        );
+    }
+
+    #[test]
     fn a_hosts_versions_are_cut_to_what_a_heartbeat_carries() {
         let versions = HostVersions {
             service: "é".repeat(100),
@@ -2105,10 +2150,15 @@ mod tests {
                 message: "x".repeat(MAX_UPDATE_MESSAGE * 2),
             }),
             wsl: vec![ManagedWsl::default(); MAX_MANAGED_WSL + 3],
+            app_missing: Some("p".repeat(MAX_UPDATE_MESSAGE * 2)),
             ..HostVersions::default()
         }
         .bounded();
         assert_eq!(versions.service.len(), MAX_VERSION_TEXT);
+        assert_eq!(
+            versions.app_missing.map(|path| path.len()),
+            Some(MAX_UPDATE_MESSAGE)
+        );
         assert_eq!(
             versions.update.map(|update| update.message.len()),
             Some(MAX_UPDATE_MESSAGE)

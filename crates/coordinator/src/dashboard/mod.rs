@@ -525,7 +525,7 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
                 remote_changes: hello.is_some_and(|hello| hello.remote_changes),
                 versions: link
                     .and_then(|host| host.heartbeat.as_ref())
-                    .and_then(|heartbeat| heartbeat.versions.clone()),
+                    .and_then(|heartbeat| heartbeat.versions.as_deref().cloned()),
             }
         })
         .collect();

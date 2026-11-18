@@ -1565,11 +1565,12 @@ async fn a_hosts_versions_reach_the_overview_from_its_heartbeat() {
     socket
         .send(Message::Text(
             HostMessage::Heartbeat(Heartbeat {
-                versions: Some(HostVersions {
+                versions: Some(Box::new(HostVersions {
                     service: "0.4.63".into(),
                     app: Some("0.4.64".into()),
                     app_source: Some("npm".into()),
                     updatable: true,
+                    app_missing: None,
                     update: Some(UpdateProgress {
                         state: "done".into(),
                         at: 1,
@@ -1588,7 +1589,7 @@ async fn a_hosts_versions_reach_the_overview_from_its_heartbeat() {
                         message: "Waiting for 1 running job.".into(),
                         runners: Some(1),
                     }),
-                }),
+                })),
                 ..Heartbeat::default()
             })
             .encode()
