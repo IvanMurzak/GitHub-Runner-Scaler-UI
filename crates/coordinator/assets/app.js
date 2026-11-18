@@ -410,6 +410,7 @@
             [x.arch, isNum(x.cores) ? `${x.cores} cores` : null].filter(Boolean).join(' · '))),
         h('div', { class: 'host-badges' },
           h('span', { class: `status status-${st.key}` }, h('i', { 'aria-hidden': 'true' }), st.label),
+          rebootBadge(x),
           accessChip(x, !!x.remote_changes))),
       h('div', { class: 'host-meters' },
         meterRow('CPU', x.cpu_load_percent, fmtPct(x.cpu_load_percent)),
@@ -1126,6 +1127,98 @@
     target.focus({ preventScroll: true });
   }
 
+  // --------------------------------------------------------------- reboot
+  // A restart asked through `host reboot`, from 0.4.73: shown while it lasts.
+  function rebootState(x) {
+    const r = x && x.online && x.versions && x.versions.reboot;
+    return r && (r.state === 'pending' || r.state === 'rebooting') ? r : null;
+  }
+  function rebootBadge(x) {
+    const r = rebootState(x);
+    if (!r) return null;
+    return r.state === 'rebooting'
+      ? h('span', { class: 'badge badge-err', title: r.message || 'Every job finished; the machine is restarting', text: 'Rebooting' })
+      : h('span', { class: 'badge badge-warn', title: r.message || 'Restarts once its running jobs finish', text: 'Reboot pending' });
+  }
+  function rebootSig(x) {
+    const v = x && x.versions;
+    return JSON.stringify(x && [x.online, x.manageable, x.remote_changes, v && [v.rebootable, v.starts_at_login, v.reboot, (v.wsl || []).length], dw.confirm === 'reboot']);
+  }
+
+  // Only for a machine that says it can (0.4.73 and later, not a WSL guest).
+  function rebootCard(x) {
+    const v = x && x.versions;
+    if (!v || !(v.rebootable || v.reboot)) return null;
+    const r = v.reboot;
+    const live = rebootState(x);
+    const busy = dw.busy.has('reboot');
+    const can = !!(x.online && x.manageable && x.remote_changes && v.rebootable);
+    let hint = (v.wsl || []).length
+      ? 'Restarts this machine once every running job has finished, its WSL distributions’ included. It takes no new job meanwhile, however long that takes.'
+      : 'Restarts this machine once every running job has finished. It takes no new job meanwhile, however long that takes.';
+    if (v.starts_at_login) hint += ' Its service starts when its account signs in: after the restart it works again only once that account is signed in (automatic sign-in, or a person).';
+    if (!x.online) hint = 'Shown while the machine is connected.';
+    else if (!x.remote_changes) hint += ' Rebooting from here needs changes through the coordinator allowed on the machine.';
+    let action = null;
+    if (can && live && live.state === 'pending') {
+      action = h('button', {
+        type: 'button', class: 'btn-sm', 'data-fk': 'reboot:cancel', 'aria-busy': busy ? 'true' : null, text: 'Cancel reboot',
+        onclick: (e) => run('reboot', ['host', 'reboot', '--cancel'], e.currentTarget),
+      });
+    } else if (can && !live && dw.confirm !== 'reboot') {
+      action = h('button', {
+        type: 'button', class: 'btn-sm btn-quiet-danger', 'data-fk': 'reboot:open', text: 'Reboot…',
+        onclick: () => { dw.confirm = 'reboot'; refreshRebootCard('reboot:go'); },
+      });
+    }
+    let confirm = null;
+    if (can && !live && dw.confirm === 'reboot') {
+      const cancel = () => { dw.confirm = null; refreshRebootCard('reboot:open'); };
+      confirm = h('form', { class: 'confirm', novalidate: true, 'aria-label': 'Confirm reboot' },
+        h('p', { class: 'confirm-title', text: `Reboot ${x.name || x.hostname || 'this machine'}?` }),
+        h('p', { class: 'confirm-text', text: 'The machine stops taking jobs now, waits for every running job to finish, then restarts. You can cancel until the restart begins.' }),
+        h('code', { class: 'cmd-preview', text: cmdLine(['host', 'reboot']) }),
+        h('div', { class: 'form-actions' },
+          h('button', { type: 'button', class: 'btn-sm', text: 'Cancel', onclick: cancel }),
+          h('button', { type: 'submit', class: 'btn-sm btn-danger', 'data-fk': 'reboot:go', text: 'Reboot' })));
+      confirm.addEventListener('submit', (e) => { e.preventDefault(); run('reboot', ['host', 'reboot'], $('[data-fk="reboot:go"]', confirm)); });
+      confirm.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancel(); } });
+    }
+    let progress = null;
+    if (r && x.online) {
+      const lead = { pending: 'Reboot asked ', rebooting: 'Rebooting · asked ', failed: 'Reboot failed ', cancelled: 'Reboot cancelled ' }[r.state] || 'Reboot ';
+      progress = h('p', { class: `ver-progress ${r.state === 'failed' ? 'text-err' : 'muted'}`, role: 'status' },
+        lead, ago(r.at), r.message ? ` · ${r.message}` : '');
+    }
+    return h('section', { class: 'card dw-card', 'data-key': 'reboot', 'data-sig': rebootSig(x), 'aria-labelledby': 'dw-h-reboot' },
+      h('fieldset', { class: 'fs', disabled: busy || null },
+        h('div', { class: 'cap-row' },
+          h('div', { class: 'cap-text' },
+            h('h3', { id: 'dw-h-reboot', class: 'cap-title' }, 'Reboot ', rebootBadge(x)),
+            h('p', { class: 'cap-hint', text: hint })),
+          action),
+        confirm,
+        progress),
+      resultNote('reboot'));
+  }
+
+  // Heartbeats bring the reboot's progress: the card follows them.
+  function refreshRebootCard(fk) {
+    if (!dw.id || dw.busy.has('reboot')) return;
+    const body = $('#dw-body');
+    const old = $('[data-key="reboot"]', body);
+    if (!old) return;
+    const x = hostById(dw.id);
+    if (!fk && old.dataset.sig === rebootSig(x)) return;
+    const had = fk || old.contains(document.activeElement);
+    const card = rebootCard(x);
+    if (!card) { old.remove(); return; }
+    old.replaceWith(card);
+    if (!had) return;
+    const target = $(`[data-fk="${CSS.escape(fk || 'reboot:open')}"]`, card) || $('[data-fk^="reboot:"]', card) || body;
+    target.focus({ preventScroll: true });
+  }
+
   // ------------------------------------------------------------ audit log
   function buildAuditControls() {
     $('#audit-filter').replaceChildren(...[['changes', 'Changes'], ['all', 'All']].map(([v, t]) => h('button', {
@@ -1283,6 +1376,7 @@
     const before = dw.sig;
     renderDrawerHead();
     refreshVersionCard();
+    refreshRebootCard();
     if (dw.sig === before) return;
     const x = hostById(dw.id);
     if (x && x.manageable && !dw.loading && !dw.busy.size && (!dw.cfg || dw.rc !== !!x.remote_changes)) loadConfig({ quiet: !!dw.cfg });
@@ -1420,7 +1514,7 @@
     }
     const known = new Set(pols.map(policyKey));
     // Results whose control is gone: a removed policy, or the add form once it closed.
-    const orphans = [...dw.results.keys()].filter((k) => (k === 'add' ? !dw.add : k !== 'host' && k !== 'update' && !known.has(k)));
+    const orphans = [...dw.results.keys()].filter((k) => (k === 'add' ? !dw.add : k !== 'host' && k !== 'update' && k !== 'reboot' && !known.has(k)));
     return h('div', { class: 'dw-stack' },
       dw.error ? h('div', { class: 'result result-err', role: 'alert' },
         h('span', { class: 'result-icon', 'aria-hidden': 'true', text: '!' }),
@@ -1429,6 +1523,7 @@
         dw.error.error ? h('pre', { class: 'result-pre', text: dw.error.error }) : null) : null,
       doc.schema_version !== 1 ? h('p', { class: 'notice notice-warn', text: `This machine describes its settings in format ${doc.schema_version}; this page reads format 1, so some details may be missing.` }) : null,
       versionCard(x),
+      rebootCard(x),
       machineCard(doc.host, can, x),
       h('section', { class: 'dw-section', 'aria-labelledby': 'dw-h-repos' },
         h('div', { class: 'section-head' },
