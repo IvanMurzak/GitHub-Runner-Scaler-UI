@@ -203,7 +203,6 @@ button { font: inherit; color: inherit; }
 .live i::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--ok); opacity: 0; }
 @media (prefers-reduced-motion: no-preference) {
   .live:not(.is-stale) i::after { animation: ping 2.6s cubic-bezier(0, 0, 0.2, 1) infinite; }
-  @keyframes ping { 0% { transform: scale(1); opacity: 0.45; } 70%, 100% { transform: scale(2.8); opacity: 0; } }
 }
 .who { display: inline-flex; align-items: center; gap: 8px; color: var(--text-2); font-size: 13px; }
 .avatar { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--border-2); }
@@ -554,8 +553,6 @@ html.has-drawer { overflow: hidden; }
 @media (prefers-reduced-motion: no-preference) {
   .drawer[open] { animation: dw-in 0.24s cubic-bezier(0.2, 0.8, 0.2, 1); }
   .drawer[open]::backdrop { animation: fade-in 0.24s ease; }
-  @keyframes dw-in { from { transform: translateX(28px); opacity: 0; } }
-  @keyframes fade-in { from { opacity: 0; } }
 }
 .dw-head {
   flex: none; display: grid; gap: 14px; padding: 18px 20px 16px;
@@ -729,7 +726,6 @@ section[tabindex="-1"]:focus { outline: none; }
   /* Shown again after being hidden: a short fade in. */
   .app, .update-chip, .notice, .count, #recent-toggle, .tbl-more { animation: fade-in 0.3s var(--ease); }
   .update-chip, .count { animation-name: pop-in; }
-  @keyframes pop-in { from { opacity: 0; transform: scale(0.85); } }
 }
 
 /* --------------------------------------------------------------- audit log */
@@ -803,7 +799,6 @@ section[tabindex="-1"]:focus { outline: none; }
   .drawer { width: 100%; border-left: 0; box-shadow: none; }
   @media (prefers-reduced-motion: no-preference) {
     .drawer[open] { animation-name: sheet-in; }
-    @keyframes sheet-in { from { transform: translateY(24px); opacity: 0; } }
   }
   .dw-head { padding: max(12px, env(safe-area-inset-top)) 16px 14px; gap: 12px; }
   .dw-title-row .host-dot { margin-top: 12px; }
@@ -1011,4 +1006,24 @@ section[tabindex="-1"]:focus { outline: none; }
   .pin-btn { width: 36px; height: 36px; margin: -6px -6px 0 0; }
   .pin-drawer { width: 44px; height: 44px; margin: 0; }
   .drawer.settings::backdrop { background: rgba(10, 12, 16, 0.36); }
+}
+
+/* Keyframes at the top level: inside a media query they would exist only
+   while it matches, and a viewer can ask for motion whatever it says. */
+@keyframes ping { 0% { transform: scale(1); opacity: 0.45; } 70%, 100% { transform: scale(2.8); opacity: 0; } }
+@keyframes dw-in { from { transform: translateX(28px); opacity: 0; } }
+@keyframes fade-in { from { opacity: 0; } }
+@keyframes pop-in { from { opacity: 0; transform: scale(0.85); } }
+@keyframes sheet-in { from { transform: translateY(24px); opacity: 0; } }
+
+/* Motion turned on in the settings (Reduce motion: Off): the animations the
+   system's reduced-motion wish would otherwise skip. */
+:root[data-motion="full"] .live:not(.is-stale) i::after { animation: ping 2.6s cubic-bezier(0, 0, 0.2, 1) infinite; }
+:root[data-motion="full"] .drawer[open] { animation: dw-in 0.24s cubic-bezier(0.2, 0.8, 0.2, 1); }
+:root[data-motion="full"] .drawer[open]::backdrop { animation: fade-in 0.24s ease; }
+:root[data-motion="full"] .sk, :root[data-motion="full"] .plot:empty { animation: pulse 1.6s ease-in-out infinite; }
+:root[data-motion="full"] :is(.app, .notice, #recent-toggle, .tbl-more) { animation: fade-in 0.3s var(--ease); }
+:root[data-motion="full"] :is(.update-chip, .count) { animation: pop-in 0.3s var(--ease); }
+@media (max-width: 720px) {
+  :root[data-motion="full"] .drawer[open] { animation-name: sheet-in; }
 }

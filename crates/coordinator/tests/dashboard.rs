@@ -925,3 +925,42 @@ async fn dashboard_settings_are_each_persons_own() {
         mine
     );
 }
+
+#[tokio::test]
+async fn an_older_write_of_the_same_page_does_not_replace_a_newer_one() {
+    let github = github_for("ivanmurzak").await;
+    let coordinator = start(Some(auth(&github))).await;
+    let (_, session) = sign_in(&coordinator).await;
+    let session = session.expect("a session");
+    let write = |client: &str, seq: u64, theme: &str| serde_json::json!({ "version": 1, "client": client, "seq": seq, "general": { "theme": theme } });
+
+    let newer = write("page-a", 2, "dark");
+    assert_eq!(
+        put_settings(&coordinator, Some(&session), newer.to_string())
+            .await
+            .status(),
+        200
+    );
+    // The same page's earlier write, arriving late: refused.
+    assert_eq!(
+        put_settings(
+            &coordinator,
+            Some(&session),
+            write("page-a", 1, "light").to_string()
+        )
+        .await
+        .status(),
+        409
+    );
+    assert_eq!(settings_of(&coordinator, &session).await["settings"], newer);
+
+    // Another page (another browser) writes whatever its count.
+    let other = write("page-b", 1, "light");
+    assert_eq!(
+        put_settings(&coordinator, Some(&session), other.to_string())
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(settings_of(&coordinator, &session).await["settings"], other);
+}
