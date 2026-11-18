@@ -855,17 +855,13 @@ async fn drain_then_reboot(
         tokio::select! {
             joined = loops.join_next() => match joined {
                 None => break,
-                Some(result) => result.map_err(|source| {
-                    CliError::new(
-                        Failure::LocalState,
-                        format!("a daemon target loop failed: {source}"),
-                    )
-                })??,
+                Some(result) => loop_outcome(result)?,
             },
             () = control.cancelled() => return resume_after_cancel(loops, shutdown, &ports.guests).await,
             stopped = &mut ports.stopped => {
                 stopped.map_err(signal_failure)?;
-                return stop_during_reboot(loops, shutdown).await;
+                stop_during_reboot(loops, shutdown).await?;
+                return Ok(DaemonOutcome::Stopped);
             }
             () = tokio::time::sleep(REBOOT_PROGRESS_EVERY) => control.waiting((ports.runners)(), None),
         }
@@ -940,7 +936,7 @@ async fn resume_after_cancel(
 ) -> Result<DaemonOutcome, CliError> {
     tracing::info!("the reboot was cancelled; serving again");
     guests.release();
-    let _ = stop_during_reboot(loops, shutdown).await?;
+    stop_during_reboot(loops, shutdown).await?;
     Ok(DaemonOutcome::Reload)
 }
 
@@ -948,17 +944,22 @@ async fn resume_after_cancel(
 async fn stop_during_reboot(
     loops: &mut tokio::task::JoinSet<Result<(), CliError>>,
     shutdown: &tokio::sync::watch::Sender<bool>,
-) -> Result<DaemonOutcome, CliError> {
+) -> Result<(), CliError> {
     let _ = shutdown.send(true);
     while let Some(result) = loops.join_next().await {
-        result.map_err(|source| {
-            CliError::new(
-                Failure::LocalState,
-                format!("a daemon target loop failed: {source}"),
-            )
-        })??;
+        loop_outcome(result)?;
     }
-    Ok(DaemonOutcome::Stopped)
+    Ok(())
+}
+
+/// A target loop's end, its panic or cancellation as a failure.
+fn loop_outcome(result: LoopResult) -> Result<(), CliError> {
+    result.map_err(|source| {
+        CliError::new(
+            Failure::LocalState,
+            format!("a daemon target loop failed: {source}"),
+        )
+    })?
 }
 
 /// Aborts the task it holds when dropped, so the coordinator link ends with
