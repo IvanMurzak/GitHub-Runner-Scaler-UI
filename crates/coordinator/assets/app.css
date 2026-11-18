@@ -684,8 +684,9 @@ html.has-drawer { overflow: hidden; }
 /* Containers of animated, keyed children: a leaving child is pinned inside them. */
 .kpis, .hosts, .pools, .charts, .legend, .tbl tbody, #queue, #running, #recent, #audit, .tbl-box { position: relative; }
 .is-leaving { z-index: 0; }
-/* While a list shrinks, what leaves it stays inside it (the margin keeps focus rings and shadows). */
-.hosts, #queue, #running, #recent, #audit, .tbl-box { overflow: clip; overflow-clip-margin: 12px; }
+/* While a list's height animates, what leaves it stays inside it (the margin keeps focus rings and shadows). */
+.is-resizing { overflow: clip; overflow-clip-margin: 12px; }
+section[tabindex="-1"]:focus { outline: none; }
 @media (prefers-reduced-motion: no-preference) {
   /* Shown again after being hidden: a short fade in. */
   .app, .update-chip, .notice, .count, #recent-toggle, .tbl-more { animation: fade-in 0.3s var(--ease); }

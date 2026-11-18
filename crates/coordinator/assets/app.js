@@ -94,11 +94,13 @@
     if (el instanceof Element && motionOk()) el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: dur || DUR.base, easing: 'ease-out' });
   }
 
-  // An element about to go must not keep keyboard focus: hand it to `to`, or the page.
-  function dropFocus(el, to) {
+  // An element about to go must not keep keyboard focus: it moves to the
+  // section around it (read out as that section), or the page.
+  function dropFocus(el) {
     if (!el.contains(document.activeElement)) return;
-    const next = to && $('a[href], button:not(:disabled), [tabindex]:not([tabindex="-1"])', to);
-    if (next) next.focus({ preventScroll: true }); else $('#main').focus({ preventScroll: true });
+    const to = (el.parentElement && el.parentElement.closest('section')) || $('#main');
+    if (!to.hasAttribute('tabindex')) to.tabIndex = -1;
+    to.focus({ preventScroll: true });
   }
 
   const rectsOf = (els) => new Map(els.map((el) => [el, el.getBoundingClientRect()]));
@@ -136,7 +138,12 @@
     const out = mutate();
     const after = el.getBoundingClientRect().height;
     if (Math.abs(after - before) > 1) {
-      el.animate([{ height: `${before}px` }, { height: `${after}px` }], { duration: DUR.slow, easing: EASE }).id = 'resize';
+      // While it shrinks, what leaves it stays inside it.
+      el.classList.add('is-resizing');
+      const a = el.animate([{ height: `${before}px` }, { height: `${after}px` }], { duration: DUR.slow, easing: EASE });
+      a.id = 'resize';
+      const end = () => { if (!el.getAnimations().some((x) => x.id === 'resize')) el.classList.remove('is-resizing'); };
+      a.finished.then(end, end);
     }
     return out;
   }
@@ -185,9 +192,8 @@
     const first = mode === 'full' ? rectsOf([...old.values(), ...leaving]) : null;
     const cols = mode === 'full' ? new Map(leaving.filter((el) => getComputedStyle(el).display === 'table-row')
       .map((el) => [el, [...el.children].map((c) => `${c.getBoundingClientRect().width}px`).join(' ')])) : null;
-    const fallback = old.values().next().value || null;
     for (const el of leaving) {
-      dropFocus(el, fallback);
+      dropFocus(el);
       if (mode === 'full') ghost(box, el, first.get(el), cols.get(el)); else el.remove();
     }
     const entering = [];
@@ -252,6 +258,8 @@
     kick();
   }
 
+  const animating = (owner) => [...loops].some((run) => run.owner === owner);
+
   // Calls draw(p) each frame with p eased from 0 to 1, replacing `owner`'s
   // previous run; with `dur` 0 or without motion, draw(1) at once.
   function frames(owner, draw, dur) {
@@ -264,7 +272,11 @@
   // Shows or hides `el` (its `hidden`) with a height and fade; in a grid or
   // flex parent its gap folds along.
   function collapse(el, show) {
-    if (el._collapse) { el._collapse.cancel(); el._collapse = null; }
+    if (el._collapse) {
+      if (el._collapse.show === show) return;  // already on its way there
+      el._collapse.cancel();
+      el._collapse = null;
+    }
     if (show === !el.hidden) return;
     if (!liveMotion()) { el.hidden = !show; return; }
     el.hidden = false;
@@ -274,6 +286,7 @@
     const shut = { height: '0px', opacity: 0, marginBottom: `${-gap}px` };
     el.style.overflow = 'hidden';
     const a = el.animate(show ? [shut, open] : [open, shut], { duration: DUR.slow, easing: EASE });
+    a.show = show;
     el._collapse = a;
     const done = () => { el.style.overflow = ''; if (el._collapse === a) el._collapse = null; };
     a.finished.then(() => { done(); if (!show) { dropFocus(el); el.hidden = true; } }, done);
@@ -906,7 +919,7 @@
       machine(j.host_id, j.host_name || hostName(j.host_id)),
       j.runner_name ? h('span', { class: 'runner mono', title: j.runner_name, text: j.runner_name }) : null);
   }
-  const countText = (v) => (isNum(v) && v > 0 ? String(Math.round(v)) : '');
+  const countText = (v) => (isNum(v) && Math.round(v) > 0 ? String(Math.round(v)) : '');
 
   function renderQueue(ov) {
     const q = ov.queue || [];
@@ -958,7 +971,8 @@
 
   function renderPools(ov) {
     const pools = ov.pools || [], leases = ov.leases || [];
-    collapse($('#pools-section'), !!(pools.length || leases.length));
+    const sec = $('#pools-section');
+    if (!pools.length && !leases.length) { collapse(sec, false); return; }
     const cards = [
       pools.length ? {
         key: 'pools', caption: 'Pools', heads: [['Repository'], ['Labels'], ['Queued', 'c-num'], ['Leases', 'c-num'], ['Oldest', 'c-num'], ['Reason']],
@@ -976,10 +990,13 @@
       } : null,
     ].filter(Boolean);
     const box = $('#pools');
-    resize(box, () => reconcile(box, cards, (c) => c.key,
-      (c) => h('div', { class: 'card' }, h('h3', { class: 'card-title', text: c.caption }), h('div', { class: 'tbl-box' })),
-      null));
-    for (const c of cards) renderTable($(`:scope > [data-key="${c.key}"]:not(.is-leaving) .tbl-box`, box), c);
+    resize(box, () => {
+      reconcile(box, cards, (c) => c.key,
+        (c) => h('div', { class: 'card' }, h('h3', { class: 'card-title', text: c.caption }), h('div', { class: 'tbl-box' })),
+        null);
+      for (const c of cards) renderTable($(`:scope > [data-key="${c.key}"]:not(.is-leaving) .tbl-box`, box), c);
+    });
+    collapse(sec, true);
   }
 
   // ---------------------------------------------------------------- charts
@@ -1081,7 +1098,8 @@
       e.preventDefault();
       showTip(c, clamp((c.idx == null ? n - 1 : c.idx) + step, 0, n - 1));
     });
-    new ResizeObserver(() => { cancelAnimationFrame(c.frame); c.frame = requestAnimationFrame(() => drawChart(c)); }).observe(plot);
+    // Mid-morph the running frames redraw at the new size anyway.
+    new ResizeObserver(() => { cancelAnimationFrame(c.frame); c.frame = requestAnimationFrame(() => { if (!animating(c)) drawChart(c); }); }).observe(plot);
     return c;
   }
   const hideAllTips = () => chartById.forEach(hideTip);
@@ -1714,13 +1732,18 @@
     const sec = $('#audit-section');
     if (state.auditErr === 'gone') { collapse(sec, false); return; }
     if (!state.audit && !state.auditErr) return;  // first load still on its way
+    fillAudit(force);
+    // Shown once filled, so it opens to its full height.
     collapse(sec, true);
+  }
+
+  function fillAudit(force) {
     const all = state.audit || [];
     const list = state.auditAll ? all : all.filter((c) => !isRead(c));
     const sig = JSON.stringify([all, state.auditAll, state.auditOpen, state.showAllAudit, state.auditErr]);
     if (!force && sig === state.auditSig) return;
     state.auditSig = sig;
-    sec.classList.toggle('is-collapsed', !state.auditOpen);
+    $('#audit-section').classList.toggle('is-collapsed', !state.auditOpen);
     tweenNumber($('#audit-count'), list.length, countText);
     const tog = $('#audit-toggle');
     tog.textContent = state.auditOpen ? 'Hide' : 'Show';
@@ -1807,14 +1830,14 @@
   function openDrawer(id, pushed) {
     const dlg = $('#drawer');
     if (dlg.open && dw.id === id) return;
-    if (!dlg.open) dw.pushed = !!pushed;
+    if (!dlg.open || dw.closing) dw.pushed = !!pushed;
     dw.id = id; dw.gen++;
     Object.assign(dw, { sig: '', cfg: null, rc: null, loading: false, error: null, add: null, confirm: null });
     dw.results.clear(); dw.busy.clear();
     renderDrawerHead();
     const x = hostById(id);
     if (!state.ov || (x && x.manageable)) loadConfig(); else renderDrawerBody();
-    if (dw.closing) { dw.closing = null; for (const a of dlg.getAnimations({ subtree: true })) a.cancel(); }
+    if (dw.closing) { for (const a of dw.closing) a.cancel(); dw.closing = null; }
     if (!dlg.open) { dlg.showModal(); document.documentElement.classList.add('has-drawer'); }
     $('#dw-body').scrollTop = 0;
     $('#dw-close').focus();
@@ -1831,9 +1854,10 @@
     dw.id = null; dw.gen++;
     const dlg = $('#drawer');
     const done = () => {
+      const anims = dw.closing || [];
       dw.closing = null;
       if (dlg.open) dlg.close();
-      for (const a of dlg.getAnimations({ subtree: true })) a.cancel();
+      for (const a of anims) a.cancel();
       document.documentElement.classList.remove('has-drawer');
       const link = $(`.host-open[data-host="${CSS.escape(id)}"]`);
       if (link) link.focus();
@@ -1843,9 +1867,10 @@
     const away = matchMedia('(max-width: 720px)').matches ? 'translateY(24px)' : 'translateX(28px)';
     const out = { duration: 200, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' };
     const a = dlg.animate([{ transform: 'none', opacity: 1 }, { transform: away, opacity: 0 }], out);
-    dlg.animate([{ opacity: 1 }, { opacity: 0 }], { ...out, pseudoElement: '::backdrop' });
-    dw.closing = a;
-    a.finished.then(() => { if (dw.closing === a) done(); }, () => {});
+    const closing = [a];
+    dw.closing = closing;
+    a.finished.then(() => { if (dw.closing === closing) done(); }, () => {});
+    try { closing.push(dlg.animate([{ opacity: 1 }, { opacity: 0 }], { ...out, pseudoElement: '::backdrop' })); } catch (_) { /* the backdrop just goes */ }
   }
 
   // Overview polls refresh the header; the body is only rebuilt when the
