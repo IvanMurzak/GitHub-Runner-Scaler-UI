@@ -51,6 +51,7 @@
     audit: null, auditErr: null, auditSig: '', showAllAudit: false,
     auditOpen: loadFlag('rm.audit.open', true),
     auditAll: loadFlag('rm.audit.all', false),
+    painted: false,     // the first overview is on screen: changes from here on animate
   };
   const serverNow = () => nowSec() + state.skew;
 
@@ -64,6 +65,238 @@
     return dflt;
   }
   function saveFlag(k, v) { try { localStorage.setItem(k, v ? '1' : '0'); } catch (_) { /* ignore */ } }
+
+  // ----------------------------------------------------------------- motion
+  // Every animated change on the page goes through these helpers, so nothing
+  // jumps and the rules live in one place:
+  //   reconcile(box, items, key, create, update)  keyed children, updated in place;
+  //                         new ones fade and grow in, gone ones fade out of the
+  //                         flow, the rest slide to their new places
+  //   flip(els, mutate)     slide elements from where they were to where `mutate` put them
+  //   resize(el, mutate)    let `el`'s height follow a change instead of jumping
+  //   tweenNumber(el, v, fmt)  count an element's number to its new value
+  //   frames(owner, draw)   run draw(p), p 0..1 eased, for SVG morphs
+  //   collapse(el, show)    show or hide an element with a height and fade
+  // Only transform, opacity and (for a container) height are animated, with
+  // the Web Animations API: CSP-safe and off the main layout path. Motion is
+  // skipped when the viewer asks for reduced motion or the tab is hidden; the
+  // first data only fades in.
+  const EASE = 'cubic-bezier(.2,.8,.2,1)';
+  const DUR = { fast: 160, base: 260, slow: 360 };
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const motionOk = () => !reducedMotion.matches && !document.hidden;
+  // Data updates: full motion once the first overview is on screen.
+  const liveMotion = () => state.painted && motionOk();
+  const easeOut = (p) => 1 - (1 - p) ** 3;
+  const mix = (a, b, p) => (isNum(a) && isNum(b) ? a + (b - a) * p : b);
+
+  function fadeIn(el, dur) {
+    if (el instanceof Element && motionOk()) el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: dur || DUR.base, easing: 'ease-out' });
+  }
+
+  // An element about to go must not keep keyboard focus: hand it to `to`, or the page.
+  function dropFocus(el, to) {
+    if (!el.contains(document.activeElement)) return;
+    const next = to && $('a[href], button:not(:disabled), [tabindex]:not([tabindex="-1"])', to);
+    if (next) next.focus({ preventScroll: true }); else $('#main').focus({ preventScroll: true });
+  }
+
+  const rectsOf = (els) => new Map(els.map((el) => [el, el.getBoundingClientRect()]));
+
+  // Plays the move from each element's `first` rect to where it is now.
+  function playFlip(first) {
+    const moves = [];
+    for (const el of first.keys()) for (const a of el.getAnimations()) if (a.id === 'flip') a.cancel();
+    for (const [el, r] of first) {
+      if (!el.isConnected) continue;
+      const n = el.getBoundingClientRect();
+      const dx = r.left - n.left, dy = r.top - n.top;
+      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) moves.push([el, dx, dy]);
+    }
+    for (const [el, dx, dy] of moves) {
+      el.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'none' }], { duration: DUR.slow, easing: EASE }).id = 'flip';
+    }
+  }
+
+  // Runs `mutate`, then slides `els` from their old places to their new ones.
+  function flip(els, mutate) {
+    if (!liveMotion()) return mutate();
+    const first = rectsOf(els);
+    const out = mutate();
+    playFlip(first);
+    return out;
+  }
+
+  // Runs `mutate`, then animates `el`'s height from before to after, so what
+  // follows it on the page glides instead of jumping.
+  function resize(el, mutate) {
+    if (!liveMotion() || !el.isConnected) return mutate();
+    const before = el.getBoundingClientRect().height;
+    for (const a of el.getAnimations()) if (a.id === 'resize') a.cancel();
+    const out = mutate();
+    const after = el.getBoundingClientRect().height;
+    if (Math.abs(after - before) > 1) {
+      el.animate([{ height: `${before}px` }, { height: `${after}px` }], { duration: DUR.slow, easing: EASE }).id = 'resize';
+    }
+    return out;
+  }
+
+  // Takes a leaving element out of the flow where it stands and fades it out.
+  // `r`: its rect, `cols`: its cells' widths when it is a table row.
+  function ghost(box, el, r, cols) {
+    const br = box.getBoundingClientRect();
+    el.classList.add('is-leaving');
+    el.inert = true;
+    el.setAttribute('aria-hidden', 'true');
+    if (cols) { el.style.display = 'grid'; el.style.gridTemplateColumns = cols; el.style.alignItems = 'center'; }
+    for (const [k, v] of Object.entries({
+      position: 'absolute', margin: '0', left: `${r.left - br.left - box.clientLeft}px`, top: `${r.top - br.top - box.clientTop}px`,
+      width: `${r.width}px`, height: `${r.height}px`, pointerEvents: 'none',
+    })) el.style[k] = v;
+    const a = el.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(0.96)' }], { duration: DUR.base, easing: EASE, fill: 'forwards' });
+    a.finished.then(() => el.remove(), () => el.remove());
+  }
+
+  // Makes `box`'s children one element per item, in order, matched by key
+  // (`data-key`; a repeated key gets a `#n` suffix). Kept elements are passed
+  // to `update`, so their transitions and focus carry over; `create` makes new
+  // ones. Children without a key (a skeleton) are replaced. When most of the
+  // list changes at once (a filter), the whole list crossfades instead: rows
+  // sliding through rows that fade out read as noise.
+  function reconcile(box, items, keyOf, create, update) {
+    let mode = !motionOk() || !box.getClientRects().length ? 'none' : state.painted ? 'full' : 'fade';
+    const seen = new Map();
+    const keys = items.map((it, i) => {
+      const k = String(keyOf(it, i));
+      const n = (seen.get(k) || 0) + 1;
+      seen.set(k, n);
+      return n > 1 ? `${k}#${n}` : k;
+    });
+    const want = new Set(keys);
+    const old = new Map(), leaving = [];
+    for (const el of box.children) {
+      if (el.classList.contains('is-leaving')) continue;
+      if (el.dataset.key != null && want.has(el.dataset.key)) old.set(el.dataset.key, el);
+      else leaving.push(el);
+    }
+    const fresh = keys.filter((k) => !old.has(k)).length;
+    if (mode === 'full' && leaving.length && fresh && leaving.length + fresh > old.size) mode = 'swap';
+    // Read everything first, then write: one layout pass each way.
+    const first = mode === 'full' ? rectsOf([...old.values(), ...leaving]) : null;
+    const cols = mode === 'full' ? new Map(leaving.filter((el) => getComputedStyle(el).display === 'table-row')
+      .map((el) => [el, [...el.children].map((c) => `${c.getBoundingClientRect().width}px`).join(' ')])) : null;
+    const fallback = old.values().next().value || null;
+    for (const el of leaving) {
+      dropFocus(el, fallback);
+      if (mode === 'full') ghost(box, el, first.get(el), cols.get(el)); else el.remove();
+    }
+    const entering = [];
+    let ref = box.firstElementChild;
+    items.forEach((it, i) => {
+      let el = old.get(keys[i]);
+      if (el) { if (update) update(el, it); }
+      else { el = create(it); el.dataset.key = keys[i]; entering.push(el); }
+      while (ref && ref !== el && ref.classList.contains('is-leaving')) ref = ref.nextElementSibling;
+      if (el === ref) ref = ref.nextElementSibling; else box.insertBefore(el, ref);
+    });
+    if (mode === 'none') return;
+    if (mode === 'swap') { box.animate([{ opacity: 0.2 }, { opacity: 1 }], { duration: DUR.base, easing: 'ease-out' }); return; }
+    if (mode === 'full') { for (const el of leaving) first.delete(el); playFlip(first); }
+    const enter = mode === 'full'
+      ? [{ opacity: 0, transform: 'translateY(6px) scale(0.97)' }, { opacity: 1, transform: 'none' }]
+      : [{ opacity: 0 }, { opacity: 1 }];
+    for (const el of entering) el.animate(enter, { duration: mode === 'full' ? DUR.slow : DUR.slow + 60, easing: EASE });
+  }
+
+  // ---- numbers and frames: one requestAnimationFrame loop for all of them
+  const tweens = new Map();   // element -> { from, to, t0, dur, fmt, value }
+  const loops = new Set();    // frames() runs: { owner, draw, t0, dur }
+  let raf = 0;
+  function kick() { if (!raf) raf = requestAnimationFrame(step); }
+  function step(now) {
+    raf = 0;
+    for (const [el, tw] of tweens) {
+      const p = Math.min(1, (now - tw.t0) / tw.dur);
+      tw.value = p >= 1 ? tw.to : tw.from + (tw.to - tw.from) * easeOut(p);
+      el.textContent = tw.fmt(tw.value);
+      if (p >= 1) tweens.delete(el);
+    }
+    for (const run of loops) {
+      const p = Math.min(1, Math.max(0, (now - run.t0) / run.dur));
+      if (p >= 1) loops.delete(run);
+      run.draw(easeOut(p));
+    }
+    if (tweens.size || loops.size) kick();
+  }
+  // Ends every running tween and frame run at its final value (the tab hid).
+  function settleMotion() {
+    for (const [el, tw] of tweens) el.textContent = tw.fmt(tw.to);
+    tweens.clear();
+    const runs = [...loops];
+    loops.clear();
+    for (const run of runs) run.draw(1);
+  }
+
+  // Sets `el`'s text to fmt(to), counting from the number it shows now.
+  function tweenNumber(el, to, fmt) {
+    const from = el._num;
+    el._num = to;
+    const run = tweens.get(el);
+    if (!isNum(to) || !isNum(from) || !liveMotion()) {
+      tweens.delete(el);
+      el.textContent = fmt(to);
+      return;
+    }
+    if (from === to) { if (run) run.fmt = fmt; else el.textContent = fmt(to); return; }
+    tweens.set(el, { from: run ? run.value : from, to, t0: performance.now(), dur: DUR.slow + 240, fmt, value: from });
+    kick();
+  }
+
+  // Calls draw(p) each frame with p eased from 0 to 1, replacing `owner`'s
+  // previous run; with `dur` 0 or without motion, draw(1) at once.
+  function frames(owner, draw, dur) {
+    for (const run of loops) if (run.owner === owner) loops.delete(run);
+    if (dur === 0 || !liveMotion()) { draw(1); return; }
+    loops.add({ owner, draw, t0: performance.now(), dur: dur || DUR.slow + 120 });
+    kick();
+  }
+
+  // Shows or hides `el` (its `hidden`) with a height and fade; in a grid or
+  // flex parent its gap folds along.
+  function collapse(el, show) {
+    if (el._collapse) { el._collapse.cancel(); el._collapse = null; }
+    if (show === !el.hidden) return;
+    if (!liveMotion()) { el.hidden = !show; return; }
+    el.hidden = false;
+    const h0 = el.getBoundingClientRect().height;
+    const gap = parseFloat(getComputedStyle(el.parentElement).rowGap) || 0;
+    const open = { height: `${h0}px`, opacity: 1, marginBottom: '0px' };
+    const shut = { height: '0px', opacity: 0, marginBottom: `${-gap}px` };
+    el.style.overflow = 'hidden';
+    const a = el.animate(show ? [shut, open] : [open, shut], { duration: DUR.slow, easing: EASE });
+    el._collapse = a;
+    const done = () => { el.style.overflow = ''; if (el._collapse === a) el._collapse = null; };
+    a.finished.then(() => { done(); if (!show) { dropFocus(el); el.hidden = true; } }, done);
+  }
+
+  // A segmented control's active background slides between its buttons.
+  function segThumb(seg) {
+    if (!seg._thumb) {
+      seg._thumb = h('span', { class: 'seg-thumb', 'aria-hidden': 'true' });
+      seg.prepend(seg._thumb);
+      seg.classList.add('has-thumb');
+      new ResizeObserver(() => placeThumb(seg, false)).observe(seg);
+    }
+    placeThumb(seg, true);
+  }
+  function placeThumb(seg, animate) {
+    const th = seg._thumb, b = $('.seg-btn[aria-pressed="true"]', seg);
+    if (!b || !b.offsetWidth) { th.classList.remove('on'); return; }
+    th.classList.toggle('no-anim', !animate || !th.classList.contains('on') || !motionOk());
+    th.style.setProperty('--x', `${b.offsetLeft}px`);
+    th.style.setProperty('--w', `${b.offsetWidth}px`);
+    th.classList.add('on');
+  }
 
   // ------------------------------------------------------------- formatting
   function fmtDur(secs) {
@@ -136,6 +369,7 @@
   async function boot() {
     $('#signout').addEventListener('click', signOut);
     $('#recent-toggle').addEventListener('click', () => { state.showAllRecent = !state.showAllRecent; if (state.ov) renderRecent(state.ov); });
+    reducedMotion.addEventListener('change', settleMotion);
     buildRangeSwitch();
     buildAuditControls();
     setupDrawer();
@@ -178,6 +412,8 @@
       h('span', { class: 'who-login', text: u.login || '' }),
     ]);
     who.title = u.login ? `Signed in as ${u.login}` : '';
+    renderSkeletons();
+    renderChartFrames();
     startTimers();
     const id = hashHost();
     if (id) openDrawer(id, false);
@@ -205,7 +441,7 @@
   const polling = () => !document.hidden && !$('#app').hidden;
   function onVisibility() {
     if ($('#app').hidden) return;
-    if (document.hidden) stopTimers(); else startTimers();
+    if (document.hidden) { stopTimers(); settleMotion(); } else startTimers();
   }
 
   async function loadOverview() {
@@ -254,24 +490,29 @@
   function renderUpdate(ov) {
     const u = ov.update;
     const banner = $('#banner'), chip = $('#update-chip');
-    banner.replaceChildren(); banner.hidden = true; chip.hidden = true;
-    if (!u) return;
-    if (u.state === 'rolled_back' || u.state === 'failed') {
+    const failed = u && (u.state === 'rolled_back' || u.state === 'failed');
+    if (failed) {
       const title = u.state === 'rolled_back' ? 'Update rolled back' : 'Update failed';
       const meta = [
         u.current && `running v${u.current}`,
         u.latest && u.latest !== u.current && `target v${u.latest}`,
       ].filter(Boolean).join(' · ');
-      banner.hidden = false;
-      banner.append(h('div', { class: 'banner', role: 'alert' },
-        h('span', { class: 'banner-icon', 'aria-hidden': 'true', text: '!' }),
-        h('div', { class: 'banner-body' },
-          h('strong', { text: title }),
-          u.message ? h('p', { text: u.message }) : null,
-          h('p', { class: 'banner-meta' }, meta, meta ? ' · ' : '', 'checked ', ago(u.checked_at))),
-      ));
-    } else if (u.state === 'updated' && isNum(u.changed_at) && serverNow() - u.changed_at < 86400) {
-      chip.hidden = false;
+      // Rebuilt only when it says something new: a role=alert is read out again on every rebuild.
+      const sig = JSON.stringify([title, u.message, meta, u.checked_at]);
+      if (banner.dataset.sig !== sig) {
+        banner.dataset.sig = sig;
+        banner.replaceChildren(h('div', { class: 'banner', role: 'alert' },
+          h('span', { class: 'banner-icon', 'aria-hidden': 'true', text: '!' }),
+          h('div', { class: 'banner-body' },
+            h('strong', { text: title }),
+            u.message ? h('p', { text: u.message }) : null,
+            h('p', { class: 'banner-meta' }, meta, meta ? ' · ' : '', 'checked ', ago(u.checked_at)))));
+      }
+    } else banner.dataset.sig = '';
+    collapse(banner, !!failed);
+    const fresh = u && !failed && u.state === 'updated' && isNum(u.changed_at) && serverNow() - u.changed_at < 86400;
+    chip.hidden = !fresh;
+    if (fresh) {
       chip.textContent = `Updated to v${u.current || ov.version}`;
       chip.title = [u.message, `${fmtAgo(u.changed_at)}`].filter(Boolean).join(' · ');
     }
@@ -291,36 +532,82 @@
     renderPools(ov);
     renderLive();
     syncDrawer();
+    state.painted = true;
   }
 
-  function meterBar(pct, extra) {
+  // Placeholders of about the size of what comes, so the first data does not push the page around.
+  function renderSkeletons() {
+    if (state.painted) return;
+    const line = (w) => h('span', { class: `sk ${w}` });
+    $('#kpis').replaceChildren(...KPIS.map(() => h('div', { class: 'kpi kpi-sk', 'aria-hidden': 'true' }, line('w50'), line('w30 sk-big'), line('w60'))));
+    $('#hosts').replaceChildren(...[1, 2, 3].map(() => h('div', { class: 'host host-sk', 'aria-hidden': 'true' },
+      line('w40 sk-big'), line('w70'), line('w60'), line('w70'), h('span', { class: 'sk sk-spark' }), line('w50'))));
+    const rows = (n) => h('div', { class: 'tbl-sk', 'aria-hidden': 'true' }, Array.from({ length: n }, (_, i) => line(['w70', 'w50', 'w60'][i % 3])));
+    for (const [id, n] of [['#queue', 3], ['#running', 3], ['#recent', 5]]) $(id).replaceChildren(rows(n));
+  }
+
+  function setBar(el, pct) {
     const p = isNum(pct) ? clamp(pct, 0, 100) : 0;
     const level = !isNum(pct) ? 'none' : p >= 90 ? 'err' : p >= 75 ? 'high' : p >= 50 ? 'warn' : 'ok';
-    return h('span', { class: `bar bar-${level} ${extra || ''}`, role: 'presentation', vars: { '--pct': `${p}%` } });
+    el.setAttribute('class', `bar bar-${level}${el.dataset.extra ? ` ${el.dataset.extra}` : ''}`);
+    el.style.setProperty('--pct', `${p}%`);
+  }
+  function meterBar(pct, extra) {
+    const el = h('span', { role: 'presentation', 'data-extra': extra || null });
+    setBar(el, pct);
+    return el;
   }
 
-  function kpi(label, value, sub, extra) {
-    return h('div', { class: 'kpi' },
-      h('p', { class: 'kpi-label', text: label }),
-      h('p', { class: 'kpi-value' }, value),
-      sub ? h('p', { class: 'kpi-sub' }, sub) : null,
-      extra || null);
+  // ------------------------------------------------------------------ KPIs
+  // The summary tiles, in order. Each fills its own tile: `value` gives the
+  // big number and what it is out of, `sub` the line under it.
+  const KPIS = [
+    { key: 'machines', label: 'Machines online', value: (c) => [c.sm.hosts_online, c.sm.hosts_total] },
+    {
+      key: 'slots', label: 'Runner slots busy', value: (c) => [c.sm.slots_busy, c.sm.slots_total], bar: (c) => c.pct,
+      sub: (c, el) => { el.textContent = isNum(c.pct) ? `${Math.round(c.pct)}% utilised` : ''; },
+    },
+    {
+      key: 'jobs', label: 'Jobs running / queued', value: (c) => [c.sm.jobs_running, c.sm.jobs_queued],
+      sub: (c, el) => {
+        const sig = JSON.stringify([c.runHosts, !!c.sm.jobs_running, c.oldest && c.oldest.queued_at]);
+        if (el.dataset.sig !== sig) { el.dataset.sig = sig; el.replaceChildren(...[jobsSub(c.sm, c.runHosts, c.oldest)].filter(Boolean)); }
+      },
+    },
+    {
+      key: 'wait', label: 'Queue wait p50', value: (c) => [c.sm.p50_queue_wait_secs], fmt: fmtDur,
+      sub: (c, el) => {
+        if (!el.firstChild) el.append('p90 ', h('b', { class: 'num' }));
+        tweenNumber(el.lastChild, c.sm.p90_queue_wait_secs, fmtDur);
+      },
+    },
+  ];
+
+  function kpiTile(k) {
+    const el = h('div', { class: 'kpi' },
+      h('p', { class: 'kpi-label', text: k.label }),
+      h('p', { class: 'kpi-value' }, h('span', { class: 'num' }, h('span', { class: 'kpi-a' }), k.fmt ? null : h('small', {}, ' / ', h('span', { class: 'kpi-b' })))),
+      k.sub ? h('p', { class: 'kpi-sub' }) : null,
+      k.bar ? meterBar(null, 'kpi-bar') : null);
+    return el;
+  }
+  function fillKpi(el, k, c) {
+    const [a, b] = k.value(c);
+    tweenNumber($('.kpi-a', el), a, k.fmt || fmtInt);
+    if (!k.fmt) tweenNumber($('.kpi-b', el), b, fmtInt);
+    if (k.sub) k.sub(c, $('.kpi-sub', el));
+    if (k.bar) setBar($('.bar', el), k.bar(c));
   }
 
   function renderKpis(ov) {
     const sm = ov.summary || {};
-    const pct = isNum(sm.slots_busy) && sm.slots_total > 0 ? (sm.slots_busy / sm.slots_total) * 100 : null;
-    const oldest = (ov.queue || [])[0];
-    const runHosts = new Set((ov.running || []).map((j) => j.host_id).filter(Boolean)).size;
-    $('#kpis').replaceChildren(
-      kpi('Machines online', h('span', { class: 'num' }, fmtInt(sm.hosts_online), h('small', { text: ` / ${fmtInt(sm.hosts_total)}` }))),
-      kpi('Runner slots busy', h('span', { class: 'num' }, fmtInt(sm.slots_busy), h('small', { text: ` / ${fmtInt(sm.slots_total)}` })),
-        isNum(pct) ? `${Math.round(pct)}% utilised` : null, meterBar(pct, 'kpi-bar')),
-      kpi('Jobs running / queued', h('span', { class: 'num' }, fmtInt(sm.jobs_running), h('small', { text: ` / ${fmtInt(sm.jobs_queued)}` })),
-        jobsSub(sm, runHosts, oldest)),
-      kpi('Queue wait p50', h('span', { class: 'num', text: fmtDur(sm.p50_queue_wait_secs) }),
-        h('span', {}, 'p90 ', h('b', { class: 'num', text: fmtDur(sm.p90_queue_wait_secs) }))),
-    );
+    const c = {
+      sm,
+      pct: isNum(sm.slots_busy) && sm.slots_total > 0 ? (sm.slots_busy / sm.slots_total) * 100 : null,
+      oldest: (ov.queue || [])[0],
+      runHosts: new Set((ov.running || []).map((j) => j.host_id).filter(Boolean)).size,
+    };
+    reconcile($('#kpis'), KPIS, (k) => k.key, (k) => { const el = kpiTile(k); fillKpi(el, k, c); return el; }, (el, k) => fillKpi(el, k, c));
   }
 
   // `on 3 machines · oldest waits 1m 12s`, or `all idle`.
@@ -333,14 +620,28 @@
   }
 
   // ---------------------------------------------------------------- hosts
-  // The one client-side sort: colours follow the name order of every known host in
-  // either list, so they stay put when a host goes offline. The lists come sorted.
+  // Colours follow the name order of every known host in either list, and a
+  // host keeps its colour while it stays known, so one that appears or goes
+  // offline does not recolour the others.
   function assignHostColors() {
     const names = new Map();
     for (const x of (state.ov && state.ov.hosts) || []) names.set(x.id, x.name || x.hostname || x.id);
     for (const x of (state.metrics && state.metrics.hosts) || []) if (!names.has(x.id)) names.set(x.id, x.name || x.id);
     const ids = [...names.keys()].sort((a, b) => String(names.get(a)).localeCompare(String(names.get(b))));
-    state.hostColors = new Map(ids.map((id, i) => [id, `var(--s${(i % 8) + 1})`]));
+    const prev = state.hostColors, next = new Map(), used = new Set();
+    for (const id of ids) {
+      const c = prev.get(id);
+      if (c && !used.has(c) && used.size < 8) { next.set(id, c); used.add(c); }
+    }
+    let i = 0;
+    for (const id of ids) {
+      if (next.has(id)) continue;
+      while (used.size < 8 && used.has(`var(--s${(i % 8) + 1})`)) i++;
+      const c = `var(--s${(i % 8) + 1})`;
+      next.set(id, c); used.add(c); i++;
+    }
+    state.hostColors = next;
+    state.colorSig = JSON.stringify([...next]);
   }
   const hostColor = (id) => state.hostColors.get(id) || 'var(--muted)';
   const hostDot = (id) => h('span', { class: 'host-dot', 'aria-hidden': 'true', vars: { '--c': hostColor(id) } });
@@ -354,11 +655,15 @@
   }
   const OS_NAME = { linux: 'Linux', windows: 'Windows', macos: 'macOS' };
 
-  function meterRow(label, pct, value) {
+  function meterRow(label) {
     return h('div', { class: 'meter' },
       h('span', { class: 'meter-label', text: label }),
-      h('span', { class: 'meter-value num', text: value }),
-      meterBar(pct));
+      h('span', { class: 'meter-value num' }),
+      meterBar(null));
+  }
+  function setMeter(row, pct, value, fmt) {
+    tweenNumber($('.meter-value', row), value, fmt);
+    setBar($('.bar', row), pct);
   }
 
   const peakOf = (vals) => { const v = (vals || []).filter(isNum); return v.length ? Math.max(...v) : null; };
@@ -371,78 +676,167 @@
     });
   }
 
-  function sparkline(hostId) {
+  // A series' value at time `t`, from the group that holds it.
+  const sampleAt = (d, vals, t) => {
+    if (!d || !vals || !d.t.length) return null;
+    const i = Math.floor((t - d.t[0]) / d.step);
+    return i >= 0 && i < d.t.length ? vals[i] : null;
+  };
+
+  // The CPU and memory sparkline: on new samples the lines slide left by
+  // their time and the values ease to their new heights.
+  function setSpark(box, hostId) {
     const m = state.metrics;
     const mh = m && (m.hosts || []).find((x) => x.id === hostId);
-    if (!mh || !Array.isArray(mh.cpu) || mh.cpu.filter(isNum).length < 2) return h('div', { class: 'spark spark-empty', text: 'No CPU history yet' });
+    if (!mh || !Array.isArray(mh.cpu) || mh.cpu.filter(isNum).length < 2) {
+      if (!box.classList.contains('spark-empty')) { box._d = null; box.className = 'spark spark-empty'; box.replaceChildren('No CPU history yet'); fadeIn(box); }
+      return;
+    }
     const rawRam = ramPct(mh);
     const g = regroup(m.t || [], m.step_secs || 60, groupOf(mh.cpu.length, SPARK_POINTS), [mh.cpu, rawRam]);
-    const [cpu, mem] = g.series;
-    const n = cpu.length, W = 120, H = 32;
-    const toPts = (vals) => vals.map((v, i) => (isNum(v) ? [(i / Math.max(1, n - 1)) * W, H - (clamp(v, 0, 100) / 100) * (H - 2) - 1] : null));
-    const cpuPts = toPts(cpu);
-    // Peaks from the samples: an averaged group hides a short spike.
+    const d = { t: g.t, step: g.step, vals: g.series };
+    const sig = JSON.stringify([d, m.range]);
     const cpuPeak = peakOf(mh.cpu), ramPeak = peakOf(rawRam);
-    return h('div', { class: 'spark' },
-      s('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', role: 'img', 'aria-label': `CPU and memory over the ${RANGE_LABEL[m.range] || m.range}: CPU peak ${fmtPct(cpuPeak)}, memory peak ${fmtPct(ramPeak)}` },
-        s('path', { class: 'spark-area', d: areaPath(cpuPts, H, true) }),
-        s('path', { class: 'spark-line spark-ram', d: linePath(toPts(mem), true), 'vector-effect': 'non-scaling-stroke' }),
-        s('path', { class: 'spark-line', d: linePath(cpuPts, true), 'vector-effect': 'non-scaling-stroke' })),
-      h('span', { class: 'spark-cap' },
-        h('span', {}, h('i', { class: 'spark-key', 'aria-hidden': 'true' }), 'CPU', h('i', { class: 'spark-key spark-key-ram', 'aria-hidden': 'true' }), `RAM · ${m.range}`),
-        h('span', { class: 'num', text: `peak ${fmtPct(cpuPeak)} · ${fmtPct(ramPeak)}` })));
+    const W = 120, H = 32;
+    if (box.classList.contains('spark-empty') || !box.firstChild) {
+      box.className = 'spark';
+      box.replaceChildren(
+        s('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', role: 'img' },
+          s('path', { class: 'spark-area' }),
+          s('path', { class: 'spark-line spark-ram', 'vector-effect': 'non-scaling-stroke' }),
+          s('path', { class: 'spark-line', 'vector-effect': 'non-scaling-stroke' })),
+        h('span', { class: 'spark-cap' },
+          h('span', {}, h('i', { class: 'spark-key', 'aria-hidden': 'true' }), 'CPU', h('i', { class: 'spark-key spark-key-ram', 'aria-hidden': 'true' }), h('span', { class: 'spark-range' })),
+          h('span', { class: 'num spark-peak' })));
+      box._d = null;
+      box._sig = null;
+      fadeIn(box);
+    }
+    if (box._sig === sig) return;
+    box._sig = sig;
+    const svg = $('svg', box);
+    const [area, ram, cpu] = svg.children;
+    svg.setAttribute('aria-label', `CPU and memory over the ${RANGE_LABEL[m.range] || m.range}: CPU peak ${fmtPct(cpuPeak)}, memory peak ${fmtPct(ramPeak)}`);
+    $('.spark-range', box).textContent = `RAM · ${m.range}`;
+    $('.spark-peak', box).textContent = `peak ${fmtPct(cpuPeak)} · ${fmtPct(ramPeak)}`;
+    const from = box._d;
+    const n = d.t.length;
+    const draw = (p) => {
+      const t0 = mix(from && from.t[0], d.t[0], p), t1 = mix(from && from.t[from.t.length - 1], d.t[n - 1], p);
+      const pts = (k) => d.vals[k].map((v, i) => {
+        const val = mix(sampleAt(from, from && from.vals[k], d.t[i]), v, p);
+        return isNum(val) ? [((d.t[i] - t0) / (t1 - t0 || 1)) * W, H - (clamp(val, 0, 100) / 100) * (H - 2) - 1] : null;
+      });
+      const cpuPts = pts(0);
+      area.setAttribute('d', areaPath(cpuPts, H, true));
+      cpu.setAttribute('d', linePath(cpuPts, true));
+      ram.setAttribute('d', linePath(pts(1), true));
+    };
+    box._d = d;
+    frames(box, draw, from ? null : 0);
   }
 
-  function hostCard(x) {
+  // A slot of a card that is rebuilt only when what it shows (`sig`) changed.
+  function slot(card, name, sig, build) {
+    const r = card._r;
+    if (r[`${name}Sig`] === sig) return;
+    const fresh = r[`${name}Sig`] !== undefined;
+    r[`${name}Sig`] = sig;
+    const node = build() || document.createComment(name);
+    r[name].replaceWith(node);
+    r[name] = node;
+    if (fresh && liveMotion()) fadeIn(node, DUR.slow);
+  }
+
+  function hostCard() {
+    const el = h('article', { class: 'host' });
+    const r = {
+      dot: hostDot(null),
+      link: h('a', { class: 'host-open' }),
+      sub: document.createComment('sub'),
+      status: h('span', { class: 'status' }, h('i', { 'aria-hidden': 'true' }), h('span')),
+      access: document.createComment('access'),
+      cpu: meterRow('CPU'), mem: meterRow('Memory'), slots: meterRow('Slots'),
+      spark: h('div', { class: 'spark' }),
+      ver: document.createComment('ver'),
+      disk: document.createComment('disk'),
+      up: document.createComment('up'),
+    };
+    el._r = r;
+    append(el, [
+      h('header', { class: 'host-head' }, r.dot,
+        h('div', { class: 'host-id' }, h('h3', { class: 'host-name' }, r.link), r.sub),
+        h('div', { class: 'host-badges' }, r.status, r.access)),
+      h('div', { class: 'host-meters' }, r.cpu, r.mem, r.slots),
+      r.spark, r.ver,
+      h('footer', { class: 'host-foot' }, r.disk, r.up),
+    ]);
+    return el;
+  }
+
+  // Updates a machine card in place: its meters and numbers glide, its status crossfades.
+  function fillHost(el, x) {
+    const r = el._r;
     const st = hostStatus(x);
+    const name = x.name || x.hostname || x.id;
+    el.setAttribute('class', `host is-${st.key}`);
+    el.setAttribute('aria-label', `${name}, ${st.label}`);
+    r.dot.style.setProperty('--c', hostColor(x.id));
+    r.link.textContent = name;
+    r.link.href = `#host=${encodeURIComponent(x.id)}`;
+    r.link.dataset.host = x.id;
+    r.link.parentNode.title = x.hostname || '';
+    r.status.setAttribute('class', `status status-${st.key}`);
+    r.status.lastChild.textContent = st.label;
+    const os = String(x.os || '').toLowerCase();
+    slot(el, 'sub', JSON.stringify([os, x.arch, x.cores]), () => h('p', { class: 'host-sub' },
+      h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' }),
+      [x.arch, isNum(x.cores) ? `${x.cores} cores` : null].filter(Boolean).join(' · ')));
+    slot(el, 'access', JSON.stringify([x.online, x.manageable, !!x.remote_changes]), () => accessChip(x, !!x.remote_changes));
+
     const total = isNum(x.ram_bytes) ? x.ram_bytes : null;
     const used = total != null && isNum(x.free_ram_bytes) ? total - x.free_ram_bytes : null;
     const slots = (x.busy_slots || 0) + (x.free_slots || 0);
-    const os = String(x.os || '').toLowerCase();
-    return h('article', { class: `host is-${st.key}`, 'aria-label': `${x.name || x.hostname}, ${st.label}` },
-      h('header', { class: 'host-head' },
-        hostDot(x.id),
-        h('div', { class: 'host-id' },
-          h('h3', { class: 'host-name', title: x.hostname || null },
-            h('a', { class: 'host-open', href: `#host=${encodeURIComponent(x.id)}`, 'data-host': x.id, text: x.name || x.hostname || x.id })),
-          h('p', { class: 'host-sub' },
-            h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' }),
-            [x.arch, isNum(x.cores) ? `${x.cores} cores` : null].filter(Boolean).join(' · '))),
-        h('div', { class: 'host-badges' },
-          h('span', { class: `status status-${st.key}` }, h('i', { 'aria-hidden': 'true' }), st.label),
-          accessChip(x, !!x.remote_changes))),
-      h('div', { class: 'host-meters' },
-        meterRow('CPU', x.cpu_load_percent, fmtPct(x.cpu_load_percent)),
-        meterRow('Memory', used != null && total ? (used / total) * 100 : null, `${fmtBytes(used)} / ${fmtBytes(total)}`),
-        meterRow('Slots', slots ? ((x.busy_slots || 0) / slots) * 100 : null, slots ? `${x.busy_slots || 0} / ${slots}` : '—')),
-      sparkline(x.id),
-      versionLine(x),
-      h('footer', { class: 'host-foot' },
-        diskLine(x),
-        !x.online ? h('span', {}, 'Last seen ', ago(x.last_seen_at))
-          : isNum(x.connected_since) ? h('span', {}, 'Up ', since(x.connected_since)) : null));
+    setMeter(r.cpu, x.cpu_load_percent, isNum(x.cpu_load_percent) ? x.cpu_load_percent : null, fmtPct);
+    setMeter(r.mem, used != null && total ? (used / total) * 100 : null, used, (v) => `${fmtBytes(v)} / ${fmtBytes(total)}`);
+    setMeter(r.slots, slots ? ((x.busy_slots || 0) / slots) * 100 : null, slots ? x.busy_slots || 0 : null, (v) => (isNum(v) ? `${Math.round(v)} / ${slots}` : '—'));
+    setSpark(r.spark, x.id);
+    slot(el, 'ver', versionSig(x), () => versionLine(x));
+
+    const dt = x.disk_total_bytes, df = x.disk_free_bytes;
+    const sized = isNum(dt) && dt > 0 && isNum(df);
+    slot(el, 'disk', String(sized), () => (sized
+      ? h('span', { class: 'disk' }, h('span', {}, 'Disk ', h('b', { class: 'num' })), meterBar(null))
+      : h('span', {}, 'Disk free ', h('b', { class: 'num' }))));
+    // `Disk 176 GiB / 1.5 TiB` with a meter, from 0.4.66; free space before.
+    if (sized) {
+      const usedDisk = Math.max(0, dt - df);
+      r.disk.title = `${fmtBytes(df)} free`;
+      tweenNumber($('b', r.disk), usedDisk, (v) => `${fmtBytes(v)} / ${fmtBytes(dt)}`);
+      setBar($('.bar', r.disk), (usedDisk / dt) * 100);
+    } else tweenNumber($('b', r.disk), df, fmtBytes);
+    slot(el, 'up', JSON.stringify(x.online ? [x.connected_since] : [null, x.last_seen_at]), () => (!x.online ? h('span', {}, 'Last seen ', ago(x.last_seen_at))
+      : isNum(x.connected_since) ? h('span', {}, 'Up ', since(x.connected_since)) : null));
   }
 
-  // `Disk 176 GiB / 1.5 TiB` with a meter, from 0.4.66; free space before.
-  function diskLine(x) {
-    const total = x.disk_total_bytes, free = x.disk_free_bytes;
-    if (!isNum(total) || total <= 0 || !isNum(free)) return h('span', {}, 'Disk free ', h('b', { class: 'num', text: fmtBytes(free) }));
-    const used = Math.max(0, total - free);
-    return h('span', { class: 'disk', title: `${fmtBytes(free)} free` },
-      h('span', {}, 'Disk ', h('b', { class: 'num', text: `${fmtBytes(used)} / ${fmtBytes(total)}` })),
-      meterBar((used / total) * 100));
+  // The order of the machine cards: online first, then by name.
+  function hostOrder(hosts) {
+    return [...hosts].sort((a, b) => (b.online - a.online) || String(a.name || a.hostname).localeCompare(String(b.name || b.hostname)));
   }
 
   function renderHosts(ov) {
-    const hosts = ov.hosts || [];  // online first, then by name
+    const hosts = hostOrder(ov.hosts || []);
     const on = hosts.filter((x) => x.online).length;
     $('#machines-count').textContent = hosts.length ? `${on} of ${hosts.length} online` : '';
-    // Cards are rebuilt on every poll: keep keyboard focus on the same card.
-    const f = document.activeElement;
-    const keep = f && f.classList && f.classList.contains('host-open') ? f.dataset.host : null;
-    $('#hosts').replaceChildren(...(hosts.length ? hosts.map(hostCard)
-      : [empty('No machines enrolled yet', 'Machines appear here once their runner-manager agent connects.')]));
-    if (keep) { const el = $(`.host-open[data-host="${CSS.escape(keep)}"]`); if (el) el.focus({ preventScroll: true }); }
+    const box = $('#hosts');
+    resize(box, () => reconcile(box, hosts.length ? hosts : [null], (x) => (x ? x.id : 'empty'),
+      (x) => {
+        if (!x) return empty('No machines enrolled yet', 'Machines appear here once their runner-manager agent connects.');
+        const el = hostCard();
+        fillHost(el, x);
+        return el;
+      },
+      (el, x) => { if (x) fillHost(el, x); }));
   }
 
   // ---------------------------------------------------------------- tables
@@ -476,6 +870,34 @@
       h('thead', {}, h('tr', {}, heads.map((x) => h('th', { scope: 'col', class: x[1] || null, text: x[0] })))),
       h('tbody', {}, rows));
   }
+
+  // A table of `spec.items` in `box`, a row per item keyed by `spec.key`, or
+  // `spec.empty()` when there are none. Rows come and go animated; a row is
+  // rebuilt only when its item (or a machine's name or colour) changed.
+  // `spec.before` / `spec.after`: more keyed blocks around it ({ key, create, update }).
+  function renderTable(box, spec) {
+    const blocks = [
+      ...(spec.before || []),
+      spec.items.length ? { key: 'tbl', create: () => table(spec.caption, spec.heads, []) } : {
+        key: 'empty', create: spec.empty,
+        update: (el) => { const n = spec.empty(); if (n.textContent !== el.textContent) el.replaceChildren(...n.childNodes); },
+      },
+      ...(spec.after || []),
+    ];
+    resize(box, () => {
+      reconcile(box, blocks, (b) => b.key, (b) => b.create(), (el, b) => { if (b.update) b.update(el); });
+      const tb = $(':scope > table:not(.is-leaving) > tbody', box);
+      if (!tb) return;
+      const fill = (tr, it) => {
+        const sig = JSON.stringify([it, spec.sig ? spec.sig(it) : null]) + state.colorSig;
+        if (tr._sig === sig) return;
+        tr._sig = sig;
+        tr.replaceChildren(...spec.row(it));
+      };
+      reconcile(tb, spec.items, spec.key, (it) => { const tr = h('tr'); fill(tr, it); return tr; }, fill);
+    });
+  }
+
   function hostName(id, fallback) {
     const x = ((state.ov && state.ov.hosts) || []).find((y) => y.id === id);
     return (x && (x.name || x.hostname)) || fallback || '—';
@@ -485,24 +907,27 @@
       machine(j.host_id, j.host_name || hostName(j.host_id)),
       j.runner_name ? h('span', { class: 'runner mono', title: j.runner_name, text: j.runner_name }) : null);
   }
+  const countText = (v) => (isNum(v) && v > 0 ? String(Math.round(v)) : '');
 
   function renderQueue(ov) {
     const q = ov.queue || [];
-    $('#queue-count').textContent = q.length ? String(q.length) : '';
-    $('#queue').replaceChildren(q.length
-      ? table('Queued jobs', [['Job'], ['Labels', 'c-labels'], ['Waiting', 'c-num']], q.map((j) => h('tr', {},
-        jobCell(j), td('Labels', 'c-labels', chips(j.labels)),
-        td('Waiting', 'c-num', since(j.queued_at, 'num wait'))))
-      ) : empty('Queue is clear', 'New jobs are placed as soon as a slot frees up.'));
+    tweenNumber($('#queue-count'), q.length, countText);
+    renderTable($('#queue'), {
+      caption: 'Queued jobs', heads: [['Job'], ['Labels', 'c-labels'], ['Waiting', 'c-num']], items: q, key: (j) => j.id,
+      row: (j) => [jobCell(j), td('Labels', 'c-labels', chips(j.labels)), td('Waiting', 'c-num', since(j.queued_at, 'num wait'))],
+      empty: () => empty('Queue is clear', 'New jobs are placed as soon as a slot frees up.'),
+    });
   }
 
   function renderRunning(ov) {
     const r = ov.running || [];
-    $('#running-count').textContent = r.length ? String(r.length) : '';
-    $('#running').replaceChildren(r.length
-      ? table('Running jobs', [['Job'], ['Machine'], ['Elapsed', 'c-num']], r.map((j) => h('tr', {},
-        jobCell(j), machineCell(j), td('Elapsed', 'c-num', since(j.started_at)))))
-      : empty('No jobs running', 'Every runner slot is idle.'));
+    tweenNumber($('#running-count'), r.length, countText);
+    renderTable($('#running'), {
+      caption: 'Running jobs', heads: [['Job'], ['Machine'], ['Elapsed', 'c-num']], items: r, key: (j) => j.id,
+      row: (j) => [jobCell(j), machineCell(j), td('Elapsed', 'c-num', since(j.started_at))],
+      sig: (j) => hostName(j.host_id),
+      empty: () => empty('No jobs running', 'Every runner slot is idle.'),
+    });
   }
 
   const CONCLUSION = {
@@ -522,35 +947,40 @@
     btn.hidden = all.length <= LIMIT;
     btn.textContent = state.showAllRecent ? 'Show fewer' : `Show all ${all.length}`;
     btn.setAttribute('aria-expanded', String(state.showAllRecent));
-    $('#recent').replaceChildren(list.length
-      ? table('Recently completed jobs', [['Result'], ['Job'], ['Machine'], ['Duration', 'c-num'], ['Finished', 'c-num']], list.map((j) => h('tr', {},
-        td('Result', 'c-result', conclusion(j.conclusion)), jobCell(j), machineCell(j),
-        numCell('Duration', fmtDur(j.duration_secs)),
-        td('Finished', 'c-num c-when', ago(j.completed_at, 'muted')))))
-      : empty('No completed jobs yet', null));
+    renderTable($('#recent'), {
+      caption: 'Recently completed jobs', heads: [['Result'], ['Job'], ['Machine'], ['Duration', 'c-num'], ['Finished', 'c-num']],
+      items: list, key: (j) => `${j.id}:${j.completed_at}`,
+      row: (j) => [td('Result', 'c-result', conclusion(j.conclusion)), jobCell(j), machineCell(j),
+        numCell('Duration', fmtDur(j.duration_secs)), td('Finished', 'c-num c-when', ago(j.completed_at, 'muted'))],
+      sig: (j) => hostName(j.host_id),
+      empty: () => empty('No completed jobs yet', null),
+    });
   }
 
   function renderPools(ov) {
     const pools = ov.pools || [], leases = ov.leases || [];
-    const sec = $('#pools-section');
-    sec.hidden = !pools.length && !leases.length;
-    if (sec.hidden) return;
-    const parts = [];
-    if (pools.length) parts.push(h('div', { class: 'card' }, h('h3', { class: 'card-title', text: 'Pools' }),
-      table('Pools', [['Repository'], ['Labels'], ['Queued', 'c-num'], ['Leases', 'c-num'], ['Oldest', 'c-num'], ['Reason']], pools.map((p) => h('tr', {},
-        h('td', { class: 'c-job' }, repoLink(p.repository, 'job-link')),
-        td('Labels', '', chips(p.labels)),
-        numCell('Queued', fmtInt(p.queued)),
-        numCell('Leases', fmtInt(p.leases)),
-        numCell('Oldest', fmtDur(p.oldest_wait_secs)),
-        td('Reason', '', h('span', { class: p.refusal ? 'text-err' : 'muted', text: p.refusal || humanize(p.reason) })))))));
-    if (leases.length) parts.push(h('div', { class: 'card' }, h('h3', { class: 'card-title', text: 'Leases' }),
-      table('Leases', [['Machine'], ['Repository'], ['State'], ['Age', 'c-num']], leases.map((l) => h('tr', {},
-        h('td', { class: 'c-job' }, machine(l.host_id, hostName(l.host_id))),
-        td('Repository', '', l.repository ? repoLink(l.repository) : '—'),
-        td('State', '', h('span', { class: 'badge badge-dim', text: humanize(l.state) })),
-        numCell('Age', fmtDur(l.age_secs)))))));
-    $('#pools').replaceChildren(...parts);
+    collapse($('#pools-section'), !!(pools.length || leases.length));
+    const cards = [
+      pools.length ? {
+        key: 'pools', caption: 'Pools', heads: [['Repository'], ['Labels'], ['Queued', 'c-num'], ['Leases', 'c-num'], ['Oldest', 'c-num'], ['Reason']],
+        items: pools, key: (p) => `${p.repository} ${p.labels}`,
+        row: (p) => [h('td', { class: 'c-job' }, repoLink(p.repository, 'job-link')), td('Labels', '', chips(p.labels)),
+          numCell('Queued', fmtInt(p.queued)), numCell('Leases', fmtInt(p.leases)), numCell('Oldest', fmtDur(p.oldest_wait_secs)),
+          td('Reason', '', h('span', { class: p.refusal ? 'text-err' : 'muted', text: p.refusal || humanize(p.reason) }))],
+      } : null,
+      leases.length ? {
+        key: 'leases', caption: 'Leases', heads: [['Machine'], ['Repository'], ['State'], ['Age', 'c-num']],
+        items: leases, key: (l) => l.lease_id || `${l.host_id} ${l.repository}`, sig: (l) => hostName(l.host_id),
+        row: (l) => [h('td', { class: 'c-job' }, machine(l.host_id, hostName(l.host_id))),
+          td('Repository', '', l.repository ? repoLink(l.repository) : '—'),
+          td('State', '', h('span', { class: 'badge badge-dim', text: humanize(l.state) })), numCell('Age', fmtDur(l.age_secs))],
+      } : null,
+    ].filter(Boolean);
+    const box = $('#pools');
+    resize(box, () => reconcile(box, cards, (c) => c.key,
+      (c) => h('div', { class: 'card' }, h('h3', { class: 'card-title', text: c.caption }), h('div', { class: 'tbl-box' })),
+      null));
+    for (const c of cards) renderTable($(`:scope > [data-key="${c.key}"]:not(.is-leaving) .tbl-box`, box), c);
   }
 
   // ---------------------------------------------------------------- charts
@@ -637,9 +1067,9 @@
   }
 
   const charts = [];
-  function setupChart(fig) {
+  function setupChart(fig, id) {
     const plot = $('.plot', fig);
-    const c = { fig, plot, cfg: null, idx: null, frame: 0 };
+    const c = { id, fig, plot, cfg: null, idx: null, frame: 0, view: null, sk: null };
     plot.tabIndex = 0;
     plot.addEventListener('pointermove', (e) => hover(c, e));
     plot.addEventListener('pointerdown', (e) => hover(c, e));
@@ -659,86 +1089,139 @@
   }
   const hideAllTips = () => charts.forEach(hideTip);
 
+  // What a chart draws: its time domain [d0, d1), the value at its top, and
+  // a value array per series over `t`. A change animates between two views:
+  // the domain slides (new samples come in from the right) and the values
+  // and the scale ease to their new heights.
+  function viewOf(cfg) {
+    const t = cfg.t, n = t.length;
+    const vals = cfg.series.map((sr) => sr.values);
+    let top = cfg.yMax || 100;
+    if (cfg.kind !== 'strips') {
+      let maxV = 0;
+      for (let i = 0; i < n; i++) {
+        let sum = 0;
+        for (const v of vals) {
+          if (!isNum(v[i])) continue;
+          if (cfg.kind === 'columns') sum += v[i]; else if (v[i] > maxV) maxV = v[i];
+        }
+        if (sum > maxV) maxV = sum;
+      }
+      top = yScale(maxV, cfg.yMax, cfg.integer).top;
+    }
+    return { t, step: cfg.step, d0: t[0], d1: n ? t[n - 1] + cfg.step : 0, vals, top, keys: cfg.series.map((sr) => sr.key).join('\n') };
+  }
+  function morphView(from, to, p) {
+    return {
+      ...to, d0: mix(from.d0, to.d0, p), d1: mix(from.d1, to.d1, p), top: mix(from.top, to.top, p),
+      vals: to.vals.map((arr, k) => arr.map((v, i) => mix(sampleAt(from, from.vals[k], to.t[i]), v, p))),
+    };
+  }
+
+  // The chart's SVG and tooltip, made once and redrawn in place, so a hover
+  // survives a refresh.
+  function scaffold(c) {
+    if (c.sk && c.sk.svg.parentNode === c.plot) return c.sk;
+    const clip = s('rect', {});
+    const svg = s('svg', { class: 'chart-svg', role: 'img' },
+      s('defs', {}, s('clipPath', { id: `clip-${c.id}` }, clip)));
+    const grid = s('g', { class: 'grid', 'aria-hidden': 'true' });
+    const marks = s('g', { class: 'marks', 'clip-path': `url(#clip-${c.id})` });
+    const cross = s('g', { class: 'cross', 'aria-hidden': 'true' }, s('line', { class: 'cross-line' }));
+    svg.append(grid, marks, cross);
+    const tip = h('div', { class: 'tip', role: 'status', 'aria-live': 'off' });
+    c.plot.replaceChildren(svg, tip);
+    fadeIn(svg, DUR.slow);
+    c.sk = { svg, clip, grid, marks, cross, tip, dots: [] };
+    return c.sk;
+  }
+
   // cfg.kind: 'lines' (smooth, one per series), 'columns' (stacked) or
-  // 'strips' (a row per series, each 0..yMax).
-  function drawChart(c) {
+  // 'strips' (a row per series, each 0..yMax). `view`: a frame of a morph;
+  // the config's own view when omitted.
+  function drawChart(c, view) {
     const { plot, cfg } = c;
     if (!cfg) return;
     const W = Math.round(plot.clientWidth), H = Math.round(plot.clientHeight);
     if (W < 40 || H < 40) return;
     const t = cfg.t || [];
     const n = t.length;
-    c.idx = null;
     if (n < 2 || !cfg.series.length) {
-      plot.replaceChildren(h('div', { class: 'plot-empty', text: 'No data for this range yet' }));
-      c.geo = null;
+      if (!$('.plot-empty', plot)) { plot.replaceChildren(h('div', { class: 'plot-empty', text: 'No data for this range yet' })); fadeIn(plot.firstChild); }
+      c.geo = null; c.view = null; c.sk = null; c.idx = null;
       return;
     }
+    const v = view || viewOf(cfg);
+    c.view = v;
+    const sk = scaffold(c);
     const narrow = W < 420;
     const strips = cfg.kind === 'strips';
     const P = { l: strips ? (narrow ? 74 : 96) : narrow ? 30 : 38, r: 8, t: 8, b: 22 };
     const pw = W - P.l - P.r, ph = H - P.t - P.b;
     const step = cfg.step;
-    const t0 = t[0], t1 = t[n - 1] + step;
+    const t0 = v.d0, t1 = v.d1;
     const X = (tv) => P.l + ((tv - t0) / (t1 - t0 || 1)) * pw;
     const xAt = (i) => X(t[i] + step / 2);
+    const vals = v.vals;
+    apply(sk.svg, { viewBox: `0 0 ${W} ${H}`, width: W, height: H, 'aria-label': cfg.summary });
+    apply(sk.clip, { x: P.l, y: 0, width: pw, height: H - P.b + 2 });
 
     // Columns stack: drawn from cumulative values; tooltips read raw ones.
-    let tops = cfg.series.map((sr) => sr.values);
+    let tops = vals;
     let bases = null;
     if (cfg.kind === 'columns') {
       const acc = new Array(n).fill(0);
       bases = []; tops = [];
-      for (const sr of cfg.series) {
+      for (const sv of vals) {
         bases.push(acc.slice());
-        for (let i = 0; i < n; i++) if (isNum(sr.values[i])) acc[i] += sr.values[i];
+        for (let i = 0; i < n; i++) if (isNum(sv[i])) acc[i] += sv[i];
         tops.push(acc.slice());
       }
     }
-    let maxV = 0;
-    for (const vals of tops) for (const v of vals) if (isNum(v) && v > maxV) maxV = v;
-    const ys = yScale(maxV, cfg.yMax, cfg.integer);
-    const Y = (v) => P.t + (1 - v / ys.top) * ph;
+    const top = v.top || 1;
+    const Y = (val) => P.t + (1 - val / top) * ph;
 
-    const svg = s('svg', { class: 'chart-svg', viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: 'img', 'aria-label': cfg.summary });
-    const grid = s('g', { class: 'grid', 'aria-hidden': 'true' });
+    const grid = [];
     if (!strips) {
-      for (const v of ys.ticks) {
-        const y = Y(v).toFixed(1);
-        grid.append(s('line', { x1: P.l, x2: W - P.r, y1: y, y2: y, class: v === 0 ? 'baseline' : null }));
-        grid.append(s('text', { x: P.l - 6, y, class: 'ytick', dy: '0.32em', text: cfg.fmtTick(v) }));
+      for (const tv of yScale(top, cfg.yMax, cfg.integer).ticks) {
+        if (tv > top * 1.001) continue;
+        const y = Y(tv).toFixed(1);
+        grid.push(s('line', { x1: P.l, x2: W - P.r, y1: y, y2: y, class: tv === 0 ? 'baseline' : null }));
+        grid.push(s('text', { x: P.l - 6, y, class: 'ytick', dy: '0.32em', text: cfg.fmtTick(tv) }));
       }
     }
     const tt = timeTicks(t0, t1, Math.max(2, Math.floor(pw / (narrow ? 64 : 84))));
     for (const tv of tt.ticks) {
       const x = X(tv);
       if (x < P.l + 14 || x > W - P.r - 14) continue;
-      grid.append(s('text', { x: x.toFixed(1), y: H - 6, class: 'xtick', text: tt.step >= 86400 ? fmtDay(tv) : fmtClock(tv) }));
+      grid.push(s('text', { x: x.toFixed(1), y: H - 6, class: 'xtick', text: tt.step >= 86400 ? fmtDay(tv) : fmtClock(tv) }));
     }
-    svg.append(grid);
 
-    const marks = s('g', { class: 'marks' });
+    const marks = [];
     let dotY;
     if (strips) {
       const m = cfg.series.length, gap = m > 8 ? 2 : 5;
       const rowH = Math.max(2, (ph - gap * (m - 1)) / m);
-      const top = cfg.yMax || 100;
-      const rowY = (k, v) => P.t + k * (rowH + gap) + rowH - (clamp(v, 0, top) / top) * (rowH - 2);
+      const rowY = (k, val) => P.t + k * (rowH + gap) + rowH - (clamp(val, 0, top) / top) * (rowH - 2);
       cfg.series.forEach((sr, k) => {
         const y0 = P.t + k * (rowH + gap);
-        const pts = sr.values.map((v, i) => (isNum(v) ? [xAt(i), rowY(k, v)] : null));
-        marks.append(s('rect', { class: 'strip-bg', x: P.l, y: f1(y0), width: pw, height: f1(rowH), rx: 3 }));
-        marks.append(s('path', { class: 'strip-area', d: areaPath(pts, y0 + rowH, true), vars: { '--c': sr.color } }));
-        marks.append(s('path', { class: 'strip-line', d: linePath(pts, true), vars: { '--c': sr.color } }));
-        const vals = sr.values.filter(isNum);
-        const two = rowH >= 26 && vals.length;
-        marks.append(s('text', { class: 'strip-name', x: 2, y: f1(y0 + rowH / 2 - (two ? 6 : 0)), dy: '0.32em', text: sr.name }));
+        const pts = vals[k].map((val, i) => (isNum(val) ? [xAt(i), rowY(k, val)] : null));
+        marks.push(s('rect', { class: 'strip-bg', x: P.l, y: f1(y0), width: pw, height: f1(rowH), rx: 3 }));
+        marks.push(s('path', { class: 'strip-area', d: areaPath(pts, y0 + rowH, true), vars: { '--c': sr.color } }));
+        marks.push(s('path', { class: 'strip-line', d: linePath(pts, true), vars: { '--c': sr.color } }));
+      });
+      // Names sit left of the plot, outside its clip.
+      cfg.series.forEach((sr, k) => {
+        const y0 = P.t + k * (rowH + gap);
+        const raw = sr.values.filter(isNum);
+        const two = rowH >= 26 && raw.length;
+        grid.push(s('text', { class: 'strip-name', x: 2, y: f1(y0 + rowH / 2 - (two ? 6 : 0)), dy: '0.32em', text: sr.name }));
         if (two) {
-          const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-          marks.append(s('text', { class: 'strip-val', x: 2, y: f1(y0 + rowH / 2 + 8), dy: '0.32em', text: `avg ${cfg.fmtVal(avg)} · max ${cfg.fmtVal(peakOf(sr.raw || vals))}` }));
+          const avg = raw.reduce((a, b) => a + b, 0) / raw.length;
+          grid.push(s('text', { class: 'strip-val', x: 2, y: f1(y0 + rowH / 2 + 8), dy: '0.32em', text: `avg ${cfg.fmtVal(avg)} · max ${cfg.fmtVal(peakOf(sr.raw || raw))}` }));
         }
       });
-      dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? rowY(k, cfg.series[k].values[i]) : null);
+      dotY = (k, i) => (isNum(vals[k][i]) ? rowY(k, vals[k][i]) : null);
     } else if (cfg.kind === 'columns') {
       const bw = (step / (t1 - t0)) * pw;
       const pad = Math.max(1, bw * 0.22);
@@ -746,32 +1229,34 @@
       cfg.series.forEach((sr, k) => {
         const g = s('g', { class: 'col', vars: { '--c': sr.color } });
         for (let i = 0; i < n; i++) {
-          if (!isNum(sr.values[i]) || sr.values[i] <= 0) continue;
+          if (!isNum(vals[k][i]) || vals[k][i] <= 0) continue;
           const y1 = Y(tops[k][i]), y0 = Y(bases[k][i]);
           g.append(s('rect', { x: f1(xAt(i) - cw / 2), y: f1(y1), width: f1(cw), height: f1(Math.max(0.5, y0 - y1)), rx: cw > 5 ? 1.5 : 0 }));
         }
-        marks.append(g);
+        marks.push(g);
       });
-      dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? Y(tops[k][i]) : null);
+      dotY = (k, i) => (isNum(vals[k][i]) ? Y(tops[k][i]) : null);
     } else {
-      cfg.series.forEach((sr) => {
-        const pts = sr.values.map((v, i) => (isNum(v) ? [xAt(i), Y(v)] : null));
-        if (cfg.series.length === 1) marks.append(s('path', { class: 'area area-soft', d: areaPath(pts, Y(0), true), vars: { '--c': sr.color } }));
-        marks.append(s('path', { class: 'line', d: linePath(pts, true), vars: { '--c': sr.color } }));
+      cfg.series.forEach((sr, k) => {
+        const pts = vals[k].map((val, i) => (isNum(val) ? [xAt(i), Y(val)] : null));
+        if (cfg.series.length === 1) marks.push(s('path', { class: 'area area-soft', d: areaPath(pts, Y(0), true), vars: { '--c': sr.color } }));
+        marks.push(s('path', { class: 'line', d: linePath(pts, true), vars: { '--c': sr.color } }));
       });
-      dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? Y(cfg.series[k].values[i]) : null);
+      dotY = (k, i) => (isNum(vals[k][i]) ? Y(vals[k][i]) : null);
     }
-    svg.append(marks);
+    sk.grid.replaceChildren(...grid);
+    sk.marks.replaceChildren(...marks);
 
-    const cross = s('g', { class: 'cross', 'aria-hidden': 'true' });
-    cross.append(s('line', { y1: P.t, y2: P.t + ph, class: 'cross-line' }));
-    const dots = cfg.series.map((sr) => s('circle', { r: 4, class: 'cross-dot', vars: { '--c': sr.color } }));
-    cross.append(...dots);
-    svg.append(cross);
-
-    const tip = h('div', { class: 'tip', role: 'status', 'aria-live': 'off' });
-    plot.replaceChildren(svg, tip);
-    c.geo = { W, P, pw, t0, t1, xAt, dotY, cross, dots, tip };
+    const line = sk.cross.firstChild;
+    line.setAttribute('y1', P.t); line.setAttribute('y2', P.t + ph);
+    if (sk.dots.length !== cfg.series.length) {
+      for (const d of sk.dots) d.remove();
+      sk.dots = cfg.series.map(() => s('circle', { r: 4, class: 'cross-dot' }));
+      sk.cross.append(...sk.dots);
+    }
+    sk.dots.forEach((d, k) => d.style.setProperty('--c', cfg.series[k].color));
+    c.geo = { W, P, pw, t0, t1, xAt, dotY, cross: sk.cross, dots: sk.dots, tip: sk.tip };
+    if (c.idx != null) showTip(c, Math.min(c.idx, n - 1));
   }
 
   function hover(c, e) {
@@ -818,9 +1303,10 @@
     c.geo.tip.classList.remove('on');
   }
 
-  function legend(fig, series, show) {
-    $('.legend', fig).replaceChildren(...(show ? series.map((sr) =>
-      h('li', {}, h('span', { class: 'legend-key', 'aria-hidden': 'true', vars: { '--c': sr.color } }), sr.name)) : []));
+  function legend(c, series, show) {
+    reconcile($('.legend', c.fig), show ? series : [], (sr) => sr.key,
+      (sr) => h('li', {}, h('span', { class: 'legend-key', 'aria-hidden': 'true', vars: { '--c': sr.color } }), h('span', { text: sr.name })),
+      (li, sr) => { li.firstChild.style.setProperty('--c', sr.color); li.lastChild.textContent = sr.name; });
   }
 
   function summarize(title, series, fmt) {
@@ -832,10 +1318,19 @@
     return `${title}, ${RANGE_LABEL[state.range] || state.range}. ${parts.join('; ')}.`;
   }
 
+  // New data morphs from what is drawn when the same series are shown the
+  // same way; otherwise (a machine came or went) the marks crossfade.
   function setChart(c, cfg) {
+    const from = c.view, prev = c.cfg;
     c.cfg = cfg;
-    legend(c.fig, cfg.series, cfg.kind !== 'strips');
-    drawChart(c);
+    legend(c, cfg.series, cfg.kind !== 'strips');
+    const to = viewOf(cfg);
+    if (from && prev && prev.kind === cfg.kind && from.keys === to.keys && to.t.length >= 2) {
+      frames(c, (p) => drawChart(c, p < 1 ? morphView(from, to, p) : null));
+      return;
+    }
+    frames(c, () => drawChart(c), 0);
+    if (from && c.sk && liveMotion()) c.sk.marks.animate([{ opacity: 0 }, { opacity: 1 }], { duration: DUR.slow, easing: 'ease-out' });
   }
 
   // `average per 20 min`, `per 2 h`.
@@ -845,59 +1340,111 @@
     return `${Number.isInteger(hrs) ? hrs : hrs.toFixed(1)} h`;
   }
 
-  let chartRefs = null;
-  function renderCharts() {
-    if (!chartRefs) chartRefs = { jobs: setupChart($('#chart-jobs')), cpu: setupChart($('#chart-cpu')), busy: setupChart($('#chart-busy')), ram: setupChart($('#chart-ram')) };
+  // The Activity charts, in order: `build(x)` gives a chart's config and its
+  // subtitle from the shared context `chartContext()` makes.
+  const CHARTS = [
+    { id: 'jobs', title: 'Jobs', sub: 'Running and queued, stacked', build: jobsChart },
+    { id: 'cpu', title: 'CPU', sub: 'A row per machine', build: cpuChart },
+    { id: 'busy', title: 'Busy slots', sub: 'Stacked per machine', build: busyChart },
+    { id: 'ram', title: 'Memory', sub: 'Used per machine', build: ramChart },
+  ];
+  const chartById = new Map();
+
+  // The chart cards, before any data: their plots hold their height.
+  function renderChartFrames() {
+    reconcile($('#charts-grid'), CHARTS, (d) => d.id, (d) => {
+      const fig = h('figure', { id: `chart-${d.id}`, class: 'chart card' },
+        h('figcaption', {}, h('h3', { text: d.title }), h('p', { class: 'chart-sub', text: d.sub })),
+        h('ul', { class: 'legend' }),
+        h('div', { class: 'plot' }));
+      chartById.set(d.id, setupChart(fig, d.id));
+      return fig;
+    }, null);
+  }
+
+  function chartContext() {
     const m = state.metrics || {};
-    assignHostColors();
     const t = m.t || [];
     const step = m.step_secs || 60;
-    const hosts = m.hosts || [];  // sorted by name
-    const hostSeries = (x) => ({ name: x.name || x.id, color: hostColor(x.id) });
-    const pctTick = (v) => `${v}%`;
-    const intTick = (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
-    const fmtAvg = (v) => (isNum(v) ? (v >= 10 || Number.isInteger(v) ? String(Math.round(v)) : v.toFixed(1)) : '—');
-    const kCol = groupOf(t.length, COLUMN_COUNT), kLine = groupOf(t.length, LINE_POINTS);
-    const span = { from: t[0], to: t.length ? t[t.length - 1] + step : 0 };
+    return {
+      t, step,
+      m, hosts: m.hosts || [],  // sorted by name
+      hostSeries: (x) => ({ key: x.id, name: x.name || x.id, color: hostColor(x.id) }),
+      pctTick: (v) => `${v}%`,
+      intTick: (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1)),
+      fmtAvg: (v) => (isNum(v) ? (v >= 10 || Number.isInteger(v) ? String(Math.round(v)) : v.toFixed(1)) : '—'),
+      kCol: groupOf(t.length, COLUMN_COUNT), kLine: groupOf(t.length, LINE_POINTS),
+      span: { from: t[0], to: t.length ? t[t.length - 1] + step : 0 },
+    };
+  }
 
-    const jg = regroup(t, step, kCol, [m.running || [], m.queued || []]);
+  function jobsChart(x) {
+    const jg = regroup(x.t, x.step, x.kCol, [x.m.running || [], x.m.queued || []]);
     const jobs = [
-      { name: 'Running', color: 'var(--s1)', values: jg.series[0] },
-      { name: 'Queued', color: 'var(--s2)', values: jg.series[1] },
+      { key: 'running', name: 'Running', color: 'var(--s1)', values: jg.series[0] },
+      { key: 'queued', name: 'Queued', color: 'var(--s2)', values: jg.series[1] },
     ];
-    setChart(chartRefs.jobs, {
-      ...span, kind: 'columns', t: jg.t, step: jg.step, series: jobs, integer: true, fmtVal: fmtAvg, fmtTick: intTick,
-      summary: summarize('Jobs running and queued', jobs, fmtAvg),
-    });
-    $('#jobs-sub').textContent = jg.step > step ? `Average per ${per(jg.step)}, stacked` : 'Running and queued, stacked';
-
-    const cg = regroup(t, step, kLine, hosts.map((x) => x.cpu || []));
-    const cpu = hosts.map((x, k) => ({ ...hostSeries(x), values: cg.series[k], raw: x.cpu }));
-    setChart(chartRefs.cpu, { ...span, kind: 'strips', t: cg.t, step: cg.step, series: cpu, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('CPU per machine', cpu, fmtPct) });
-    $('#cpu-sub').textContent = cg.step > step ? `A row per machine · average per ${per(cg.step)}` : 'A row per machine';
-
-    const bg = regroup(t, step, kCol, [...hosts.map((x) => x.busy || []), ...hosts.map((x) => x.slots || [])]);
-    const busy = hosts.map((x, k) => {
-      const values = bg.series[k], slots = bg.series[hosts.length + k];
-      return { ...hostSeries(x), values, fmtAt: (i) => (isNum(values[i]) ? `${fmtAvg(values[i])}${isNum(slots[i]) ? ` / ${fmtAvg(slots[i])}` : ''}` : '—') };
-    });
-    setChart(chartRefs.busy, {
-      ...span, kind: 'columns', t: bg.t, step: bg.step, series: busy, integer: true, fmtVal: fmtAvg, fmtTick: intTick, summary: summarize('Busy runner slots per machine, stacked', busy, fmtAvg),
-      total: (i) => {
-        const sum = busy.reduce((a, sr) => a + (isNum(sr.values[i]) ? sr.values[i] : 0), 0);
-        return h('div', { class: 'tip-row tip-total' }, h('span', { class: 'tip-key tip-key-none' }), h('b', { class: 'num', text: fmtAvg(sum) }), h('span', { class: 'tip-name', text: 'Total busy' }));
+    return {
+      sub: jg.step > x.step ? `Average per ${per(jg.step)}, stacked` : 'Running and queued, stacked',
+      cfg: {
+        ...x.span, kind: 'columns', t: jg.t, step: jg.step, series: jobs, integer: true, fmtVal: x.fmtAvg, fmtTick: x.intTick,
+        summary: summarize('Jobs running and queued', jobs, x.fmtAvg),
       },
-    });
-    $('#busy-sub').textContent = bg.step > step ? `Average per ${per(bg.step)}, stacked per machine` : 'Stacked per machine';
+    };
+  }
 
-    const rg = regroup(t, step, kLine, [...hosts.map(ramPct), ...hosts.map((x) => x.ram_used || [])]);
-    const ram = hosts.map((x, k) => {
-      const values = rg.series[k], used = rg.series[hosts.length + k];
-      return { ...hostSeries(x), values, raw: ramPct(x), fmtAt: (i) => (isNum(values[i]) ? `${fmtPct(values[i])} · ${fmtBytes(used[i])}` : '—') };
-    });
-    setChart(chartRefs.ram, { ...span, kind: 'lines', t: rg.t, step: rg.step, series: ram, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('Memory used per machine', ram, fmtPct) });
-    $('#ram-sub').textContent = rg.step > step ? `Used per machine · average per ${per(rg.step)}` : 'Used per machine';
+  function cpuChart(x) {
+    const cg = regroup(x.t, x.step, x.kLine, x.hosts.map((y) => y.cpu || []));
+    const cpu = x.hosts.map((y, k) => ({ ...x.hostSeries(y), values: cg.series[k], raw: y.cpu }));
+    return {
+      sub: cg.step > x.step ? `A row per machine · average per ${per(cg.step)}` : 'A row per machine',
+      cfg: { ...x.span, kind: 'strips', t: cg.t, step: cg.step, series: cpu, yMax: 100, fmtVal: fmtPct, fmtTick: x.pctTick, summary: summarize('CPU per machine', cpu, fmtPct) },
+    };
+  }
 
+  function busyChart(x) {
+    const n = x.hosts.length;
+    const bg = regroup(x.t, x.step, x.kCol, [...x.hosts.map((y) => y.busy || []), ...x.hosts.map((y) => y.slots || [])]);
+    const busy = x.hosts.map((y, k) => {
+      const values = bg.series[k], slots = bg.series[n + k];
+      return { ...x.hostSeries(y), values, fmtAt: (i) => (isNum(values[i]) ? `${x.fmtAvg(values[i])}${isNum(slots[i]) ? ` / ${x.fmtAvg(slots[i])}` : ''}` : '—') };
+    });
+    return {
+      sub: bg.step > x.step ? `Average per ${per(bg.step)}, stacked per machine` : 'Stacked per machine',
+      cfg: {
+        ...x.span, kind: 'columns', t: bg.t, step: bg.step, series: busy, integer: true, fmtVal: x.fmtAvg, fmtTick: x.intTick, summary: summarize('Busy runner slots per machine, stacked', busy, x.fmtAvg),
+        total: (i) => {
+          const sum = busy.reduce((a, sr) => a + (isNum(sr.values[i]) ? sr.values[i] : 0), 0);
+          return h('div', { class: 'tip-row tip-total' }, h('span', { class: 'tip-key tip-key-none' }), h('b', { class: 'num', text: x.fmtAvg(sum) }), h('span', { class: 'tip-name', text: 'Total busy' }));
+        },
+      },
+    };
+  }
+
+  function ramChart(x) {
+    const n = x.hosts.length;
+    const rg = regroup(x.t, x.step, x.kLine, [...x.hosts.map(ramPct), ...x.hosts.map((y) => y.ram_used || [])]);
+    const ram = x.hosts.map((y, k) => {
+      const values = rg.series[k], used = rg.series[n + k];
+      return { ...x.hostSeries(y), values, raw: ramPct(y), fmtAt: (i) => (isNum(values[i]) ? `${fmtPct(values[i])} · ${fmtBytes(used[i])}` : '—') };
+    });
+    return {
+      sub: rg.step > x.step ? `Used per machine · average per ${per(rg.step)}` : 'Used per machine',
+      cfg: { ...x.span, kind: 'lines', t: rg.t, step: rg.step, series: ram, yMax: 100, fmtVal: fmtPct, fmtTick: x.pctTick, summary: summarize('Memory used per machine', ram, fmtPct) },
+    };
+  }
+
+  function renderCharts() {
+    renderChartFrames();
+    assignHostColors();
+    const x = chartContext();
+    for (const d of CHARTS) {
+      const c = chartById.get(d.id);
+      const { cfg, sub } = d.build(x);
+      $('.chart-sub', c.fig).textContent = sub;
+      setChart(c, cfg);
+    }
+    const m = x.m;
     $('#charts-sub').textContent = m.step_secs ? `${RANGE_LABEL[state.range]} · ${m.step_secs % 60 ? `${m.step_secs}s` : `${m.step_secs / 60} min`} samples` : RANGE_LABEL[state.range];
   }
 
@@ -910,10 +1457,12 @@
         if (r === state.range) return;
         state.range = r; saveRange(r);
         $$('.seg-btn', box).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.range === r)));
+        segThumb(box);
         $('#charts-sub').textContent = RANGE_LABEL[r];
         loadMetrics();
       },
     })));
+    segThumb(box);
   }
 
   // ======================================================== remote commands
@@ -1132,6 +1681,7 @@
       type: 'button', class: 'seg-btn', 'data-v': v, text: t, 'aria-pressed': String((v === 'all') === state.auditAll),
       onclick: () => { state.auditAll = v === 'all'; saveFlag('rm.audit.all', state.auditAll); renderAudit(true); },
     })));
+    segThumb($('#audit-filter'));
     $('#audit-toggle').addEventListener('click', () => {
       state.auditOpen = !state.auditOpen; saveFlag('rm.audit.open', state.auditOpen);
       renderAudit(true);
@@ -1165,50 +1715,62 @@
 
   function renderAudit(force) {
     const sec = $('#audit-section');
-    if (state.auditErr === 'gone') { sec.hidden = true; return; }
+    if (state.auditErr === 'gone') { collapse(sec, false); return; }
     if (!state.audit && !state.auditErr) return;  // first load still on its way
-    sec.hidden = false;
+    collapse(sec, true);
     const all = state.audit || [];
     const list = state.auditAll ? all : all.filter((c) => !isRead(c));
     const sig = JSON.stringify([all, state.auditAll, state.auditOpen, state.showAllAudit, state.auditErr]);
     if (!force && sig === state.auditSig) return;
     state.auditSig = sig;
     sec.classList.toggle('is-collapsed', !state.auditOpen);
-    $('#audit-count').textContent = list.length ? String(list.length) : '';
+    tweenNumber($('#audit-count'), list.length, countText);
     const tog = $('#audit-toggle');
     tog.textContent = state.auditOpen ? 'Hide' : 'Show';
     tog.setAttribute('aria-expanded', String(state.auditOpen));
-    $('#audit-filter').hidden = !state.auditOpen;
-    $$('.seg-btn', $('#audit-filter')).forEach((b) => b.setAttribute('aria-pressed', String((b.dataset.v === 'all') === state.auditAll)));
+    const filter = $('#audit-filter');
+    filter.hidden = !state.auditOpen;
+    $$('.seg-btn', filter).forEach((b) => b.setAttribute('aria-pressed', String((b.dataset.v === 'all') === state.auditAll)));
+    segThumb(filter);
     const box = $('#audit');
-    box.hidden = !state.auditOpen;
-    if (!state.auditOpen) return;
+    if (!state.auditOpen) { collapse(box, false); return; }
     const LIMIT = 15;
     const shown = state.showAllAudit ? list : list.slice(0, LIMIT);
     const reads = all.length - list.length;
-    box.replaceChildren(...[
-      state.auditErr ? h('p', { class: 'notice notice-warn', role: 'status', text: `The log could not be refreshed. ${state.auditErr}` }) : null,
-      shown.length
-        ? table('Commands run on machines through the coordinator', [['Result'], ['Command'], ['Machine'], ['By'], ['When', 'c-num']], shown.map((c) => h('tr', {},
-          td('Result', 'c-result', outcomeBadge(c.outcome)),
-          td('Command', 'c-cmd', cmdCode(c.argv)),
-          td('Machine', 'c-machine', machine(c.host_id, c.host_name || hostName(c.host_id, c.host_id))),
-          td('By', 'c-who', h('span', { text: c.login || '—' })),
-          td('When', 'c-num c-when', ago(c.at, 'muted')))))
-        : empty(all.length ? 'No changes yet' : 'No remote commands yet',
-          reads ? `${reads} read${reads === 1 ? '' : 's'} hidden. Choose All to see them.` : 'Changes made from a machine’s panel are recorded here.'),
-      list.length > LIMIT ? h('div', { class: 'tbl-more' }, h('button', {
-        type: 'button', class: 'link-btn', 'aria-expanded': String(state.showAllAudit), text: state.showAllAudit ? 'Show fewer' : `Show all ${list.length}`,
-        onclick: () => { state.showAllAudit = !state.showAllAudit; renderAudit(true); },
-      })) : null,
-    ].filter(Boolean));
+    const errText = state.auditErr ? `The log could not be refreshed. ${state.auditErr}` : null;
+    const moreText = () => (state.showAllAudit ? 'Show fewer' : `Show all ${list.length}`);
+    renderTable(box, {
+      before: errText ? [{
+        key: 'err', create: () => h('p', { class: 'notice notice-warn', role: 'status', text: errText }),
+        update: (el) => { if (el.textContent !== errText) el.textContent = errText; },
+      }] : [],
+      caption: 'Commands run on machines through the coordinator', heads: [['Result'], ['Command'], ['Machine'], ['By'], ['When', 'c-num']],
+      items: shown, key: (c) => `${c.at} ${c.host_id} ${(c.argv || []).join(' ')}`, sig: (c) => hostName(c.host_id, c.host_id),
+      row: (c) => [
+        td('Result', 'c-result', outcomeBadge(c.outcome)),
+        td('Command', 'c-cmd', cmdCode(c.argv)),
+        td('Machine', 'c-machine', machine(c.host_id, c.host_name || hostName(c.host_id, c.host_id))),
+        td('By', 'c-who', h('span', { text: c.login || '—' })),
+        td('When', 'c-num c-when', ago(c.at, 'muted'))],
+      empty: () => empty(all.length ? 'No changes yet' : 'No remote commands yet',
+        reads ? `${reads} read${reads === 1 ? '' : 's'} hidden. Choose All to see them.` : 'Changes made from a machine’s panel are recorded here.'),
+      after: list.length > LIMIT ? [{
+        key: 'more',
+        create: () => h('div', { class: 'tbl-more' }, h('button', {
+          type: 'button', class: 'link-btn', 'aria-expanded': String(state.showAllAudit), text: moreText(),
+          onclick: () => { state.showAllAudit = !state.showAllAudit; renderAudit(true); },
+        })),
+        update: (el) => { el.firstChild.textContent = moreText(); el.firstChild.setAttribute('aria-expanded', String(state.showAllAudit)); },
+      }] : [],
+    });
+    collapse(box, true);
   }
 
   // --------------------------------------------------------- machine panel
   const dw = {
     id: null, gen: 0, pushed: false, sig: '',
     cfg: null, rc: null, loading: false, error: null, cfgSeq: 0,
-    results: new Map(), busy: new Set(), add: null, confirm: null, updateSent: null,
+    results: new Map(), busy: new Set(), add: null, confirm: null, updateSent: null, closing: null,
   };
 
   function hashHost() {
@@ -1255,6 +1817,7 @@
     renderDrawerHead();
     const x = hostById(id);
     if (!state.ov || (x && x.manageable)) loadConfig(); else renderDrawerBody();
+    if (dw.closing) { dw.closing = null; for (const a of dlg.getAnimations({ subtree: true })) a.cancel(); }
     if (!dlg.open) { dlg.showModal(); document.documentElement.classList.add('has-drawer'); }
     $('#dw-body').scrollTop = 0;
     $('#dw-close').focus();
@@ -1270,10 +1833,22 @@
     const id = dw.id;
     dw.id = null; dw.gen++;
     const dlg = $('#drawer');
-    if (dlg.open) dlg.close();
-    document.documentElement.classList.remove('has-drawer');
-    const link = $(`.host-open[data-host="${CSS.escape(id)}"]`);
-    if (link) link.focus();
+    const done = () => {
+      dw.closing = null;
+      if (dlg.open) dlg.close();
+      for (const a of dlg.getAnimations({ subtree: true })) a.cancel();
+      document.documentElement.classList.remove('has-drawer');
+      const link = $(`.host-open[data-host="${CSS.escape(id)}"]`);
+      if (link) link.focus();
+    };
+    if (!dlg.open || !motionOk()) { done(); return; }
+    // Slides out the way it came in, with the backdrop fading; opening again meanwhile cancels it.
+    const away = matchMedia('(max-width: 720px)').matches ? 'translateY(24px)' : 'translateX(28px)';
+    const out = { duration: 200, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' };
+    const a = dlg.animate([{ transform: 'none', opacity: 1 }, { transform: away, opacity: 0 }], out);
+    dlg.animate([{ opacity: 1 }, { opacity: 0 }], { ...out, pseudoElement: '::backdrop' });
+    dw.closing = a;
+    a.finished.then(() => { if (dw.closing === a) done(); }, () => {});
   }
 
   // Overview polls refresh the header; the body is only rebuilt when the
@@ -1376,7 +1951,11 @@
     else if (dw.loading) view = skeleton();
     else if (dw.error) view = errorPanel(dw.error);
     else view = unavailablePanel(x);
-    $('#dw-body').replaceChildren(view);
+    const body = $('#dw-body');
+    const was = body.firstElementChild;
+    body.replaceChildren(view);
+    // The skeleton crossfades into what replaces it; later rebuilds do not flicker.
+    if (was && was.getAttribute('aria-busy') === 'true' && view.getAttribute('aria-busy') !== 'true') fadeIn(view);
   }
 
   function skeleton() {
@@ -1590,6 +2169,7 @@
     const pathRow = h('div', { class: 'ws-path-row' }, path);
     const sync = () => {
       $$('.seg-btn', seg).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.k === sel)));
+      segThumb(seg);
       pathRow.hidden = sel !== 'persistent';
       form.classList.toggle('is-dirty', sel !== kind || (sel === 'persistent' && path.value.trim() !== base));
     };

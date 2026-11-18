@@ -5,6 +5,7 @@
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --r: 14px;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
   --r-sm: 8px;
   --gap: 20px;
 
@@ -156,12 +157,18 @@ button { font: inherit; color: inherit; }
 .update-chip { font-size: 12px; color: var(--ok); background: var(--ok-soft); padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
 .spacer { flex: 1; }
 .live { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-2); white-space: nowrap; }
-.live i { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.live { transition: color 0.3s; }
+.live i {
+  position: relative; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft);
+  transition: background-color 0.3s, box-shadow 0.3s;
+}
 .live.is-stale { color: var(--warn); }
 .live.is-stale i { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+/* A soft ring grows out of the live dot and fades: transform and opacity only. */
+.live i::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--ok); opacity: 0; }
 @media (prefers-reduced-motion: no-preference) {
-  .live:not(.is-stale) i { animation: breathe 2.4s ease-in-out infinite; }
-  @keyframes breathe { 50% { box-shadow: 0 0 0 5px transparent; } }
+  .live:not(.is-stale) i::after { animation: ping 2.6s cubic-bezier(0, 0, 0.2, 1) infinite; }
+  @keyframes ping { 0% { transform: scale(1); opacity: 0.45; } 70%, 100% { transform: scale(2.8); opacity: 0; } }
 }
 .who { display: inline-flex; align-items: center; gap: 8px; color: var(--text-2); font-size: 13px; }
 .avatar { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--border-2); }
@@ -219,7 +226,7 @@ button { font: inherit; color: inherit; }
 .bar { display: block; position: relative; height: 4px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
 .bar::after {
   content: ""; position: absolute; inset: 0 auto 0 0; width: var(--pct, 0%);
-  border-radius: 4px; background: var(--bar-ok); transition: width 0.4s ease;
+  border-radius: 4px; background: var(--bar-ok); transition: width 0.6s var(--ease), background-color 0.4s;
 }
 /* 50% and up yellow, 75% orange, 90% red */
 .bar-warn::after { background: var(--bar-warn); }
@@ -232,17 +239,19 @@ button { font: inherit; color: inherit; }
 .host {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); box-shadow: var(--shadow);
   padding: 16px 18px 14px; display: grid; gap: 14px; min-width: 0;
-  transition: border-color 0.2s;
+  transition: border-color 0.3s, background-color 0.3s, box-shadow 0.3s, opacity 0.3s;
 }
 .host:hover { border-color: var(--border-2); }
 .host.is-offline { opacity: 0.6; box-shadow: none; background: transparent; border-style: dashed; }
 .host-head { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
-.host-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--c); margin-top: 6px; }
+.host-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--c); margin-top: 6px; transition: background-color 0.3s; }
 .host-id { flex: 1; min-width: 0; }
 .host-name { font-size: 15px; font-weight: 620; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .host-sub { color: var(--muted); font-size: 12.5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
 .os { font-size: 11px; font-weight: 600; letter-spacing: 0.02em; padding: 1px 7px; border-radius: 5px; background: var(--surface-2); color: var(--text-2); border: 1px solid var(--border); }
 .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 550; padding: 2px 9px 2px 8px; border-radius: 999px; white-space: nowrap; }
+/* Status, badges and chips crossfade their colours when they change in place. */
+.status, .badge, .access, .chip, .os, .legend-key, .count { transition: color 0.3s, background-color 0.3s, border-color 0.3s; }
 .status i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .status-online { color: var(--ok); background: var(--ok-soft); }
 .status-draining { color: var(--warn); background: var(--warn-soft); }
@@ -316,14 +325,25 @@ button { font: inherit; color: inherit; }
 .empty-icon::after { content: ""; position: absolute; inset: 11px; border-radius: 50%; border: 2px solid var(--axis); }
 
 /* --------------------------------------------------------------- charts */
-.seg { display: inline-flex; padding: 3px; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; }
+.seg { position: relative; display: inline-flex; padding: 3px; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; }
 .seg-btn {
+  position: relative; z-index: 1;
   min-width: 46px; min-height: 30px; padding: 0 10px; border: 0; border-radius: 7px; cursor: pointer;
   background: transparent; color: var(--text-2); font-size: 12.5px; font-weight: 550; font-variant-numeric: tabular-nums;
   transition: background-color 0.15s, color 0.15s;
 }
 .seg-btn:hover { color: var(--text); }
 .seg-btn[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12); }
+/* The active background is one element that slides to the pressed button. */
+.seg-thumb {
+  position: absolute; top: 3px; bottom: 3px; left: 0; width: var(--w, 0); transform: translateX(var(--x, 0));
+  border-radius: 7px; background: var(--surface); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12); opacity: 0;
+  transition: transform 0.3s var(--ease), width 0.3s var(--ease), opacity 0.15s;
+}
+.seg-thumb.on { opacity: 1; }
+.seg-thumb.no-anim { transition: none; }
+.seg.has-thumb .seg-btn[aria-pressed="true"] { background: transparent; box-shadow: none; }
+.seg-sm .seg-thumb { top: 2px; bottom: 2px; border-radius: 6px; }
 .charts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; transition: opacity 0.2s; }
 #charts.is-loading .charts { opacity: 0.6; }
 .chart { margin: 0; padding: 16px 16px 10px; min-width: 0; display: grid; grid-template-rows: auto auto 1fr; }
@@ -335,6 +355,7 @@ button { font: inherit; color: inherit; }
 .legend-key { width: 12px; height: 3px; border-radius: 2px; background: var(--c); }
 .plot { position: relative; height: 210px; min-width: 0; touch-action: pan-y; cursor: crosshair; border-radius: 6px; }
 .plot-empty { height: 100%; display: grid; place-items: center; color: var(--muted); font-size: 12.5px; }
+.plot:empty { background: var(--surface-2); }
 .chart-svg { display: block; overflow: visible; }
 .grid line { stroke: var(--grid); stroke-width: 1; shape-rendering: crispEdges; }
 .grid line.baseline { stroke: var(--axis); }
@@ -360,7 +381,7 @@ button { font: inherit; color: inherit; }
   min-width: 130px; max-width: 220px; padding: 8px 10px; pointer-events: none;
   background: var(--tip-bg); border: 1px solid var(--border-2); border-radius: 10px;
   box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.25); font-size: 12px;
-  opacity: 0; visibility: hidden; transition: opacity 0.1s;
+  opacity: 0; visibility: hidden; transition: opacity 0.12s, visibility 0.12s, transform 0.12s var(--ease);
 }
 .tip.on { opacity: 1; visibility: visible; }
 .tip-time { color: var(--muted); font-size: 11px; margin-bottom: 4px; white-space: nowrap; }
@@ -651,7 +672,26 @@ html.has-drawer { overflow: hidden; }
 .sk-card .sk:first-child { height: 14px; }
 .sk-head { height: 14px; margin: 9px 0 21px; }
 .w20 { width: 20%; } .w30 { width: 30%; } .w40 { width: 40%; } .w50 { width: 50%; } .w60 { width: 60%; } .w70 { width: 70%; }
-@media (prefers-reduced-motion: no-preference) { .sk { animation: pulse 1.6s ease-in-out infinite; } }
+@media (prefers-reduced-motion: no-preference) { .sk, .plot:empty { animation: pulse 1.6s ease-in-out infinite; } }
+
+/* --------------------------------------------------- loading + motion */
+/* Placeholders about the size of what replaces them, so nothing jumps. */
+.kpi-sk { display: grid; gap: 12px; align-content: start; min-height: 104px; }
+.sk.sk-big { height: 22px; }
+.host-sk { min-height: 318px; align-content: start; gap: 16px; }
+.sk.sk-spark { height: 44px; width: 100%; border-radius: var(--r-sm); }
+.tbl-sk { display: grid; gap: 20px; padding: 16px 4px 22px; }
+/* Containers of animated, keyed children: a leaving child is pinned inside them. */
+.kpis, .hosts, .pools, .charts, .legend, .tbl tbody, #queue, #running, #recent, #audit, .tbl-box { position: relative; }
+.is-leaving { z-index: 0; }
+/* While a list shrinks, what leaves it stays inside it (the margin keeps focus rings and shadows). */
+.hosts, #queue, #running, #recent, #audit, .tbl-box { overflow: clip; overflow-clip-margin: 12px; }
+@media (prefers-reduced-motion: no-preference) {
+  /* Shown again after being hidden: a short fade in. */
+  .app, .update-chip, .notice, .count, #recent-toggle, .tbl-more { animation: fade-in 0.3s var(--ease); }
+  .update-chip, .count { animation-name: pop-in; }
+  @keyframes pop-in { from { opacity: 0; transform: scale(0.85); } }
+}
 
 /* --------------------------------------------------------------- audit log */
 #audit-section .section-head .seg { margin-left: auto; }
