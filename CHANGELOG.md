@@ -7,6 +7,36 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.73
+
+### Added
+
+- A machine can be restarted without cutting a job short:
+  `runner-manager host reboot` on the machine, or **Reboot** in its panel on
+  the coordinator's dashboard (`host reboot` is a change command there, so it
+  needs `coordinator remote-changes allow` on that machine). The service stops
+  taking jobs, tells the coordinator it is draining, lets every running runner
+  finish however long that takes, then restarts the system (`shutdown /r` on
+  Windows; `systemctl reboot`, `shutdown -r` or `sudo -n` on Linux;
+  `shutdown -r`, System Events or `sudo -n` on macOS). A Windows machine also
+  waits for the runners of the WSL distributions it manages. Until the restart
+  begins, `host reboot --cancel` (or **Cancel reboot**) takes it back; when the
+  system refuses, the dashboard shows why and the machine serves again. A WSL
+  distribution refuses: restart its Windows machine instead. A service that
+  starts at login comes back only once that account signs in, and the
+  dashboard says so. The host and the coordinator both need 0.4.73; an older
+  host shows no Reboot button.
+- The dashboard animates its changes: machines, job rows and tiles come and go
+  and move smoothly, numbers count to their new values, meters glide and charts
+  slide and morph instead of jumping. Reduced motion is honoured.
+- Dashboard settings, saved on the coordinator per GitHub login so they follow
+  you to any browser: section order and visibility; pinned machines in your
+  order, how the rest sort and group, hidden machines and what a card shows;
+  which charts show, in what order, their style, smoothing, scale and machines
+  (with two new charts, Slot use and Disk free); which summary tiles show;
+  theme, density, motion, refresh interval, time and unit formats. Export and
+  import as JSON.
+
 ## 0.4.72
 
 ### Fixed
