@@ -94,6 +94,23 @@ pub fn commands(os: Os, administrator: bool, reason: &str) -> Vec<RebootCommand>
     }
 }
 
+/// The commands that call off a restart `commands` asked for and the system
+/// has not begun: `shutdown /a` within Windows' delay, `shutdown -c` for a
+/// scheduled Linux shutdown. macOS has none: an application that refuses
+/// to quit has already called its restart off.
+#[must_use]
+pub fn abort_commands(os: Os, administrator: bool) -> Vec<RebootCommand> {
+    match os {
+        Os::Windows => vec![RebootCommand {
+            program: windows_shutdown_exe(),
+            args: vec!["/a".to_owned()],
+        }],
+        Os::Linux if administrator => vec![RebootCommand::new("shutdown", &["-c"])],
+        Os::Linux => vec![RebootCommand::new("sudo", &["-n", "shutdown", "-c"])],
+        Os::MacOs => Vec::new(),
+    }
+}
+
 /// `shutdown.exe` by its full path, so a `shutdown` earlier on `PATH` is not
 /// the one run.
 fn windows_shutdown_exe() -> String {
@@ -108,6 +125,11 @@ pub trait Rebooter: Send + Sync {
     /// # Errors
     /// Why every way was refused, one line per command tried.
     fn reboot(&self, reason: &str) -> Result<String, String>;
+
+    /// Calls off a restart the system accepted and has not begun, where the
+    /// system can. Best effort: the caller reports the restart failed either
+    /// way.
+    fn abort(&self) {}
 }
 
 /// The real thing: runs [`commands`] for this machine until one is accepted.
@@ -125,6 +147,17 @@ impl Rebooter for SystemRebooter {
             }
         }
         Err(refused.join("; "))
+    }
+
+    fn abort(&self) {
+        let Some(os) = crate::os::detect_os() else {
+            return;
+        };
+        for command in abort_commands(os, crate::host_fitness::is_elevated()) {
+            if run(&command).is_ok() {
+                return;
+            }
+        }
     }
 }
 
@@ -238,6 +271,21 @@ mod tests {
                 "/usr/bin/sudo -n /sbin/shutdown -r now"
             ]
         );
+    }
+
+    #[test]
+    fn a_restart_that_did_not_begin_is_called_off_where_the_system_can() {
+        let aborts = |os, administrator| -> Vec<String> {
+            abort_commands(os, administrator)
+                .into_iter()
+                .map(|command| command.display())
+                .collect()
+        };
+        let [windows] = aborts(Os::Windows, true).try_into().unwrap();
+        assert!(windows.ends_with(r"\System32\shutdown.exe /a"), "{windows}");
+        assert_eq!(aborts(Os::Linux, true), ["shutdown -c"]);
+        assert_eq!(aborts(Os::Linux, false), ["sudo -n shutdown -c"]);
+        assert!(aborts(Os::MacOs, false).is_empty());
     }
 
     #[test]

@@ -1179,7 +1179,7 @@
         h('p', { class: 'confirm-text', text: 'The machine stops taking jobs now, waits for every running job to finish, then restarts. You can cancel until the restart begins.' }),
         h('code', { class: 'cmd-preview', text: cmdLine(['host', 'reboot']) }),
         h('div', { class: 'form-actions' },
-          h('button', { type: 'button', class: 'btn-sm', text: 'Cancel', onclick: cancel }),
+          h('button', { type: 'button', class: 'btn-sm', 'data-fk': 'reboot:back', text: 'Cancel', onclick: cancel }),
           h('button', { type: 'submit', class: 'btn-sm btn-danger', 'data-fk': 'reboot:go', text: 'Reboot' })));
       confirm.addEventListener('submit', (e) => { e.preventDefault(); run('reboot', ['host', 'reboot'], $('[data-fk="reboot:go"]', confirm)); });
       confirm.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancel(); } });
@@ -1210,13 +1210,16 @@
     if (!old) return;
     const x = hostById(dw.id);
     if (!fk && old.dataset.sig === rebootSig(x)) return;
-    const had = fk || old.contains(document.activeElement);
+    // Focus stays on the control it was on, never moved onto another one.
+    const focused = old.contains(document.activeElement) ? document.activeElement.dataset.fk || '' : null;
+    const want = fk || focused;
     const card = rebootCard(x);
-    if (!card) { old.remove(); return; }
+    if (!card) { old.remove(); if (want != null) body.focus({ preventScroll: true }); return; }
     old.replaceWith(card);
-    if (!had) return;
-    const target = $(`[data-fk="${CSS.escape(fk || 'reboot:open')}"]`, card) || $('[data-fk^="reboot:"]', card) || body;
-    target.focus({ preventScroll: true });
+    if (want == null) return;
+    const target = want && $(`[data-fk="${CSS.escape(want)}"]`, card);
+    if (target && !target.closest('fieldset:disabled')) target.focus({ preventScroll: true });
+    else body.focus({ preventScroll: true });
   }
 
   // ------------------------------------------------------------ audit log

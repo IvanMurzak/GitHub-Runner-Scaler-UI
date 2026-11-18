@@ -871,16 +871,21 @@ Homebrew prefix, an nvm npm). A WSL distribution is updated through its own host
 ### Reboot a machine
 
 From 0.4.73 a machine can be restarted without cutting a job short: **Reboot** in its panel (it asks
-for a confirmation), or `runner-manager host reboot` on the machine itself, or `--host remote:NAME
-host reboot`. The service then:
+for a confirmation), or `runner-manager host reboot` on the machine itself (with `sudo` where the
+service runs as root: a root service takes a reboot asked on the machine only from root), or
+`--host remote:NAME host reboot`. The service then:
 
 1. says it is draining, so the coordinator places nothing there and refuses its launches as
    `draining`, and takes no new job of its own;
 2. waits for every runner it runs to finish, with no deadline, exactly as before an upgrade;
-3. on a Windows machine that manages WSL distributions, asks each of them to start no runner (the
-   WSL recovery drain request) and waits until each says it holds none: restarting Windows stops
-   them too;
-4. waits 30 seconds, so the dashboard shows it coming, and asks the system to restart.
+3. on a Windows machine that manages WSL distributions, does to each what WSL recovery does
+   before it touches one: the drain request in its shared directory, its launch fence taken (so a
+   runner it was starting cannot slip through), then two idle heartbeats from it; restarting
+   Windows stops them too;
+4. checks its journal holds no runner (one that came up as its loop drained makes the service
+   rebuild, adopt it and drain again, the reboot still asked);
+5. waits 30 seconds, so the dashboard shows it coming, looks once more, and asks the system to
+   restart.
 
 Until that last step `host reboot --cancel` (or **Cancel reboot** in the panel) keeps the machine
 running: the service takes jobs again within a minute, and nothing that was running is stopped. The
@@ -896,9 +901,12 @@ How each system is asked, as the account the service runs as:
 | macOS | `shutdown -r now` | System Events' restart (asks the open apps to quit), else `sudo -n shutdown -r now` |
 
 `sudo -n` never asks for a password: a user service restarts the machine only where polkit or a
-`NOPASSWD` sudo rule lets that account. When every way is refused, or the system accepted but had
+`NOPASSWD` sudo rule lets that account. On Windows `/t 5` closes the applications open on the
+desktop without saving (the runners are done by then; a person's open work is not). When every way is refused, or the system accepted but had
 not restarted ten minutes later (an app refused to quit), the panel says so with the reason and the
-host serves again; it is never left drained. A WSL distribution refuses: restart its Windows machine.
+host serves again; it is never left drained (Windows and Linux are first asked to call the restart
+off, `shutdown /a` or `shutdown -c`). A WSL distribution refuses: restart its Windows machine. A
+service finishing its jobs before an upgrade, or stopping, refuses too: ask again once it is back.
 
 The service comes back with the machine where it starts at boot (the Windows service, the systemd
 system unit, the LaunchDaemon). A service installed with `--start-at login` (the Windows login
