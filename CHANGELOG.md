@@ -7,6 +7,22 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.74
+
+### Fixed
+
+- **Update** no longer fails with "cannot stage the new binary beside the old
+  one: No such file or directory" on a machine whose service was installed from
+  a binary that is gone since (a checkout build on a removed volume, a Homebrew
+  link after `brew uninstall`). The service now reports its App as missing, the
+  dashboard shows that path with the remedy instead of an Update button, and
+  `runner-manager update` refuses before downloading anything. To repair such a
+  machine, run `runner-manager service uninstall` and then
+  `runner-manager service install` from the copy you want the service to run.
+  Both the host and the coordinator need 0.4.74 for the dashboard to show it.
+- A build in a custom cargo target directory is recognised as a checkout build
+  rather than a release archive.
+
 ## 0.4.73
 
 ### Added
