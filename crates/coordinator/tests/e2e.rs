@@ -1543,7 +1543,7 @@ async fn a_command_posted_over_http_is_relayed_to_the_host_and_its_result_return
 #[tokio::test]
 async fn a_hosts_versions_reach_the_overview_from_its_heartbeat() {
     use runner_manager_domain::coordinator_protocol::{
-        COMMAND_VERSION, Heartbeat, HostVersions, ManagedWsl, UpdateProgress,
+        COMMAND_VERSION, Heartbeat, HostVersions, ManagedWsl, RebootProgress, UpdateProgress,
     };
 
     let (coordinator, token) = start_with_a_cli_session().await;
@@ -1580,6 +1580,14 @@ async fn a_hosts_versions_reach_the_overview_from_its_heartbeat() {
                         installed_version: "0.4.63".into(),
                     }],
                     wsl_guest: false,
+                    rebootable: true,
+                    starts_at_login: false,
+                    reboot: Some(RebootProgress {
+                        state: "pending".into(),
+                        at: 2,
+                        message: "Waiting for 1 running job.".into(),
+                        runners: Some(1),
+                    }),
                 }),
                 ..Heartbeat::default()
             })
@@ -1606,6 +1614,9 @@ async fn a_hosts_versions_reach_the_overview_from_its_heartbeat() {
     assert_eq!(versions["update"]["state"], "done");
     assert_eq!(versions["wsl"][0]["distribution"], "Ubuntu");
     assert_eq!(versions["wsl_guest"], false);
+    assert_eq!(versions["rebootable"], true);
+    assert_eq!(versions["reboot"]["state"], "pending");
+    assert_eq!(versions["reboot"]["runners"], 1);
 }
 
 #[tokio::test]

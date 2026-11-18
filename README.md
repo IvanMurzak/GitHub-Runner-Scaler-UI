@@ -323,6 +323,7 @@ runner-manager auth logout                                     # Purge the local
 
 runner-manager host show                                       # Show capacity, secret store and REST budget
 runner-manager host set-capacity N                             # Change the host limit without restarting the service
+runner-manager host reboot [--cancel]                          # Restart this machine once every running job has finished
 runner-manager host set-auto-update BOOL                      # Daily automatic updates (default: true)
 runner-manager host set-poll-interval [--idle 10s] [--active 60s] [--coordinated 300s] # How often GitHub is polled: idle, busy, and covered by a coordinator
 runner-manager host set-memory-margin SIZE|off|on             # Free memory a runner needs beyond its estimate (default 1GiB), or off

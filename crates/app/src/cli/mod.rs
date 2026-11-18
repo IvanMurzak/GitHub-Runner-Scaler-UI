@@ -57,6 +57,7 @@ pub mod policy;
 pub mod polling;
 pub mod profile;
 pub mod protect_path;
+pub mod reboot;
 pub mod remote;
 pub mod service;
 pub mod status;
@@ -969,6 +970,12 @@ pub enum HostCommand {
     ResetRuntimeRoot,
     /// Show this machine's capacity, store, and projected REST budget.
     Show,
+    /// Restart this machine once every running job has finished.
+    ///
+    /// Asks the running service: it takes no new job from then on, waits for
+    /// every runner to finish however long that takes, then restarts the
+    /// machine. The service starts again with it.
+    Reboot(HostRebootArgs),
     /// Inspect this host's execution provider capabilities.
     #[command(subcommand)]
     Isolation(HostIsolationCommand),
@@ -1354,6 +1361,14 @@ pub struct HostSetMemoryMarginArgs {
     /// memory admission off; `on` turns it back on with the margin kept.
     #[arg(value_name = "SIZE|off|on")]
     pub margin: String,
+}
+
+#[derive(Debug, Args)]
+pub struct HostRebootArgs {
+    /// Keep this machine running after all: the service takes jobs again.
+    /// Possible until the restart has begun.
+    #[arg(long)]
+    pub cancel: bool,
 }
 
 #[derive(Debug, Args)]

@@ -791,8 +791,8 @@ The page loads nothing from elsewhere (GitHub avatars aside) and is served with 
 Content-Security-Policy. History is a sample a minute per machine, kept 7 days in the same
 database (schema 6, from 0.4.58). On a wide range the charts average the samples into fewer
 points (about 90 per line, 48 columns), aligned to whole periods so a refresh does not reshape the
-past: jobs and busy slots as stacked columns, CPU as a row per machine with its average and peak,
-memory as a line per machine.
+past. By default jobs and busy slots show as stacked columns, CPU as a row per machine with its
+average and peak, memory as a line per machine; [the settings](#dashboard-settings) change that.
 
 The job lists are built from the `workflow_job` webhooks. From 0.4.66 they are saved every minute
 and at shutdown, and restored at start when the save is under an hour old, so an update no longer
@@ -810,6 +810,48 @@ there (which an update inside the distribution leaves behind).
 Without a proxy in front, forward `/`, `/assets/*`, `/auth/*` and `/api/*` as well as the four
 endpoints in [Deploy](#deploy).
 
+### Dashboard settings
+
+The sliders button in the top bar opens Settings, a panel beside the page; every change shows on
+the dashboard at once and animates into place. From 0.4.73:
+
+- **General**: theme (system, light or dark), density, reduce motion (system, on or off), refresh
+  interval (2 s to 1 min), times as "3 min ago" or the time of day, a 24- or 12-hour clock, sizes
+  in GiB or GB, compact table rows, how many Recent jobs and remote commands show before "Show
+  all", and whether the remote commands list shows changes only or every read too.
+- **Layout**: the order of the sections (drag a section by its handle, or use its arrow buttons or
+  the arrow keys on the handle), which show, and Queue and Running side by side or stacked.
+- **Machines**: pinned machines first, in the order you give them (pin one with the pin on its
+  card, in its panel, or in the list); the rest sorted by name, status, operating system, CPU,
+  memory, busy or free slots or uptime, optionally reversed, online first or not, and optionally
+  grouped by operating system or status; hide machines or offline ones; compact or comfortable
+  cards; and which parts a card shows (each meter, the history sparkline, versions, disk, uptime)
+  in which order.
+- **Charts**: the default range, legends, one to three columns, the chart height; which charts show
+  and their order (besides Jobs, CPU, Busy slots and Memory: Slot use, the fleet's busy share of
+  its slots, and Disk free per machine); for each, how it draws (columns, stacked areas, lines,
+  filled lines or a row per machine, as fits it), smoothing, a 0–100% or fitted scale for the
+  percentages, and all machines, the top N over the range, or the ones you choose.
+- **Tiles**: which summary tiles show (also average CPU and memory in use across the online
+  machines) and their order.
+
+Each group has its own Reset, the footer a Reset all (both can be undone for a few seconds), and
+Export and Import move the settings as a JSON file.
+
+Settings belong to the signed-in GitHub login and follow it to any browser: the page keeps a copy
+in the browser for its first paint, loads the coordinator's (which wins), and saves changes back a
+moment after they are made. They are stored in the `dashboard_settings` table (one row per
+lower-cased login; no schema version change, so a rollback ignores it). A pin of a machine the
+coordinator no longer lists is kept, in case it comes back, and skipped on the page.
+
+| Method and path | Who | Answer |
+| --- | --- | --- |
+| `GET /api/settings` | a session | `{"settings": {...} \| null, "updated_at": seconds \| null}` |
+| `PUT /api/settings` | a session; a cookie also needs this origin | a JSON object with a positive integer `version`, at most 64 KiB: `{"updated_at"}`; `400` not such an object, `413` too large, `403` from another origin, `409` an older write of the same page (its `client` and a lower `seq` than the kept copy's) |
+
+Each page tags its writes with a random `client` and a rising `seq`, so a save sent as the page closes cannot be replaced by an earlier one that arrives after it. The coordinator checks only that shape, that order and the size; the page reads any stored value through its
+own rules, so an unknown or out-of-range setting falls back to its default.
+
 ## Remote management
 
 A person signed in to the coordinator can read, and where allowed change, the repositories and
@@ -826,7 +868,7 @@ addresses another host (`--host`, `--data-dir`):
 | Kind | Commands | Answered |
 | --- | --- | --- |
 | Read | `status`, `host show`, `repo list [--json]`, `repo profile list`, `repo profile show` | always |
-| Change | `host set-capacity`; `repo add`, `remove`, `set-capacity`, `set-scale`, `add-label`, `remove-label`, `set-workspace`; `repo profile add`, `remove`, `set-capacity`, `set-scale`, `add-label`, `remove-label`, `set-workspace`; `update` (from 0.4.64, no flags) | only after `runner-manager coordinator remote-changes allow` **on that host** |
+| Change | `host set-capacity`; `repo add`, `remove`, `set-capacity`, `set-scale`, `add-label`, `remove-label`, `set-workspace`; `repo profile add`, `remove`, `set-capacity`, `set-scale`, `add-label`, `remove-label`, `set-workspace`; `update` (from 0.4.64, no flags); `host reboot [--cancel]` (from 0.4.73) | only after `runner-manager coordinator remote-changes allow` **on that host** |
 
 Changes are off until the host's own operator turns them on there:
 
@@ -868,6 +910,57 @@ binary that `update --force` put at such a path, with the copy it keeps beside i
 the release archive), and when its service runs as root and the app belongs to another account (a
 Homebrew prefix, an nvm npm). A WSL distribution is updated through its own host.
 
+### Reboot a machine
+
+From 0.4.73 a machine can be restarted without cutting a job short: **Reboot** in its panel (it asks
+for a confirmation), or `runner-manager host reboot` on the machine itself (with `sudo` where the
+service runs as root: a root service takes a reboot asked on the machine only from a request
+file root wrote, a regular file with a single link), or
+`--host remote:NAME host reboot`. The service then:
+
+1. says it is draining, so the coordinator places nothing there and refuses its launches as
+   `draining`, and takes no new job of its own;
+2. waits for every runner it runs to finish, with no deadline, exactly as before an upgrade;
+3. on a Windows machine that manages WSL distributions, does to each what WSL recovery does
+   before it touches one: the drain request in its shared directory, its launch fence taken (so a
+   runner it was starting cannot slip through), then two idle heartbeats from it; restarting
+   Windows stops them too. A distribution WSL lists as stopped is not waited for. One that gives
+   no sign of the drain for 10 minutes (no heartbeat, or its fence never free) fails the reboot,
+   which is then reported and the host serves again: it never restarts over a guest that may be
+   busy;
+4. checks its journal holds no runner (one that came up as its loop drained makes the service
+   rebuild, adopt it and drain again, the reboot still asked);
+5. waits 30 seconds, so the dashboard shows it coming, looks once more, and asks the system to
+   restart.
+
+Until that last step `host reboot --cancel` (or **Cancel reboot** in the panel) keeps the machine
+running: the service takes jobs again within a minute, and nothing that was running is stopped. The
+machine's card shows **Reboot pending** or **Rebooting** while it lasts, and its panel how many
+runners it still waits for.
+
+How each system is asked, as the account the service runs as:
+
+| System | Service as administrator (boot) | Service as a user (login) |
+| --- | --- | --- |
+| Windows | `shutdown.exe /r /t 5 /d p:4:1` (LocalSystem) | the same, with the user's own shutdown right |
+| Linux | `systemctl reboot`, else `shutdown -r now`, else `reboot` | `systemctl --no-ask-password reboot` (polkit), else `sudo -n systemctl reboot` or `sudo -n shutdown -r now` |
+| macOS | `shutdown -r now` | System Events' restart (asks the open apps to quit), else `sudo -n shutdown -r now` |
+
+`sudo -n` never asks for a password: a user service restarts the machine only where polkit or a
+`NOPASSWD` sudo rule lets that account. On Windows `/t 5` closes the applications open on the
+desktop without saving (the runners are done by then; a person's open work is not). When every way is refused, or the system accepted but had
+not restarted ten minutes later (an app refused to quit), the panel says so with the reason and the
+host serves again once the restart is called off (`shutdown /a` on Windows, `shutdown -c` on
+Linux). Where it cannot be called off (macOS, or the command failed) the machine stays drained,
+since the restart may still come, until a person cancels the reboot or restarts it by hand. A WSL distribution refuses: restart its Windows machine. A
+service finishing its jobs before an upgrade, or stopping, refuses too: ask again once it is back.
+
+The service comes back with the machine where it starts at boot (the Windows service, the systemd
+system unit, the LaunchDaemon). A service installed with `--start-at login` (the Windows login
+task, the systemd user unit, the LaunchAgent) comes back only once its account signs in, which
+the panel says: give that account automatic sign-in, or move the service to `--start-at boot`.
+FileVault holds a Mac at its unlock screen after a restart either way.
+
 ### Sign in the CLI
 
 ```bash
@@ -907,7 +1000,7 @@ old to take commands; the coordinator waits up to a minute for an answer.
 | `POST /auth/cli/approve` | a browser's session cookie, this origin | form `code`, `decision=approve\|deny` |
 | `POST /auth/cli/poll` | the CLI, `{"device_code"}` | `428 {"status":"pending"}`, `403 denied`, `410 expired`, or once `200 {"token", "login"}` |
 | `POST /auth/cli/logout` | `Authorization: Bearer` | `204` |
-| `GET /api/overview` | a session | hosts with `online`, `manageable`, `remote_changes`, and from 0.4.64 `versions` (`service`, `app`, `app_source`, `updatable`, `update`, `wsl`, `wsl_guest`) |
+| `GET /api/overview` | a session | hosts with `online`, `manageable`, `remote_changes`, and from 0.4.64 `versions` (`service`, `app`, `app_source`, `updatable`, `update`, `wsl`, `wsl_guest`, and from 0.4.73 `rebootable`, `starts_at_login`, `reboot`: `state` `pending`/`rebooting`/`failed`/`cancelled`, `at`, `message`, `runners`) |
 | `POST /api/hosts/{id}/command` | a session; a cookie also needs this origin | `{"argv": [...]}` to `{"request_id", "exit_code", "stdout", "stderr", "truncated"}`; `503` offline, `409` too old, `504` no answer |
 | `GET /api/hosts/{id}/config` | a session | the host's `repo list --json` and `remote_changes` |
 | `GET /api/audit` | a session | the last 100 remote commands |
@@ -935,7 +1028,8 @@ ran `remote-changes allow`. It can never change a host that did not, and no host
 outside the list, whoever asks: no shell, no sign-in, no service removal. An update it starts
 installs only the newest published release, through the channel the host's operator installed
 it with, as the daily automatic update would; a host with automatic updates off refuses it. From
-0.4.64 `remote-changes allow` covers this update too. A host that
+0.4.64 `remote-changes allow` covers this update too, and from 0.4.73 a restart of the machine,
+which waits for every running job. A host that
 does not want to be managed at all keeps changes off (the default), or leaves the coordinator.
 
 ## Updates

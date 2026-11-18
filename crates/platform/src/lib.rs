@@ -62,6 +62,7 @@ pub mod os;
 pub mod paths;
 pub mod polling;
 pub mod process;
+pub mod reboot;
 pub mod resource_usage;
 pub mod runner_account;
 pub mod runner_env;

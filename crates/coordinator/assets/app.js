@@ -34,36 +34,321 @@
   const isNum = (v) => typeof v === 'number' && isFinite(v);
   const nowSec = () => Date.now() / 1000;
 
+  // --------------------------------------------------------------- settings
+  // The viewer's settings (settings.js has their shape and rules): this
+  // browser's copy at once, then the coordinator's, which follows the
+  // signed-in person to any browser. `cfg` is always normalized.
+  const RS = window.RMSettings;
+  const SETTINGS_KEY = 'rm.settings';
+  let cfg = loadLocalSettings();
+
+  function loadLocalSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (raw) return RS.normalize(JSON.parse(raw));
+      // Before settings: the range and the audit filter were kept on their own.
+      return RS.fromLegacy(localStorage.getItem('rm.range'), localStorage.getItem('rm.audit.all') === '1');
+    } catch (_) { return RS.defaults(); }
+  }
+  function storeLocal() { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(cfg)); } catch (_) { /* storage unavailable */ } }
+  // Set while this browser's copy holds a change the coordinator has not
+  // confirmed: a reload, or another tab, then sends it rather than taking
+  // the coordinator's older copy.
+  const UNSAVED_KEY = 'rm.settings.unsaved';
+  // Holds the unsaved copy itself, so a save of another copy (another tab's)
+  // does not clear it: `markUnsaved(copy)` sets it, `markUnsaved(null, saved)`
+  // clears it only when `saved` is that copy.
+  function markUnsaved(copy, saved) {
+    try {
+      if (copy != null) localStorage.setItem(UNSAVED_KEY, copy);
+      else if (localStorage.getItem(UNSAVED_KEY) === saved) localStorage.removeItem(UNSAVED_KEY);
+    } catch (_) { /* storage unavailable */ }
+  }
+  function unsaved() { try { return localStorage.getItem(UNSAVED_KEY) != null; } catch (_) { return false; } }
+
   // ------------------------------------------------------------------ state
-  const RANGES = ['1h', '6h', '24h', '7d'];
+  const RANGES = RS.RANGES;
   const RANGE_LABEL = { '1h': 'last hour', '6h': 'last 6 hours', '24h': 'last 24 hours', '7d': 'last 7 days' };
-  const OVERVIEW_MS = 5000, METRICS_MIN_MS = 60000, STALE_SECS = 20;
+  const METRICS_MIN_MS = 60000;
+  const overviewMs = () => cfg.general.refresh * 1000;
+  // Stale after a few missed refreshes, and never sooner than 20 s.
+  const staleSecs = () => Math.max(20, cfg.general.refresh * 3);
 
   const state = {
     session: null, ov: null, metrics: null,
-    range: loadRange(),
+    range: cfg.charts.range,
     skew: 0,            // server clock minus local clock, seconds
     lastOk: 0,          // local time of the last successful overview fetch
     failed: false,
     timers: {},
     showAllRecent: false,
-    hostColors: new Map(),
+    hostColors: new Map(), colorSig: '',
     audit: null, auditErr: null, auditSig: '', showAllAudit: false,
     auditOpen: loadFlag('rm.audit.open', true),
-    auditAll: loadFlag('rm.audit.all', false),
+    painted: false,     // the first overview is on screen: changes from here on animate
   };
   const serverNow = () => nowSec() + state.skew;
 
-  function loadRange() {
-    try { const r = localStorage.getItem('rm.range'); if (RANGES.includes(r)) return r; } catch (_) { /* storage unavailable */ }
-    return '6h';
-  }
-  function saveRange(r) { try { localStorage.setItem('rm.range', r); } catch (_) { /* ignore */ } }
   function loadFlag(k, dflt) {
     try { const v = localStorage.getItem(k); if (v === '1' || v === '0') return v === '1'; } catch (_) { /* storage unavailable */ }
     return dflt;
   }
   function saveFlag(k, v) { try { localStorage.setItem(k, v ? '1' : '0'); } catch (_) { /* ignore */ } }
+
+  // ----------------------------------------------------------------- motion
+  // Every animated change on the page goes through these helpers, so nothing
+  // jumps and the rules live in one place:
+  //   reconcile(box, items, key, create, update)  keyed children, updated in place;
+  //                         new ones fade and grow in, gone ones fade out of the
+  //                         flow, the rest slide to their new places
+  //   flip(els, mutate)     slide elements from where they were to where `mutate` put them
+  //   resize(el, mutate)    let `el`'s height follow a change instead of jumping
+  //   tweenNumber(el, v, fmt)  count an element's number to its new value
+  //   frames(owner, draw)   run draw(p), p 0..1 eased, for SVG morphs
+  //   collapse(el, show)    show or hide an element with a height and fade
+  // Only transform, opacity and (for a container) height are animated, with
+  // the Web Animations API: CSP-safe and off the main layout path. Motion is
+  // skipped when the viewer asks for reduced motion or the tab is hidden; the
+  // first data only fades in.
+  const EASE = 'cubic-bezier(.2,.8,.2,1)';
+  const DUR = { fast: 160, base: 260, slow: 360 };
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  // The viewer's own choice in the settings, else the system's.
+  const lessMotion = () => (cfg.general.motion === 'system' ? reducedMotion.matches : cfg.general.motion === 'reduce');
+  const motionOk = () => !lessMotion() && !document.hidden;
+  // Data updates: full motion once the first overview is on screen.
+  const liveMotion = () => state.painted && motionOk();
+  const easeOut = (p) => 1 - (1 - p) ** 3;
+  const mix = (a, b, p) => (isNum(a) && isNum(b) ? a + (b - a) * p : b);
+
+  function fadeIn(el, dur) {
+    if (el instanceof Element && motionOk()) el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: dur || DUR.base, easing: 'ease-out' });
+  }
+
+  // An element about to go must not keep keyboard focus: it moves to the
+  // section around it (read out as that section), or the page.
+  function dropFocus(el) {
+    if (!el.contains(document.activeElement)) return;
+    const to = (el.parentElement && el.parentElement.closest('section')) || $('#main');
+    if (!to.hasAttribute('tabindex')) to.tabIndex = -1;
+    to.focus({ preventScroll: true });
+  }
+
+  const rectsOf = (els) => new Map(els.map((el) => [el, el.getBoundingClientRect()]));
+
+  // Plays the move from each element's `first` rect to where it is now.
+  function playFlip(first) {
+    const moves = [];
+    for (const el of first.keys()) for (const a of el.getAnimations()) if (a.id === 'flip') a.cancel();
+    for (const [el, r] of first) {
+      if (!el.isConnected) continue;
+      const n = el.getBoundingClientRect();
+      const dx = r.left - n.left, dy = r.top - n.top;
+      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) moves.push([el, dx, dy]);
+    }
+    for (const [el, dx, dy] of moves) {
+      el.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'none' }], { duration: DUR.slow, easing: EASE }).id = 'flip';
+    }
+  }
+
+  // Runs `mutate`, then slides `els` from their old places to their new ones.
+  function flip(els, mutate) {
+    if (!liveMotion()) return mutate();
+    const first = rectsOf(els);
+    const out = mutate();
+    playFlip(first);
+    return out;
+  }
+
+  // Runs `mutate`, then animates `el`'s height from before to after, so what
+  // follows it on the page glides instead of jumping.
+  function resize(el, mutate) {
+    if (!liveMotion() || !el.isConnected) return mutate();
+    const before = el.getBoundingClientRect().height;
+    for (const a of el.getAnimations()) if (a.id === 'resize') a.cancel();
+    const out = mutate();
+    const after = el.getBoundingClientRect().height;
+    if (Math.abs(after - before) > 1) {
+      // While it shrinks, what leaves it stays inside it.
+      el.classList.add('is-resizing');
+      const a = el.animate([{ height: `${before}px` }, { height: `${after}px` }], { duration: DUR.slow, easing: EASE });
+      a.id = 'resize';
+      const end = () => { if (!el.getAnimations().some((x) => x.id === 'resize')) el.classList.remove('is-resizing'); };
+      a.finished.then(end, end);
+    }
+    return out;
+  }
+
+  // Takes a leaving element out of the flow where it stands and fades it out.
+  // `r`: its rect, `cols`: its cells' widths when it is a table row.
+  function ghost(box, el, r, cols) {
+    const br = box.getBoundingClientRect();
+    el.classList.add('is-leaving');
+    el.inert = true;
+    el.setAttribute('aria-hidden', 'true');
+    if (cols) { el.style.display = 'grid'; el.style.gridTemplateColumns = cols; el.style.alignItems = 'center'; }
+    for (const [k, v] of Object.entries({
+      position: 'absolute', margin: '0', left: `${r.left - br.left - box.clientLeft}px`, top: `${r.top - br.top - box.clientTop}px`,
+      width: `${r.width}px`, height: `${r.height}px`, pointerEvents: 'none',
+    })) el.style[k] = v;
+    const a = el.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(0.96)' }], { duration: DUR.base, easing: EASE, fill: 'forwards' });
+    a.finished.then(() => el.remove(), () => el.remove());
+  }
+
+  // Makes `box`'s children one element per item, in order, matched by key
+  // (`data-key`; a repeated key gets a `#n` suffix). Kept elements are passed
+  // to `update`, so their transitions and focus carry over; `create` makes new
+  // ones. Children without a key (a skeleton) are replaced. When most of the
+  // list changes at once (a filter), the whole list crossfades instead: rows
+  // sliding through rows that fade out read as noise.
+  function reconcile(box, items, keyOf, create, update) {
+    let mode = !motionOk() || !box.getClientRects().length ? 'none' : state.painted ? 'full' : 'fade';
+    const seen = new Map();
+    const keys = items.map((it, i) => {
+      const k = String(keyOf(it, i));
+      const n = (seen.get(k) || 0) + 1;
+      seen.set(k, n);
+      return n > 1 ? `${k}#${n}` : k;
+    });
+    const want = new Set(keys);
+    const old = new Map(), leaving = [];
+    for (const el of box.children) {
+      if (el.classList.contains('is-leaving')) continue;
+      if (el.dataset.key != null && want.has(el.dataset.key)) old.set(el.dataset.key, el);
+      else leaving.push(el);
+    }
+    const fresh = keys.filter((k) => !old.has(k)).length;
+    if (mode === 'full' && leaving.length && fresh && leaving.length + fresh > old.size) mode = 'swap';
+    // Read everything first, then write: one layout pass each way.
+    const first = mode === 'full' ? rectsOf([...old.values(), ...leaving]) : null;
+    const cols = mode === 'full' ? new Map(leaving.filter((el) => getComputedStyle(el).display === 'table-row')
+      .map((el) => [el, [...el.children].map((c) => `${c.getBoundingClientRect().width}px`).join(' ')])) : null;
+    for (const el of leaving) {
+      dropFocus(el);
+      if (mode === 'full') ghost(box, el, first.get(el), cols.get(el)); else el.remove();
+    }
+    const entering = [];
+    // A kept element that moves leaves the document for a moment, and its
+    // focus with it, unless the browser can move it in place.
+    const focused = document.activeElement;
+    const keep = focused && focused !== document.body && [...old.values()].some((el) => el.contains(focused)) ? focused : null;
+    let ref = box.firstElementChild;
+    items.forEach((it, i) => {
+      let el = old.get(keys[i]);
+      if (el) { if (update) update(el, it); }
+      else { el = create(it); el.dataset.key = keys[i]; entering.push(el); }
+      while (ref && ref !== el && ref.classList.contains('is-leaving')) ref = ref.nextElementSibling;
+      if (el === ref) ref = ref.nextElementSibling;
+      else if (box.moveBefore && el.parentNode === box) box.moveBefore(el, ref);
+      else box.insertBefore(el, ref);
+    });
+    if (keep && keep.isConnected && document.activeElement !== keep) keep.focus({ preventScroll: true });
+    if (mode === 'none') return;
+    if (mode === 'swap') { box.animate([{ opacity: 0.2 }, { opacity: 1 }], { duration: DUR.base, easing: 'ease-out' }); return; }
+    if (mode === 'full') { for (const el of leaving) first.delete(el); playFlip(first); }
+    const enter = mode === 'full'
+      ? [{ opacity: 0, transform: 'translateY(6px) scale(0.97)' }, { opacity: 1, transform: 'none' }]
+      : [{ opacity: 0 }, { opacity: 1 }];
+    for (const el of entering) el.animate(enter, { duration: mode === 'full' ? DUR.slow : DUR.slow + 60, easing: EASE });
+  }
+
+  // ---- numbers and frames: one requestAnimationFrame loop for all of them
+  const tweens = new Map();   // element -> { from, to, t0, dur, fmt, value }
+  const loops = new Set();    // frames() runs: { owner, draw, t0, dur }
+  let raf = 0;
+  function kick() { if (!raf) raf = requestAnimationFrame(step); }
+  function step(now) {
+    raf = 0;
+    for (const [el, tw] of tweens) {
+      const p = Math.min(1, (now - tw.t0) / tw.dur);
+      tw.value = p >= 1 ? tw.to : tw.from + (tw.to - tw.from) * easeOut(p);
+      el.textContent = tw.fmt(tw.value);
+      if (p >= 1) tweens.delete(el);
+    }
+    for (const run of loops) {
+      const p = Math.min(1, Math.max(0, (now - run.t0) / run.dur));
+      if (p >= 1) loops.delete(run);
+      run.draw(easeOut(p));
+    }
+    if (tweens.size || loops.size) kick();
+  }
+  // Ends every running tween and frame run at its final value (the tab hid).
+  function settleMotion() {
+    for (const [el, tw] of tweens) el.textContent = tw.fmt(tw.to);
+    tweens.clear();
+    const runs = [...loops];
+    loops.clear();
+    for (const run of runs) run.draw(1);
+  }
+
+  // Sets `el`'s text to fmt(to), counting from the number it shows now.
+  function tweenNumber(el, to, fmt) {
+    const from = el._num;
+    el._num = to;
+    const run = tweens.get(el);
+    if (!isNum(to) || !isNum(from) || !liveMotion()) {
+      tweens.delete(el);
+      el.textContent = fmt(to);
+      return;
+    }
+    if (from === to) { if (run) run.fmt = fmt; else el.textContent = fmt(to); return; }
+    tweens.set(el, { from: run ? run.value : from, to, t0: performance.now(), dur: DUR.slow + 240, fmt, value: from });
+    kick();
+  }
+
+  const animating = (owner) => [...loops].some((run) => run.owner === owner);
+
+  // Calls draw(p) each frame with p eased from 0 to 1, replacing `owner`'s
+  // previous run; with `dur` 0 or without motion, draw(1) at once.
+  function frames(owner, draw, dur) {
+    for (const run of loops) if (run.owner === owner) loops.delete(run);
+    if (dur === 0 || !liveMotion()) { draw(1); return; }
+    loops.add({ owner, draw, t0: performance.now(), dur: dur || DUR.slow + 120 });
+    kick();
+  }
+
+  // Shows or hides `el` (its `hidden`) with a height and fade; in a grid or
+  // flex parent its gap folds along.
+  function collapse(el, show) {
+    if (el._collapse) {
+      if (el._collapse.show === show) return;  // already on its way there
+      el._collapse.cancel();
+      el._collapse = null;
+    }
+    if (show === !el.hidden) return;
+    if (!liveMotion()) { el.hidden = !show; return; }
+    el.hidden = false;
+    const h0 = el.getBoundingClientRect().height;
+    const gap = parseFloat(getComputedStyle(el.parentElement).rowGap) || 0;
+    const open = { height: `${h0}px`, opacity: 1, marginBottom: '0px' };
+    const shut = { height: '0px', opacity: 0, marginBottom: `${-gap}px` };
+    el.style.overflow = 'hidden';
+    const a = el.animate(show ? [shut, open] : [open, shut], { duration: DUR.slow, easing: EASE });
+    a.show = show;
+    el._collapse = a;
+    const done = () => { el.style.overflow = ''; if (el._collapse === a) el._collapse = null; };
+    a.finished.then(() => { done(); if (!show) { dropFocus(el); el.hidden = true; } }, done);
+  }
+
+  // A segmented control's active background slides between its buttons.
+  function segThumb(seg) {
+    if (!seg._thumb) {
+      seg._thumb = h('span', { class: 'seg-thumb', 'aria-hidden': 'true' });
+      seg.prepend(seg._thumb);
+      seg.classList.add('has-thumb');
+      new ResizeObserver(() => placeThumb(seg, false)).observe(seg);
+    }
+    placeThumb(seg, true);
+  }
+  const segThumbs = (root) => $$('.seg', root).forEach(segThumb);
+  function placeThumb(seg, animate) {
+    const th = seg._thumb, b = $('.seg-btn[aria-pressed="true"], .seg-btn[aria-selected="true"]', seg);
+    if (!b || !b.offsetWidth) { th.classList.remove('on'); return; }
+    th.classList.toggle('no-anim', !animate || !th.classList.contains('on') || !motionOk());
+    th.style.setProperty('--x', `${b.offsetLeft}px`);
+    th.style.setProperty('--w', `${b.offsetWidth}px`);
+    th.classList.add('on');
+  }
 
   // ------------------------------------------------------------- formatting
   function fmtDur(secs) {
@@ -76,8 +361,10 @@
     if (hr < 24) return `${hr}h ${pad2(m % 60)}m`;
     return `${Math.floor(hr / 24)}d ${hr % 24}h`;
   }
+  // `3 min ago`, or with absolute times chosen `14:32`, `Mon 14:32`.
   function fmtAgo(t) {
     if (!isNum(t)) return '—';
+    if (cfg.general.time === 'absolute') return fmtWhen(t);
     const d = serverNow() - t;
     if (d < 10) return 'just now';
     if (d < 60) return `${Math.floor(d)}s ago`;
@@ -85,25 +372,40 @@
     if (d < 86400) return `${Math.floor(d / 3600)} h ago`;
     return `${Math.floor(d / 86400)} d ago`;
   }
+  // GiB (1024³) or, with decimal units chosen, GB (1000³).
   function fmtBytes(b) {
     if (!isNum(b)) return '—';
-    const g = b / 2 ** 30;
-    if (g >= 1024) return `${(g / 1024).toFixed(g >= 10240 ? 0 : 1)} TiB`;
-    if (g >= 100) return `${g.toFixed(0)} GiB`;
-    if (g >= 1) return `${g.toFixed(1)} GiB`;
-    return `${Math.round(b / 2 ** 20)} MiB`;
+    const dec = cfg.general.bytes === 'decimal';
+    const k = dec ? 1000 : 1024, i = dec ? '' : 'i';
+    const g = b / k ** 3;
+    if (g >= k) return `${(g / k).toFixed(g >= 10 * k ? 0 : 1)} T${i}B`;
+    if (g >= 100) return `${g.toFixed(0)} G${i}B`;
+    if (g >= 1) return `${g.toFixed(1)} G${i}B`;
+    return `${Math.round(b / k ** 2)} M${i}B`;
   }
+  const gigabyte = () => (cfg.general.bytes === 'decimal' ? 1e9 : 2 ** 30);
   const fmtPct = (v) => (isNum(v) ? `${Math.round(v)}%` : '—');
   const fmtInt = (v) => (isNum(v) ? String(Math.round(v)) : '—');
   function fmtClock(t) {
     const d = new Date(t * 1000);
-    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    const hr = d.getHours();
+    if (cfg.general.clock === '12') return `${hr % 12 || 12}:${pad2(d.getMinutes())} ${hr < 12 ? 'AM' : 'PM'}`;
+    return `${pad2(hr)}:${pad2(d.getMinutes())}`;
   }
   function fmtDay(t) {
     return new Date(t * 1000).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric' });
   }
   function fmtStamp(t) {
-    return new Date(t * 1000).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    return new Date(t * 1000).toLocaleString(undefined, {
+      weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: cfg.general.clock === '12' ? 'h12' : 'h23',
+    });
+  }
+  // A moment as a time of day: today `14:32`, this week `Mon 14:32`, else `3 Nov 14:32`.
+  function fmtWhen(t) {
+    const d = new Date(t * 1000), now = new Date(serverNow() * 1000);
+    if (d.toDateString() === now.toDateString()) return fmtClock(t);
+    const opts = Math.abs(now - d) < 6 * 86400e3 ? { weekday: 'short' } : { day: 'numeric', month: 'short' };
+    return `${d.toLocaleDateString(undefined, opts)} ${fmtClock(t)}`;
   }
   const repoShort = (r) => (r ? String(r).split('/').pop() : '—');
   const humanize = (v) => (v ? String(v).replace(/_/g, ' ') : '—');
@@ -116,6 +418,9 @@
   // Live-updating text: elements carry data-since (elapsed) or data-ago (relative).
   const since = (t, cls) => h('span', { class: cls || 'num', 'data-since': isNum(t) ? t : null, text: isNum(t) ? fmtDur(serverNow() - t) : '—' });
   const ago = (t, cls) => h('time', { class: cls, 'data-ago': isNum(t) ? t : null, datetime: isNum(t) ? new Date(t * 1000).toISOString() : null, title: isNum(t) ? fmtStamp(t) : null, text: fmtAgo(t) });
+  // What every row and slot that shows a formatted value depends on: a
+  // change rebuilds them.
+  const fmtSig = () => JSON.stringify([cfg.general.time, cfg.general.clock, cfg.general.bytes]);
 
   function tick() {
     for (const el of $$('[data-since]')) el.textContent = fmtDur(serverNow() - Number(el.dataset.since));
@@ -134,11 +439,16 @@
 
   // ------------------------------------------------------------------ boot
   async function boot() {
+    applyGeneral();
+    applyLayout();
     $('#signout').addEventListener('click', signOut);
     $('#recent-toggle').addEventListener('click', () => { state.showAllRecent = !state.showAllRecent; if (state.ov) renderRecent(state.ov); });
+    reducedMotion.addEventListener('change', settleMotion);
+    darkScheme.addEventListener('change', applyGeneral);
     buildRangeSwitch();
     buildAuditControls();
     setupDrawer();
+    setupSettings();
     document.addEventListener('visibilitychange', onVisibility);
     document.addEventListener('pointerdown', (e) => { if (!e.target.closest('.plot')) hideAllTips(); });
     try {
@@ -178,7 +488,10 @@
       h('span', { class: 'who-login', text: u.login || '' }),
     ]);
     who.title = u.login ? `Signed in as ${u.login}` : '';
+    renderSkeletons();
+    renderChartFrames();
     startTimers();
+    loadServerSettings();
     const id = hashHost();
     if (id) openDrawer(id, false);
   }
@@ -205,7 +518,7 @@
   const polling = () => !document.hidden && !$('#app').hidden;
   function onVisibility() {
     if ($('#app').hidden) return;
-    if (document.hidden) stopTimers(); else startTimers();
+    if (document.hidden) { stopTimers(); settleMotion(); } else startTimers();
   }
 
   async function loadOverview() {
@@ -220,7 +533,7 @@
       state.failed = true;
       renderLive();
     }
-    if (polling()) state.timers.ov = setTimeout(loadOverview, OVERVIEW_MS);
+    if (polling()) state.timers.ov = setTimeout(loadOverview, overviewMs());
   }
 
   async function loadMetrics() {
@@ -245,7 +558,7 @@
     const el = $('#live');
     if (!el || $('#app').hidden) return;
     const age = state.lastOk ? nowSec() - state.lastOk : Infinity;
-    const stale = state.failed || age > STALE_SECS;
+    const stale = state.failed || age > staleSecs();
     el.classList.toggle('is-stale', stale);
     $('#live-text').textContent = stale ? (state.lastOk ? `Stale · ${fmtDur(age)}` : 'Connecting') : 'Live';
     el.title = state.lastOk ? `Last update ${new Date(state.lastOk * 1000).toLocaleTimeString()}${state.failed ? ' · last refresh failed' : ''}` : 'Waiting for first update';
@@ -254,24 +567,29 @@
   function renderUpdate(ov) {
     const u = ov.update;
     const banner = $('#banner'), chip = $('#update-chip');
-    banner.replaceChildren(); banner.hidden = true; chip.hidden = true;
-    if (!u) return;
-    if (u.state === 'rolled_back' || u.state === 'failed') {
+    const failed = u && (u.state === 'rolled_back' || u.state === 'failed');
+    if (failed) {
       const title = u.state === 'rolled_back' ? 'Update rolled back' : 'Update failed';
       const meta = [
         u.current && `running v${u.current}`,
         u.latest && u.latest !== u.current && `target v${u.latest}`,
       ].filter(Boolean).join(' · ');
-      banner.hidden = false;
-      banner.append(h('div', { class: 'banner', role: 'alert' },
-        h('span', { class: 'banner-icon', 'aria-hidden': 'true', text: '!' }),
-        h('div', { class: 'banner-body' },
-          h('strong', { text: title }),
-          u.message ? h('p', { text: u.message }) : null,
-          h('p', { class: 'banner-meta' }, meta, meta ? ' · ' : '', 'checked ', ago(u.checked_at))),
-      ));
-    } else if (u.state === 'updated' && isNum(u.changed_at) && serverNow() - u.changed_at < 86400) {
-      chip.hidden = false;
+      // Rebuilt only when it says something new: a role=alert is read out again on every rebuild.
+      const sig = JSON.stringify([title, u.message, meta, u.checked_at]);
+      if (banner.dataset.sig !== sig) {
+        banner.dataset.sig = sig;
+        banner.replaceChildren(h('div', { class: 'banner', role: 'alert' },
+          h('span', { class: 'banner-icon', 'aria-hidden': 'true', text: '!' }),
+          h('div', { class: 'banner-body' },
+            h('strong', { text: title }),
+            u.message ? h('p', { text: u.message }) : null,
+            h('p', { class: 'banner-meta' }, meta, meta ? ' · ' : '', 'checked ', ago(u.checked_at)))));
+      }
+    } else banner.dataset.sig = '';
+    collapse(banner, !!failed);
+    const fresh = u && !failed && u.state === 'updated' && isNum(u.changed_at) && serverNow() - u.changed_at < 86400;
+    chip.hidden = !fresh;
+    if (fresh) {
       chip.textContent = `Updated to v${u.current || ov.version}`;
       chip.title = [u.message, `${fmtAgo(u.changed_at)}`].filter(Boolean).join(' · ');
     }
@@ -291,36 +609,113 @@
     renderPools(ov);
     renderLive();
     syncDrawer();
+    state.painted = true;
   }
 
-  function meterBar(pct, extra) {
+  // Placeholders of about the size of what comes, so the first data does not push the page around.
+  function renderSkeletons() {
+    if (state.painted) return;
+    const line = (w) => h('span', { class: `sk ${w}` });
+    $('#kpis').replaceChildren(...shownKpis().map(() => h('div', { class: 'kpi kpi-sk', 'aria-hidden': 'true' }, line('w50'), line('w30 sk-big'), line('w60'))));
+    $('#hosts').replaceChildren(...[1, 2, 3].map(() => h('div', { class: 'host host-sk', 'aria-hidden': 'true' },
+      line('w40 sk-big'), line('w70'), line('w60'), line('w70'), h('span', { class: 'sk sk-spark' }), line('w50'))));
+    const rows = (n) => h('div', { class: 'tbl-sk', 'aria-hidden': 'true' }, Array.from({ length: n }, (_, i) => line(['w70', 'w50', 'w60'][i % 3])));
+    for (const [id, n] of [['#queue', 3], ['#running', 3], ['#recent', 5]]) $(id).replaceChildren(rows(n));
+  }
+
+  function setBar(el, pct) {
     const p = isNum(pct) ? clamp(pct, 0, 100) : 0;
     const level = !isNum(pct) ? 'none' : p >= 90 ? 'err' : p >= 75 ? 'high' : p >= 50 ? 'warn' : 'ok';
-    return h('span', { class: `bar bar-${level} ${extra || ''}`, role: 'presentation', vars: { '--pct': `${p}%` } });
+    el.setAttribute('class', `bar bar-${level}${el.dataset.extra ? ` ${el.dataset.extra}` : ''}`);
+    el.style.setProperty('--pct', `${p}%`);
+  }
+  function meterBar(pct, extra) {
+    const el = h('span', { role: 'presentation', 'data-extra': extra || null });
+    setBar(el, pct);
+    return el;
   }
 
-  function kpi(label, value, sub, extra) {
+  // ------------------------------------------------------------------ KPIs
+  // The summary tiles (settings.js lists them). Each fills its own tile:
+  // `value` gives the big number and what it is out of (`single`: nothing),
+  // `fmt` formats both, `sub` fills the line under it. Which show, and in
+  // what order, is a setting.
+  const KPI_FILL = {
+    machines: { value: (c) => [c.sm.hosts_online, c.sm.hosts_total] },
+    slots: {
+      value: (c) => [c.sm.slots_busy, c.sm.slots_total], bar: (c) => c.pct,
+      sub: (c, el) => { el.textContent = isNum(c.pct) ? `${Math.round(c.pct)}% utilised` : ''; },
+    },
+    jobs: {
+      value: (c) => [c.sm.jobs_running, c.sm.jobs_queued],
+      sub: (c, el) => {
+        const sig = JSON.stringify([c.runHosts, !!c.sm.jobs_running, c.oldest && c.oldest.queued_at]);
+        if (el.dataset.sig !== sig) { el.dataset.sig = sig; el.replaceChildren(...[jobsSub(c.sm, c.runHosts, c.oldest)].filter(Boolean)); }
+      },
+    },
+    wait: {
+      value: (c) => [c.sm.p50_queue_wait_secs], fmt: fmtDur, single: true,
+      sub: (c, el) => {
+        if (!el.firstChild) el.append('p90 ', h('b', { class: 'num' }));
+        tweenNumber(el.lastChild, c.sm.p90_queue_wait_secs, fmtDur);
+      },
+    },
+    cpu: {
+      value: (c) => [c.cpu.avg], fmt: fmtPct, single: true, bar: (c) => c.cpu.avg,
+      sub: (c, el) => { el.textContent = c.cpu.top ? `busiest ${c.cpu.top.name || c.cpu.top.hostname} · ${fmtPct(c.cpu.top.cpu_load_percent)}` : 'no machine reports CPU'; },
+    },
+    memory: {
+      value: (c) => [c.mem.used, c.mem.total], fmt: fmtBytes, bar: (c) => c.mem.pct,
+      sub: (c, el) => { el.textContent = isNum(c.mem.pct) ? `${Math.round(c.mem.pct)}% of the online machines’ memory` : ''; },
+    },
+  };
+  const kpiByKey = new Map(RS.KPIS.map((d) => [d.key, { ...KPI_FILL[d.key], key: d.key, label: d.label }]));
+  const shownKpis = () => RS.shown(cfg.kpis.order, cfg.kpis.hidden).map((key) => kpiByKey.get(key)).filter(Boolean);
+
+  function kpiTile(k) {
     return h('div', { class: 'kpi' },
-      h('p', { class: 'kpi-label', text: label }),
-      h('p', { class: 'kpi-value' }, value),
-      sub ? h('p', { class: 'kpi-sub' }, sub) : null,
-      extra || null);
+      h('p', { class: 'kpi-label', text: k.label }),
+      h('p', { class: 'kpi-value' }, h('span', { class: 'num' }, h('span', { class: 'kpi-a' }), k.single ? null : h('small', {}, ' / ', h('span', { class: 'kpi-b' })))),
+      k.sub ? h('p', { class: 'kpi-sub' }) : null,
+      k.bar ? meterBar(null, 'kpi-bar') : null);
+  }
+  function fillKpi(el, k, c) {
+    const [a, b] = k.value(c);
+    tweenNumber($('.kpi-a', el), a, k.fmt || fmtInt);
+    if (!k.single) tweenNumber($('.kpi-b', el), b, k.fmt || fmtInt);
+    if (k.sub) k.sub(c, $('.kpi-sub', el));
+    if (k.bar) setBar($('.bar', el), k.bar(c));
+  }
+
+  // The fleet's CPU and memory, from the online machines that report them.
+  function fleetLoad(hosts) {
+    const on = hosts.filter((x) => x.online);
+    const cpus = on.filter((x) => isNum(x.cpu_load_percent));
+    const rams = on.filter((x) => isNum(x.ram_bytes) && isNum(x.free_ram_bytes) && x.ram_bytes > 0);
+    const total = rams.reduce((a, x) => a + x.ram_bytes, 0);
+    const used = rams.reduce((a, x) => a + x.ram_bytes - x.free_ram_bytes, 0);
+    return {
+      cpu: {
+        avg: cpus.length ? cpus.reduce((a, x) => a + x.cpu_load_percent, 0) / cpus.length : null,
+        top: cpus.reduce((a, x) => (!a || x.cpu_load_percent > a.cpu_load_percent ? x : a), null),
+      },
+      mem: { used: rams.length ? used : null, total: rams.length ? total : null, pct: total ? (used / total) * 100 : null },
+    };
   }
 
   function renderKpis(ov) {
     const sm = ov.summary || {};
-    const pct = isNum(sm.slots_busy) && sm.slots_total > 0 ? (sm.slots_busy / sm.slots_total) * 100 : null;
-    const oldest = (ov.queue || [])[0];
-    const runHosts = new Set((ov.running || []).map((j) => j.host_id).filter(Boolean)).size;
-    $('#kpis').replaceChildren(
-      kpi('Machines online', h('span', { class: 'num' }, fmtInt(sm.hosts_online), h('small', { text: ` / ${fmtInt(sm.hosts_total)}` }))),
-      kpi('Runner slots busy', h('span', { class: 'num' }, fmtInt(sm.slots_busy), h('small', { text: ` / ${fmtInt(sm.slots_total)}` })),
-        isNum(pct) ? `${Math.round(pct)}% utilised` : null, meterBar(pct, 'kpi-bar')),
-      kpi('Jobs running / queued', h('span', { class: 'num' }, fmtInt(sm.jobs_running), h('small', { text: ` / ${fmtInt(sm.jobs_queued)}` })),
-        jobsSub(sm, runHosts, oldest)),
-      kpi('Queue wait p50', h('span', { class: 'num', text: fmtDur(sm.p50_queue_wait_secs) }),
-        h('span', {}, 'p90 ', h('b', { class: 'num', text: fmtDur(sm.p90_queue_wait_secs) }))),
-    );
+    const c = {
+      sm,
+      pct: isNum(sm.slots_busy) && sm.slots_total > 0 ? (sm.slots_busy / sm.slots_total) * 100 : null,
+      oldest: (ov.queue || [])[0],
+      runHosts: new Set((ov.running || []).map((j) => j.host_id).filter(Boolean)).size,
+      ...fleetLoad(ov.hosts || []),
+    };
+    const box = $('#kpis');
+    const n = shownKpis().length;
+    box.style.setProperty('--kpi-cols', String(n > 5 ? 3 : Math.max(1, n)));
+    reconcile(box, shownKpis(), (k) => k.key, (k) => { const el = kpiTile(k); fillKpi(el, k, c); return el; }, (el, k) => fillKpi(el, k, c));
   }
 
   // `on 3 machines · oldest waits 1m 12s`, or `all idle`.
@@ -333,32 +728,50 @@
   }
 
   // ---------------------------------------------------------------- hosts
-  // The one client-side sort: colours follow the name order of every known host in
-  // either list, so they stay put when a host goes offline. The lists come sorted.
+  // Colours follow the name order of every known host in either list, and a
+  // host keeps its colour while it stays known, so one that appears or goes
+  // offline does not recolour the others.
   function assignHostColors() {
     const names = new Map();
     for (const x of (state.ov && state.ov.hosts) || []) names.set(x.id, x.name || x.hostname || x.id);
     for (const x of (state.metrics && state.metrics.hosts) || []) if (!names.has(x.id)) names.set(x.id, x.name || x.id);
     const ids = [...names.keys()].sort((a, b) => String(names.get(a)).localeCompare(String(names.get(b))));
-    state.hostColors = new Map(ids.map((id, i) => [id, `var(--s${(i % 8) + 1})`]));
+    const prev = state.hostColors, next = new Map(), used = new Set();
+    for (const id of ids) {
+      const c = prev.get(id);
+      if (c && !used.has(c) && used.size < 8) { next.set(id, c); used.add(c); }
+    }
+    let i = 0;
+    for (const id of ids) {
+      if (next.has(id)) continue;
+      while (used.size < 8 && used.has(`var(--s${(i % 8) + 1})`)) i++;
+      const c = `var(--s${(i % 8) + 1})`;
+      next.set(id, c); used.add(c); i++;
+    }
+    state.hostColors = next;
+    state.colorSig = JSON.stringify([...next]);
   }
   const hostColor = (id) => state.hostColors.get(id) || 'var(--muted)';
   const hostDot = (id) => h('span', { class: 'host-dot', 'aria-hidden': 'true', vars: { '--c': hostColor(id) } });
   const machine = (id, name) => h('span', { class: 'machine' }, hostDot(id), name);
 
+  const STATUS_LABEL = Object.fromEntries(RS.STATUS);
   function hostStatus(x) {
-    if (!x.online) return { key: 'offline', label: 'Offline' };
-    if (x.unfit) return { key: 'unfit', label: 'Unfit' };
-    if (x.draining) return { key: 'draining', label: 'Draining' };
-    return { key: 'online', label: 'Online' };
+    const key = RS.statusOf(x);
+    return { key, label: STATUS_LABEL[key] };
   }
-  const OS_NAME = { linux: 'Linux', windows: 'Windows', macos: 'macOS' };
+  const OS_NAME = RS.OS_NAME;
+  const osTag = (os) => h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' });
 
-  function meterRow(label, pct, value) {
+  function meterRow(label) {
     return h('div', { class: 'meter' },
       h('span', { class: 'meter-label', text: label }),
-      h('span', { class: 'meter-value num', text: value }),
-      meterBar(pct));
+      h('span', { class: 'meter-value num' }),
+      meterBar(null));
+  }
+  function setMeter(row, pct, value, fmt) {
+    tweenNumber($('.meter-value', row), value, fmt);
+    setBar($('.bar', row), pct);
   }
 
   const peakOf = (vals) => { const v = (vals || []).filter(isNum); return v.length ? Math.max(...v) : null; };
@@ -371,78 +784,240 @@
     });
   }
 
-  function sparkline(hostId) {
+  // A series' value at time `t`, from the group that holds it.
+  const sampleAt = (d, vals, t) => {
+    if (!d || !vals || !d.t.length) return null;
+    const i = Math.floor((t - d.t[0]) / d.step);
+    return i >= 0 && i < d.t.length ? vals[i] : null;
+  };
+
+  // The CPU and memory sparkline: on new samples the lines slide left by
+  // their time and the values ease to their new heights.
+  function setSpark(box, hostId) {
     const m = state.metrics;
     const mh = m && (m.hosts || []).find((x) => x.id === hostId);
-    if (!mh || !Array.isArray(mh.cpu) || mh.cpu.filter(isNum).length < 2) return h('div', { class: 'spark spark-empty', text: 'No CPU history yet' });
+    if (!mh || !Array.isArray(mh.cpu) || mh.cpu.filter(isNum).length < 2) {
+      if (!box.classList.contains('spark-empty')) { box._d = null; box.className = 'spark spark-empty'; box.replaceChildren('No CPU history yet'); fadeIn(box); }
+      return;
+    }
     const rawRam = ramPct(mh);
     const g = regroup(m.t || [], m.step_secs || 60, groupOf(mh.cpu.length, SPARK_POINTS), [mh.cpu, rawRam]);
-    const [cpu, mem] = g.series;
-    const n = cpu.length, W = 120, H = 32;
-    const toPts = (vals) => vals.map((v, i) => (isNum(v) ? [(i / Math.max(1, n - 1)) * W, H - (clamp(v, 0, 100) / 100) * (H - 2) - 1] : null));
-    const cpuPts = toPts(cpu);
-    // Peaks from the samples: an averaged group hides a short spike.
+    const d = { t: g.t, step: g.step, vals: g.series };
+    const sig = JSON.stringify([d, m.range]);
     const cpuPeak = peakOf(mh.cpu), ramPeak = peakOf(rawRam);
-    return h('div', { class: 'spark' },
-      s('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', role: 'img', 'aria-label': `CPU and memory over the ${RANGE_LABEL[m.range] || m.range}: CPU peak ${fmtPct(cpuPeak)}, memory peak ${fmtPct(ramPeak)}` },
-        s('path', { class: 'spark-area', d: areaPath(cpuPts, H, true) }),
-        s('path', { class: 'spark-line spark-ram', d: linePath(toPts(mem), true), 'vector-effect': 'non-scaling-stroke' }),
-        s('path', { class: 'spark-line', d: linePath(cpuPts, true), 'vector-effect': 'non-scaling-stroke' })),
-      h('span', { class: 'spark-cap' },
-        h('span', {}, h('i', { class: 'spark-key', 'aria-hidden': 'true' }), 'CPU', h('i', { class: 'spark-key spark-key-ram', 'aria-hidden': 'true' }), `RAM · ${m.range}`),
-        h('span', { class: 'num', text: `peak ${fmtPct(cpuPeak)} · ${fmtPct(ramPeak)}` })));
+    const W = 120, H = 32;
+    if (box.classList.contains('spark-empty') || !box.firstChild) {
+      box.className = 'spark';
+      box.replaceChildren(
+        s('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', role: 'img' },
+          s('path', { class: 'spark-area' }),
+          s('path', { class: 'spark-line spark-ram', 'vector-effect': 'non-scaling-stroke' }),
+          s('path', { class: 'spark-line', 'vector-effect': 'non-scaling-stroke' })),
+        h('span', { class: 'spark-cap' },
+          h('span', {}, h('i', { class: 'spark-key', 'aria-hidden': 'true' }), 'CPU', h('i', { class: 'spark-key spark-key-ram', 'aria-hidden': 'true' }), h('span', { class: 'spark-range' })),
+          h('span', { class: 'num spark-peak' })));
+      box._d = null;
+      box._sig = null;
+      fadeIn(box);
+    }
+    if (box._sig === sig) return;
+    box._sig = sig;
+    const svg = $('svg', box);
+    const [area, ram, cpu] = svg.children;
+    svg.setAttribute('aria-label', `CPU and memory over the ${RANGE_LABEL[m.range] || m.range}: CPU peak ${fmtPct(cpuPeak)}, memory peak ${fmtPct(ramPeak)}`);
+    $('.spark-range', box).textContent = `RAM · ${m.range}`;
+    $('.spark-peak', box).textContent = `peak ${fmtPct(cpuPeak)} · ${fmtPct(ramPeak)}`;
+    const from = box._d;
+    const n = d.t.length;
+    const draw = (p) => {
+      const t0 = mix(from && from.t[0], d.t[0], p), t1 = mix(from && from.t[from.t.length - 1], d.t[n - 1], p);
+      const pts = (k) => d.vals[k].map((v, i) => {
+        const val = mix(sampleAt(from, from && from.vals[k], d.t[i]), v, p);
+        return isNum(val) ? [((d.t[i] - t0) / (t1 - t0 || 1)) * W, H - (clamp(val, 0, 100) / 100) * (H - 2) - 1] : null;
+      });
+      const cpuPts = pts(0);
+      area.setAttribute('d', areaPath(cpuPts, H, true));
+      cpu.setAttribute('d', linePath(cpuPts, true));
+      ram.setAttribute('d', linePath(pts(1), true));
+    };
+    box._d = d;
+    frames(box, draw, from ? null : 0);
   }
 
-  function hostCard(x) {
+  // A slot of a card that is rebuilt only when what it shows (`sig`) changed.
+  function slot(card, name, sig, build) {
+    const r = card._r;
+    if (r[`${name}Sig`] === sig) return;
+    const fresh = r[`${name}Sig`] !== undefined;
+    r[`${name}Sig`] = sig;
+    const node = build() || document.createComment(name);
+    r[name].replaceWith(node);
+    r[name] = node;
+    if (fresh && liveMotion()) fadeIn(node, DUR.slow);
+  }
+
+  function hostCard() {
+    const el = h('article', { class: 'host' });
+    const r = {
+      dot: hostDot(null),
+      link: h('a', { class: 'host-open' }),
+      pin: pinButton('pin-card'),
+      sub: document.createComment('sub'),
+      status: h('span', { class: 'status' }, h('i', { 'aria-hidden': 'true' }), h('span')),
+      reboot: document.createComment('reboot'),
+      access: document.createComment('access'),
+      cpu: meterRow('CPU'), mem: meterRow('Memory'), slots: meterRow('Slots'),
+      spark: h('div', { class: 'spark' }),
+      ver: document.createComment('ver'),
+      disk: document.createComment('disk'),
+      up: document.createComment('up'),
+    };
+    r.head = h('header', { class: 'host-head' }, r.dot,
+      h('div', { class: 'host-id' }, h('h3', { class: 'host-name' }, r.link), r.sub),
+      r.pin,
+      h('div', { class: 'host-badges' }, r.status, r.reboot, r.access));
+    el._r = r;
+    layoutCard(el);
+    return el;
+  }
+
+  // Lays a card out with the parts the settings show, in their order:
+  // neighbouring meters share a block, disk and uptime sit in the footer.
+  // A part left out keeps updating off the page, ready to come back.
+  function layoutCard(el) {
+    const ms = cfg.machines;
+    const parts = RS.shown(ms.fields, ms.fieldsHidden);
+    const sig = parts.join();
+    if (el._layout === sig) return;
+    const first = el._layout != null;
+    el._layout = sig;
+    const r = el._r;
+    const body = [], foot = [];
+    for (const key of parts) {
+      if (key === 'disk' || key === 'up') foot.push(r[key]);
+      else if (key === 'cpu' || key === 'mem' || key === 'slots') {
+        const last = body[body.length - 1];
+        if (last && last.classList && last.classList.contains('host-meters')) last.append(r[key]);
+        else body.push(h('div', { class: 'host-meters' }, r[key]));
+      } else body.push(r[key]);
+    }
+    el.replaceChildren(r.head, ...body, foot.length ? h('footer', { class: 'host-foot' }, foot) : '');
+    if (first && liveMotion()) for (const n of [...body, el.lastElementChild]) if (n !== r.head) fadeIn(n, DUR.slow);
+  }
+
+  // Updates a machine card in place: its meters and numbers glide, its status crossfades.
+  function fillHost(el, x) {
+    const r = el._r;
     const st = hostStatus(x);
+    const name = x.name || x.hostname || x.id;
+    el.setAttribute('class', `host is-${st.key}`);
+    el.setAttribute('aria-label', `${name}, ${st.label}`);
+    r.dot.style.setProperty('--c', hostColor(x.id));
+    r.link.textContent = name;
+    r.link.href = `#host=${encodeURIComponent(x.id)}`;
+    r.link.dataset.host = x.id;
+    r.link.parentNode.title = x.hostname || '';
+    r.status.setAttribute('class', `status status-${st.key}`);
+    r.status.lastChild.textContent = st.label;
+    setPin(r.pin, x.id, name);
+    layoutCard(el);
+    const os = String(x.os || '').toLowerCase();
+    slot(el, 'sub', JSON.stringify([os, x.arch, x.cores]), () => h('p', { class: 'host-sub' },
+      osTag(os),
+      [x.arch, isNum(x.cores) ? `${x.cores} cores` : null].filter(Boolean).join(' · ')));
+    slot(el, 'access', JSON.stringify([x.online, x.manageable, !!x.remote_changes]), () => accessChip(x, !!x.remote_changes));
+    const reboot = rebootState(x);
+    slot(el, 'reboot', JSON.stringify(reboot && [reboot.state, reboot.message]), () => rebootBadge(x));
+
     const total = isNum(x.ram_bytes) ? x.ram_bytes : null;
     const used = total != null && isNum(x.free_ram_bytes) ? total - x.free_ram_bytes : null;
     const slots = (x.busy_slots || 0) + (x.free_slots || 0);
-    const os = String(x.os || '').toLowerCase();
-    return h('article', { class: `host is-${st.key}`, 'aria-label': `${x.name || x.hostname}, ${st.label}` },
-      h('header', { class: 'host-head' },
-        hostDot(x.id),
-        h('div', { class: 'host-id' },
-          h('h3', { class: 'host-name', title: x.hostname || null },
-            h('a', { class: 'host-open', href: `#host=${encodeURIComponent(x.id)}`, 'data-host': x.id, text: x.name || x.hostname || x.id })),
-          h('p', { class: 'host-sub' },
-            h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' }),
-            [x.arch, isNum(x.cores) ? `${x.cores} cores` : null].filter(Boolean).join(' · '))),
-        h('div', { class: 'host-badges' },
-          h('span', { class: `status status-${st.key}` }, h('i', { 'aria-hidden': 'true' }), st.label),
-          accessChip(x, !!x.remote_changes))),
-      h('div', { class: 'host-meters' },
-        meterRow('CPU', x.cpu_load_percent, fmtPct(x.cpu_load_percent)),
-        meterRow('Memory', used != null && total ? (used / total) * 100 : null, `${fmtBytes(used)} / ${fmtBytes(total)}`),
-        meterRow('Slots', slots ? ((x.busy_slots || 0) / slots) * 100 : null, slots ? `${x.busy_slots || 0} / ${slots}` : '—')),
-      sparkline(x.id),
-      versionLine(x),
-      h('footer', { class: 'host-foot' },
-        diskLine(x),
-        !x.online ? h('span', {}, 'Last seen ', ago(x.last_seen_at))
-          : isNum(x.connected_since) ? h('span', {}, 'Up ', since(x.connected_since)) : null));
+    setMeter(r.cpu, x.cpu_load_percent, isNum(x.cpu_load_percent) ? x.cpu_load_percent : null, fmtPct);
+    setMeter(r.mem, used != null && total ? (used / total) * 100 : null, used, (v) => `${fmtBytes(v)} / ${fmtBytes(total)}`);
+    setMeter(r.slots, slots ? ((x.busy_slots || 0) / slots) * 100 : null, slots ? x.busy_slots || 0 : null, (v) => (isNum(v) ? `${Math.round(v)} / ${slots}` : '—'));
+    setSpark(r.spark, x.id);
+    slot(el, 'ver', versionSig(x), () => versionLine(x));
+
+    const dt = x.disk_total_bytes, df = x.disk_free_bytes;
+    const sized = isNum(dt) && dt > 0 && isNum(df);
+    slot(el, 'disk', String(sized) + fmtSig(), () => (sized
+      ? h('span', { class: 'disk' }, h('span', {}, 'Disk ', h('b', { class: 'num' })), meterBar(null))
+      : h('span', {}, 'Disk free ', h('b', { class: 'num' }))));
+    // `Disk 176 GiB / 1.5 TiB` with a meter, from 0.4.66; free space before.
+    if (sized) {
+      const usedDisk = Math.max(0, dt - df);
+      r.disk.title = `${fmtBytes(df)} free`;
+      tweenNumber($('b', r.disk), usedDisk, (v) => `${fmtBytes(v)} / ${fmtBytes(dt)}`);
+      setBar($('.bar', r.disk), (usedDisk / dt) * 100);
+    } else tweenNumber($('b', r.disk), df, fmtBytes);
+    slot(el, 'up', JSON.stringify(x.online ? [x.connected_since] : [null, x.last_seen_at]) + fmtSig(), () => (!x.online ? h('span', {}, 'Last seen ', ago(x.last_seen_at))
+      : isNum(x.connected_since) ? h('span', {}, 'Up ', since(x.connected_since)) : null));
   }
 
-  // `Disk 176 GiB / 1.5 TiB` with a meter, from 0.4.66; free space before.
-  function diskLine(x) {
-    const total = x.disk_total_bytes, free = x.disk_free_bytes;
-    if (!isNum(total) || total <= 0 || !isNum(free)) return h('span', {}, 'Disk free ', h('b', { class: 'num', text: fmtBytes(free) }));
-    const used = Math.max(0, total - free);
-    return h('span', { class: 'disk', title: `${fmtBytes(free)} free` },
-      h('span', {}, 'Disk ', h('b', { class: 'num', text: `${fmtBytes(used)} / ${fmtBytes(total)}` })),
-      meterBar((used / total) * 100));
+  // The machine cards in the order the settings give (settings.js
+  // `arrangeHosts`): pinned first, then by the chosen rule, perhaps under
+  // group headings. Each item is a host or a heading `{ head }`.
+  function hostItems(hosts) {
+    const groups = RS.arrangeHosts(hosts, cfg.machines);
+    return groups.flatMap((g) => (g.label ? [{ head: g }, ...g.hosts] : g.hosts));
   }
 
   function renderHosts(ov) {
-    const hosts = ov.hosts || [];  // online first, then by name
-    const on = hosts.filter((x) => x.online).length;
-    $('#machines-count').textContent = hosts.length ? `${on} of ${hosts.length} online` : '';
-    // Cards are rebuilt on every poll: keep keyboard focus on the same card.
-    const f = document.activeElement;
-    const keep = f && f.classList && f.classList.contains('host-open') ? f.dataset.host : null;
-    $('#hosts').replaceChildren(...(hosts.length ? hosts.map(hostCard)
-      : [empty('No machines enrolled yet', 'Machines appear here once their runner-manager agent connects.')]));
-    if (keep) { const el = $(`.host-open[data-host="${CSS.escape(keep)}"]`); if (el) el.focus({ preventScroll: true }); }
+    const all = ov.hosts || [];
+    const items = hostItems(all);
+    const on = all.filter((x) => x.online).length;
+    const away = all.length - items.filter((x) => !x.head).length;
+    $('#machines-count').textContent = all.length ? `${on} of ${all.length} online${away ? ` · ${away} not shown` : ''}` : '';
+    const box = $('#hosts');
+    box.classList.toggle('is-compact', cfg.machines.density === 'compact');
+    const none = !all.length ? 'none' : !items.length ? 'filtered' : null;
+    resize(box, () => reconcile(box, none ? [none] : items, (x) => (typeof x === 'string' ? x : x.head ? `g:${x.head.key}` : x.id),
+      (x) => {
+        if (x === 'none') return empty('No machines enrolled yet', 'Machines appear here once their runner-manager agent connects.');
+        if (x === 'filtered') return empty('Every machine is hidden', 'Settings → Machines chooses which machines show.');
+        if (x.head) return groupHead(x.head);
+        const el = hostCard();
+        fillHost(el, x);
+        return el;
+      },
+      (el, x) => { if (x.head) fillGroupHead(el, x.head); else if (typeof x !== 'string') fillHost(el, x); }));
+  }
+
+  function groupHead(g) {
+    const el = h('h3', { class: 'host-group' }, h('span', { class: 'host-group-name' }), h('span', { class: 'count num' }));
+    fillGroupHead(el, g);
+    return el;
+  }
+  function fillGroupHead(el, g) {
+    el.firstChild.textContent = g.label;
+    tweenNumber(el.lastChild, g.hosts.length, countText);
+  }
+
+  // ----------------------------------------------------------------- pins
+  const isPinned = (id) => cfg.machines.pinned.includes(id);
+  function togglePin(id) {
+    update((c) => {
+      const ms = c.machines;
+      if (ms.pinned.includes(id)) ms.pinned = ms.pinned.filter((x) => x !== id);
+      else { ms.pinned.push(id); ms.hidden = ms.hidden.filter((x) => x !== id); }
+    });
+  }
+  const pinIcon = (n) => icon('M7.5 3.5h5M8.5 3.5v4.2L6 10.5v1.5h8v-1.5l-2.5-2.8V3.5M10 12v4.5', n || 14);
+  function pinButton(cls) {
+    const b = h('button', { type: 'button', class: `pin-btn ${cls}`, 'aria-pressed': 'false' }, pinIcon(15));
+    b.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (b.dataset.host) togglePin(b.dataset.host);
+    });
+    return b;
+  }
+  function setPin(b, id, name) {
+    const on = isPinned(id);
+    b.dataset.host = id;
+    b.setAttribute('aria-pressed', String(on));
+    b.setAttribute('aria-label', `${on ? 'Unpin' : 'Pin'} ${name}`);
+    b.title = on ? 'Pinned: shown first. Click to unpin.' : 'Pin: show this machine first';
   }
 
   // ---------------------------------------------------------------- tables
@@ -476,6 +1051,34 @@
       h('thead', {}, h('tr', {}, heads.map((x) => h('th', { scope: 'col', class: x[1] || null, text: x[0] })))),
       h('tbody', {}, rows));
   }
+
+  // A table of `spec.items` in `box`, a row per item keyed by `spec.key`, or
+  // `spec.empty()` when there are none. Rows come and go animated; a row is
+  // rebuilt only when its item (or a machine's name or colour) changed.
+  // `spec.before` / `spec.after`: more keyed blocks around it ({ key, create, update }).
+  function renderTable(box, spec) {
+    const blocks = [
+      ...(spec.before || []),
+      spec.items.length ? { key: 'tbl', create: () => table(spec.caption, spec.heads, []) } : {
+        key: 'empty', create: spec.empty,
+        update: (el) => { const n = spec.empty(); if (n.textContent !== el.textContent) el.replaceChildren(...n.childNodes); },
+      },
+      ...(spec.after || []),
+    ];
+    resize(box, () => {
+      reconcile(box, blocks, (b) => b.key, (b) => b.create(), (el, b) => { if (b.update) b.update(el); });
+      const tb = $(':scope > table:not(.is-leaving) > tbody', box);
+      if (!tb) return;
+      const fill = (tr, it) => {
+        const sig = JSON.stringify([it, spec.sig ? spec.sig(it) : null]) + state.colorSig + fmtSig();
+        if (tr._sig === sig) return;
+        tr._sig = sig;
+        tr.replaceChildren(...spec.row(it));
+      };
+      reconcile(tb, spec.items, spec.key, (it) => { const tr = h('tr'); fill(tr, it); return tr; }, fill);
+    });
+  }
+
   function hostName(id, fallback) {
     const x = ((state.ov && state.ov.hosts) || []).find((y) => y.id === id);
     return (x && (x.name || x.hostname)) || fallback || '—';
@@ -485,24 +1088,27 @@
       machine(j.host_id, j.host_name || hostName(j.host_id)),
       j.runner_name ? h('span', { class: 'runner mono', title: j.runner_name, text: j.runner_name }) : null);
   }
+  const countText = (v) => (isNum(v) && Math.round(v) > 0 ? String(Math.round(v)) : '');
 
   function renderQueue(ov) {
     const q = ov.queue || [];
-    $('#queue-count').textContent = q.length ? String(q.length) : '';
-    $('#queue').replaceChildren(q.length
-      ? table('Queued jobs', [['Job'], ['Labels', 'c-labels'], ['Waiting', 'c-num']], q.map((j) => h('tr', {},
-        jobCell(j), td('Labels', 'c-labels', chips(j.labels)),
-        td('Waiting', 'c-num', since(j.queued_at, 'num wait'))))
-      ) : empty('Queue is clear', 'New jobs are placed as soon as a slot frees up.'));
+    tweenNumber($('#queue-count'), q.length, countText);
+    renderTable($('#queue'), {
+      caption: 'Queued jobs', heads: [['Job'], ['Labels', 'c-labels'], ['Waiting', 'c-num']], items: q, key: (j) => j.id,
+      row: (j) => [jobCell(j), td('Labels', 'c-labels', chips(j.labels)), td('Waiting', 'c-num', since(j.queued_at, 'num wait'))],
+      empty: () => empty('Queue is clear', 'New jobs are placed as soon as a slot frees up.'),
+    });
   }
 
   function renderRunning(ov) {
     const r = ov.running || [];
-    $('#running-count').textContent = r.length ? String(r.length) : '';
-    $('#running').replaceChildren(r.length
-      ? table('Running jobs', [['Job'], ['Machine'], ['Elapsed', 'c-num']], r.map((j) => h('tr', {},
-        jobCell(j), machineCell(j), td('Elapsed', 'c-num', since(j.started_at)))))
-      : empty('No jobs running', 'Every runner slot is idle.'));
+    tweenNumber($('#running-count'), r.length, countText);
+    renderTable($('#running'), {
+      caption: 'Running jobs', heads: [['Job'], ['Machine'], ['Elapsed', 'c-num']], items: r, key: (j) => j.id,
+      row: (j) => [jobCell(j), machineCell(j), td('Elapsed', 'c-num', since(j.started_at))],
+      sig: (j) => hostName(j.host_id),
+      empty: () => empty('No jobs running', 'Every runner slot is idle.'),
+    });
   }
 
   const CONCLUSION = {
@@ -516,41 +1122,50 @@
 
   function renderRecent(ov) {
     const all = ov.recent || [];
-    const LIMIT = 12;
+    const LIMIT = cfg.general.recentRows;
     const list = state.showAllRecent ? all : all.slice(0, LIMIT);
     const btn = $('#recent-toggle');
     btn.hidden = all.length <= LIMIT;
     btn.textContent = state.showAllRecent ? 'Show fewer' : `Show all ${all.length}`;
     btn.setAttribute('aria-expanded', String(state.showAllRecent));
-    $('#recent').replaceChildren(list.length
-      ? table('Recently completed jobs', [['Result'], ['Job'], ['Machine'], ['Duration', 'c-num'], ['Finished', 'c-num']], list.map((j) => h('tr', {},
-        td('Result', 'c-result', conclusion(j.conclusion)), jobCell(j), machineCell(j),
-        numCell('Duration', fmtDur(j.duration_secs)),
-        td('Finished', 'c-num c-when', ago(j.completed_at, 'muted')))))
-      : empty('No completed jobs yet', null));
+    renderTable($('#recent'), {
+      caption: 'Recently completed jobs', heads: [['Result'], ['Job'], ['Machine'], ['Duration', 'c-num'], ['Finished', 'c-num']],
+      items: list, key: (j) => `${j.id}:${j.completed_at}`,
+      row: (j) => [td('Result', 'c-result', conclusion(j.conclusion)), jobCell(j), machineCell(j),
+        numCell('Duration', fmtDur(j.duration_secs)), td('Finished', 'c-num c-when', ago(j.completed_at, 'muted'))],
+      sig: (j) => hostName(j.host_id),
+      empty: () => empty('No completed jobs yet', null),
+    });
   }
 
   function renderPools(ov) {
     const pools = ov.pools || [], leases = ov.leases || [];
     const sec = $('#pools-section');
-    sec.hidden = !pools.length && !leases.length;
-    if (sec.hidden) return;
-    const parts = [];
-    if (pools.length) parts.push(h('div', { class: 'card' }, h('h3', { class: 'card-title', text: 'Pools' }),
-      table('Pools', [['Repository'], ['Labels'], ['Queued', 'c-num'], ['Leases', 'c-num'], ['Oldest', 'c-num'], ['Reason']], pools.map((p) => h('tr', {},
-        h('td', { class: 'c-job' }, repoLink(p.repository, 'job-link')),
-        td('Labels', '', chips(p.labels)),
-        numCell('Queued', fmtInt(p.queued)),
-        numCell('Leases', fmtInt(p.leases)),
-        numCell('Oldest', fmtDur(p.oldest_wait_secs)),
-        td('Reason', '', h('span', { class: p.refusal ? 'text-err' : 'muted', text: p.refusal || humanize(p.reason) })))))));
-    if (leases.length) parts.push(h('div', { class: 'card' }, h('h3', { class: 'card-title', text: 'Leases' }),
-      table('Leases', [['Machine'], ['Repository'], ['State'], ['Age', 'c-num']], leases.map((l) => h('tr', {},
-        h('td', { class: 'c-job' }, machine(l.host_id, hostName(l.host_id))),
-        td('Repository', '', l.repository ? repoLink(l.repository) : '—'),
-        td('State', '', h('span', { class: 'badge badge-dim', text: humanize(l.state) })),
-        numCell('Age', fmtDur(l.age_secs)))))));
-    $('#pools').replaceChildren(...parts);
+    if (!pools.length && !leases.length) { collapse(sec, false); return; }
+    const cards = [
+      pools.length ? {
+        key: 'pools', caption: 'Pools', heads: [['Repository'], ['Labels'], ['Queued', 'c-num'], ['Leases', 'c-num'], ['Oldest', 'c-num'], ['Reason']],
+        items: pools, key: (p) => `${p.repository} ${p.labels}`,
+        row: (p) => [h('td', { class: 'c-job' }, repoLink(p.repository, 'job-link')), td('Labels', '', chips(p.labels)),
+          numCell('Queued', fmtInt(p.queued)), numCell('Leases', fmtInt(p.leases)), numCell('Oldest', fmtDur(p.oldest_wait_secs)),
+          td('Reason', '', h('span', { class: p.refusal ? 'text-err' : 'muted', text: p.refusal || humanize(p.reason) }))],
+      } : null,
+      leases.length ? {
+        key: 'leases', caption: 'Leases', heads: [['Machine'], ['Repository'], ['State'], ['Age', 'c-num']],
+        items: leases, key: (l) => l.lease_id || `${l.host_id} ${l.repository}`, sig: (l) => hostName(l.host_id),
+        row: (l) => [h('td', { class: 'c-job' }, machine(l.host_id, hostName(l.host_id))),
+          td('Repository', '', l.repository ? repoLink(l.repository) : '—'),
+          td('State', '', h('span', { class: 'badge badge-dim', text: humanize(l.state) })), numCell('Age', fmtDur(l.age_secs))],
+      } : null,
+    ].filter(Boolean);
+    const box = $('#pools');
+    resize(box, () => {
+      reconcile(box, cards, (c) => c.key,
+        (c) => h('div', { class: 'card' }, h('h3', { class: 'card-title', text: c.caption }), h('div', { class: 'tbl-box' })),
+        null);
+      for (const c of cards) renderTable($(`:scope > [data-key="${c.key}"]:not(.is-leaving) .tbl-box`, box), c);
+    });
+    collapse(sec, true);
   }
 
   // ---------------------------------------------------------------- charts
@@ -614,6 +1229,20 @@
   // Area under a line down to a fixed baseline, one closed shape per run of values.
   const areaPath = (pts, base, smooth) => runsOf(pts).map((r) =>
     `${curve(r, smooth)}L${f1(r[r.length - 1][0])} ${f1(base)}L${f1(r[0][0])} ${f1(base)}Z`).join('');
+  // A stacked band: along `top` and back along `base` (points or null, by
+  // index), one closed shape per run of values.
+  function bandPath(top, base, smooth) {
+    let d = '', run = [];
+    const flush = () => {
+      if (run.length) d += `${curve(run.map((i) => top[i]), smooth)}${curve(run.map((i) => base[i]).reverse(), smooth).replace(/^M/, 'L')}Z`;
+      run = [];
+    };
+    top.forEach((p, i) => { if (p) run.push(i); else flush(); });
+    flush();
+    return d;
+  }
+  // Kinds drawn from values summed up per step.
+  const stacks = (kind) => kind === 'columns' || kind === 'stacked';
 
   function yScale(maxV, fixed, integer) {
     const top0 = fixed || (maxV > 0 ? maxV : 1);
@@ -636,10 +1265,11 @@
     return { step, ticks: out };
   }
 
-  const charts = [];
-  function setupChart(fig) {
+  let chartSeq = 0;
+  function setupChart(fig, id) {
     const plot = $('.plot', fig);
-    const c = { fig, plot, cfg: null, idx: null, frame: 0 };
+    // Its own clip id: a chart removed in settings fades out beside the one that replaces it.
+    const c = { id: `${id}-${++chartSeq}`, fig, plot, cfg: null, idx: null, frame: 0, view: null, sk: null };
     plot.tabIndex = 0;
     plot.addEventListener('pointermove', (e) => hover(c, e));
     plot.addEventListener('pointerdown', (e) => hover(c, e));
@@ -653,92 +1283,148 @@
       e.preventDefault();
       showTip(c, clamp((c.idx == null ? n - 1 : c.idx) + step, 0, n - 1));
     });
-    new ResizeObserver(() => { cancelAnimationFrame(c.frame); c.frame = requestAnimationFrame(() => drawChart(c)); }).observe(plot);
-    charts.push(c);
+    // Mid-morph the running frames redraw at the new size anyway.
+    new ResizeObserver(() => { cancelAnimationFrame(c.frame); c.frame = requestAnimationFrame(() => { if (!animating(c)) drawChart(c); }); }).observe(plot);
     return c;
   }
-  const hideAllTips = () => charts.forEach(hideTip);
+  const hideAllTips = () => chartById.forEach(hideTip);
 
-  // cfg.kind: 'lines' (smooth, one per series), 'columns' (stacked) or
-  // 'strips' (a row per series, each 0..yMax).
-  function drawChart(c) {
+  // What a chart draws: its time domain [d0, d1), the value at its top, and
+  // a value array per series over `t`. A change animates between two views:
+  // the domain slides (new samples come in from the right) and the values
+  // and the scale ease to their new heights.
+  function viewOf(cfg) {
+    const t = cfg.t, n = t.length;
+    const vals = cfg.series.map((sr) => sr.values);
+    let top = cfg.yMax || 100;
+    // Rows share a fixed top when given one; otherwise every kind fits its data.
+    if (cfg.kind !== 'strips' || !cfg.yMax) {
+      let maxV = 0;
+      for (let i = 0; i < n; i++) {
+        let sum = 0;
+        for (const v of vals) {
+          if (!isNum(v[i])) continue;
+          if (stacks(cfg.kind)) sum += v[i]; else if (v[i] > maxV) maxV = v[i];
+        }
+        if (sum > maxV) maxV = sum;
+      }
+      top = yScale(maxV, cfg.yMax, cfg.integer).top;
+    }
+    return { t, step: cfg.step, d0: t[0], d1: n ? t[n - 1] + cfg.step : 0, vals, top, keys: cfg.series.map((sr) => sr.key).join('\n') };
+  }
+  function morphView(from, to, p) {
+    return {
+      ...to, d0: mix(from.d0, to.d0, p), d1: mix(from.d1, to.d1, p), top: mix(from.top, to.top, p),
+      vals: to.vals.map((arr, k) => arr.map((v, i) => mix(sampleAt(from, from.vals[k], to.t[i]), v, p))),
+    };
+  }
+
+  // The chart's SVG and tooltip, made once and redrawn in place, so a hover
+  // survives a refresh.
+  function scaffold(c) {
+    if (c.sk && c.sk.svg.parentNode === c.plot) return c.sk;
+    const clip = s('rect', {});
+    const svg = s('svg', { class: 'chart-svg', role: 'img' },
+      s('defs', {}, s('clipPath', { id: `clip-${c.id}` }, clip)));
+    const grid = s('g', { class: 'grid', 'aria-hidden': 'true' });
+    const marks = s('g', { class: 'marks', 'clip-path': `url(#clip-${c.id})` });
+    const cross = s('g', { class: 'cross', 'aria-hidden': 'true' }, s('line', { class: 'cross-line' }));
+    svg.append(grid, marks, cross);
+    const tip = h('div', { class: 'tip', role: 'status', 'aria-live': 'off' });
+    c.plot.replaceChildren(svg, tip);
+    fadeIn(svg, DUR.slow);
+    c.sk = { svg, clip, grid, marks, cross, tip, dots: [] };
+    return c.sk;
+  }
+
+  // cfg.kind: 'lines' (one per series), 'area' (a filled line per series),
+  // 'columns' or 'stacked' (columns or areas, stacked) or 'strips' (a row per
+  // series, each 0..top); `cfg.smooth` curves the lines. `view`: a frame of
+  // a morph; the config's own view when omitted.
+  function drawChart(c, view) {
     const { plot, cfg } = c;
     if (!cfg) return;
     const W = Math.round(plot.clientWidth), H = Math.round(plot.clientHeight);
     if (W < 40 || H < 40) return;
     const t = cfg.t || [];
     const n = t.length;
-    c.idx = null;
     if (n < 2 || !cfg.series.length) {
-      plot.replaceChildren(h('div', { class: 'plot-empty', text: 'No data for this range yet' }));
-      c.geo = null;
+      if (!$('.plot-empty', plot)) { plot.replaceChildren(h('div', { class: 'plot-empty', text: 'No data for this range yet' })); fadeIn(plot.firstChild); }
+      c.geo = null; c.view = null; c.sk = null; c.idx = null;
       return;
     }
+    const v = view || viewOf(cfg);
+    c.view = v;
+    const sk = scaffold(c);
     const narrow = W < 420;
     const strips = cfg.kind === 'strips';
     const P = { l: strips ? (narrow ? 74 : 96) : narrow ? 30 : 38, r: 8, t: 8, b: 22 };
     const pw = W - P.l - P.r, ph = H - P.t - P.b;
     const step = cfg.step;
-    const t0 = t[0], t1 = t[n - 1] + step;
+    const t0 = v.d0, t1 = v.d1;
     const X = (tv) => P.l + ((tv - t0) / (t1 - t0 || 1)) * pw;
     const xAt = (i) => X(t[i] + step / 2);
+    const vals = v.vals;
+    apply(sk.svg, { viewBox: `0 0 ${W} ${H}`, width: W, height: H, 'aria-label': cfg.summary });
+    apply(sk.clip, { x: P.l, y: 0, width: pw, height: H - P.b + 2 });
 
-    // Columns stack: drawn from cumulative values; tooltips read raw ones.
-    let tops = cfg.series.map((sr) => sr.values);
+    // Stacks are drawn from cumulative values; tooltips read raw ones.
+    let tops = vals;
     let bases = null;
-    if (cfg.kind === 'columns') {
+    const smooth = cfg.smooth !== false;
+    if (stacks(cfg.kind)) {
       const acc = new Array(n).fill(0);
       bases = []; tops = [];
-      for (const sr of cfg.series) {
+      for (const sv of vals) {
         bases.push(acc.slice());
-        for (let i = 0; i < n; i++) if (isNum(sr.values[i])) acc[i] += sr.values[i];
+        for (let i = 0; i < n; i++) if (isNum(sv[i])) acc[i] += sv[i];
         tops.push(acc.slice());
       }
     }
-    let maxV = 0;
-    for (const vals of tops) for (const v of vals) if (isNum(v) && v > maxV) maxV = v;
-    const ys = yScale(maxV, cfg.yMax, cfg.integer);
-    const Y = (v) => P.t + (1 - v / ys.top) * ph;
+    const top = v.top || 1;
+    const Y = (val) => P.t + (1 - val / top) * ph;
 
-    const svg = s('svg', { class: 'chart-svg', viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: 'img', 'aria-label': cfg.summary });
-    const grid = s('g', { class: 'grid', 'aria-hidden': 'true' });
+    const grid = [];
     if (!strips) {
-      for (const v of ys.ticks) {
-        const y = Y(v).toFixed(1);
-        grid.append(s('line', { x1: P.l, x2: W - P.r, y1: y, y2: y, class: v === 0 ? 'baseline' : null }));
-        grid.append(s('text', { x: P.l - 6, y, class: 'ytick', dy: '0.32em', text: cfg.fmtTick(v) }));
+      for (const tv of yScale(top, cfg.yMax, cfg.integer).ticks) {
+        if (tv > top * 1.001) continue;
+        const y = Y(tv).toFixed(1);
+        grid.push(s('line', { x1: P.l, x2: W - P.r, y1: y, y2: y, class: tv === 0 ? 'baseline' : null }));
+        grid.push(s('text', { x: P.l - 6, y, class: 'ytick', dy: '0.32em', text: cfg.fmtTick(tv) }));
       }
     }
     const tt = timeTicks(t0, t1, Math.max(2, Math.floor(pw / (narrow ? 64 : 84))));
     for (const tv of tt.ticks) {
       const x = X(tv);
       if (x < P.l + 14 || x > W - P.r - 14) continue;
-      grid.append(s('text', { x: x.toFixed(1), y: H - 6, class: 'xtick', text: tt.step >= 86400 ? fmtDay(tv) : fmtClock(tv) }));
+      grid.push(s('text', { x: x.toFixed(1), y: H - 6, class: 'xtick', text: tt.step >= 86400 ? fmtDay(tv) : fmtClock(tv) }));
     }
-    svg.append(grid);
 
-    const marks = s('g', { class: 'marks' });
+    const marks = [];
     let dotY;
     if (strips) {
       const m = cfg.series.length, gap = m > 8 ? 2 : 5;
       const rowH = Math.max(2, (ph - gap * (m - 1)) / m);
-      const top = cfg.yMax || 100;
-      const rowY = (k, v) => P.t + k * (rowH + gap) + rowH - (clamp(v, 0, top) / top) * (rowH - 2);
+      const rowY = (k, val) => P.t + k * (rowH + gap) + rowH - (clamp(val, 0, top) / top) * (rowH - 2);
       cfg.series.forEach((sr, k) => {
         const y0 = P.t + k * (rowH + gap);
-        const pts = sr.values.map((v, i) => (isNum(v) ? [xAt(i), rowY(k, v)] : null));
-        marks.append(s('rect', { class: 'strip-bg', x: P.l, y: f1(y0), width: pw, height: f1(rowH), rx: 3 }));
-        marks.append(s('path', { class: 'strip-area', d: areaPath(pts, y0 + rowH, true), vars: { '--c': sr.color } }));
-        marks.append(s('path', { class: 'strip-line', d: linePath(pts, true), vars: { '--c': sr.color } }));
-        const vals = sr.values.filter(isNum);
-        const two = rowH >= 26 && vals.length;
-        marks.append(s('text', { class: 'strip-name', x: 2, y: f1(y0 + rowH / 2 - (two ? 6 : 0)), dy: '0.32em', text: sr.name }));
+        const pts = vals[k].map((val, i) => (isNum(val) ? [xAt(i), rowY(k, val)] : null));
+        marks.push(s('rect', { class: 'strip-bg', x: P.l, y: f1(y0), width: pw, height: f1(rowH), rx: 3 }));
+        marks.push(s('path', { class: 'strip-area', d: areaPath(pts, y0 + rowH, smooth), vars: { '--c': sr.color } }));
+        marks.push(s('path', { class: 'strip-line', d: linePath(pts, smooth), vars: { '--c': sr.color } }));
+      });
+      // Names sit left of the plot, outside its clip.
+      cfg.series.forEach((sr, k) => {
+        const y0 = P.t + k * (rowH + gap);
+        const raw = sr.values.filter(isNum);
+        const two = rowH >= 26 && raw.length;
+        grid.push(s('text', { class: 'strip-name', x: 2, y: f1(y0 + rowH / 2 - (two ? 6 : 0)), dy: '0.32em', text: sr.name }));
         if (two) {
-          const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-          marks.append(s('text', { class: 'strip-val', x: 2, y: f1(y0 + rowH / 2 + 8), dy: '0.32em', text: `avg ${cfg.fmtVal(avg)} · max ${cfg.fmtVal(peakOf(sr.raw || vals))}` }));
+          const avg = raw.reduce((a, b) => a + b, 0) / raw.length;
+          grid.push(s('text', { class: 'strip-val', x: 2, y: f1(y0 + rowH / 2 + 8), dy: '0.32em', text: `avg ${cfg.fmtVal(avg)} · max ${cfg.fmtVal(peakOf(sr.raw || raw))}` }));
         }
       });
-      dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? rowY(k, cfg.series[k].values[i]) : null);
+      dotY = (k, i) => (isNum(vals[k][i]) ? rowY(k, vals[k][i]) : null);
     } else if (cfg.kind === 'columns') {
       const bw = (step / (t1 - t0)) * pw;
       const pad = Math.max(1, bw * 0.22);
@@ -746,37 +1432,50 @@
       cfg.series.forEach((sr, k) => {
         const g = s('g', { class: 'col', vars: { '--c': sr.color } });
         for (let i = 0; i < n; i++) {
-          if (!isNum(sr.values[i]) || sr.values[i] <= 0) continue;
+          if (!isNum(vals[k][i]) || vals[k][i] <= 0) continue;
           const y1 = Y(tops[k][i]), y0 = Y(bases[k][i]);
           g.append(s('rect', { x: f1(xAt(i) - cw / 2), y: f1(y1), width: f1(cw), height: f1(Math.max(0.5, y0 - y1)), rx: cw > 5 ? 1.5 : 0 }));
         }
-        marks.append(g);
+        marks.push(g);
       });
-      dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? Y(tops[k][i]) : null);
+      dotY = (k, i) => (isNum(vals[k][i]) ? Y(tops[k][i]) : null);
+    } else if (cfg.kind === 'stacked') {
+      cfg.series.forEach((sr, k) => {
+        // A machine without a value is a band of no height, so the bands
+        // above it stay joined to it.
+        const top = vals[k].map((_, i) => [xAt(i), Y(tops[k][i])]);
+        const base = vals[k].map((_, i) => [xAt(i), Y(bases[k][i])]);
+        marks.push(s('path', { class: 'band', d: bandPath(top, base, smooth), vars: { '--c': sr.color } }));
+        marks.push(s('path', { class: 'line line-thin', d: linePath(top, smooth), vars: { '--c': sr.color } }));
+      });
+      dotY = (k, i) => (isNum(vals[k][i]) ? Y(tops[k][i]) : null);
     } else {
-      cfg.series.forEach((sr) => {
-        const pts = sr.values.map((v, i) => (isNum(v) ? [xAt(i), Y(v)] : null));
-        if (cfg.series.length === 1) marks.append(s('path', { class: 'area area-soft', d: areaPath(pts, Y(0), true), vars: { '--c': sr.color } }));
-        marks.append(s('path', { class: 'line', d: linePath(pts, true), vars: { '--c': sr.color } }));
+      const filled = cfg.kind === 'area', one = cfg.series.length === 1;
+      cfg.series.forEach((sr, k) => {
+        const pts = vals[k].map((val, i) => (isNum(val) ? [xAt(i), Y(val)] : null));
+        if (filled || one) marks.push(s('path', { class: `area${filled ? (one ? '' : ' area-many') : ' area-soft'}`, d: areaPath(pts, Y(0), smooth), vars: { '--c': sr.color } }));
+        marks.push(s('path', { class: 'line', d: linePath(pts, smooth), vars: { '--c': sr.color } }));
       });
-      dotY = (k, i) => (isNum(cfg.series[k].values[i]) ? Y(cfg.series[k].values[i]) : null);
+      dotY = (k, i) => (isNum(vals[k][i]) ? Y(vals[k][i]) : null);
     }
-    svg.append(marks);
+    sk.grid.replaceChildren(...grid);
+    sk.marks.replaceChildren(...marks);
 
-    const cross = s('g', { class: 'cross', 'aria-hidden': 'true' });
-    cross.append(s('line', { y1: P.t, y2: P.t + ph, class: 'cross-line' }));
-    const dots = cfg.series.map((sr) => s('circle', { r: 4, class: 'cross-dot', vars: { '--c': sr.color } }));
-    cross.append(...dots);
-    svg.append(cross);
-
-    const tip = h('div', { class: 'tip', role: 'status', 'aria-live': 'off' });
-    plot.replaceChildren(svg, tip);
-    c.geo = { W, P, pw, t0, t1, xAt, dotY, cross, dots, tip };
+    const line = sk.cross.firstChild;
+    line.setAttribute('y1', P.t); line.setAttribute('y2', P.t + ph);
+    if (sk.dots.length !== cfg.series.length) {
+      for (const d of sk.dots) d.remove();
+      sk.dots = cfg.series.map(() => s('circle', { r: 4, class: 'cross-dot' }));
+      sk.cross.append(...sk.dots);
+    }
+    sk.dots.forEach((d, k) => d.style.setProperty('--c', cfg.series[k].color));
+    c.geo = { W, P, pw, t0, t1, xAt, dotY, cross: sk.cross, dots: sk.dots, tip: sk.tip };
+    if (c.idx != null) showTip(c, Math.min(c.idx, n - 1));
   }
 
   function hover(c, e) {
     if (!c.geo || !c.cfg) return;
-    if (e.type === 'pointerdown') charts.forEach((o) => o !== c && hideTip(o));
+    if (e.type === 'pointerdown') chartById.forEach((o) => o !== c && hideTip(o));
     const r = c.plot.getBoundingClientRect();
     const { P, pw, t0, t1 } = c.geo;
     const t = c.cfg.t;
@@ -818,9 +1517,10 @@
     c.geo.tip.classList.remove('on');
   }
 
-  function legend(fig, series, show) {
-    $('.legend', fig).replaceChildren(...(show ? series.map((sr) =>
-      h('li', {}, h('span', { class: 'legend-key', 'aria-hidden': 'true', vars: { '--c': sr.color } }), sr.name)) : []));
+  function legend(c, series, show) {
+    reconcile($('.legend', c.fig), show ? series : [], (sr) => sr.key,
+      (sr) => h('li', {}, h('span', { class: 'legend-key', 'aria-hidden': 'true', vars: { '--c': sr.color } }), h('span', { text: sr.name })),
+      (li, sr) => { li.firstChild.style.setProperty('--c', sr.color); li.lastChild.textContent = sr.name; });
   }
 
   function summarize(title, series, fmt) {
@@ -832,10 +1532,19 @@
     return `${title}, ${RANGE_LABEL[state.range] || state.range}. ${parts.join('; ')}.`;
   }
 
+  // New data morphs from what is drawn when the same series are shown the
+  // same way; otherwise (a machine came or went) the marks crossfade.
   function setChart(c, cfg) {
+    const from = c.view, prev = c.cfg;
     c.cfg = cfg;
-    legend(c.fig, cfg.series, cfg.kind !== 'strips');
-    drawChart(c);
+    legend(c, cfg.series, cfg.kind !== 'strips' && cfg.legend !== false);
+    const to = viewOf(cfg);
+    if (from && prev && prev.kind === cfg.kind && from.keys === to.keys && to.t.length >= 2) {
+      frames(c, (p) => drawChart(c, p < 1 ? morphView(from, to, p) : null));
+      return;
+    }
+    frames(c, () => drawChart(c), 0);
+    if (from && c.sk && liveMotion()) c.sk.marks.animate([{ opacity: 0 }, { opacity: 1 }], { duration: DUR.slow, easing: 'ease-out' });
   }
 
   // `average per 20 min`, `per 2 h`.
@@ -845,59 +1554,174 @@
     return `${Number.isInteger(hrs) ? hrs : hrs.toFixed(1)} h`;
   }
 
-  let chartRefs = null;
-  function renderCharts() {
-    if (!chartRefs) chartRefs = { jobs: setupChart($('#chart-jobs')), cpu: setupChart($('#chart-cpu')), busy: setupChart($('#chart-busy')), ram: setupChart($('#chart-ram')) };
+  // The Activity charts (settings.js lists them): `build(x, o)` gives a
+  // chart's config and subtitle from the shared context `chartContext()`
+  // makes and the chart's own settings `o`. Which show, in what order, is a
+  // setting too.
+  const CHART_BUILD = { jobs: jobsChart, cpu: cpuChart, busy: busyChart, ram: ramChart, util: utilChart, disk: diskChart };
+  const CHARTS = RS.CHARTS.map((d) => ({ id: d.key, title: d.label, sub: d.sub, build: CHART_BUILD[d.key] }));
+  const chartDef = new Map(CHARTS.map((d) => [d.id, d]));
+  const shownCharts = () => RS.shown(cfg.charts.order, cfg.charts.hidden).map((k) => chartDef.get(k)).filter(Boolean);
+  const chartById = new Map();
+
+  // The chart cards, before any data: their plots hold their height.
+  function renderChartFrames() {
+    const grid = $('#charts-grid');
+    grid.style.setProperty('--chart-cols', String(cfg.charts.columns));
+    grid.style.setProperty('--plot-h', `${RS.HEIGHTS[cfg.charts.height]}px`);
+    grid.dataset.cols = String(cfg.charts.columns);
+    resize(grid, () => reconcile(grid, shownCharts(), (d) => d.id, (d) => {
+      const fig = h('figure', { class: 'chart card' },
+        h('figcaption', {}, h('h3', { text: d.title }), h('p', { class: 'chart-sub', text: d.sub })),
+        h('ul', { class: 'legend' }),
+        h('div', { class: 'plot' }));
+      chartById.set(d.id, setupChart(fig, d.id));
+      return fig;
+    }, null));
+  }
+
+  function chartContext() {
     const m = state.metrics || {};
-    assignHostColors();
     const t = m.t || [];
     const step = m.step_secs || 60;
-    const hosts = m.hosts || [];  // sorted by name
-    const hostSeries = (x) => ({ name: x.name || x.id, color: hostColor(x.id) });
-    const pctTick = (v) => `${v}%`;
-    const intTick = (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
-    const fmtAvg = (v) => (isNum(v) ? (v >= 10 || Number.isInteger(v) ? String(Math.round(v)) : v.toFixed(1)) : '—');
-    const kCol = groupOf(t.length, COLUMN_COUNT), kLine = groupOf(t.length, LINE_POINTS);
-    const span = { from: t[0], to: t.length ? t[t.length - 1] + step : 0 };
+    return {
+      t, step,
+      m, hosts: m.hosts || [],  // sorted by name
+      hostSeries: (x) => ({ key: x.id, name: x.name || x.id, color: hostColor(x.id) }),
+      pctTick: (v) => `${v}%`,
+      intTick: (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1)),
+      fmtAvg: (v) => (isNum(v) ? (v >= 10 || Number.isInteger(v) ? String(Math.round(v)) : v.toFixed(1)) : '—'),
+      kCol: groupOf(t.length, COLUMN_COUNT), kLine: groupOf(t.length, LINE_POINTS),
+      span: { from: t[0], to: t.length ? t[t.length - 1] + step : 0 },
+    };
+  }
 
-    const jg = regroup(t, step, kCol, [m.running || [], m.queued || []]);
+  // What every chart's config carries from its settings.
+  const common = (x, o) => ({ ...x.span, kind: o.style, smooth: o.smooth, legend: cfg.charts.legend });
+  // Columns and stacks average into fewer, wider groups than lines.
+  const groupFor = (x, o) => (stacks(o.style) ? x.kCol : x.kLine);
+  const meanOf = (vals) => { const v = (vals || []).filter(isNum); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
+
+  // The machines a chart shows: all, its top N by `score` over the range, or
+  // the ones picked (a picked machine not in the data is skipped). In name
+  // order, so their colours and rows stay put.
+  function chartHosts(o, hosts, score) {
+    if (o.hosts === 'pick') return hosts.filter((y) => o.pick.includes(y.id));
+    if (o.hosts !== 'top') return hosts;
+    const ranked = hosts.map((y) => [y, score(y)]).filter((p) => isNum(p[1])).sort((a, b) => b[1] - a[1]).slice(0, o.top);
+    const keep = new Set(ranked.map((p) => p[0]));
+    return hosts.filter((y) => keep.has(y));
+  }
+  // `· top 3 by average` and the like, for a subtitle.
+  function hostsNote(o, by) {
+    if (o.hosts === 'top') return ` · top ${o.top} by ${by}`;
+    if (o.hosts === 'pick') return ` · ${o.pick.length} chosen`;
+    return '';
+  }
+  const averaged = (g, x) => (g.step > x.step ? ` · average per ${per(g.step)}` : '');
+  const pctTop = (o) => (o.scale === 'full' ? 100 : undefined);
+
+  function jobsChart(x, o) {
+    const jg = regroup(x.t, x.step, groupFor(x, o), [x.m.running || [], x.m.queued || []]);
     const jobs = [
-      { name: 'Running', color: 'var(--s1)', values: jg.series[0] },
-      { name: 'Queued', color: 'var(--s2)', values: jg.series[1] },
+      { key: 'running', name: 'Running', color: 'var(--s1)', values: jg.series[0] },
+      { key: 'queued', name: 'Queued', color: 'var(--s2)', values: jg.series[1] },
     ];
-    setChart(chartRefs.jobs, {
-      ...span, kind: 'columns', t: jg.t, step: jg.step, series: jobs, integer: true, fmtVal: fmtAvg, fmtTick: intTick,
-      summary: summarize('Jobs running and queued', jobs, fmtAvg),
-    });
-    $('#jobs-sub').textContent = jg.step > step ? `Average per ${per(jg.step)}, stacked` : 'Running and queued, stacked';
-
-    const cg = regroup(t, step, kLine, hosts.map((x) => x.cpu || []));
-    const cpu = hosts.map((x, k) => ({ ...hostSeries(x), values: cg.series[k], raw: x.cpu }));
-    setChart(chartRefs.cpu, { ...span, kind: 'strips', t: cg.t, step: cg.step, series: cpu, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('CPU per machine', cpu, fmtPct) });
-    $('#cpu-sub').textContent = cg.step > step ? `A row per machine · average per ${per(cg.step)}` : 'A row per machine';
-
-    const bg = regroup(t, step, kCol, [...hosts.map((x) => x.busy || []), ...hosts.map((x) => x.slots || [])]);
-    const busy = hosts.map((x, k) => {
-      const values = bg.series[k], slots = bg.series[hosts.length + k];
-      return { ...hostSeries(x), values, fmtAt: (i) => (isNum(values[i]) ? `${fmtAvg(values[i])}${isNum(slots[i]) ? ` / ${fmtAvg(slots[i])}` : ''}` : '—') };
-    });
-    setChart(chartRefs.busy, {
-      ...span, kind: 'columns', t: bg.t, step: bg.step, series: busy, integer: true, fmtVal: fmtAvg, fmtTick: intTick, summary: summarize('Busy runner slots per machine, stacked', busy, fmtAvg),
-      total: (i) => {
-        const sum = busy.reduce((a, sr) => a + (isNum(sr.values[i]) ? sr.values[i] : 0), 0);
-        return h('div', { class: 'tip-row tip-total' }, h('span', { class: 'tip-key tip-key-none' }), h('b', { class: 'num', text: fmtAvg(sum) }), h('span', { class: 'tip-name', text: 'Total busy' }));
+    return {
+      sub: `Running and queued${stacks(o.style) ? ', stacked' : ''}${averaged(jg, x)}`,
+      cfg: {
+        ...common(x, o), t: jg.t, step: jg.step, series: jobs, integer: true, fmtVal: x.fmtAvg, fmtTick: x.intTick,
+        summary: summarize('Jobs running and queued', jobs, x.fmtAvg),
       },
-    });
-    $('#busy-sub').textContent = bg.step > step ? `Average per ${per(bg.step)}, stacked per machine` : 'Stacked per machine';
+    };
+  }
 
-    const rg = regroup(t, step, kLine, [...hosts.map(ramPct), ...hosts.map((x) => x.ram_used || [])]);
-    const ram = hosts.map((x, k) => {
-      const values = rg.series[k], used = rg.series[hosts.length + k];
-      return { ...hostSeries(x), values, raw: ramPct(x), fmtAt: (i) => (isNum(values[i]) ? `${fmtPct(values[i])} · ${fmtBytes(used[i])}` : '—') };
-    });
-    setChart(chartRefs.ram, { ...span, kind: 'lines', t: rg.t, step: rg.step, series: ram, yMax: 100, fmtVal: fmtPct, fmtTick: pctTick, summary: summarize('Memory used per machine', ram, fmtPct) });
-    $('#ram-sub').textContent = rg.step > step ? `Used per machine · average per ${per(rg.step)}` : 'Used per machine';
+  function cpuChart(x, o) {
+    const hosts = chartHosts(o, x.hosts, (y) => meanOf(y.cpu));
+    const cg = regroup(x.t, x.step, groupFor(x, o), hosts.map((y) => y.cpu || []));
+    const cpu = hosts.map((y, k) => ({ ...x.hostSeries(y), values: cg.series[k], raw: y.cpu }));
+    return {
+      sub: `${o.style === 'strips' ? 'A row per machine' : 'Per machine'}${hostsNote(o, 'average')}${averaged(cg, x)}`,
+      cfg: { ...common(x, o), t: cg.t, step: cg.step, series: cpu, yMax: pctTop(o), fmtVal: fmtPct, fmtTick: x.pctTick, summary: summarize('CPU per machine', cpu, fmtPct) },
+    };
+  }
 
+  function busyChart(x, o) {
+    const hosts = chartHosts(o, x.hosts, (y) => meanOf(y.busy));
+    const n = hosts.length;
+    const bg = regroup(x.t, x.step, groupFor(x, o), [...hosts.map((y) => y.busy || []), ...hosts.map((y) => y.slots || [])]);
+    const busy = hosts.map((y, k) => {
+      const values = bg.series[k], slots = bg.series[n + k];
+      return { ...x.hostSeries(y), values, fmtAt: (i) => (isNum(values[i]) ? `${x.fmtAvg(values[i])}${isNum(slots[i]) ? ` / ${x.fmtAvg(slots[i])}` : ''}` : '—') };
+    });
+    return {
+      sub: `${stacks(o.style) ? 'Stacked per machine' : 'Per machine'}${hostsNote(o, 'average')}${averaged(bg, x)}`,
+      cfg: {
+        ...common(x, o), t: bg.t, step: bg.step, series: busy, integer: true, fmtVal: x.fmtAvg, fmtTick: x.intTick, summary: summarize('Busy runner slots per machine', busy, x.fmtAvg),
+        total: (i) => {
+          const sum = busy.reduce((a, sr) => a + (isNum(sr.values[i]) ? sr.values[i] : 0), 0);
+          return h('div', { class: 'tip-row tip-total' }, h('span', { class: 'tip-key tip-key-none' }), h('b', { class: 'num', text: x.fmtAvg(sum) }), h('span', { class: 'tip-name', text: 'Total busy' }));
+        },
+      },
+    };
+  }
+
+  function ramChart(x, o) {
+    const hosts = chartHosts(o, x.hosts, (y) => meanOf(ramPct(y)));
+    const n = hosts.length;
+    const rg = regroup(x.t, x.step, groupFor(x, o), [...hosts.map(ramPct), ...hosts.map((y) => y.ram_used || [])]);
+    const ram = hosts.map((y, k) => {
+      const values = rg.series[k], used = rg.series[n + k];
+      return { ...x.hostSeries(y), values, raw: ramPct(y), fmtAt: (i) => (isNum(values[i]) ? `${fmtPct(values[i])} · ${fmtBytes(used[i])}` : '—') };
+    });
+    return {
+      sub: `${o.style === 'strips' ? 'A row per machine' : 'Used per machine'}${hostsNote(o, 'average')}${averaged(rg, x)}`,
+      cfg: { ...common(x, o), t: rg.t, step: rg.step, series: ram, yMax: pctTop(o), fmtVal: fmtPct, fmtTick: x.pctTick, summary: summarize('Memory used per machine', ram, fmtPct) },
+    };
+  }
+
+  // The fleet's busy share of all its slots, per sample.
+  function utilChart(x, o) {
+    const util = x.t.map((_, i) => {
+      let busy = 0, slots = 0;
+      for (const y of x.hosts) {
+        const b = (y.busy || [])[i], n = (y.slots || [])[i];
+        if (isNum(b) && isNum(n)) { busy += b; slots += n; }
+      }
+      return slots > 0 ? (busy / slots) * 100 : null;
+    });
+    const ug = regroup(x.t, x.step, groupFor(x, o), [util]);
+    const series = [{ key: 'util', name: 'Slots busy', color: 'var(--s3)', values: ug.series[0] }];
+    return {
+      sub: `Busy share of every slot${averaged(ug, x)}`,
+      cfg: { ...common(x, o), t: ug.t, step: ug.step, series, yMax: pctTop(o), fmtVal: fmtPct, fmtTick: x.pctTick, summary: summarize('Share of runner slots busy', series, fmtPct) },
+    };
+  }
+
+  // Free disk per machine, in GiB (or GB), the least free first for top N.
+  function diskChart(x, o) {
+    const gb = gigabyte();
+    const hosts = chartHosts(o, x.hosts, (y) => { const m = meanOf(y.disk_free); return isNum(m) ? -m : null; });
+    const dg = regroup(x.t, x.step, groupFor(x, o), hosts.map((y) => (y.disk_free || []).map((v) => (isNum(v) ? v / gb : null))));
+    const fmtGb = (v) => (isNum(v) ? fmtBytes(v * gb) : '—');
+    const disk = hosts.map((y, k) => ({ ...x.hostSeries(y), values: dg.series[k] }));
+    return {
+      sub: `${o.style === 'strips' ? 'A row per machine' : 'Per machine'}${hostsNote(o, 'least free')}${averaged(dg, x)}`,
+      cfg: { ...common(x, o), t: dg.t, step: dg.step, series: disk, fmtVal: fmtGb, fmtTick: fmtGb, summary: summarize('Free disk per machine', disk, fmtGb) },
+    };
+  }
+
+  function renderCharts() {
+    renderChartFrames();
+    assignHostColors();
+    const x = chartContext();
+    for (const d of shownCharts()) {
+      const c = chartById.get(d.id);
+      const built = d.build(x, cfg.charts.per[d.id]);
+      $('.chart-sub', c.fig).textContent = built.sub;
+      setChart(c, built.cfg);
+    }
+    const m = x.m;
     $('#charts-sub').textContent = m.step_secs ? `${RANGE_LABEL[state.range]} · ${m.step_secs % 60 ? `${m.step_secs}s` : `${m.step_secs / 60} min`} samples` : RANGE_LABEL[state.range];
   }
 
@@ -906,14 +1730,20 @@
     box.replaceChildren(...RANGES.map((r) => h('button', {
       type: 'button', class: 'seg-btn', 'aria-pressed': String(r === state.range), 'data-range': r, text: r,
       'aria-label': `Show ${RANGE_LABEL[r]}`,
-      onclick: () => {
-        if (r === state.range) return;
-        state.range = r; saveRange(r);
-        $$('.seg-btn', box).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.range === r)));
-        $('#charts-sub').textContent = RANGE_LABEL[r];
-        loadMetrics();
-      },
+      onclick: () => { if (r !== state.range) update((c) => { c.charts.range = r; }); },
     })));
+    segThumb(box);
+  }
+
+  // The range switch follows the setting, wherever it was changed.
+  function syncRange() {
+    if (cfg.charts.range === state.range) return;
+    const r = state.range = cfg.charts.range;
+    const box = $('#range');
+    $$('.seg-btn', box).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.range === r)));
+    segThumb(box);
+    $('#charts-sub').textContent = RANGE_LABEL[r];
+    if (!$('#app').hidden) loadMetrics();
   }
 
   // ======================================================== remote commands
@@ -1126,12 +1956,115 @@
     target.focus({ preventScroll: true });
   }
 
+  // --------------------------------------------------------------- reboot
+  // A restart asked through `host reboot`, from 0.4.73: shown while it lasts.
+  function rebootState(x) {
+    const r = x && x.online && x.versions && x.versions.reboot;
+    return r && (r.state === 'pending' || r.state === 'rebooting') ? r : null;
+  }
+  function rebootBadge(x) {
+    const r = rebootState(x);
+    if (!r) return null;
+    return r.state === 'rebooting'
+      ? h('span', { class: 'badge badge-err', title: r.message || 'Every job finished; the machine is restarting', text: 'Rebooting' })
+      : h('span', { class: 'badge badge-warn', title: r.message || 'Restarts once its running jobs finish', text: 'Reboot pending' });
+  }
+  function rebootSig(x) {
+    const v = x && x.versions;
+    return JSON.stringify(x && [x.online, x.manageable, x.remote_changes, v && [v.rebootable, v.starts_at_login, v.reboot, (v.wsl || []).length], dw.confirm === 'reboot']);
+  }
+
+  // Only for a machine that says it can (0.4.73 and later, not a WSL guest).
+  function rebootCard(x) {
+    const v = x && x.versions;
+    if (!v || !(v.rebootable || v.reboot)) return null;
+    const r = v.reboot;
+    const live = rebootState(x);
+    const busy = dw.busy.has('reboot');
+    const can = !!(x.online && x.manageable && x.remote_changes && v.rebootable);
+    let hint = (v.wsl || []).length
+      ? 'Restarts this machine once every running job has finished, its WSL distributions’ included. It takes no new job meanwhile, however long that takes.'
+      : 'Restarts this machine once every running job has finished. It takes no new job meanwhile, however long that takes.';
+    if (v.starts_at_login) hint += ' Its service starts when its account signs in: after the restart it works again only once that account is signed in (automatic sign-in, or a person).';
+    if (!x.online) hint = 'Shown while the machine is connected.';
+    else if (!x.remote_changes) hint += ' Rebooting from here needs changes through the coordinator allowed on the machine.';
+    let action = null;
+    if (can && live && live.state === 'pending') {
+      action = h('button', {
+        type: 'button', class: 'btn-sm', 'data-fk': 'reboot:cancel', 'aria-busy': busy ? 'true' : null, text: 'Cancel reboot',
+        onclick: (e) => run('reboot', ['host', 'reboot', '--cancel'], e.currentTarget),
+      });
+    } else if (can && !live && dw.confirm !== 'reboot') {
+      action = h('button', {
+        type: 'button', class: 'btn-sm btn-quiet-danger', 'data-fk': 'reboot:open', text: 'Reboot…',
+        onclick: () => { dw.confirm = 'reboot'; refreshRebootCard('reboot:go'); },
+      });
+    }
+    let confirm = null;
+    if (can && !live && dw.confirm === 'reboot') {
+      const cancel = () => { dw.confirm = null; refreshRebootCard('reboot:open'); };
+      confirm = h('form', { class: 'confirm', novalidate: true, 'aria-label': 'Confirm reboot' },
+        h('p', { class: 'confirm-title', text: `Reboot ${x.name || x.hostname || 'this machine'}?` }),
+        h('p', { class: 'confirm-text', text: 'The machine stops taking jobs now, waits for every running job to finish, then restarts. You can cancel until the restart begins.' }),
+        h('code', { class: 'cmd-preview', text: cmdLine(['host', 'reboot']) }),
+        h('div', { class: 'form-actions' },
+          h('button', { type: 'button', class: 'btn-sm', 'data-fk': 'reboot:back', text: 'Cancel', onclick: cancel }),
+          h('button', { type: 'submit', class: 'btn-sm btn-danger', 'data-fk': 'reboot:go', text: 'Reboot' })));
+      confirm.addEventListener('submit', (e) => { e.preventDefault(); run('reboot', ['host', 'reboot'], $('[data-fk="reboot:go"]', confirm)); });
+      confirm.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancel(); } });
+    }
+    let progress = null;
+    if (r && x.online) {
+      const lead = { pending: 'Reboot asked ', rebooting: 'Rebooting · asked ', failed: 'Reboot failed ', cancelled: 'Reboot cancelled ' }[r.state] || 'Reboot ';
+      progress = h('p', { class: `ver-progress ${r.state === 'failed' ? 'text-err' : 'muted'}`, role: 'status' },
+        lead, ago(r.at), r.message ? ` · ${r.message}` : '');
+    }
+    return h('section', { class: 'card dw-card', 'data-key': 'reboot', 'data-sig': rebootSig(x), 'aria-labelledby': 'dw-h-reboot' },
+      h('fieldset', { class: 'fs', disabled: busy || null },
+        h('div', { class: 'cap-row' },
+          h('div', { class: 'cap-text' },
+            h('h3', { id: 'dw-h-reboot', class: 'cap-title' }, 'Reboot ', rebootBadge(x)),
+            h('p', { class: 'cap-hint', text: hint })),
+          action),
+        confirm,
+        progress),
+      resultNote('reboot'));
+  }
+
+  // Heartbeats bring the reboot's progress: the card follows them.
+  function refreshRebootCard(fk) {
+    if (!dw.id || dw.busy.has('reboot')) return;
+    const body = $('#dw-body');
+    const old = $('[data-key="reboot"]', body);
+    const x = hostById(dw.id);
+    if (!old) {
+      // The machine said it can reboot after the panel was built: the card
+      // joins it below the versions.
+      const after = $('[data-key="update"]', body);
+      const card = after && rebootCard(x);
+      if (card) { after.after(card); if (liveMotion()) fadeIn(card, DUR.slow); }
+      return;
+    }
+    if (!fk && old.dataset.sig === rebootSig(x)) return;
+    // Focus stays on the control it was on, never moved onto another one.
+    const focused = old.contains(document.activeElement) ? document.activeElement.dataset.fk || '' : null;
+    const want = fk || focused;
+    const card = rebootCard(x);
+    if (!card) { old.remove(); if (want != null) body.focus({ preventScroll: true }); return; }
+    old.replaceWith(card);
+    if (want == null) return;
+    const target = want && $(`[data-fk="${CSS.escape(want)}"]`, card);
+    if (target && !target.closest('fieldset:disabled')) target.focus({ preventScroll: true });
+    else body.focus({ preventScroll: true });
+  }
+
   // ------------------------------------------------------------ audit log
   function buildAuditControls() {
     $('#audit-filter').replaceChildren(...[['changes', 'Changes'], ['all', 'All']].map(([v, t]) => h('button', {
-      type: 'button', class: 'seg-btn', 'data-v': v, text: t, 'aria-pressed': String((v === 'all') === state.auditAll),
-      onclick: () => { state.auditAll = v === 'all'; saveFlag('rm.audit.all', state.auditAll); renderAudit(true); },
+      type: 'button', class: 'seg-btn', 'data-v': v, text: t, 'aria-pressed': String(v === cfg.general.auditFilter),
+      onclick: () => update((c) => { c.general.auditFilter = v; }),
     })));
+    segThumb($('#audit-filter'));
     $('#audit-toggle').addEventListener('click', () => {
       state.auditOpen = !state.auditOpen; saveFlag('rm.audit.open', state.auditOpen);
       renderAudit(true);
@@ -1165,50 +2098,68 @@
 
   function renderAudit(force) {
     const sec = $('#audit-section');
-    if (state.auditErr === 'gone') { sec.hidden = true; return; }
+    if (state.auditErr === 'gone') { collapse(sec, false); return; }
     if (!state.audit && !state.auditErr) return;  // first load still on its way
-    sec.hidden = false;
+    fillAudit(force);
+    // Shown once filled, so it opens to its full height.
+    collapse(sec, true);
+  }
+
+  function fillAudit(force) {
     const all = state.audit || [];
-    const list = state.auditAll ? all : all.filter((c) => !isRead(c));
-    const sig = JSON.stringify([all, state.auditAll, state.auditOpen, state.showAllAudit, state.auditErr]);
+    const showAll = cfg.general.auditFilter === 'all';
+    const list = showAll ? all : all.filter((c) => !isRead(c));
+    const sig = JSON.stringify([all, showAll, state.auditOpen, state.showAllAudit, state.auditErr, cfg.general.auditRows]);
     if (!force && sig === state.auditSig) return;
     state.auditSig = sig;
-    sec.classList.toggle('is-collapsed', !state.auditOpen);
-    $('#audit-count').textContent = list.length ? String(list.length) : '';
+    $('#audit-section').classList.toggle('is-collapsed', !state.auditOpen);
+    tweenNumber($('#audit-count'), list.length, countText);
     const tog = $('#audit-toggle');
     tog.textContent = state.auditOpen ? 'Hide' : 'Show';
     tog.setAttribute('aria-expanded', String(state.auditOpen));
-    $('#audit-filter').hidden = !state.auditOpen;
-    $$('.seg-btn', $('#audit-filter')).forEach((b) => b.setAttribute('aria-pressed', String((b.dataset.v === 'all') === state.auditAll)));
+    const filter = $('#audit-filter');
+    filter.hidden = !state.auditOpen;
+    $$('.seg-btn', filter).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.v === cfg.general.auditFilter)));
+    segThumb(filter);
     const box = $('#audit');
-    box.hidden = !state.auditOpen;
-    if (!state.auditOpen) return;
-    const LIMIT = 15;
+    if (!state.auditOpen) { collapse(box, false); return; }
+    const LIMIT = cfg.general.auditRows;
     const shown = state.showAllAudit ? list : list.slice(0, LIMIT);
     const reads = all.length - list.length;
-    box.replaceChildren(...[
-      state.auditErr ? h('p', { class: 'notice notice-warn', role: 'status', text: `The log could not be refreshed. ${state.auditErr}` }) : null,
-      shown.length
-        ? table('Commands run on machines through the coordinator', [['Result'], ['Command'], ['Machine'], ['By'], ['When', 'c-num']], shown.map((c) => h('tr', {},
-          td('Result', 'c-result', outcomeBadge(c.outcome)),
-          td('Command', 'c-cmd', cmdCode(c.argv)),
-          td('Machine', 'c-machine', machine(c.host_id, c.host_name || hostName(c.host_id, c.host_id))),
-          td('By', 'c-who', h('span', { text: c.login || '—' })),
-          td('When', 'c-num c-when', ago(c.at, 'muted')))))
-        : empty(all.length ? 'No changes yet' : 'No remote commands yet',
-          reads ? `${reads} read${reads === 1 ? '' : 's'} hidden. Choose All to see them.` : 'Changes made from a machine’s panel are recorded here.'),
-      list.length > LIMIT ? h('div', { class: 'tbl-more' }, h('button', {
-        type: 'button', class: 'link-btn', 'aria-expanded': String(state.showAllAudit), text: state.showAllAudit ? 'Show fewer' : `Show all ${list.length}`,
-        onclick: () => { state.showAllAudit = !state.showAllAudit; renderAudit(true); },
-      })) : null,
-    ].filter(Boolean));
+    const errText = state.auditErr ? `The log could not be refreshed. ${state.auditErr}` : null;
+    const moreText = () => (state.showAllAudit ? 'Show fewer' : `Show all ${list.length}`);
+    renderTable(box, {
+      before: errText ? [{
+        key: 'err', create: () => h('p', { class: 'notice notice-warn', role: 'status', text: errText }),
+        update: (el) => { if (el.textContent !== errText) el.textContent = errText; },
+      }] : [],
+      caption: 'Commands run on machines through the coordinator', heads: [['Result'], ['Command'], ['Machine'], ['By'], ['When', 'c-num']],
+      items: shown, key: (c) => `${c.at} ${c.host_id} ${(c.argv || []).join(' ')}`, sig: (c) => hostName(c.host_id, c.host_id),
+      row: (c) => [
+        td('Result', 'c-result', outcomeBadge(c.outcome)),
+        td('Command', 'c-cmd', cmdCode(c.argv)),
+        td('Machine', 'c-machine', machine(c.host_id, c.host_name || hostName(c.host_id, c.host_id))),
+        td('By', 'c-who', h('span', { text: c.login || '—' })),
+        td('When', 'c-num c-when', ago(c.at, 'muted'))],
+      empty: () => empty(all.length ? 'No changes yet' : 'No remote commands yet',
+        reads ? `${reads} read${reads === 1 ? '' : 's'} hidden. Choose All to see them.` : 'Changes made from a machine’s panel are recorded here.'),
+      after: list.length > LIMIT ? [{
+        key: 'more',
+        create: () => h('div', { class: 'tbl-more' }, h('button', {
+          type: 'button', class: 'link-btn', 'aria-expanded': String(state.showAllAudit), text: moreText(),
+          onclick: () => { state.showAllAudit = !state.showAllAudit; renderAudit(true); },
+        })),
+        update: (el) => { el.firstChild.textContent = moreText(); el.firstChild.setAttribute('aria-expanded', String(state.showAllAudit)); },
+      }] : [],
+    });
+    collapse(box, true);
   }
 
   // --------------------------------------------------------- machine panel
   const dw = {
     id: null, gen: 0, pushed: false, sig: '',
     cfg: null, rc: null, loading: false, error: null, cfgSeq: 0,
-    results: new Map(), busy: new Set(), add: null, confirm: null, updateSent: null,
+    results: new Map(), busy: new Set(), add: null, confirm: null, updateSent: null, closing: null,
   };
 
   function hashHost() {
@@ -1219,6 +2170,7 @@
 
   function setupDrawer() {
     const dlg = $('#drawer');
+    $('#dw-close').before(pinButton('pin-drawer'));
     $('#dw-close').addEventListener('click', () => closeDrawer());
     dlg.addEventListener('cancel', (e) => { e.preventDefault(); closeDrawer(); });
     dlg.addEventListener('close', () => { if (dw.id) closeDrawer(); });
@@ -1226,7 +2178,12 @@
     dlg.addEventListener('keydown', trapTab);
     window.addEventListener('hashchange', () => {
       const id = hashHost();
-      if (id) { if (!$('#app').hidden) openDrawer(id, true); } else if (dw.id) closeDrawer(true);
+      if (id) {
+        if ($('#app').hidden) return;
+        // One panel at a time: Back or Forward to a machine closes Settings first.
+        if (st.open) closeSettings(true);
+        openDrawer(id, true);
+      } else if (dw.id) closeDrawer(true);
     });
     // The card's name is a link (Enter); Space opens it too, as on a button.
     $('#hosts').addEventListener('keydown', (e) => {
@@ -1236,7 +2193,7 @@
 
   function trapTab(e) {
     if (e.key !== 'Tab') return;
-    const dlg = $('#drawer');
+    const dlg = e.currentTarget;
     const f = $$('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])', dlg)
       .filter((el) => !el.disabled && !el.closest('fieldset:disabled') && (el.checkVisibility ? el.checkVisibility({ visibilityProperty: true }) : el.getClientRects().length));
     if (!f.length) return;
@@ -1248,13 +2205,14 @@
   function openDrawer(id, pushed) {
     const dlg = $('#drawer');
     if (dlg.open && dw.id === id) return;
-    if (!dlg.open) dw.pushed = !!pushed;
+    if (!dlg.open || dw.closing) dw.pushed = !!pushed;
     dw.id = id; dw.gen++;
     Object.assign(dw, { sig: '', cfg: null, rc: null, loading: false, error: null, add: null, confirm: null });
     dw.results.clear(); dw.busy.clear();
     renderDrawerHead();
     const x = hostById(id);
     if (!state.ov || (x && x.manageable)) loadConfig(); else renderDrawerBody();
+    if (dw.closing) { for (const a of dw.closing) a.cancel(); dw.closing = null; }
     if (!dlg.open) { dlg.showModal(); document.documentElement.classList.add('has-drawer'); }
     $('#dw-body').scrollTop = 0;
     $('#dw-close').focus();
@@ -1270,10 +2228,29 @@
     const id = dw.id;
     dw.id = null; dw.gen++;
     const dlg = $('#drawer');
-    if (dlg.open) dlg.close();
-    document.documentElement.classList.remove('has-drawer');
-    const link = $(`.host-open[data-host="${CSS.escape(id)}"]`);
-    if (link) link.focus();
+    const done = () => {
+      const anims = dw.closing || [];
+      dw.closing = null;
+      if (dlg.open) dlg.close();
+      for (const a of anims) a.cancel();
+      document.documentElement.classList.remove('has-drawer');
+      const link = $(`.host-open[data-host="${CSS.escape(id)}"]`);
+      if (link) link.focus();
+    };
+    if (!dlg.open || !motionOk()) { done(); return; }
+    const closing = slideOut(dlg, () => { if (dw.closing === closing) done(); });
+    dw.closing = closing;
+  }
+
+  // Slides a side panel out the way it came in, with its backdrop fading,
+  // then calls `end`. Its animations, which opening it again meanwhile cancels.
+  function slideOut(dlg, end) {
+    const away = matchMedia('(max-width: 720px)').matches ? 'translateY(24px)' : 'translateX(28px)';
+    const out = { duration: 200, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' };
+    const closing = [dlg.animate([{ transform: 'none', opacity: 1 }, { transform: away, opacity: 0 }], out)];
+    closing[0].finished.then(end, () => {});
+    try { closing.push(dlg.animate([{ opacity: 1 }, { opacity: 0 }], { ...out, pseudoElement: '::backdrop' })); } catch (_) { /* the backdrop just goes */ }
+    return closing;
   }
 
   // Overview polls refresh the header; the body is only rebuilt when the
@@ -1283,6 +2260,7 @@
     const before = dw.sig;
     renderDrawerHead();
     refreshVersionCard();
+    refreshRebootCard();
     if (dw.sig === before) return;
     const x = hostById(dw.id);
     if (x && x.manageable && !dw.loading && !dw.busy.size && (!dw.cfg || dw.rc !== !!x.remote_changes)) loadConfig({ quiet: !!dw.cfg });
@@ -1295,6 +2273,7 @@
     const doc = dw.cfg && dw.cfg.config;
     const name = (x && (x.name || x.hostname)) || (doc && doc.host && doc.host.name) || 'Machine';
     const rc = dw.rc != null ? dw.rc : !!(x && x.remote_changes);
+    setPin($('.pin-drawer'), dw.id, name);
     const sig = JSON.stringify([name, !!state.ov, x && [x.hostname, x.os, x.arch, x.online, x.unfit, x.draining, !!x.manageable, !!x.remote_changes], dw.rc]);
     if (sig === dw.sig) return;
     dw.sig = sig;
@@ -1306,7 +2285,7 @@
       const os = String(x.os || '').toLowerCase();
       const extra = [x.hostname && x.hostname !== name ? x.hostname : null, x.arch, isNum(x.cores) ? `${x.cores} cores` : null].filter(Boolean).join(' · ');
       sub.replaceChildren(...[
-        h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' }),
+        osTag(os),
         h('span', { class: `status status-${st.key}` }, h('i', { 'aria-hidden': 'true' }), st.label),
         x.online ? accessChip(x, rc) : null,
         extra ? h('span', { text: extra }) : null,
@@ -1376,7 +2355,11 @@
     else if (dw.loading) view = skeleton();
     else if (dw.error) view = errorPanel(dw.error);
     else view = unavailablePanel(x);
-    $('#dw-body').replaceChildren(view);
+    const body = $('#dw-body');
+    const was = body.firstElementChild;
+    body.replaceChildren(view);
+    // The skeleton crossfades into what replaces it; later rebuilds do not flicker.
+    if (was && was.getAttribute('aria-busy') === 'true' && view.getAttribute('aria-busy') !== 'true') fadeIn(view);
   }
 
   function skeleton() {
@@ -1420,7 +2403,7 @@
     }
     const known = new Set(pols.map(policyKey));
     // Results whose control is gone: a removed policy, or the add form once it closed.
-    const orphans = [...dw.results.keys()].filter((k) => (k === 'add' ? !dw.add : k !== 'host' && k !== 'update' && !known.has(k)));
+    const orphans = [...dw.results.keys()].filter((k) => (k === 'add' ? !dw.add : k !== 'host' && k !== 'update' && k !== 'reboot' && !known.has(k)));
     return h('div', { class: 'dw-stack' },
       dw.error ? h('div', { class: 'result result-err', role: 'alert' },
         h('span', { class: 'result-icon', 'aria-hidden': 'true', text: '!' }),
@@ -1429,6 +2412,7 @@
         dw.error.error ? h('pre', { class: 'result-pre', text: dw.error.error }) : null) : null,
       doc.schema_version !== 1 ? h('p', { class: 'notice notice-warn', text: `This machine describes its settings in format ${doc.schema_version}; this page reads format 1, so some details may be missing.` }) : null,
       versionCard(x),
+      rebootCard(x),
       machineCard(doc.host, can, x),
       h('section', { class: 'dw-section', 'aria-labelledby': 'dw-h-repos' },
         h('div', { class: 'section-head' },
@@ -1590,6 +2574,7 @@
     const pathRow = h('div', { class: 'ws-path-row' }, path);
     const sync = () => {
       $$('.seg-btn', seg).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.k === sel)));
+      segThumb(seg);
       pathRow.hidden = sel !== 'persistent';
       form.classList.toggle('is-dirty', sel !== kind || (sel === 'persistent' && path.value.trim() !== base));
     };
@@ -1801,6 +2786,792 @@
     refocus(fk, key, !res.ok);
     loadAudit();
     if (res.ok) loadOverview();
+  }
+
+  // ============================================================== settings
+  // Every change goes through update(): normalized, kept in this browser at
+  // once, sent to the coordinator a moment later, and applied to the page
+  // with the usual animations (no reload).
+  const clone = (v) => JSON.parse(JSON.stringify(v));
+  const getPath = (o, path) => path.split('.').reduce((a, k) => (a == null ? a : a[k]), o);
+  function setPath(o, path, v) {
+    const ks = path.split('.'), last = ks.pop();
+    ks.reduce((a, k) => a[k], o)[last] = clone(v);
+  }
+
+  function update(mutate) {
+    const next = clone(cfg);
+    mutate(next);
+    replaceSettings(next);
+  }
+  // `remote`: the settings came from elsewhere (the coordinator, another
+  // tab), so they are not sent back.
+  function replaceSettings(next, remote) {
+    const prev = cfg, n = RS.normalize(next);
+    if (RS.same(n, prev)) return false;
+    cfg = n;
+    if (remote !== 'tab') storeLocal();
+    if (!remote) saveSoon();
+    applyAll(prev);
+    return true;
+  }
+
+  // Brings the page in line with the settings: each render is a diff, so
+  // what did not change stays put and what did moves.
+  function applyAll(prev) {
+    const changed = (k) => !RS.same(prev[k], cfg[k]);
+    if (changed('general')) {
+      applyGeneral();
+      if (prev.general.refresh !== cfg.general.refresh && state.timers.ov) {
+        clearTimeout(state.timers.ov);
+        state.timers.ov = setTimeout(loadOverview, Math.min(overviewMs(), 1000));
+      }
+    }
+    if (changed('layout')) applyLayout();
+    syncRange();
+    if (state.ov) renderOverview(state.ov);
+    else if (changed('kpis')) renderSkeletons();
+    if (state.metrics) renderCharts(); else renderChartFrames();
+    if (changed('general')) { renderAudit(true); tick(); }
+  }
+
+  const darkScheme = matchMedia('(prefers-color-scheme: dark)');
+  // Theme, motion, density and compact tables, as attributes the stylesheet reads.
+  function applyGeneral() {
+    const g = cfg.general, root = document.documentElement;
+    const set = (k, v) => { if (v == null) delete root.dataset[k]; else root.dataset[k] = v; };
+    set('theme', g.theme === 'system' ? null : g.theme);
+    set('motion', g.motion === 'system' ? null : g.motion);
+    set('density', g.density === 'compact' ? 'compact' : null);
+    set('tables', g.compactTables ? 'compact' : null);
+    const dark = g.theme === 'dark' || (g.theme === 'system' && darkScheme.matches);
+    for (const m of $$('meta[name="theme-color"]')) {
+      if (!m.dataset.color) m.dataset.color = m.content;
+      m.content = g.theme === 'system' ? m.dataset.color : dark ? '#0a0b0d' : '#f6f7f9';
+    }
+    if (lessMotion()) settleMotion();
+  }
+
+  // The sections in their order, the hidden ones out, Queue and Running
+  // side by side or stacked; the rest slide to their new places.
+  function applyLayout() {
+    const main = $('#main'), L = cfg.layout;
+    const secs = L.order.map((k) => $(`:scope > [data-section="${k}"]`, main)).filter(Boolean);
+    const split = $('[data-section="queue-running"]', main);
+    const moving = [...secs, ...$$(':scope > .section', split)];
+    const shown = [];
+    flip(moving, () => {
+      for (const el of secs) {
+        main.append(el);
+        const off = L.hidden.includes(el.dataset.section);
+        if (!off && el.hasAttribute('data-off')) shown.push(el);
+        el.toggleAttribute('data-off', off);
+      }
+      split.classList.toggle('is-stacked', L.split === 'stacked');
+    });
+    for (const el of shown) if (liveMotion()) el.animate([{ opacity: 0, transform: 'translateY(8px)' }, { opacity: 1, transform: 'none' }], { duration: DUR.slow, easing: EASE });
+  }
+
+  // ------------------------------------------------------------- syncing
+  const SAVE_DELAY = 700;
+  // `changes` counts this page's changes; `client` and `seq` order its
+  // writes, so the coordinator keeps the newest of two on their way at once.
+  const sync = {
+    timer: 0, state: 'idle', note: '', dirty: false, inflight: false, again: false,
+    changes: 0, client: Math.random().toString(36).slice(2, 12), seq: 0,
+  };
+
+  function saveSoon() {
+    sync.dirty = true;
+    sync.changes++;
+    markUnsaved(JSON.stringify(cfg));
+    setSync('pending');
+    clearTimeout(sync.timer);
+    sync.timer = setTimeout(pushSettings, SAVE_DELAY);
+  }
+
+  async function pushSettings(keepalive) {
+    clearTimeout(sync.timer);
+    // The page is going: send now even beside a request on its way; the
+    // coordinator keeps whichever comes last, and both carry this copy.
+    if (sync.inflight && keepalive !== true) { sync.again = true; return; }
+    sync.inflight = true;
+    sync.dirty = false;
+    setSync('saving');
+    const copy = JSON.stringify(cfg);
+    const r = await call('/api/settings', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...cfg, client: sync.client, seq: ++sync.seq }), keepalive: keepalive === true,
+    });
+    sync.inflight = false;
+    // 409: a newer write of this page got there first, which carries this change too.
+    if (!r.ok && r.status !== 409) { sync.dirty = true; setSync('error', r.status === 401 ? '' : r.error || r.hint); }
+    else {
+      if (!sync.dirty) markUnsaved(null, copy);
+      setSync(sync.dirty ? 'pending' : 'saved');
+    }
+    if (sync.again) { sync.again = false; if (sync.dirty) pushSettings(); }
+  }
+
+  // The coordinator's copy wins over this browser's, unless this browser
+  // changed something meanwhile. With none there yet, this browser's
+  // becomes the account's.
+  async function loadServerSettings() {
+    const changes = sync.changes;
+    const r = await call('/api/settings');
+    if (!r.ok) { if (r.status !== 401) setSync('error', 'Your saved settings could not be loaded; these are this browser’s.'); return; }
+    // Changed here while the answer was on its way (perhaps saved already): this page's is newer.
+    if (sync.dirty || sync.inflight || sync.changes !== changes) return;
+    // A change this browser kept but never got confirmed: it is newer.
+    if (unsaved()) { saveSoon(); return; }
+    const remote = r.body && r.body.settings;
+    if (remote) {
+      replaceSettings(remote, 'server');
+      setSync('saved');
+      if (st.open) renderSettings();
+    } else if (!RS.same(cfg, RS.defaults())) saveSoon();
+  }
+
+  function setSync(kind, note) {
+    sync.state = kind;
+    sync.note = note || '';
+    $('#settings-btn').classList.toggle('has-error', kind === 'error');
+    $('#settings-btn').title = kind === 'error' ? 'Settings · not saved' : 'Settings';
+    renderStatus();
+  }
+
+  function renderStatus() {
+    const box = $('#st-status');
+    if (!box) return;
+    let kids;
+    if (st.undo) {
+      kids = [h('span', { text: st.undo.text }), h('button', { type: 'button', class: 'link-btn', text: 'Undo', 'data-fk': 'undo', onclick: undoSettings })];
+    } else if (st.msg) {
+      kids = [h('span', { class: st.msg.kind === 'err' ? 'text-err' : null, text: st.msg.text })];
+    } else {
+      const text = {
+        idle: 'Saved to your GitHub account as you go',
+        pending: 'Saving…', saving: 'Saving…',
+        saved: 'Saved to your account',
+        error: 'Not saved',
+      }[sync.state];
+      kids = [
+        h('i', { class: `st-dot st-dot-${sync.state}`, 'aria-hidden': 'true' }),
+        h('span', { text }),
+        sync.state === 'error' && sync.note ? h('span', { class: 'muted', text: ` · ${sync.note}` }) : null,
+        sync.state === 'error' ? h('button', { type: 'button', class: 'link-btn', text: 'Retry', onclick: () => pushSettings() }) : null,
+      ];
+    }
+    const sig = JSON.stringify([sync.state, sync.note, st.undo && st.undo.text, st.msg]);
+    if (box.dataset.sig === sig) return;
+    box.dataset.sig = sig;
+    box.replaceChildren(...kids.filter(Boolean));
+    fadeIn(box, DUR.fast);
+  }
+
+  // A message in the footer for a few seconds (an import that failed).
+  function notify(text, kind) {
+    clearTimeout(st.msgTimer);
+    st.msg = { text, kind };
+    renderStatus();
+    st.msgTimer = setTimeout(() => { st.msg = null; renderStatus(); }, 6000);
+  }
+
+  // A reset or an import can be taken back for a while.
+  function offerUndo(before, text) {
+    clearTimeout(st.undoTimer);
+    st.undo = { before, text };
+    renderStatus();
+    st.undoTimer = setTimeout(() => { st.undo = null; renderStatus(); }, 10000);
+  }
+  // After a reset the keyboard lands on its Undo.
+  function focusUndo() {
+    const b = $('#st-status [data-fk="undo"]');
+    if (b) b.focus();
+    return !!b;
+  }
+  function undoSettings() {
+    if (!st.undo) return;
+    const before = st.undo.before;
+    st.undo = null;
+    replaceSettings(before);
+    renderSettings();
+    $('#st-close').focus();
+  }
+
+  // ----------------------------------------------------------- the view
+  const TABS = [['general', 'General'], ['layout', 'Layout'], ['machines', 'Machines'], ['charts', 'Charts'], ['kpis', 'Tiles']];
+  const st = { open: false, tab: 'general', closing: null, expanded: new Set(), undo: null, msg: null, seq: 0 };
+
+  function setupSettings() {
+    const dlg = $('#settings');
+    $('#settings-btn').addEventListener('click', openSettings);
+    $('#st-close').addEventListener('click', () => closeSettings());
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); closeSettings(); });
+    dlg.addEventListener('click', (e) => { if (e.target === dlg) closeSettings(); });
+    dlg.addEventListener('keydown', trapTab);
+    const tabs = $('#st-tabs');
+    tabs.replaceChildren(...TABS.map(([k, label]) => h('button', {
+      type: 'button', role: 'tab', class: 'seg-btn', id: `st-tab-${k}`, 'aria-controls': 'st-body', 'data-tab': k, text: label,
+      onclick: () => selectTab(k),
+    })));
+    tabs.addEventListener('keydown', (e) => {
+      const i = TABS.findIndex((t) => t[0] === st.tab);
+      const j = { ArrowLeft: i - 1, ArrowRight: i + 1, Home: 0, End: TABS.length - 1 }[e.key];
+      if (j == null) return;
+      e.preventDefault();
+      const k = TABS[(j + TABS.length) % TABS.length][0];
+      selectTab(k);
+      $(`#st-tab-${k}`).focus();
+    });
+    $('#st-export').addEventListener('click', exportSettings);
+    $('#st-import').addEventListener('click', () => $('#st-file').click());
+    $('#st-file').addEventListener('change', importSettings);
+    $('#st-reset').addEventListener('click', () => setConfirm(true));
+    $('#st-reset-no').addEventListener('click', () => { setConfirm(false); $('#st-reset').focus(); });
+    $('#st-reset-yes').addEventListener('click', () => {
+      const before = cfg;
+      setConfirm(false);
+      if (replaceSettings(RS.defaults())) offerUndo(before, 'Every setting is back to its default.');
+      renderSettings();
+      if (!focusUndo()) $('#st-reset').focus();
+    });
+    // Another tab of this dashboard changed them: follow it.
+    window.addEventListener('storage', (e) => {
+      if (e.key !== SETTINGS_KEY || !e.newValue) return;
+      try { if (replaceSettings(JSON.parse(e.newValue), 'tab') && st.open) renderSettings(); } catch (_) { /* not ours to read */ }
+    });
+    // Leaving with a change not yet sent: send it now.
+    window.addEventListener('pagehide', () => { if (sync.dirty) pushSettings(true); });
+    document.addEventListener('visibilitychange', () => { if (document.hidden && sync.dirty) pushSettings(true); });
+  }
+
+  function setConfirm(on) {
+    $('#st-actions').hidden = on;
+    $('#st-confirm').hidden = !on;
+    if (on) { $('#st-reset-no').focus(); fadeIn($('#st-confirm'), DUR.fast); }
+  }
+
+  function openSettings() {
+    const dlg = $('#settings');
+    if (dlg.open && !st.closing) return;
+    if (st.closing) { for (const a of st.closing) a.cancel(); st.closing = null; }
+    st.open = true;
+    setConfirm(false);
+    if (!dlg.open) dlg.showModal();
+    renderSettings(true);
+    segThumb($('#st-tabs'));
+    $('#st-close').focus();
+  }
+
+  // `handOff`: another panel takes over, so focus does not go back to the button.
+  function closeSettings(handOff) {
+    const dlg = $('#settings');
+    if (!st.open) return;
+    st.open = false;
+    const done = () => {
+      const anims = st.closing || [];
+      st.closing = null;
+      if (dlg.open) dlg.close();
+      for (const a of anims) a.cancel();
+      if (handOff !== true) $('#settings-btn').focus();
+    };
+    if (!motionOk()) { done(); return; }
+    const closing = slideOut(dlg, () => { if (st.closing === closing) done(); });
+    st.closing = closing;
+  }
+
+  function selectTab(k) {
+    if (k === st.tab) return;
+    st.tab = k;
+    $('#st-body').scrollTop = 0;
+    renderSettings(true);
+  }
+
+  const TAB_VIEW = { general: generalTab, layout: layoutTab, machines: machinesTab, charts: chartsTab, kpis: kpisTab };
+
+  // Builds the open tab. `fresh`: a new tab, faded in at the top; otherwise
+  // the same tab again (a reset, an import), keeping the scroll and focus.
+  function renderSettings(fresh) {
+    if (!st.open) return;
+    for (const b of $$('[role="tab"]', $('#st-tabs'))) {
+      const on = b.dataset.tab === st.tab;
+      b.setAttribute('aria-selected', String(on));
+      b.tabIndex = on ? 0 : -1;
+    }
+    segThumb($('#st-tabs'));
+    const body = $('#st-body');
+    const fk = document.activeElement && body.contains(document.activeElement) ? document.activeElement.dataset.fk : null;
+    const top = body.scrollTop;
+    st.seq = 0;
+    const view = h('div', { class: 'st-stack' }, TAB_VIEW[st.tab]());
+    body.replaceChildren(view);
+    body.setAttribute('aria-labelledby', `st-tab-${st.tab}`);
+    segThumbs(view);
+    if (fresh) {
+      if (motionOk()) view.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: DUR.base, easing: EASE });
+      return;
+    }
+    body.scrollTop = top;
+    if (!fk) return;
+    // What had focus may be gone (an unpinned row): the panel keeps it.
+    const again = $(`[data-fk="${CSS.escape(fk)}"]`, body);
+    (again && !again.disabled ? again : body).focus({ preventScroll: true });
+  }
+
+  // ------------------------------------------------------------ controls
+  const uid = (p) => `st-${p}-${++st.seq}`;
+
+  // A card of related settings; `paths` are what its Reset puts back.
+  function group(title, hint, paths, ...kids) {
+    const isDefault = () => paths.every((p) => RS.same(getPath(cfg, p), getPath(RS.defaults(), p)));
+    const reset = paths.length ? h('button', {
+      type: 'button', class: 'link-btn st-reset', 'data-fk': `reset:${title}`, text: 'Reset', 'aria-label': `Reset ${title}`,
+      disabled: isDefault() || null,
+      onclick: () => {
+        const before = cfg, d = RS.defaults();
+        update((c) => { for (const p of paths) setPath(c, p, getPath(d, p)); });
+        offerUndo(before, `${title} reset to defaults.`);
+        renderSettings();
+        focusUndo();
+      },
+    }) : null;
+    const el = h('section', { class: 'card st-group' },
+      h('header', { class: 'st-group-head' },
+        h('div', { class: 'st-group-id' }, h('h3', { class: 'st-group-title', text: title }), hint ? h('p', { class: 'st-hint', text: hint }) : null),
+        reset),
+      ...kids);
+    // A change in the card turns its Reset on or off.
+    el._sync = () => { if (reset) reset.disabled = isDefault(); };
+    el.addEventListener('st-change', () => el._sync());
+    return el;
+  }
+  const touched = (from) => from.dispatchEvent(new Event('st-change', { bubbles: true }));
+
+  // A setting: its name and hint, and its control (made by `make(labelId)`).
+  function row(label, hint, make) {
+    const id = uid('l');
+    const ctl = make(id);
+    // A switch or a stepper stays beside its name on a phone; wider controls go under it.
+    const inline = ctl.classList.contains('switch') || ctl.classList.contains('stepper');
+    return h('div', { class: `st-row${inline ? ' is-inline' : ''}` },
+      h('div', { class: 'st-label' }, h('span', { class: 'st-name', id, text: label }), hint ? h('span', { class: 'st-hint', text: hint }) : null),
+      h('div', { class: 'st-ctl' }, ctl));
+  }
+
+  function segCtl(path, options, labelId, after) {
+    const box = h('div', { class: 'seg seg-sm', role: 'group', 'aria-labelledby': labelId });
+    const press = () => { for (const b of $$('.seg-btn', box)) b.setAttribute('aria-pressed', String(b.dataset.v === String(getPath(cfg, path)))); };
+    box.append(...options.map(([v, text]) => h('button', {
+      type: 'button', class: 'seg-btn', 'data-v': String(v), 'data-fk': `${path}=${v}`, text,
+      onclick: (e) => {
+        update((c) => setPath(c, path, v));
+        press();
+        segThumb(box);
+        touched(e.currentTarget);
+        if (after) after();
+      },
+    })));
+    press();
+    return box;
+  }
+
+  // An on/off switch; `props` its label, state and data-fk.
+  const switchBtn = (props) => h('button', { type: 'button', class: 'switch st-switch', role: 'switch', ...props },
+    h('span', { class: 'switch-track', 'aria-hidden': 'true' }, h('i')));
+
+  function switchCtl(path, labelId, after, opts = {}) {
+    const get = () => (opts.invert ? !getPath(cfg, path) : !!getPath(cfg, path));
+    const b = switchBtn({ 'aria-checked': String(get()), 'data-fk': path, 'aria-labelledby': labelId || null, 'aria-label': opts.label || null });
+    b.addEventListener('click', () => {
+      const v = !getPath(cfg, path);
+      update((c) => setPath(c, path, v));
+      b.setAttribute('aria-checked', String(get()));
+      touched(b);
+      if (after) after();
+    });
+    return b;
+  }
+
+  function stepperCtl(path, min, max, step, labelId) {
+    const input = h('input', {
+      class: 'num-input', type: 'number', inputmode: 'numeric', min, max, step, value: getPath(cfg, path),
+      'aria-labelledby': labelId, 'data-fk': path,
+    });
+    const set = (v) => {
+      const n = String(v).trim() === '' ? NaN : clamp(Math.round(Number(v)), min, max);
+      if (!isFinite(n)) { input.value = getPath(cfg, path); return; }
+      update((c) => setPath(c, path, n));
+      input.value = getPath(cfg, path);
+      dec.disabled = n <= min; inc.disabled = n >= max;
+      touched(input);
+    };
+    const dec = h('button', { type: 'button', class: 'step-btn', 'aria-label': 'Fewer', text: '−', tabindex: -1, onclick: () => set(Number(input.value) - step) });
+    const inc = h('button', { type: 'button', class: 'step-btn', 'aria-label': 'More', text: '+', tabindex: -1, onclick: () => set(Number(input.value) + step) });
+    dec.disabled = getPath(cfg, path) <= min; inc.disabled = getPath(cfg, path) >= max;
+    input.addEventListener('change', () => set(input.value));
+    return h('div', { class: 'stepper' }, dec, input, inc);
+  }
+
+  function selectCtl(path, options, labelId) {
+    const sel = h('select', { class: 'input st-select', 'aria-labelledby': labelId, 'data-fk': path },
+      options.map(([v, text]) => h('option', { value: v, text, selected: v === getPath(cfg, path) || null })));
+    sel.addEventListener('change', () => { update((c) => setPath(c, path, sel.value)); touched(sel); });
+    return sel;
+  }
+
+  const gripIcon = () => s('svg', { viewBox: '0 0 20 20', width: 16, height: 16, 'aria-hidden': 'true' },
+    ...[[7.5, 5], [12.5, 5], [7.5, 10], [12.5, 10], [7.5, 15], [12.5, 15]].map(([cx, cy]) => s('circle', { cx, cy, r: 1.4, fill: 'currentColor' })));
+  const upIcon = () => icon('M6 12.5l4-4 4 4', 14);
+  const downIcon = () => icon('M6 8l4 4 4-4', 14);
+
+  function announce(text) {
+    const live = $('#st-live');
+    live.textContent = '';
+    requestAnimationFrame(() => { live.textContent = text; });
+  }
+
+  // A list to put in order and, with `spec.hidden`, to switch items on and
+  // off. A row moves by dragging its handle (mouse, pen or touch), by the
+  // arrow keys on the handle, or by its up and down buttons; the others
+  // slide out of its way. `spec`: { label, items: [{ key, label, sub, lead }],
+  // order, hidden, onOrder(keys), onShow(key, on), actions(key), detail(key) }.
+  function orderList(spec) {
+    const ul = h('ul', { class: 'olist', 'aria-label': spec.label });
+    const byKey = new Map(spec.items.map((it) => [it.key, it]));
+    const rows = () => $$(':scope > li', ul);
+    const keys = () => rows().map((li) => li.dataset.key);
+    const syncMoves = () => rows().forEach((li, i, all) => { li._up.disabled = i === 0; li._down.disabled = i === all.length - 1; });
+    const commit = () => { spec.onOrder(keys()); syncMoves(); touched(ul); };
+    const labelOf = (li) => byKey.get(li.dataset.key).label;
+
+    // `focus`: what keeps the keyboard focus (a move takes the row out of
+    // the document for a moment); a move button that is now disabled hands
+    // it to the other one.
+    function moveBy(li, by, focus) {
+      const all = rows(), i = all.indexOf(li), j = i + by;
+      if (j < 0 || j >= all.length) return;
+      flip(all, () => ul.insertBefore(li, by < 0 ? all[j] : all[j].nextSibling));
+      commit();
+      if (focus) (focus.disabled ? (focus === li._up ? li._down : li._up) : focus).focus({ preventScroll: false });
+      announce(`${labelOf(li)}, position ${j + 1} of ${all.length}`);
+    }
+
+    function drag(e, li, handle) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      // On the window, not the handle: the row moves in the document as it
+      // passes others, which would drop a pointer capture.
+      const id = e.pointerId;
+      const scroller = ul.closest('.dw-body');
+      const before = keys().join('\n');
+      let y0 = e.clientY, dy = 0, moving = false, lastY = e.clientY;
+      const place = () => { li.style.transform = `translateY(${dy}px)`; };
+      const reorder = () => {
+        const r = li.getBoundingClientRect(), mid = r.top + r.height / 2;
+        const others = rows().filter((x) => x !== li);
+        const next = others.find((o) => { const q = o.getBoundingClientRect(); return mid < q.top + q.height / 2; }) || null;
+        if (li.nextElementSibling === next) return;
+        const natural = r.top - dy;
+        flip(others, () => ul.insertBefore(li, next));
+        y0 += li.getBoundingClientRect().top - dy - natural;
+        dy = lastY - y0;
+        place();
+      };
+      const onMove = (ev) => {
+        if (ev.pointerId !== id) return;
+        lastY = ev.clientY;
+        dy = ev.clientY - y0;
+        if (!moving && Math.abs(dy) < 4) return;
+        if (!moving) { moving = true; li.classList.add('is-dragging'); }
+        // Near the panel's edges it scrolls, and the row stays under the pointer.
+        if (scroller) {
+          const b = scroller.getBoundingClientRect();
+          const by = ev.clientY < b.top + 40 ? -12 : ev.clientY > b.bottom - 40 ? 12 : 0;
+          if (by) { const t0 = scroller.scrollTop; scroller.scrollTop += by; y0 -= scroller.scrollTop - t0; dy = ev.clientY - y0; }
+        }
+        place();
+        reorder();
+      };
+      const onUp = (ev) => {
+        if (ev.pointerId !== id) return;
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
+        if (!moving) return;
+        li.classList.remove('is-dragging');
+        li.style.transform = '';
+        handle.focus({ preventScroll: true });
+        if (motionOk() && Math.abs(dy) > 0.5) li.animate([{ transform: `translateY(${dy}px)` }, { transform: 'none' }], { duration: DUR.base, easing: EASE });
+        if (ul.isConnected && keys().join('\n') !== before) {
+          commit();
+          const all = rows();
+          announce(`${labelOf(li)}, position ${all.indexOf(li) + 1} of ${all.length}`);
+        }
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
+    }
+
+    function item(it) {
+      const off = spec.hidden ? spec.hidden.includes(it.key) : false;
+      const name = uid('o');
+      const handle = h('button', {
+        type: 'button', class: 'ol-handle', 'aria-label': `Move ${it.label}`, 'aria-describedby': 'st-drag-help', 'data-fk': `${spec.fk}:${it.key}:grab`,
+        title: 'Drag to reorder, or use the arrow keys',
+      }, gripIcon());
+      const li = h('li', { class: `ol-item${off ? ' is-off' : ''}`, 'data-key': it.key });
+      li._up = h('button', { type: 'button', class: 'ol-move', 'aria-label': `Move ${it.label} up`, 'data-fk': `${spec.fk}:${it.key}:up`, onclick: () => moveBy(li, -1, li._up) }, upIcon());
+      li._down = h('button', { type: 'button', class: 'ol-move', 'aria-label': `Move ${it.label} down`, 'data-fk': `${spec.fk}:${it.key}:down`, onclick: () => moveBy(li, 1, li._down) }, downIcon());
+      handle.addEventListener('pointerdown', (e) => drag(e, li, handle));
+      handle.addEventListener('keydown', (e) => {
+        const by = { ArrowUp: -1, ArrowDown: 1 }[e.key];
+        if (!by) return;
+        e.preventDefault();
+        moveBy(li, by, handle);
+      });
+      const open = spec.detail && st.expanded.has(`${spec.fk}:${it.key}`);
+      const more = spec.detail ? h('button', {
+        type: 'button', class: 'ol-more', 'aria-expanded': String(!!open), 'aria-label': `${it.label} options`, 'data-fk': `${spec.fk}:${it.key}:more`,
+      }, h('span', { text: 'Options' }), downIcon()) : null;
+      const show = spec.hidden ? switchBtn({ 'aria-checked': String(!off), 'aria-label': `Show ${it.label}`, 'data-fk': `${spec.fk}:${it.key}:show` }) : null;
+      if (show) {
+        show.addEventListener('click', () => {
+          const on = show.getAttribute('aria-checked') !== 'true';
+          spec.onShow(it.key, on);
+          show.setAttribute('aria-checked', String(on));
+          li.classList.toggle('is-off', !on);
+          touched(show);
+        });
+      }
+      append(li, [
+        h('div', { class: 'ol-row' },
+          handle,
+          it.lead || null,
+          h('div', { class: 'ol-text' }, h('span', { class: 'ol-name', id: name, text: it.label }), it.sub ? h('span', { class: 'ol-sub', text: it.sub }) : null),
+          spec.actions ? spec.actions(it.key) : null,
+          more, show,
+          h('span', { class: 'ol-moves' }, li._up, li._down)),
+      ]);
+      if (spec.detail) {
+        const box = h('div', { class: 'ol-detail', hidden: !open || null });
+        if (open) box.append(spec.detail(it.key));
+        li.append(box);
+        more.addEventListener('click', () => {
+          const k = `${spec.fk}:${it.key}`, on = !st.expanded.has(k);
+          if (on) st.expanded.add(k); else st.expanded.delete(k);
+          more.setAttribute('aria-expanded', String(on));
+          if (on) { box.replaceChildren(spec.detail(it.key)); segThumbs(box); }
+          collapse(box, on);
+        });
+      }
+      return li;
+    }
+
+    for (const key of spec.order) if (byKey.has(key)) ul.append(item(byKey.get(key)));
+    syncMoves();
+    return rows().length ? ul : (spec.empty || null);
+  }
+
+  // A list's order and its hidden keys at `path` and `hiddenPath`.
+  function listAt(path, hiddenPath) {
+    return {
+      order: getPath(cfg, path), hidden: hiddenPath ? getPath(cfg, hiddenPath) : null, fk: path,
+      onOrder: (keys) => update((c) => setPath(c, path, keys)),
+      onShow: (key, on) => update((c) => {
+        const now = getPath(c, hiddenPath).filter((k) => k !== key);
+        setPath(c, hiddenPath, on ? now : [...now, key]);
+      }),
+    };
+  }
+
+  // --------------------------------------------------------------- tabs
+  function generalTab() {
+    return [
+      group('Appearance', null, ['general.theme', 'general.density', 'general.motion'],
+        row('Theme', 'System follows your device’s light or dark mode.', (id) => segCtl('general.theme', [['system', 'System'], ['light', 'Light'], ['dark', 'Dark']], id)),
+        row('Density', 'Spacing between and inside the sections.', (id) => segCtl('general.density', [['comfortable', 'Comfortable'], ['compact', 'Compact']], id)),
+        row('Reduce motion', 'Off plays the dashboard’s animations even when your device asks for less motion.', (id) => segCtl('general.motion', [['system', 'System'], ['reduce', 'On'], ['full', 'Off']], id))),
+      group('Data and units', null, ['general.refresh', 'general.time', 'general.clock', 'general.bytes'],
+        row('Refresh every', 'How often the machines, queue and jobs are read again.', (id) => segCtl('general.refresh', RS.REFRESH.map((n) => [n, n < 60 ? `${n} s` : `${n / 60} min`]), id)),
+        row('Times', 'When something happened: “3 min ago”, or the time of day.', (id) => segCtl('general.time', [['relative', 'Relative'], ['absolute', 'Time of day']], id)),
+        row('Clock', null, (id) => segCtl('general.clock', [['24', '24-hour'], ['12', '12-hour']], id)),
+        row('Sizes', 'Memory and disk in GiB (1024³ bytes) or GB (1000³).', (id) => segCtl('general.bytes', [['binary', 'GiB'], ['decimal', 'GB']], id))),
+      group('Tables', null, ['general.compactTables', 'general.recentRows', 'general.auditRows', 'general.auditFilter'],
+        row('Compact rows', 'Tighter rows in every table.', (id) => switchCtl('general.compactTables', id)),
+        row('Recent jobs', 'Rows shown before “Show all”.', (id) => stepperCtl('general.recentRows', 5, 50, 1, id)),
+        row('Remote commands', 'Rows shown before “Show all”.', (id) => stepperCtl('general.auditRows', 5, 100, 5, id)),
+        row('Remote commands show', 'Changes only, or the panel’s reads too.', (id) => segCtl('general.auditFilter', [['changes', 'Changes'], ['all', 'All']], id))),
+    ];
+  }
+
+  function layoutTab() {
+    return [
+      group('Sections', 'Drag a section by its handle, or use its arrows. Switch one off to hide it.', ['layout.order', 'layout.hidden'],
+        orderList({ ...listAt('layout.order', 'layout.hidden'), label: 'Dashboard sections', items: RS.SECTIONS })),
+      group('Queue and Running', null, ['layout.split'],
+        row('Arrangement', 'On narrow screens they always stack.', (id) => segCtl('layout.split', [['side', 'Side by side'], ['stacked', 'Stacked']], id))),
+    ];
+  }
+
+  // Every machine the page knows: the coordinator's list, then any only in
+  // the charts' history, then pins of machines it does not know now.
+  function knownHosts() {
+    const seen = new Map();
+    for (const x of (state.ov && state.ov.hosts) || []) seen.set(x.id, x);
+    for (const x of (state.metrics && state.metrics.hosts) || []) if (!seen.has(x.id)) seen.set(x.id, { id: x.id, name: x.name, online: false, metricsOnly: true });
+    return [...seen.values()].sort((a, b) => String(a.name || a.hostname || a.id).localeCompare(String(b.name || b.hostname || b.id)));
+  }
+  const hostLabel = (id) => { const x = knownHosts().find((y) => y.id === id); return x ? x.name || x.hostname || x.id : id; };
+  function hostSub(x) {
+    if (!x) return 'Not known to the coordinator now: kept for when it returns';
+    const os = String(x.os || '').toLowerCase();
+    return [OS_NAME[os] || null, x.metricsOnly ? 'in the history only' : RS.statusOf(x)].filter(Boolean).join(' · ');
+  }
+
+  function machinesTab() {
+    const ms = cfg.machines;
+    const hosts = knownHosts();
+    const byId = new Map(hosts.map((x) => [x.id, x]));
+    const pinned = orderList({
+      ...listAt('machines.pinned'), label: 'Pinned machines',
+      items: ms.pinned.map((id) => ({ key: id, label: hostLabel(id), sub: hostSub(byId.get(id)), lead: hostDot(id) })),
+      actions: (id) => h('button', {
+        type: 'button', class: 'btn-sm btn-quiet st-unpin', 'data-fk': `unpin:${id}`, 'aria-label': `Unpin ${hostLabel(id)}`,
+        onclick: () => { togglePin(id); renderSettings(); },
+      }, xIcon(12), 'Unpin'),
+      empty: h('p', { class: 'st-empty', text: 'Nothing pinned. Pin a machine with the pin on its card, in its panel, or in the list below.' }),
+    });
+    return [
+      group('Pinned', 'Pinned machines come first, in this order, offline or not.', ['machines.pinned'], pinned),
+      group('Order', 'For the machines not pinned.', ['machines.sort', 'machines.reverse', 'machines.onlineFirst', 'machines.group', 'machines.showOffline'],
+        row('Sort by', 'Loads and slots sort busiest first.', (id) => selectCtl('machines.sort', RS.SORTS, id)),
+        row('Reverse', null, (id) => switchCtl('machines.reverse', id)),
+        row('Online first', 'Offline machines after the connected ones.', (id) => switchCtl('machines.onlineFirst', id)),
+        row('Group by', 'Headings over the cards; pinned ones get their own.', (id) => segCtl('machines.group', RS.GROUPS, id)),
+        row('Show offline machines', 'A pinned machine shows anyway.', (id) => switchCtl('machines.showOffline', id))),
+      group('Cards', 'What a card shows, top to bottom.', ['machines.density', 'machines.fields', 'machines.fieldsHidden'],
+        row('Density', null, (id) => segCtl('machines.density', [['comfortable', 'Comfortable'], ['compact', 'Compact']], id)),
+        orderList({ ...listAt('machines.fields', 'machines.fieldsHidden'), label: 'Card contents', items: RS.FIELDS })),
+      group('All machines', 'Hidden machines leave the Machines section only; their jobs and history stay.', ['machines.hidden'],
+        hosts.length ? h('ul', { class: 'olist st-hosts', 'aria-label': 'All machines' }, hosts.map((x) => hostRow(x))) : h('p', { class: 'st-empty', text: 'No machines yet.' })),
+    ];
+  }
+
+  function hostRow(x) {
+    const name = x.name || x.hostname || x.id;
+    const pin = h('button', {
+      type: 'button', class: 'pin-btn pin-list', 'aria-pressed': String(isPinned(x.id)), 'aria-label': `${isPinned(x.id) ? 'Unpin' : 'Pin'} ${name}`, 'data-fk': `pin:${x.id}`,
+      onclick: () => { togglePin(x.id); renderSettings(); },
+    }, pinIcon(15));
+    const shown = !cfg.machines.hidden.includes(x.id);
+    const show = switchBtn({
+      'aria-checked': String(shown), 'aria-label': `Show ${name}`, 'data-fk': `show:${x.id}`,
+      onclick: () => {
+        update((c) => {
+          const ms = c.machines;
+          if (ms.hidden.includes(x.id)) ms.hidden = ms.hidden.filter((k) => k !== x.id);
+          else { ms.hidden.push(x.id); ms.pinned = ms.pinned.filter((k) => k !== x.id); }
+        });
+        renderSettings();
+      },
+    });
+    return h('li', { class: `ol-item${shown ? '' : ' is-off'}` },
+      h('div', { class: 'ol-row' }, hostDot(x.id),
+        h('div', { class: 'ol-text' }, h('span', { class: 'ol-name', text: name }), h('span', { class: 'ol-sub', text: hostSub(x) })),
+        pin, show));
+  }
+
+  function chartsTab() {
+    return [
+      group('All charts', null, ['charts.range', 'charts.legend', 'charts.columns', 'charts.height'],
+        row('Time range', 'The range the charts open with; the switch above them changes it too.', (id) => segCtl('charts.range', RANGES.map((r) => [r, r]), id)),
+        row('Legends', 'The machine names over each chart (rows are named on their left).', (id) => switchCtl('charts.legend', id)),
+        row('Columns', 'Narrow screens show one.', (id) => segCtl('charts.columns', [[1, '1'], [2, '2'], [3, '3']], id)),
+        row('Height', null, (id) => segCtl('charts.height', [['s', 'Small'], ['m', 'Medium'], ['l', 'Large']], id))),
+      group('Charts', 'Drag to reorder, switch off to hide; Options sets how each one draws.', ['charts.order', 'charts.hidden', 'charts.per'],
+        orderList({
+          ...listAt('charts.order', 'charts.hidden'), label: 'Charts', fk: 'charts',
+          items: RS.CHARTS.map((d) => ({ key: d.key, label: d.label, sub: d.sub })),
+          detail: chartOptionsView,
+        })),
+    ];
+  }
+
+  // One chart's options; redrawn when its style changes what applies.
+  function chartOptionsView(key) {
+    const d = RS.CHARTS.find((c) => c.key === key);
+    const base = `charts.per.${key}`;
+    const box = h('div', { class: 'st-sub' });
+    const redo = () => {
+      const o = cfg.charts.per[key];
+      const fk = document.activeElement && box.contains(document.activeElement) ? document.activeElement.dataset.fk : null;
+      box.replaceChildren(...[
+        d.styles.length > 1 ? row('Style', null, (id) => segCtl(`${base}.style`, d.styles.map((x) => [x, RS.STYLE_LABEL[x]]), id, redo)) : null,
+        o.style !== 'columns' ? row('Smooth lines', 'Curves through the points, or straight segments.', (id) => switchCtl(`${base}.smooth`, id)) : null,
+        d.pct ? row('Scale', 'The full 0–100%, or fitted to the values.', (id) => segCtl(`${base}.scale`, [['full', '0–100%'], ['fit', 'Fit']], id)) : null,
+        d.fleet ? null : row('Machines', null, (id) => segCtl(`${base}.hosts`, [['all', 'All'], ['top', 'Top'], ['pick', 'Chosen']], id, redo)),
+        !d.fleet && o.hosts === 'top' ? row('How many', key === 'disk' ? 'The machines with the least free disk.' : 'The busiest machines over the range.', (id) => stepperCtl(`${base}.top`, 1, RS.MAX_TOP, 1, id)) : null,
+        !d.fleet && o.hosts === 'pick' ? pickHosts(key) : null].filter(Boolean));
+      segThumbs(box);
+      const again = fk && $(`[data-fk="${CSS.escape(fk)}"]`, box);
+      if (again) again.focus({ preventScroll: true });
+    };
+    redo();
+    return box;
+  }
+
+  function pickHosts(key) {
+    const hosts = knownHosts();
+    const path = `charts.per.${key}.pick`;
+    if (!hosts.length) return h('p', { class: 'st-empty', text: 'No machines yet.' });
+    return h('div', { class: 'st-picks', role: 'group', 'aria-label': 'Machines this chart shows' }, hosts.map((x) => {
+      const input = h('input', { type: 'checkbox', checked: cfg.charts.per[key].pick.includes(x.id) || null, 'data-fk': `${path}:${x.id}` });
+      input.addEventListener('change', () => {
+        update((c) => {
+          const now = c.charts.per[key].pick.filter((k) => k !== x.id);
+          c.charts.per[key].pick = input.checked ? [...now, x.id] : now;
+        });
+        touched(input);
+      });
+      return h('label', { class: 'check st-pick' }, input, hostDot(x.id), h('span', { text: x.name || x.hostname || x.id }));
+    }));
+  }
+
+  function kpisTab() {
+    return [
+      group('Summary tiles', 'The tiles at the top of the page: drag to reorder, switch off to hide.', ['kpis.order', 'kpis.hidden'],
+        orderList({ ...listAt('kpis.order', 'kpis.hidden'), label: 'Summary tiles', items: RS.KPIS })),
+    ];
+  }
+
+  // --------------------------------------------------- export and import
+  function exportSettings() {
+    const blob = new Blob([`${JSON.stringify(cfg, null, 2)}\n`], { type: 'application/json' });
+    const a = h('a', { href: URL.createObjectURL(blob), download: 'runner-manager-dashboard-settings.json', hidden: true });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    notify('Exported as runner-manager-dashboard-settings.json');
+  }
+
+  async function importSettings(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > 64 * 1024) { notify('That file is too large to be dashboard settings.', 'err'); return; }
+    let raw;
+    try { raw = JSON.parse(await file.text()); } catch (_) { notify('That file is not JSON.', 'err'); return; }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !Number.isInteger(raw.version) || raw.version < 1) {
+      notify('That file does not hold dashboard settings.', 'err');
+      return;
+    }
+    const before = cfg;
+    if (replaceSettings(raw)) offerUndo(before, `Imported ${file.name}.`);
+    else notify('Those are the settings already in use.');
+    renderSettings();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);

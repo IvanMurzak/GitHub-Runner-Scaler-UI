@@ -607,6 +607,7 @@ pub fn dispatch(
         HostCommand::SetRuntimeRoot(args) => runtime_root(context, Some(&args.path), styling, out),
         HostCommand::ResetRuntimeRoot => runtime_root(context, None, styling, out),
         HostCommand::Show => show(context, out),
+        HostCommand::Reboot(args) => super::reboot::command(context, args, out),
         HostCommand::Isolation(super::HostIsolationCommand::Status(args)) => {
             isolation_status(args.json, isolation_settings(context)?, out)
         }

@@ -66,6 +66,18 @@ pub const GITHUB_DISCOVERY: Channel = Channel {
     slots: Slots::PerRequest("github-discovery"),
 };
 
+/// `host reboot`: restart this machine once every running job has finished.
+/// Only the service can, because only it knows when its runners are done; the
+/// answer says what it will do.
+pub const REBOOT: Channel = Channel {
+    slots: Slots::PerRequest("reboot"),
+};
+
+/// `host reboot --cancel`: keep this machine running after all.
+pub const REBOOT_CANCEL: Channel = Channel {
+    slots: Slots::PerRequest("reboot-cancel"),
+};
+
 /// How long a command waits on the service, and how often it looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Wait {
@@ -78,6 +90,13 @@ pub struct Wait {
 }
 
 impl Wait {
+    /// What `host reboot` uses: the service answers at once.
+    pub const REBOOT: Self = Self {
+        taken: Duration::from_secs(4 * POLL.as_secs()),
+        finished: Duration::from_secs(10),
+        poll: Duration::from_millis(250),
+    };
+
     /// What a command waiting on a GitHub request uses.
     pub const GITHUB: Self = Self {
         taken: Duration::from_secs(4 * POLL.as_secs()),
@@ -213,23 +232,37 @@ impl Channel {
     /// deleting it, so a request is answered once.
     #[must_use]
     pub fn take(&self, state_dir: &Path) -> Vec<String> {
-        match self.slots {
+        self.take_where(state_dir, |_| true).0
+    }
+
+    /// [`Self::take`], judging each per-request file by its metadata (not
+    /// followed through a link) before it is removed: the identifiers
+    /// `accept` took, then those it refused, which are answered as refused.
+    /// A single-slot channel's request is always taken.
+    #[must_use]
+    pub fn take_where(
+        &self,
+        state_dir: &Path,
+        accept: impl Fn(&fs::Metadata) -> bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut refused = Vec::new();
+        let taken = match self.slots {
             Slots::One { request, .. } => {
                 let path = state_dir.join(request);
                 if fs::symlink_metadata(&path).is_err() {
-                    return Vec::new();
+                    return (Vec::new(), refused);
                 }
                 let id = read_request(&path);
                 // Removed whatever it held: an unreadable or malformed request
                 // is not going to become a good one.
                 if fs::remove_file(&path).is_err() {
-                    return Vec::new();
+                    return (Vec::new(), refused);
                 }
                 id.into_iter().collect()
             }
             Slots::PerRequest(prefix) => {
                 let Ok(entries) = fs::read_dir(state_dir.join(REQUESTS_DIR)) else {
-                    return Vec::new();
+                    return (Vec::new(), refused);
                 };
                 let mut taken = Vec::new();
                 for entry in entries.flatten() {
@@ -242,8 +275,14 @@ impl Channel {
                     if let Some(id) = rest.strip_suffix(".request") {
                         // The identifier is the file's name, so its contents
                         // are never read, and a link is removed as a link.
+                        let accepted =
+                            fs::symlink_metadata(entry.path()).is_ok_and(|meta| accept(&meta));
                         if fs::remove_file(entry.path()).is_ok() && valid_id(id) {
-                            taken.push(id.to_owned());
+                            if accepted {
+                                taken.push(id.to_owned());
+                            } else {
+                                refused.push(id.to_owned());
+                            }
                         }
                     } else if rest.ends_with(".result")
                         && entry
@@ -258,7 +297,8 @@ impl Channel {
                 }
                 taken
             }
-        }
+        };
+        (taken, refused)
     }
 
     /// The service's answer to `request`.
@@ -388,6 +428,21 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         })
+    }
+
+    #[test]
+    fn a_request_its_judge_refuses_is_removed_and_named_as_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let requests = dir.path().join(REQUESTS_DIR);
+        fs::create_dir_all(&requests).unwrap();
+        fs::write(requests.join("reboot.a1.request"), "").unwrap();
+        fs::write(requests.join("reboot-cancel.b2.request"), "").unwrap();
+        assert_eq!(
+            REBOOT.take_where(dir.path(), |_| false),
+            (Vec::new(), vec!["a1".to_owned()])
+        );
+        assert!(!requests.join("reboot.a1.request").exists());
+        assert_eq!(REBOOT_CANCEL.take(dir.path()), ["b2"]);
     }
 
     #[test]

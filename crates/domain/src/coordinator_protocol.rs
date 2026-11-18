@@ -329,6 +329,20 @@ pub struct HostVersions {
     /// Linux: this host runs inside a WSL distribution a Windows machine
     /// manages.
     pub wsl_guest: bool,
+    /// From 0.4.73: the service can restart this machine once its running
+    /// jobs finish (`runner-manager host reboot`). `false` from an older host,
+    /// and from a WSL guest, whose Windows machine is the one to restart.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rebootable: bool,
+    /// From 0.4.73: the service starts when its account signs in, not at
+    /// boot, so after a restart it comes back only once that account signs in
+    /// (automatically, or by a person).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub starts_at_login: bool,
+    /// From 0.4.73: the last restart asked of this machine, while this service
+    /// runs. `None` from an older host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reboot: Option<RebootProgress>,
 }
 
 /// The most WSL distributions a heartbeat names.
@@ -352,6 +366,10 @@ impl HostVersions {
         if let Some(update) = &mut self.update {
             cut(&mut update.message, MAX_UPDATE_MESSAGE);
         }
+        if let Some(reboot) = &mut self.reboot {
+            cut(&mut reboot.state, MAX_VERSION_TEXT);
+            cut(&mut reboot.message, MAX_UPDATE_MESSAGE);
+        }
         self.wsl.truncate(MAX_MANAGED_WSL);
         for wsl in &mut self.wsl {
             cut(&mut wsl.distribution, MAX_VERSION_TEXT);
@@ -371,6 +389,23 @@ pub struct UpdateProgress {
     pub at: i64,
     /// What it did, or why it failed.
     pub message: String,
+}
+
+/// A restart of the machine asked through `host reboot`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RebootProgress {
+    /// `pending` (waiting for the running jobs to finish, taking no new
+    /// one), `rebooting` (the system was asked to restart), `failed` (the
+    /// host serves again) or `cancelled`.
+    pub state: String,
+    /// Unix seconds: when it was asked, or reached this state.
+    pub at: i64,
+    /// What it waits for, or why it failed.
+    pub message: String,
+    /// While `pending`: the runners this machine still runs, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runners: Option<u32>,
 }
 
 /// A WSL distribution a Windows machine manages.
@@ -1992,6 +2027,14 @@ mod tests {
                 installed_version: "0.4.64".into(),
             }],
             wsl_guest: false,
+            rebootable: true,
+            starts_at_login: true,
+            reboot: Some(RebootProgress {
+                state: "pending".into(),
+                at: 5,
+                message: "Waiting for 2 running jobs.".into(),
+                runners: Some(2),
+            }),
         };
         let sent = HostMessage::Heartbeat(Heartbeat {
             versions: Some(versions.clone()),
@@ -2006,6 +2049,49 @@ mod tests {
         assert_eq!(
             beat.versions.map(|versions| versions.service).as_deref(),
             Some("9.0.0")
+        );
+    }
+
+    #[test]
+    fn a_reboot_is_said_only_by_a_host_that_can_and_an_older_one_offers_none() {
+        // A 0.4.72 host's versions: no reboot fields, so no Reboot button.
+        let older: HostVersions =
+            serde_json::from_str(r#"{"service":"0.4.72","updatable":true}"#).unwrap();
+        assert!(!older.rebootable);
+        assert!(!older.starts_at_login);
+        assert_eq!(older.reboot, None);
+        // A host that cannot reboot sends exactly what it sent before.
+        let quiet = serde_json::to_string(&HostVersions::default()).unwrap();
+        for key in ["rebootable", "starts_at_login", "reboot"] {
+            assert!(!quiet.contains(key), "{quiet}");
+        }
+        // A pending reboot travels with its runner count; an older
+        // coordinator, which knows none of it, still reads the rest.
+        let versions = HostVersions {
+            service: "0.4.73".into(),
+            rebootable: true,
+            reboot: Some(RebootProgress {
+                state: "pending".into(),
+                at: 1,
+                message: "Waiting for 1 running job.".into(),
+                runners: Some(1),
+            }),
+            ..HostVersions::default()
+        };
+        let json = serde_json::to_string(&versions).unwrap();
+        assert_eq!(
+            serde_json::from_str::<HostVersions>(&json).unwrap(),
+            versions
+        );
+        #[derive(Deserialize)]
+        struct OlderCoordinator {
+            service: String,
+        }
+        assert_eq!(
+            serde_json::from_str::<OlderCoordinator>(&json)
+                .unwrap()
+                .service,
+            "0.4.73"
         );
     }
 
@@ -2028,6 +2114,18 @@ mod tests {
             Some(MAX_UPDATE_MESSAGE)
         );
         assert_eq!(versions.wsl.len(), MAX_MANAGED_WSL);
+        let rebooting = HostVersions {
+            reboot: Some(RebootProgress {
+                message: "x".repeat(MAX_UPDATE_MESSAGE * 2),
+                ..RebootProgress::default()
+            }),
+            ..HostVersions::default()
+        }
+        .bounded();
+        assert_eq!(
+            rebooting.reboot.map(|reboot| reboot.message.len()),
+            Some(MAX_UPDATE_MESSAGE)
+        );
     }
 
     #[test]

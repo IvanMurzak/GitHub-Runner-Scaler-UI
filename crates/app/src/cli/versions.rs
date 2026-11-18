@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use runner_manager_domain::coordinator_protocol::{HostVersions, ManagedWsl};
 use runner_manager_platform::paths::AppPaths;
-use runner_manager_platform::wsl::fence::GuestRecoveryConfig;
 use runner_manager_platform::wsl::record::WslProviderRecord;
 
 use super::daemon::BinaryStamp;
@@ -72,6 +71,10 @@ pub fn report(paths: &AppPaths) -> Option<HostVersions> {
     }
     versions.map(|mut versions| {
         versions.update = super::remote::update_progress();
+        let reboot = super::reboot::control();
+        versions.rebootable = reboot.available();
+        versions.starts_at_login = reboot.starts_at_login();
+        versions.reboot = reboot.progress();
         versions.bounded()
     })
 }
@@ -112,7 +115,7 @@ fn refresh(paths: &AppPaths) {
                 installed_version: record.installed_version,
             })
             .collect(),
-        wsl_guest: GuestRecoveryConfig::path(paths).exists(),
+        wsl_guest: super::reboot::is_wsl_guest(paths),
         ..HostVersions::default()
     };
     let previous = reading().source.take();

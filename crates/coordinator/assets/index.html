@@ -10,6 +10,7 @@
   <title>Runner Manager</title>
   <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/settings.js" defer></script>
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
@@ -44,6 +45,9 @@
         <span class="spacer"></span>
         <span id="live" class="live"><i aria-hidden="true"></i><span id="live-text">Connecting</span></span>
         <span id="who" class="who"></span>
+        <button id="settings-btn" class="icon-btn settings-btn" type="button" aria-label="Settings" aria-haspopup="dialog" title="Settings">
+          <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M3.5 6h6.5M15 6h1.5M3.5 14h1.5M10 14h6.5"/><circle cx="12.5" cy="6" r="2.2"/><circle cx="7.5" cy="14" r="2.2"/></g></svg>
+        </button>
         <button id="signout" class="icon-btn" type="button" aria-label="Sign out" title="Sign out">
           <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 4H5.5A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8M12.5 6.5 16 10l-3.5 3.5M16 10H8"/></svg>
         </button>
@@ -53,9 +57,9 @@
     <main id="main" class="main" tabindex="-1">
       <div id="banner" hidden></div>
 
-      <section id="kpis" class="kpis" aria-label="Summary"></section>
+      <section id="kpis" class="kpis" data-section="kpis" aria-label="Summary"></section>
 
-      <section class="section" aria-labelledby="h-machines">
+      <section class="section" data-section="machines" aria-labelledby="h-machines">
         <div class="section-head">
           <h2 id="h-machines">Machines</h2>
           <span id="machines-count" class="section-meta"></span>
@@ -63,7 +67,7 @@
         <div id="hosts" class="hosts"></div>
       </section>
 
-      <div class="split">
+      <div class="split" data-section="queue-running">
         <section class="section card" aria-labelledby="h-queue">
           <div class="section-head">
             <h2 id="h-queue">Queue</h2>
@@ -80,7 +84,7 @@
         </section>
       </div>
 
-      <section id="charts" class="section" aria-labelledby="h-charts">
+      <section id="charts" class="section" data-section="activity" aria-labelledby="h-charts">
         <div class="section-head">
           <div>
             <h2 id="h-charts">Activity</h2>
@@ -88,31 +92,10 @@
           </div>
           <div id="range" class="seg" role="group" aria-label="Time range"></div>
         </div>
-        <div class="charts">
-          <figure id="chart-jobs" class="chart card">
-            <figcaption><h3>Jobs</h3><p id="jobs-sub">Running and queued, stacked</p></figcaption>
-            <ul class="legend"></ul>
-            <div class="plot"></div>
-          </figure>
-          <figure id="chart-cpu" class="chart card">
-            <figcaption><h3>CPU</h3><p id="cpu-sub">A row per machine</p></figcaption>
-            <ul class="legend"></ul>
-            <div class="plot"></div>
-          </figure>
-          <figure id="chart-busy" class="chart card">
-            <figcaption><h3>Busy slots</h3><p id="busy-sub">Stacked per machine</p></figcaption>
-            <ul class="legend"></ul>
-            <div class="plot"></div>
-          </figure>
-          <figure id="chart-ram" class="chart card">
-            <figcaption><h3>Memory</h3><p id="ram-sub">Used per machine</p></figcaption>
-            <ul class="legend"></ul>
-            <div class="plot"></div>
-          </figure>
-        </div>
+        <div id="charts-grid" class="charts"></div>
       </section>
 
-      <section class="section card" aria-labelledby="h-recent">
+      <section class="section card" data-section="recent" aria-labelledby="h-recent">
         <div class="section-head">
           <h2 id="h-recent">Recent</h2>
           <button id="recent-toggle" class="link-btn" type="button" aria-controls="recent" hidden></button>
@@ -120,7 +103,7 @@
         <div id="recent"></div>
       </section>
 
-      <section id="audit-section" class="section card" aria-labelledby="h-audit" hidden>
+      <section id="audit-section" class="section card" data-section="audit" aria-labelledby="h-audit" hidden>
         <div class="section-head">
           <h2 id="h-audit">Remote commands</h2>
           <span id="audit-count" class="count num"></span>
@@ -130,7 +113,7 @@
         <div id="audit"></div>
       </section>
 
-      <section id="pools-section" class="section" aria-labelledby="h-pools" hidden>
+      <section id="pools-section" class="section" data-section="pools" aria-labelledby="h-pools" hidden>
         <div class="section-head"><h2 id="h-pools">Pools &amp; leases</h2></div>
         <div id="pools" class="pools"></div>
       </section>
@@ -151,6 +134,38 @@
         <div id="dw-access" hidden></div>
       </header>
       <div id="dw-body" class="dw-body" tabindex="-1"></div>
+    </dialog>
+
+    <dialog id="settings" class="drawer settings" aria-labelledby="st-title">
+      <header class="dw-head st-head">
+        <div class="dw-title-row">
+          <div class="dw-id">
+            <h2 id="st-title">Settings</h2>
+            <p class="host-sub">Changes show on the dashboard as you make them, and follow your GitHub account to any browser.</p>
+          </div>
+          <button id="st-close" class="icon-btn" type="button" aria-label="Close settings" title="Close (Esc)">
+            <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M5.5 5.5l9 9M14.5 5.5l-9 9"/></svg>
+          </button>
+        </div>
+        <div id="st-tabs" class="seg st-tabs" role="tablist" aria-label="Settings sections"></div>
+      </header>
+      <div id="st-body" class="dw-body st-body" role="tabpanel" tabindex="-1"></div>
+      <footer class="st-foot">
+        <p id="st-status" class="st-status" role="status"></p>
+        <div id="st-actions" class="st-actions">
+          <button id="st-export" class="btn-sm" type="button">Export</button>
+          <button id="st-import" class="btn-sm" type="button">Import</button>
+          <button id="st-reset" class="btn-sm btn-quiet-danger" type="button">Reset all</button>
+        </div>
+        <div id="st-confirm" class="st-actions st-confirm" hidden>
+          <span class="st-confirm-text">Reset every setting?</span>
+          <button id="st-reset-no" class="btn-sm" type="button">Cancel</button>
+          <button id="st-reset-yes" class="btn-sm btn-danger" type="button">Reset all</button>
+        </div>
+        <input id="st-file" type="file" accept="application/json,.json" hidden>
+      </footer>
+      <p id="st-drag-help" class="sr-only">Drag, or press the up and down arrow keys, to move it.</p>
+      <p id="st-live" class="sr-only" aria-live="polite"></p>
     </dialog>
 
     <footer class="foot">
