@@ -1912,7 +1912,7 @@
     let hint;
     if (!x || !x.online) hint = 'Shown while the machine is connected.';
     else if (!v) hint = justConnected(x) ? 'Reading this machine’s versions…' : 'This machine runs a runner-manager older than 0.4.64, which does not report its versions or take updates from here. Update it on the machine once.';
-    else if (v.app_missing) hint = 'The binary its service was installed from no longer exists, so there is nothing to update. On the machine, install runner-manager again, then, while no job runs: runner-manager service uninstall && runner-manager service install --start-at boot|login (as it was installed).';
+    else if (v.app_missing) hint = 'The binary its service was installed from no longer exists, so there is nothing to update. On the machine, install runner-manager again, then, while no job runs, register the service from it: runner-manager service uninstall, then runner-manager service install --start-at boot (or login, as it was installed; boot needs sudo off Windows). runner-manager update there names the exact commands.';
     else if (!x.remote_changes) hint = 'Updating from here needs changes through the coordinator allowed on the machine.';
     else if (!v.updatable) hint = `Its app is ${v.app_source || 'not known'}, which the service cannot update. Update it on the machine.`;
     else hint = 'Update installs the newest release the way the app was installed. The service finishes its running jobs first, then restarts into it.';

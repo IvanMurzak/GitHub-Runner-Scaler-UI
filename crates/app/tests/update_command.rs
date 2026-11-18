@@ -1042,13 +1042,22 @@ fn a_service_whose_source_is_gone_is_told_to_register_again_not_to_force() {
         "{}",
         outcome.both()
     );
-    assert!(
-        outcome
-            .stdout
-            .contains("runner-manager service uninstall && runner-manager service install"),
-        "{}",
-        outcome.both()
-    );
+    // The record says boot, so the commands are root's, for this data
+    // directory, from this copy.
+    for command in [
+        "service uninstall",
+        "service install --start-at boot",
+        "--data-dir",
+    ] {
+        assert!(
+            outcome.stdout.contains(command),
+            "{command}: {}",
+            outcome.both()
+        );
+    }
+    if cfg!(unix) {
+        assert!(outcome.stdout.contains("sudo "), "{}", outcome.both());
+    }
     assert!(
         !outcome.stdout.contains("update --force"),
         "{}",

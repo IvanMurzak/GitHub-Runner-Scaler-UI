@@ -612,9 +612,29 @@ impl Installation {
 
     /// Why the service (its daily check, or the coordinator) must not update
     /// this binary, decided before anything is downloaded.
-    fn service_refusal(&self) -> Option<CliError> {
+    fn service_refusal(&self, context: &Context) -> Option<CliError> {
         match self.channel {
-            Channel::SourceBuild | Channel::Missing => self.refusal(),
+            Channel::Missing => {
+                // Run by a person on the machine, from the copy they install.
+                let remedy = InstallRecord::read(context.paths())
+                    .ok()
+                    .flatten()
+                    .map_or_else(
+                        || REREGISTER_GENERIC.to_owned(),
+                        |record| {
+                            format!(
+                                "install runner-manager again, then, {}",
+                                reregister_remedy(
+                                    context.data_root.as_deref(),
+                                    record.start_mode,
+                                    Path::new("runner-manager"),
+                                )
+                            )
+                        },
+                    );
+                Some(missing_source(&self.path, remedy))
+            }
+            Channel::SourceBuild => self.refusal(),
             _ => self.foreign_to_root_service(),
         }
     }
@@ -649,7 +669,7 @@ impl Installation {
                 ),
                 "runner-manager service status",
             )),
-            Channel::Missing => Some(missing_source(&self.path)),
+            Channel::Missing => Some(missing_source(&self.path, REREGISTER_GENERIC.to_owned())),
             Channel::Npm => self.npm_prefix().err(),
             Channel::Archive | Channel::Homebrew | Channel::Cargo => None,
         }
@@ -700,27 +720,60 @@ pub(crate) fn service_source(
 }
 
 /// Whether nothing is at `path`, following symlinks: a removed file, a
-/// dangling link, a directory that is gone. A path that cannot be read for
+/// dangling link, a directory or a drive that is gone. A path that cannot be read for
 /// another reason (permissions) is not called missing.
 fn is_missing(path: &Path) -> bool {
     std::fs::metadata(path).is_err_and(|error| {
         matches!(
             error.kind(),
             std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        )
+        ) || (cfg!(windows) && error.raw_os_error() == Some(WINDOWS_ERROR_NOT_READY))
     })
 }
 
-/// The commands that register the service again from the copy they run as,
-/// so that it records a source that exists. `service install` alone refuses
-/// while the daemon runs (it holds the agent lock), and `uninstall` stops it,
-/// so they are run while no job is.
-const REREGISTER_FROM_THIS_COPY: &str =
-    "runner-manager service uninstall && runner-manager service install --start-at boot|login";
+/// `ERROR_NOT_READY`: a drive letter with no volume behind it any more (a
+/// detached disk or VHD), which std does not map to `NotFound`.
+const WINDOWS_ERROR_NOT_READY: i32 = 21;
 
-/// Why a service whose recorded source is gone cannot be updated, and how to
-/// give it one again.
-fn missing_source(path: &Path) -> CliError {
+/// How to register the service again when the start mode it was installed
+/// with is not known here.
+const REREGISTER_GENERIC: &str = "install runner-manager again, then, while no job is running: \
+     runner-manager service uninstall, then runner-manager service install --start-at boot \
+     (or login, as the service was installed; boot needs sudo off Windows)";
+
+/// The two commands that register the service again from `binary`, so that
+/// it records a source that exists, for `mode` and `data_root`. Two, run one
+/// after the other while no job is: `service install` alone refuses while the
+/// daemon runs (it holds the agent lock), and `uninstall` stops it.
+fn reregister_commands(
+    data_root: Option<&Path>,
+    mode: runner_manager_domain::model::StartMode,
+    binary: &Path,
+) -> [String; 2] {
+    [
+        force::command_line_for(data_root, mode, binary, "service uninstall"),
+        force::command_line_for(
+            data_root,
+            mode,
+            binary,
+            &format!("service install --start-at {}", force::mode_name(mode)),
+        ),
+    ]
+}
+
+/// [`reregister_commands`] as one remedy line.
+fn reregister_remedy(
+    data_root: Option<&Path>,
+    mode: runner_manager_domain::model::StartMode,
+    binary: &Path,
+) -> String {
+    let [uninstall, install] = reregister_commands(data_root, mode, binary);
+    format!("while no job is running: {uninstall}, then {install}")
+}
+
+/// Why a service whose recorded source is gone cannot be updated, with
+/// `remedy`, how to give it one again.
+fn missing_source(path: &Path, remedy: String) -> CliError {
     CliError::with_remedy(
         Failure::UpdateUnsupported,
         format!(
@@ -730,7 +783,7 @@ fn missing_source(path: &Path) -> CliError {
              `--start-at` it was installed with), so the service records the new binary.",
             display_path(path)
         ),
-        REREGISTER_FROM_THIS_COPY,
+        remedy,
     )
 }
 
@@ -879,7 +932,8 @@ fn classify(path: &Path, state_dir: &Path) -> Channel {
 /// binaries: `target/debug` or `target/release` by name, and, wherever
 /// `CARGO_TARGET_DIR` pointed or whatever the profile is called, by what
 /// cargo leaves there: a `.fingerprint` directory beside the binary, or the
-/// `CACHEDIR.TAG` cargo writes at the root of its target directory. A release
+/// `CACHEDIR.TAG` cargo writes (and names itself in) at the root of its
+/// target directory. A release
 /// archive unpacked into a directory somebody happened to call `release` has
 /// neither, and is not a checkout.
 fn is_cargo_profile_dir(dir: &Path) -> bool {
@@ -890,9 +944,11 @@ fn is_cargo_profile_dir(dir: &Path) -> bool {
         == Some(std::ffi::OsStr::new("target"));
     named_target
         || dir.join(".fingerprint").is_dir()
-        || dir
-            .parent()
-            .is_some_and(|target| target.join("CACHEDIR.TAG").is_file())
+        || dir.parent().is_some_and(|target| {
+            // Other tools write the tag too; cargo names itself in it.
+            std::fs::read_to_string(target.join("CACHEDIR.TAG"))
+                .is_ok_and(|tag| tag.contains("created by cargo"))
+        })
 }
 
 /// `$CARGO_HOME/bin`, or the default `~/.cargo/bin`.
@@ -1067,7 +1123,7 @@ pub(super) fn perform(
         installation = source;
     }
     if caller != Caller::Operator {
-        if let Some(refusal) = installation.service_refusal() {
+        if let Some(refusal) = installation.service_refusal(context) {
             return match caller {
                 Caller::Coordinator => Err(refusal),
                 _ => Ok(()),
@@ -2380,7 +2436,7 @@ fn report_service_consequence(
     };
 
     writeln!(out).map_err(failed)?;
-    match recorded_source(&record, installation) {
+    match recorded_source(&record, installation, context.data_root.as_deref()) {
         RecordedSource::ThisCopy(_) => writeln!(
             out,
             "The service runs its own copy of this binary. It will finish every job it is \
@@ -2389,6 +2445,9 @@ fn report_service_consequence(
         )
         .map_err(failed),
         RecordedSource::Other(source) => write_hand_over_with_force(&source, version, out),
+        RecordedSource::Gone { source, commands } => {
+            write_register_again(&source, &commands, version, out)
+        }
         RecordedSource::None => write_reregister(version, out),
     }
 }
@@ -2403,13 +2462,29 @@ enum RecordedSource {
     ThisCopy(PathBuf),
     /// The daemon watches another copy.
     Other(PathBuf),
+    /// The daemon watches a copy that no longer exists (after Homebrew's
+    /// versioned path is followed to its stable link, as the daemon does), so
+    /// nothing reaches it: the service has to be registered again, with
+    /// `commands`.
+    Gone {
+        source: PathBuf,
+        commands: [String; 2],
+    },
 }
 
-fn recorded_source(record: &InstallRecord, installation: &Installation) -> RecordedSource {
+fn recorded_source(
+    record: &InstallRecord,
+    installation: &Installation,
+    data_root: Option<&Path>,
+) -> RecordedSource {
     match &record.source_binary {
         Some(source) if same_file(source, &installation.path) => {
             RecordedSource::ThisCopy(source.clone())
         }
+        Some(source) if is_missing(&restart_path(source)) => RecordedSource::Gone {
+            source: restart_path(source),
+            commands: reregister_commands(data_root, record.start_mode, &installation.path),
+        },
         Some(source) => RecordedSource::Other(source.clone()),
         None => RecordedSource::None,
     }
@@ -2423,19 +2498,6 @@ fn write_hand_over_with_force(
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let failed = write_failed("this update");
-    // `--force` stages into the recorded source, and refuses one that is gone:
-    // the registration has to name a binary that exists again.
-    if is_missing(source) {
-        writeln!(
-            out,
-            "The service was installed from {}, which no longer exists, so it cannot take \
-             {version} from there. While no job is running, register it again from this copy \
-             (with the `--start-at` it was installed with):",
-            display_path(source)
-        )
-        .map_err(failed)?;
-        return writeln!(out, "  {REREGISTER_FROM_THIS_COPY}").map_err(failed);
-    }
     writeln!(
         out,
         "The service was installed from {}, not from this copy, so it keeps running the version \
@@ -2444,6 +2506,29 @@ fn write_hand_over_with_force(
     )
     .map_err(failed)?;
     writeln!(out, "  runner-manager update --force").map_err(failed)
+}
+
+/// `--force` stages into the recorded source and refuses one that is gone:
+/// the registration has to name a binary that exists again.
+fn write_register_again(
+    source: &Path,
+    commands: &[String; 2],
+    version: &str,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let failed = write_failed("this update");
+    writeln!(
+        out,
+        "The service was installed from {}, which no longer exists, so it cannot take {version} \
+         from there. While no job is running, register it again from this copy (`uninstall` \
+         stops the service):",
+        display_path(source)
+    )
+    .map_err(failed)?;
+    for command in commands {
+        writeln!(out, "  {command}").map_err(failed)?;
+    }
+    Ok(())
 }
 
 /// A registration from before the service ran a copy of its own cannot be
@@ -2510,7 +2595,7 @@ fn service_behind(
     let mut behind = decide_service_behind(
         installed,
         service.as_deref(),
-        recorded_source(&record, installation),
+        recorded_source(&record, installation, context.data_root.as_deref()),
     )?;
     if matches!(behind.source, RecordedSource::ThisCopy(_)) {
         behind.not_running = restart_unless_running(context, &record);
@@ -2554,6 +2639,9 @@ fn report_service_behind(
     let source = match &behind.source {
         RecordedSource::ThisCopy(source) => source,
         RecordedSource::Other(source) => return write_hand_over_with_force(source, installed, out),
+        RecordedSource::Gone { source, commands } => {
+            return write_register_again(source, commands, installed, out);
+        }
         RecordedSource::None => return write_reregister(installed, out),
     };
     // Marked whether or not the daemon runs: a daemon that starts later swaps
@@ -2902,11 +2990,20 @@ mod tests {
         let installation = Installation::of_source(&paths, gone.clone(), None);
         assert_eq!(installation.channel, Channel::Missing);
         assert_eq!(installation.channel.describe(), "missing");
-        let refusal = installation.service_refusal().expect("refused");
+        let endpoints =
+            runner_manager_github::Endpoints::for_test_server("http://127.0.0.1:9").unwrap();
+        let context = Context::rooted_against(dir.path(), endpoints).unwrap();
+        let refusal = installation.service_refusal(&context).expect("refused");
         let message = refusal.to_string();
         assert!(message.contains("no longer exists"), "{message}");
         assert!(message.contains(&display_path(&gone)), "{message}");
-        assert_eq!(refusal.remedy(), Some(REREGISTER_FROM_THIS_COPY));
+        // No record here: the remedy names both start modes.
+        let remedy = refusal.remedy().unwrap_or_default();
+        assert!(remedy.contains("service uninstall"), "{remedy}");
+        assert!(
+            remedy.contains("service install --start-at boot"),
+            "{remedy}"
+        );
         assert!(installation.refusal().is_some());
 
         // Homebrew's stable link after `brew uninstall`: missing, not an
@@ -2938,7 +3035,7 @@ mod tests {
         std::fs::write(&archive, b"archive").unwrap();
         let installation = Installation::of_source(&paths, archive, Some("0.4.72"));
         assert_eq!(installation.channel, Channel::Archive);
-        assert!(installation.service_refusal().is_none());
+        assert!(installation.service_refusal(&context).is_none());
     }
 
     /// A cargo build outside a directory called `target` (`CARGO_TARGET_DIR`,
@@ -2960,10 +3057,26 @@ mod tests {
             Channel::SourceBuild
         );
         let tagged = profile("other-target", "release");
-        std::fs::write(dir.path().join("other-target/CACHEDIR.TAG"), b"tag").unwrap();
+        std::fs::write(
+            dir.path().join("other-target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
         assert_eq!(
             classify(&tagged.join("runner-manager"), &state),
             Channel::SourceBuild
+        );
+        // Another tool's cache tag is not cargo's.
+        let cached = profile("tool-cache", "bin");
+        std::fs::write(
+            dir.path().join("tool-cache/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# created by uv\n",
+        )
+        .unwrap();
+        assert_eq!(
+            classify(&cached.join("runner-manager"), &state),
+            Channel::Archive
         );
         // An archive unpacked into a `release` directory is not a build.
         let unpacked = profile("downloads", "release");

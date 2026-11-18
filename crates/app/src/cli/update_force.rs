@@ -14,7 +14,8 @@ use runner_manager_platform::service::{InstallRecord, ServiceError};
 
 use super::{
     CliError, Context, Failure, Installation, compare_versions, display_path, install_over,
-    parse_version, same_file, sha256_of, write_failed,
+    is_missing, missing_source, parse_version, reregister_remedy, restart_path, same_file,
+    sha256_of, write_failed,
 };
 
 fn record_failure(error: ServiceError) -> CliError {
@@ -44,6 +45,13 @@ pub(super) fn preflight_force(context: &Context) -> Result<(), CliError> {
     let Some((record, source)) = recorded_source(context)? else {
         return Ok(());
     };
+    if is_missing(&restart_path(&source)) {
+        let this_copy = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("runner-manager"));
+        return Err(missing_source(
+            &source,
+            reregister_remedy(context.data_root.as_deref(), record.start_mode, &this_copy),
+        ));
+    }
     validate_live_service(context, &record)?;
     let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
         CliError::new(
@@ -398,7 +406,7 @@ pub(in crate::cli) fn command_line_for(
     format!("{elevation}{executable}{data} {arguments}")
 }
 
-fn mode_name(mode: StartMode) -> &'static str {
+pub(super) fn mode_name(mode: StartMode) -> &'static str {
     match mode {
         StartMode::Login => "login",
         StartMode::Boot => "boot",

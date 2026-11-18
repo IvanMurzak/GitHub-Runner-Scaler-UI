@@ -917,9 +917,11 @@ package uninstalled, its volume gone) refuses before it downloads anything, and 
 so (`app_source` `missing`, `app_missing` the recorded path, `updatable` false): the panel shows
 the App as missing with that path and offers no Update. There is nothing to update in place. On
 the machine, install runner-manager again and, while no job is running, register the service from
-that copy: `runner-manager service uninstall && runner-manager service install --start-at boot|login`
-(the start mode it was installed with). The path is the `source_binary` in the `service.toml` of
-the service's data directory. An older host still offers Update there, and it fails after the
+that copy: `runner-manager service uninstall`, then `runner-manager service install --start-at
+boot` (or `login`, the start mode it was installed with; under `sudo` for boot off Windows).
+`runner-manager update` run from the new copy names both commands exactly. The path is the
+`source_binary` in the `service.toml` of the service's data directory (for a Homebrew `Cellar` path,
+the `opt` link it leads to). An older host still offers Update there, and it fails after the
 download.
 
 ### Reboot a machine
