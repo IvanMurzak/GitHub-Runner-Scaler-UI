@@ -791,8 +791,8 @@ The page loads nothing from elsewhere (GitHub avatars aside) and is served with 
 Content-Security-Policy. History is a sample a minute per machine, kept 7 days in the same
 database (schema 6, from 0.4.58). On a wide range the charts average the samples into fewer
 points (about 90 per line, 48 columns), aligned to whole periods so a refresh does not reshape the
-past: jobs and busy slots as stacked columns, CPU as a row per machine with its average and peak,
-memory as a line per machine.
+past. By default jobs and busy slots show as stacked columns, CPU as a row per machine with its
+average and peak, memory as a line per machine; [the settings](#dashboard-settings) change that.
 
 The job lists are built from the `workflow_job` webhooks. From 0.4.66 they are saved every minute
 and at shutdown, and restored at start when the save is under an hour old, so an update no longer
@@ -806,6 +806,9 @@ its disk's size, shown as used / total.
 A Windows machine's card names the version of the WSL distribution it manages: the one its own
 WSL host runs when exactly one WSL host shares the machine's name, else what `wsl install` last put
 there (which an update inside the distribution leaves behind).
+
+Without a proxy in front, forward `/`, `/assets/*`, `/auth/*` and `/api/*` as well as the four
+endpoints in [Deploy](#deploy).
 
 ### Dashboard settings
 
@@ -848,9 +851,6 @@ coordinator no longer lists is kept, in case it comes back, and skipped on the p
 
 The coordinator checks only that shape and the size; the page reads any stored value through its
 own rules, so an unknown or out-of-range setting falls back to its default.
-
-Without a proxy in front, forward `/`, `/assets/*`, `/auth/*` and `/api/*` as well as the four
-endpoints in [Deploy](#deploy).
 
 ## Remote management
 

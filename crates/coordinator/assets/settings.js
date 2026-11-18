@@ -284,7 +284,7 @@
 
   const api = {
     VERSION, SECTIONS, KPIS, FIELDS, CHARTS, STYLE_LABEL, RANGES, REFRESH, SORTS, GROUPS, HEIGHTS, MAX_TOP,
-    defaults, normalize, fromLegacy, same, shown, arrangeHosts, statusOf,
+    OS_NAME, STATUS, defaults, normalize, fromLegacy, same, shown, arrangeHosts, statusOf,
   };
   root.RMSettings = api;
   if (typeof module === 'object' && module.exports) module.exports = api;

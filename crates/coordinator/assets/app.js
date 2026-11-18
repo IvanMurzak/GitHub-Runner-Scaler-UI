@@ -325,6 +325,7 @@
     }
     placeThumb(seg, true);
   }
+  const segThumbs = (root) => $$('.seg', root).forEach(segThumb);
   function placeThumb(seg, animate) {
     const th = seg._thumb, b = $('.seg-btn[aria-pressed="true"], .seg-btn[aria-selected="true"]', seg);
     if (!b || !b.offsetWidth) { th.classList.remove('on'); return; }
@@ -428,7 +429,7 @@
     $('#signout').addEventListener('click', signOut);
     $('#recent-toggle').addEventListener('click', () => { state.showAllRecent = !state.showAllRecent; if (state.ov) renderRecent(state.ov); });
     reducedMotion.addEventListener('change', settleMotion);
-    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyGeneral);
+    darkScheme.addEventListener('change', applyGeneral);
     buildRangeSwitch();
     buildAuditControls();
     setupDrawer();
@@ -620,39 +621,40 @@
   }
 
   // ------------------------------------------------------------------ KPIs
-  // The summary tiles. Each fills its own tile: `value` gives the big number
-  // and what it is out of (`single`: nothing), `fmt` formats both, `sub`
-  // fills the line under it. Which show, and in what order, is a setting.
-  const KPIS = [
-    { key: 'machines', label: 'Machines online', value: (c) => [c.sm.hosts_online, c.sm.hosts_total] },
-    {
-      key: 'slots', label: 'Runner slots busy', value: (c) => [c.sm.slots_busy, c.sm.slots_total], bar: (c) => c.pct,
+  // The summary tiles (settings.js lists them). Each fills its own tile:
+  // `value` gives the big number and what it is out of (`single`: nothing),
+  // `fmt` formats both, `sub` fills the line under it. Which show, and in
+  // what order, is a setting.
+  const KPI_FILL = {
+    machines: { value: (c) => [c.sm.hosts_online, c.sm.hosts_total] },
+    slots: {
+      value: (c) => [c.sm.slots_busy, c.sm.slots_total], bar: (c) => c.pct,
       sub: (c, el) => { el.textContent = isNum(c.pct) ? `${Math.round(c.pct)}% utilised` : ''; },
     },
-    {
-      key: 'jobs', label: 'Jobs running / queued', value: (c) => [c.sm.jobs_running, c.sm.jobs_queued],
+    jobs: {
+      value: (c) => [c.sm.jobs_running, c.sm.jobs_queued],
       sub: (c, el) => {
         const sig = JSON.stringify([c.runHosts, !!c.sm.jobs_running, c.oldest && c.oldest.queued_at]);
         if (el.dataset.sig !== sig) { el.dataset.sig = sig; el.replaceChildren(...[jobsSub(c.sm, c.runHosts, c.oldest)].filter(Boolean)); }
       },
     },
-    {
-      key: 'wait', label: 'Queue wait p50', value: (c) => [c.sm.p50_queue_wait_secs], fmt: fmtDur, single: true,
+    wait: {
+      value: (c) => [c.sm.p50_queue_wait_secs], fmt: fmtDur, single: true,
       sub: (c, el) => {
         if (!el.firstChild) el.append('p90 ', h('b', { class: 'num' }));
         tweenNumber(el.lastChild, c.sm.p90_queue_wait_secs, fmtDur);
       },
     },
-    {
-      key: 'cpu', label: 'Average CPU', value: (c) => [c.cpu.avg], fmt: fmtPct, single: true, bar: (c) => c.cpu.avg,
+    cpu: {
+      value: (c) => [c.cpu.avg], fmt: fmtPct, single: true, bar: (c) => c.cpu.avg,
       sub: (c, el) => { el.textContent = c.cpu.top ? `busiest ${c.cpu.top.name || c.cpu.top.hostname} · ${fmtPct(c.cpu.top.cpu_load_percent)}` : 'no machine reports CPU'; },
     },
-    {
-      key: 'memory', label: 'Memory in use', value: (c) => [c.mem.used, c.mem.total], fmt: fmtBytes, bar: (c) => c.mem.pct,
+    memory: {
+      value: (c) => [c.mem.used, c.mem.total], fmt: fmtBytes, bar: (c) => c.mem.pct,
       sub: (c, el) => { el.textContent = isNum(c.mem.pct) ? `${Math.round(c.mem.pct)}% of the online machines’ memory` : ''; },
     },
-  ];
-  const kpiByKey = new Map(KPIS.map((k) => [k.key, k]));
+  };
+  const kpiByKey = new Map(RS.KPIS.map((d) => [d.key, { ...KPI_FILL[d.key], key: d.key, label: d.label }]));
   const shownKpis = () => RS.shown(cfg.kpis.order, cfg.kpis.hidden).map((key) => kpiByKey.get(key)).filter(Boolean);
 
   function kpiTile(k) {
@@ -738,13 +740,13 @@
   const hostDot = (id) => h('span', { class: 'host-dot', 'aria-hidden': 'true', vars: { '--c': hostColor(id) } });
   const machine = (id, name) => h('span', { class: 'machine' }, hostDot(id), name);
 
+  const STATUS_LABEL = Object.fromEntries(RS.STATUS);
   function hostStatus(x) {
-    if (!x.online) return { key: 'offline', label: 'Offline' };
-    if (x.unfit) return { key: 'unfit', label: 'Unfit' };
-    if (x.draining) return { key: 'draining', label: 'Draining' };
-    return { key: 'online', label: 'Online' };
+    const key = RS.statusOf(x);
+    return { key, label: STATUS_LABEL[key] };
   }
-  const OS_NAME = { linux: 'Linux', windows: 'Windows', macos: 'macOS' };
+  const OS_NAME = RS.OS_NAME;
+  const osTag = (os) => h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' });
 
   function meterRow(label) {
     return h('div', { class: 'meter' },
@@ -906,7 +908,7 @@
     layoutCard(el);
     const os = String(x.os || '').toLowerCase();
     slot(el, 'sub', JSON.stringify([os, x.arch, x.cores]), () => h('p', { class: 'host-sub' },
-      h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' }),
+      osTag(os),
       [x.arch, isNum(x.cores) ? `${x.cores} cores` : null].filter(Boolean).join(' · ')));
     slot(el, 'access', JSON.stringify([x.online, x.manageable, !!x.remote_changes]), () => accessChip(x, !!x.remote_changes));
     const reboot = rebootState(x);
@@ -2213,14 +2215,19 @@
       if (link) link.focus();
     };
     if (!dlg.open || !motionOk()) { done(); return; }
-    // Slides out the way it came in, with the backdrop fading; opening again meanwhile cancels it.
+    const closing = slideOut(dlg, () => { if (dw.closing === closing) done(); });
+    dw.closing = closing;
+  }
+
+  // Slides a side panel out the way it came in, with its backdrop fading,
+  // then calls `end`. Its animations, which opening it again meanwhile cancels.
+  function slideOut(dlg, end) {
     const away = matchMedia('(max-width: 720px)').matches ? 'translateY(24px)' : 'translateX(28px)';
     const out = { duration: 200, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' };
-    const a = dlg.animate([{ transform: 'none', opacity: 1 }, { transform: away, opacity: 0 }], out);
-    const closing = [a];
-    dw.closing = closing;
-    a.finished.then(() => { if (dw.closing === closing) done(); }, () => {});
+    const closing = [dlg.animate([{ transform: 'none', opacity: 1 }, { transform: away, opacity: 0 }], out)];
+    closing[0].finished.then(end, () => {});
     try { closing.push(dlg.animate([{ opacity: 1 }, { opacity: 0 }], { ...out, pseudoElement: '::backdrop' })); } catch (_) { /* the backdrop just goes */ }
+    return closing;
   }
 
   // Overview polls refresh the header; the body is only rebuilt when the
@@ -2255,7 +2262,7 @@
       const os = String(x.os || '').toLowerCase();
       const extra = [x.hostname && x.hostname !== name ? x.hostname : null, x.arch, isNum(x.cores) ? `${x.cores} cores` : null].filter(Boolean).join(' · ');
       sub.replaceChildren(...[
-        h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' }),
+        osTag(os),
         h('span', { class: `status status-${st.key}` }, h('i', { 'aria-hidden': 'true' }), st.label),
         x.online ? accessChip(x, rc) : null,
         extra ? h('span', { text: extra }) : null,
@@ -3029,12 +3036,8 @@
       $('#settings-btn').focus();
     };
     if (!motionOk()) { done(); return; }
-    const away = matchMedia('(max-width: 720px)').matches ? 'translateY(24px)' : 'translateX(28px)';
-    const out = { duration: 200, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' };
-    const closing = [dlg.animate([{ transform: 'none', opacity: 1 }, { transform: away, opacity: 0 }], out)];
+    const closing = slideOut(dlg, () => { if (st.closing === closing) done(); });
     st.closing = closing;
-    closing[0].finished.then(() => { if (st.closing === closing) done(); }, () => {});
-    try { closing.push(dlg.animate([{ opacity: 1 }, { opacity: 0 }], { ...out, pseudoElement: '::backdrop' })); } catch (_) { /* the backdrop just goes */ }
   }
 
   function selectTab(k) {
@@ -3063,7 +3066,7 @@
     const view = h('div', { class: 'st-stack' }, TAB_VIEW[st.tab]());
     body.replaceChildren(view);
     body.setAttribute('aria-labelledby', `st-tab-${st.tab}`);
-    for (const seg of $$('.seg', view)) segThumb(seg);
+    segThumbs(view);
     if (fresh) {
       if (motionOk()) view.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: DUR.base, easing: EASE });
       return;
@@ -3131,12 +3134,13 @@
     return box;
   }
 
+  // An on/off switch; `props` its label, state and data-fk.
+  const switchBtn = (props) => h('button', { type: 'button', class: 'switch st-switch', role: 'switch', ...props },
+    h('span', { class: 'switch-track', 'aria-hidden': 'true' }, h('i')));
+
   function switchCtl(path, labelId, after, opts = {}) {
     const get = () => (opts.invert ? !getPath(cfg, path) : !!getPath(cfg, path));
-    const b = h('button', {
-      type: 'button', class: 'switch st-switch', role: 'switch', 'aria-checked': String(get()), 'data-fk': path,
-      'aria-labelledby': labelId || null, 'aria-label': opts.label || null,
-    }, h('span', { class: 'switch-track', 'aria-hidden': 'true' }, h('i')));
+    const b = switchBtn({ 'aria-checked': String(get()), 'data-fk': path, 'aria-labelledby': labelId || null, 'aria-label': opts.label || null });
     b.addEventListener('click', () => {
       const v = !getPath(cfg, path);
       update((c) => setPath(c, path, v));
@@ -3289,9 +3293,7 @@
       const more = spec.detail ? h('button', {
         type: 'button', class: 'ol-more', 'aria-expanded': String(!!open), 'aria-label': `${it.label} options`, 'data-fk': `${spec.fk}:${it.key}:more`,
       }, h('span', { text: 'Options' }), downIcon()) : null;
-      const show = spec.hidden ? h('button', {
-        type: 'button', class: 'switch st-switch', role: 'switch', 'aria-checked': String(!off), 'aria-label': `Show ${it.label}`, 'data-fk': `${spec.fk}:${it.key}:show`,
-      }, h('span', { class: 'switch-track', 'aria-hidden': 'true' }, h('i'))) : null;
+      const show = spec.hidden ? switchBtn({ 'aria-checked': String(!off), 'aria-label': `Show ${it.label}`, 'data-fk': `${spec.fk}:${it.key}:show` }) : null;
       if (show) {
         show.addEventListener('click', () => {
           const on = show.getAttribute('aria-checked') !== 'true';
@@ -3318,7 +3320,7 @@
           const k = `${spec.fk}:${it.key}`, on = !st.expanded.has(k);
           if (on) st.expanded.add(k); else st.expanded.delete(k);
           more.setAttribute('aria-expanded', String(on));
-          if (on) { box.replaceChildren(spec.detail(it.key)); for (const seg of $$('.seg', box)) segThumb(seg); }
+          if (on) { box.replaceChildren(spec.detail(it.key)); segThumbs(box); }
           collapse(box, on);
         });
       }
@@ -3422,8 +3424,8 @@
       onclick: () => { togglePin(x.id); renderSettings(); },
     }, pinIcon(15));
     const shown = !cfg.machines.hidden.includes(x.id);
-    const show = h('button', {
-      type: 'button', class: 'switch st-switch', role: 'switch', 'aria-checked': String(shown), 'aria-label': `Show ${name}`, 'data-fk': `show:${x.id}`,
+    const show = switchBtn({
+      'aria-checked': String(shown), 'aria-label': `Show ${name}`, 'data-fk': `show:${x.id}`,
       onclick: () => {
         update((c) => {
           const ms = c.machines;
@@ -3432,7 +3434,7 @@
         });
         renderSettings();
       },
-    }, h('span', { class: 'switch-track', 'aria-hidden': 'true' }, h('i')));
+    });
     return h('li', { class: `ol-item${shown ? '' : ' is-off'}` },
       h('div', { class: 'ol-row' }, hostDot(x.id),
         h('div', { class: 'ol-text' }, h('span', { class: 'ol-name', text: name }), h('span', { class: 'ol-sub', text: hostSub(x) })),
@@ -3470,7 +3472,7 @@
         d.fleet ? null : row('Machines', null, (id) => segCtl(`${base}.hosts`, [['all', 'All'], ['top', 'Top'], ['pick', 'Chosen']], id, redo)),
         !d.fleet && o.hosts === 'top' ? row('How many', key === 'disk' ? 'The machines with the least free disk.' : 'The busiest machines over the range.', (id) => stepperCtl(`${base}.top`, 1, RS.MAX_TOP, 1, id)) : null,
         !d.fleet && o.hosts === 'pick' ? pickHosts(key) : null].filter(Boolean));
-      for (const seg of $$('.seg', box)) segThumb(seg);
+      segThumbs(box);
       const again = fk && $(`[data-fk="${CSS.escape(fk)}"]`, box);
       if (again) again.focus({ preventScroll: true });
     };
