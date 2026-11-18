@@ -914,7 +914,8 @@ Homebrew prefix, an nvm npm). A WSL distribution is updated through its own host
 
 From 0.4.73 a machine can be restarted without cutting a job short: **Reboot** in its panel (it asks
 for a confirmation), or `runner-manager host reboot` on the machine itself (with `sudo` where the
-service runs as root: a root service takes a reboot asked on the machine only from root), or
+service runs as root: a root service takes a reboot asked on the machine only from a request
+file root wrote, a regular file with a single link), or
 `--host remote:NAME host reboot`. The service then:
 
 1. says it is draining, so the coordinator places nothing there and refuses its launches as
@@ -923,7 +924,10 @@ service runs as root: a root service takes a reboot asked on the machine only fr
 3. on a Windows machine that manages WSL distributions, does to each what WSL recovery does
    before it touches one: the drain request in its shared directory, its launch fence taken (so a
    runner it was starting cannot slip through), then two idle heartbeats from it; restarting
-   Windows stops them too;
+   Windows stops them too. A distribution WSL lists as stopped is not waited for. One that gives
+   no sign of the drain for 10 minutes (no heartbeat, or its fence never free) fails the reboot,
+   which is then reported and the host serves again: it never restarts over a guest that may be
+   busy;
 4. checks its journal holds no runner (one that came up as its loop drained makes the service
    rebuild, adopt it and drain again, the reboot still asked);
 5. waits 30 seconds, so the dashboard shows it coming, looks once more, and asks the system to
@@ -946,8 +950,9 @@ How each system is asked, as the account the service runs as:
 `NOPASSWD` sudo rule lets that account. On Windows `/t 5` closes the applications open on the
 desktop without saving (the runners are done by then; a person's open work is not). When every way is refused, or the system accepted but had
 not restarted ten minutes later (an app refused to quit), the panel says so with the reason and the
-host serves again; it is never left drained (Windows and Linux are first asked to call the restart
-off, `shutdown /a` or `shutdown -c`). A WSL distribution refuses: restart its Windows machine. A
+host serves again once the restart is called off (`shutdown /a` on Windows, `shutdown -c` on
+Linux). Where it cannot be called off (macOS, or the command failed) the machine stays drained,
+since the restart may still come, until a person cancels the reboot or restarts it by hand. A WSL distribution refuses: restart its Windows machine. A
 service finishing its jobs before an upgrade, or stopping, refuses too: ask again once it is back.
 
 The service comes back with the machine where it starts at boot (the Windows service, the systemd

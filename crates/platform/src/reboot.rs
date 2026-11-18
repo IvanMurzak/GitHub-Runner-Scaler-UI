@@ -127,9 +127,11 @@ pub trait Rebooter: Send + Sync {
     fn reboot(&self, reason: &str) -> Result<String, String>;
 
     /// Calls off a restart the system accepted and has not begun, where the
-    /// system can. Best effort: the caller reports the restart failed either
-    /// way.
-    fn abort(&self) {}
+    /// system can. `true` only when a command said it did: otherwise the
+    /// restart may still come.
+    fn abort(&self) -> bool {
+        false
+    }
 }
 
 /// The real thing: runs [`commands`] for this machine until one is accepted.
@@ -149,15 +151,12 @@ impl Rebooter for SystemRebooter {
         Err(refused.join("; "))
     }
 
-    fn abort(&self) {
-        let Some(os) = crate::os::detect_os() else {
-            return;
-        };
-        for command in abort_commands(os, crate::host_fitness::is_elevated()) {
-            if run(&command).is_ok() {
-                return;
-            }
-        }
+    fn abort(&self) -> bool {
+        crate::os::detect_os().is_some_and(|os| {
+            abort_commands(os, crate::host_fitness::is_elevated())
+                .iter()
+                .any(|command| run(command).is_ok())
+        })
     }
 }
 

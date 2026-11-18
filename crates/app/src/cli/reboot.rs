@@ -271,6 +271,15 @@ impl Control {
         self.locked().progress = progress("rebooting", message, Some(0));
     }
 
+    /// An accepted restart did not happen and could not be called off: still
+    /// wanted, and cancellable again, so a person decides when to serve.
+    pub fn stalled(&self, message: String) {
+        let mut state = self.locked();
+        if *self.wanted.borrow() {
+            state.progress = progress("pending", message, Some(0));
+        }
+    }
+
     /// Something started running during the grace: back to waiting, still
     /// wanted.
     pub fn back_to_pending(&self) {
@@ -404,13 +413,21 @@ fn asked_by_an_equal(meta: &std::fs::Metadata, administrator: bool) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        !administrator || meta.uid() == 0
+        !administrator || written_by_root(meta.file_type().is_file(), meta.uid(), meta.nlink())
     }
     #[cfg(not(unix))]
     {
         let _ = (meta, administrator);
         true
     }
+}
+
+/// A request root wrote itself: a regular file root owns, under one name. A
+/// hard link to some root-owned file elsewhere (which macOS, and Linux
+/// without `protected_hardlinks`, let any account make) has two.
+#[cfg_attr(not(unix), allow(dead_code))]
+const fn written_by_root(regular: bool, uid: u32, links: u64) -> bool {
+    regular && uid == 0 && links == 1
 }
 
 // ---------------------------------------------------------------------------
@@ -426,16 +443,37 @@ const GUEST_DRAIN_FILE: &str = "reboot-wsl-drain";
 /// launch it had begun was not journaled yet.
 const QUIET_HEARTBEATS: u8 = 2;
 
+/// How long a guest may give no sign of this drain (no fence taken, no
+/// acknowledging heartbeat) before the reboot fails rather than wait on a
+/// guest that may be busy and cannot say so.
+pub const GUEST_UNRESPONSIVE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// One managed distribution, and what it said since the drain began.
 struct Guest {
     distribution: String,
     root: PathBuf,
-    /// When this machine took the guest's launch fence: from then on the
-    /// guest starts no runner.
+    /// When the guest's launch fence was first seen held against launches
+    /// (taken by this drain, or held by a WSL recovery): from then on no
+    /// launch the guest had begun can slip through.
     fenced_at: Option<chrono::DateTime<chrono::Utc>>,
     last_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
     quiet: u8,
 }
+
+/// Where a reboot stands with the guests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestWait {
+    /// Every guest holds no runner, or is not running at all.
+    Drained,
+    /// Still waiting, and why.
+    Waiting(String),
+    /// A guest gave no sign of the drain within [`GUEST_UNRESPONSIVE`]: the
+    /// reboot fails rather than restart over a guest that may be busy.
+    Unresponsive(String),
+}
+
+/// Whether a distribution is known to be stopped (it then runs nothing).
+type StoppedProbe = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// The managed WSL distributions a reboot of this Windows machine waits for.
 ///
@@ -443,14 +481,17 @@ struct Guest {
 /// distribution: a drain request in the shared directory (renewed, so the
 /// watchdog never retires it as abandoned), the launch fence taken as a
 /// Windows recovery of its own generation (so no launch the guest had begun
-/// slips through), and several idle heartbeats after that.
+/// slips through), and several idle heartbeats after that. A distribution
+/// WSL lists as stopped runs nothing and is not waited for.
 pub struct GuestDrain {
     guests: Vec<Guest>,
     generation: u64,
+    started: chrono::DateTime<chrono::Utc>,
     state_dir: PathBuf,
     /// The managed distributions could not be listed: the reboot does not
     /// guess that there are none.
     unreadable: Option<String>,
+    stopped: StoppedProbe,
 }
 
 impl GuestDrain {
@@ -467,12 +508,14 @@ impl GuestDrain {
         };
         let mut drain = Self::over(roots, paths.state_dir());
         drain.unreadable = unreadable;
+        drain.stopped = Box::new(known_stopped);
         drain
     }
 
-    /// Over the given distributions' shared directories.
+    /// Over the given distributions' shared directories, none known stopped.
     #[must_use]
     pub fn over(guests: Vec<(String, PathBuf)>, state_dir: &Path) -> Self {
+        let started = chrono::Utc::now();
         Self {
             guests: guests
                 .into_iter()
@@ -484,9 +527,11 @@ impl GuestDrain {
                     quiet: 0,
                 })
                 .collect(),
-            generation: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(1),
+            generation: u64::try_from(started.timestamp_millis()).unwrap_or(1),
+            started,
             state_dir: state_dir.to_path_buf(),
             unreadable: None,
+            stopped: Box::new(|_| false),
         }
     }
 
@@ -526,8 +571,19 @@ impl GuestDrain {
                         claim.make_durable();
                         guest.fenced_at = Some(chrono::Utc::now());
                     }
-                    // The guest is starting a runner: taken at a later turn.
-                    Ok(None) => {}
+                    // A WSL recovery holds it: the guest starts nothing either
+                    // (and a launch it begins after the recovery reads this
+                    // drain's request). A guest's own claim is a launch in
+                    // flight: taken at a later turn.
+                    Ok(None) => {
+                        if FenceClaim::owner(&guest.root)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|owner| owner.kind == FenceOwnerKind::WindowsRecovery)
+                        {
+                            guest.fenced_at = Some(chrono::Utc::now());
+                        }
+                    }
                     Err(error) => {
                         tracing::warn!(%distribution, %error, "a WSL guest's launch fence could not be taken for the reboot");
                     }
@@ -536,28 +592,24 @@ impl GuestDrain {
         }
     }
 
-    /// What the reboot still waits for among the guests, or `None` when every
-    /// guest has said, since its fence was taken, that it holds no runner.
-    #[must_use]
-    pub fn waiting(&mut self) -> Option<String> {
+    /// Where the reboot stands with the guests.
+    pub fn waiting(&mut self) -> GuestWait {
+        self.waiting_at(chrono::Utc::now())
+    }
+
+    fn waiting_at(&mut self, now: chrono::DateTime<chrono::Utc>) -> GuestWait {
         let generation = self.generation;
+        let patience =
+            chrono::Duration::from_std(GUEST_UNRESPONSIVE).unwrap_or(chrono::Duration::MAX);
         let mut waiting = None;
         for guest in &mut self.guests {
             let distribution = &guest.distribution;
-            let Some(fenced_at) = guest.fenced_at else {
-                waiting.get_or_insert_with(|| {
-                    format!("Waiting for WSL {distribution} to finish starting a runner.")
-                });
-                continue;
-            };
             let heartbeat = GuestHeartbeat::read(&guest.root)
                 .ok()
                 .flatten()
-                .filter(|heartbeat| {
-                    heartbeat.acknowledged_generation == Some(generation)
-                        && heartbeat.observed_at > fenced_at
-                });
-            if let Some(heartbeat) = &heartbeat
+                .filter(|heartbeat| heartbeat.acknowledged_generation == Some(generation));
+            if let (Some(heartbeat), Some(fenced_at)) = (&heartbeat, guest.fenced_at)
+                && heartbeat.observed_at > fenced_at
                 && guest.last_heartbeat != Some(heartbeat.observed_at)
             {
                 guest.last_heartbeat = Some(heartbeat.observed_at);
@@ -567,25 +619,43 @@ impl GuestDrain {
                     0
                 };
             }
-            if guest.quiet >= QUIET_HEARTBEATS {
+            if guest.quiet >= QUIET_HEARTBEATS || (self.stopped)(distribution) {
                 continue;
             }
-            waiting.get_or_insert_with(|| match heartbeat.map(|h| h.local_active_attempts) {
-                Some(Some(runners)) if runners > 0 => format!(
+            // A sign of life since the drain began: the fence, and a heartbeat
+            // that read this drain's request, the latest within the patience.
+            let answered = heartbeat.as_ref().map_or(self.started, |heartbeat| {
+                heartbeat.observed_at.max(self.started)
+            });
+            if guest.fenced_at.is_none() && now - self.started > patience {
+                return GuestWait::Unresponsive(format!(
+                    "WSL {distribution} kept its launch fence for {} minutes (a runner start that \
+                     never finished?); its runners cannot be vouched for.",
+                    GUEST_UNRESPONSIVE.as_secs() / 60
+                ));
+            }
+            if now - answered > patience {
+                return GuestWait::Unresponsive(format!(
+                    "WSL {distribution} has not answered for {} minutes and is not known to be \
+                     stopped; its runners cannot be vouched for.",
+                    GUEST_UNRESPONSIVE.as_secs() / 60
+                ));
+            }
+            waiting.get_or_insert_with(|| match (guest.fenced_at, heartbeat.map(|h| h.local_active_attempts)) {
+                (None, _) => format!("Waiting for WSL {distribution} to finish starting a runner."),
+                (_, Some(Some(runners))) if runners > 0 => format!(
                     "Waiting for WSL {distribution}: {} still running.",
                     runners_text(runners)
                 ),
-                Some(None) => {
-                    format!("Waiting for WSL {distribution}: it cannot read its runners.")
-                }
-                Some(Some(_)) => format!("Waiting for WSL {distribution} to confirm it is idle."),
-                None => format!(
+                (_, Some(None)) => format!("Waiting for WSL {distribution}: it cannot read its runners."),
+                (_, Some(Some(_))) => format!("Waiting for WSL {distribution} to confirm it is idle."),
+                (_, None) => format!(
                     "Waiting for WSL {distribution} to confirm it takes no new job (its service \
                      has not answered yet)."
                 ),
             });
         }
-        waiting
+        waiting.map_or(GuestWait::Drained, GuestWait::Waiting)
     }
 
     /// The reboot did not happen: the guests take jobs again.
@@ -614,6 +684,21 @@ impl GuestDrain {
             .unwrap_or_default();
         release(&roots, generation, paths.state_dir());
     }
+}
+
+/// Whether WSL lists `distribution` as stopped. Only the English word is
+/// trusted (`--list` localises it), and anything else, an error included
+/// (a LocalSystem service cannot list a user's distributions), is "not
+/// known": the heartbeat decides then.
+fn known_stopped(distribution: &str) -> bool {
+    runner_manager_platform::wsl::WslHost::on_this_host("the reboot's WSL drain")
+        .ok()
+        .and_then(|host| {
+            let table = host.invoker().list().ok()?;
+            let entry = table.exactly(distribution).ok()?;
+            Some(entry.state() == "Stopped")
+        })
+        .unwrap_or(false)
 }
 
 fn guest_roots(paths: &AppPaths, records: Vec<WslProviderRecord>) -> Vec<(String, PathBuf)> {
@@ -790,7 +875,7 @@ mod tests {
             DrainRequest::read(&root).unwrap().unwrap().generation,
             generation
         );
-        assert!(drain.waiting().unwrap().contains("starting a runner"));
+        assert!(waiting_text(&mut drain).contains("starting a runner"));
         drop(guest_launch);
         drain.request();
         let owner = FenceClaim::owner(&root).unwrap().unwrap();
@@ -800,23 +885,96 @@ mod tests {
         let after = |secs| chrono::Utc::now() + chrono::Duration::seconds(secs);
         // Idle, but not acknowledging this drain: not yet a promise.
         heartbeat(&root, after(1), None, 0);
-        assert!(drain.waiting().unwrap().contains("has not answered"));
+        assert!(waiting_text(&mut drain).contains("has not answered"));
         heartbeat(&root, after(2), Some(generation), 1);
-        assert!(drain.waiting().unwrap().contains("1 runner"));
+        assert!(waiting_text(&mut drain).contains("1 runner"));
         heartbeat(&root, after(3), Some(generation), 0);
         assert!(
-            drain.waiting().is_some(),
+            drain.waiting() != GuestWait::Drained,
             "one idle heartbeat is not enough"
         );
-        assert!(drain.waiting().is_some(), "the same heartbeat counts once");
+        assert!(
+            drain.waiting() != GuestWait::Drained,
+            "the same heartbeat counts once"
+        );
         heartbeat(&root, after(4), Some(generation), 0);
-        assert_eq!(drain.waiting(), None);
+        assert_eq!(drain.waiting(), GuestWait::Drained);
 
         // A reboot that did not happen lifts the guests' drain and fence.
         drain.release();
         assert_eq!(DrainRequest::read(&root).unwrap(), None);
         assert_eq!(FenceClaim::owner(&root).unwrap(), None);
         assert!(!state.join(GUEST_DRAIN_FILE).exists());
+    }
+
+    fn waiting_text(drain: &mut GuestDrain) -> String {
+        match drain.waiting() {
+            GuestWait::Waiting(text) => text,
+            other => panic!("not waiting: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stopped_guest_is_not_waited_for_and_a_silent_one_fails_the_reboot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let guests = vec![
+            ("Stopped".into(), dir.path().join("Stopped")),
+            ("Silent".into(), dir.path().join("Silent")),
+        ];
+        let mut drain = GuestDrain::over(guests, &state);
+        drain.stopped = Box::new(|distribution| distribution == "Stopped");
+        drain.request();
+        // A WSL recovery already holds the silent guest's fence: it starts
+        // nothing either, and counts as fenced.
+        let root = dir.path().join("Silent");
+        clear_recovery(&root, drain.generation).unwrap();
+        FenceClaim::try_claim(&root, FenceOwnerKind::WindowsRecovery, Some(7))
+            .unwrap()
+            .unwrap()
+            .make_durable();
+        drain.guests[1].fenced_at = None;
+        drain.request();
+        assert!(drain.guests[1].fenced_at.is_some());
+        let text = waiting_text(&mut drain);
+        assert!(text.contains("WSL Silent"), "{text}");
+        assert!(!text.contains("WSL Stopped"), "{text}");
+        let later = drain.started
+            + chrono::Duration::from_std(GUEST_UNRESPONSIVE).unwrap()
+            + chrono::Duration::seconds(1);
+        match drain.waiting_at(later) {
+            GuestWait::Unresponsive(why) => assert!(why.contains("WSL Silent"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_guest_busy_for_hours_is_waited_for_while_it_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Ubuntu");
+        let mut drain =
+            GuestDrain::over(vec![("Ubuntu".into(), root.clone())], &dir.path().join("s"));
+        drain.request();
+        let hours = drain.started + chrono::Duration::hours(3);
+        heartbeat(&root, hours, Some(drain.generation), 1);
+        assert!(matches!(drain.waiting_at(hours), GuestWait::Waiting(_)));
+        // A guest whose fence stays held by its own launch is not vouched for.
+        let stuck = dir.path().join("Stuck");
+        let _launch = FenceClaim::try_claim(&stuck, FenceOwnerKind::GuestLaunch, None)
+            .unwrap()
+            .unwrap();
+        let mut drain = GuestDrain::over(vec![("Stuck".into(), stuck)], &dir.path().join("s2"));
+        drain.request();
+        heartbeat(
+            &drain.guests[0].root.clone(),
+            hours,
+            Some(drain.generation),
+            0,
+        );
+        assert!(matches!(
+            drain.waiting_at(hours),
+            GuestWait::Unresponsive(_)
+        ));
     }
 
     #[test]
@@ -843,6 +1001,14 @@ mod tests {
             None,
             "its fence is lifted"
         );
+    }
+
+    #[test]
+    fn a_hard_link_to_a_root_file_is_not_a_request_from_root() {
+        assert!(written_by_root(true, 0, 1));
+        assert!(!written_by_root(true, 0, 2), "a hard link");
+        assert!(!written_by_root(false, 0, 1), "not a regular file");
+        assert!(!written_by_root(true, 501, 1));
     }
 
     #[test]
