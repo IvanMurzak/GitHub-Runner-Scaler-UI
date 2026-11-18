@@ -47,7 +47,7 @@
     failed: false,
     timers: {},
     showAllRecent: false,
-    hostColors: new Map(),
+    hostColors: new Map(), colorSig: '',
     audit: null, auditErr: null, auditSig: '', showAllAudit: false,
     auditOpen: loadFlag('rm.audit.open', true),
     auditAll: loadFlag('rm.audit.all', false),
@@ -584,12 +584,11 @@
   ];
 
   function kpiTile(k) {
-    const el = h('div', { class: 'kpi' },
+    return h('div', { class: 'kpi' },
       h('p', { class: 'kpi-label', text: k.label }),
       h('p', { class: 'kpi-value' }, h('span', { class: 'num' }, h('span', { class: 'kpi-a' }), k.fmt ? null : h('small', {}, ' / ', h('span', { class: 'kpi-b' })))),
       k.sub ? h('p', { class: 'kpi-sub' }) : null,
       k.bar ? meterBar(null, 'kpi-bar') : null);
-    return el;
   }
   function fillKpi(el, k, c) {
     const [a, b] = k.value(c);
@@ -1066,7 +1065,6 @@
     return { step, ticks: out };
   }
 
-  const charts = [];
   function setupChart(fig, id) {
     const plot = $('.plot', fig);
     const c = { id, fig, plot, cfg: null, idx: null, frame: 0, view: null, sk: null };
@@ -1084,10 +1082,9 @@
       showTip(c, clamp((c.idx == null ? n - 1 : c.idx) + step, 0, n - 1));
     });
     new ResizeObserver(() => { cancelAnimationFrame(c.frame); c.frame = requestAnimationFrame(() => drawChart(c)); }).observe(plot);
-    charts.push(c);
     return c;
   }
-  const hideAllTips = () => charts.forEach(hideTip);
+  const hideAllTips = () => chartById.forEach(hideTip);
 
   // What a chart draws: its time domain [d0, d1), the value at its top, and
   // a value array per series over `t`. A change animates between two views:
@@ -1261,7 +1258,7 @@
 
   function hover(c, e) {
     if (!c.geo || !c.cfg) return;
-    if (e.type === 'pointerdown') charts.forEach((o) => o !== c && hideTip(o));
+    if (e.type === 'pointerdown') chartById.forEach((o) => o !== c && hideTip(o));
     const r = c.plot.getBoundingClientRect();
     const { P, pw, t0, t1 } = c.geo;
     const t = c.cfg.t;
