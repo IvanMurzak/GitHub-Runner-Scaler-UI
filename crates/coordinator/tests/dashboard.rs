@@ -118,6 +118,15 @@ async fn sign_in(coordinator: &Coordinator) -> (String, Option<String>) {
 
 /// [`sign_in`], starting at `login` (`/auth/login?next=...`).
 async fn sign_in_from(coordinator: &Coordinator, login: &str) -> (String, Option<String>) {
+    sign_in_with(coordinator, login, "the-code").await
+}
+
+/// [`sign_in_from`], GitHub giving back `code`.
+async fn sign_in_with(
+    coordinator: &Coordinator,
+    login: &str,
+    code: &str,
+) -> (String, Option<String>) {
     let http = client();
     let login = http
         .get(format!("{}{login}", coordinator.base))
@@ -140,7 +149,7 @@ async fn sign_in_from(coordinator: &Coordinator, login: &str) -> (String, Option
     assert_eq!(cookie, state);
     let back = http
         .get(format!(
-            "{}/auth/callback?code=the-code&state={state}",
+            "{}/auth/callback?code={code}&state={state}",
             coordinator.base
         ))
         .header(
@@ -185,6 +194,12 @@ async fn an_allowed_login_signs_in_and_sees_the_queue() {
     assert_eq!(page.headers()["x-frame-options"], "DENY");
     assert_eq!(
         get(&coordinator, "/assets/app.js", None).await.status(),
+        200
+    );
+    assert_eq!(
+        get(&coordinator, "/assets/settings.js", None)
+            .await
+            .status(),
         200
     );
     assert_eq!(
@@ -708,4 +723,205 @@ async fn cli_sign_ins_are_rate_limited_per_address() {
     }
     assert_eq!(statuses.first(), Some(&200));
     assert_eq!(statuses.last(), Some(&429));
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard settings
+// ---------------------------------------------------------------------------
+
+/// A GitHub on which each `(code, login)` signs in as that login.
+async fn github_for_each(users: &[(&str, &str)]) -> MockServer {
+    let github = MockServer::start().await;
+    for (n, (code, login)) in users.iter().enumerate() {
+        let token = format!("gho_fixtureUSERtoken{n:016}");
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .and(body_partial_json(serde_json::json!({ "code": code })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"access_token": token, "token_type": "bearer"}),
+                ),
+            )
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "login": login })),
+            )
+            .mount(&github)
+            .await;
+    }
+    github
+}
+
+/// `PUT /api/settings` with `body`, as a browser of this origin would send it.
+async fn put_settings(
+    coordinator: &Coordinator,
+    session: Option<&str>,
+    body: impl Into<reqwest::Body>,
+) -> reqwest::Response {
+    let mut request = client()
+        .put(format!("{}/api/settings", coordinator.base))
+        .header("origin", &coordinator.base)
+        .header("content-type", "application/json")
+        .body(body);
+    if let Some(session) = session {
+        request = request.header("cookie", format!("rm_session={session}"));
+    }
+    request.send().await.expect("sent")
+}
+
+async fn settings_of(coordinator: &Coordinator, session: &str) -> serde_json::Value {
+    let response = get(coordinator, "/api/settings", Some(session)).await;
+    assert_eq!(response.status(), 200);
+    response.json().await.expect("json")
+}
+
+#[tokio::test]
+async fn dashboard_settings_need_a_session_and_round_trip() {
+    let github = github_for("ivanmurzak").await;
+    let coordinator = start(Some(auth(&github))).await;
+    let settings = serde_json::json!({
+        "version": 1,
+        "machines": { "pinned": ["h-2", "gone-host"] },
+        "general": { "theme": "dark" },
+    });
+
+    assert_eq!(get(&coordinator, "/api/settings", None).await.status(), 401);
+    assert_eq!(
+        put_settings(&coordinator, None, settings.to_string())
+            .await
+            .status(),
+        401
+    );
+
+    let (_, session) = sign_in(&coordinator).await;
+    let session = session.expect("a session");
+    let first = settings_of(&coordinator, &session).await;
+    assert_eq!(first["settings"], serde_json::Value::Null, "nothing yet");
+    assert_eq!(first["updated_at"], serde_json::Value::Null);
+
+    let saved = put_settings(&coordinator, Some(&session), settings.to_string()).await;
+    assert_eq!(saved.status(), 200);
+    assert_eq!(saved.headers()["cache-control"], "no-store");
+    let saved: serde_json::Value = saved.json().await.expect("json");
+    assert!(saved["updated_at"].as_i64().is_some());
+
+    let back = settings_of(&coordinator, &session).await;
+    assert_eq!(back["settings"], settings);
+    assert_eq!(back["updated_at"], saved["updated_at"]);
+
+    let newer = serde_json::json!({ "version": 2, "layout": {} });
+    assert_eq!(
+        put_settings(&coordinator, Some(&session), newer.to_string())
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        settings_of(&coordinator, &session).await["settings"],
+        newer,
+        "replaced, not merged"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_settings_refuse_what_is_not_a_versioned_json_object() {
+    let github = github_for("ivanmurzak").await;
+    let coordinator = start(Some(auth(&github))).await;
+    let (_, session) = sign_in(&coordinator).await;
+    let session = session.expect("a session");
+    let kept = serde_json::json!({ "version": 1, "kpis": { "hidden": ["wait"] } });
+    assert_eq!(
+        put_settings(&coordinator, Some(&session), kept.to_string())
+            .await
+            .status(),
+        200
+    );
+
+    for bad in [
+        "not json",
+        "{\"version\": 1",
+        "[1, 2]",
+        "\"version\"",
+        "{}",
+        "{\"version\": 0}",
+        "{\"version\": \"1\"}",
+        "{\"version\": 1.5}",
+    ] {
+        let response = put_settings(&coordinator, Some(&session), bad).await;
+        assert_eq!(response.status(), 400, "{bad}");
+        let body: serde_json::Value = response.json().await.expect("an error body");
+        assert!(body["error"].is_string(), "{bad}");
+    }
+
+    // Over the limit: refused before it is read.
+    let padding = "x".repeat(runner_manager_coordinator::dashboard::SETTINGS_MAX_BYTES);
+    let huge = serde_json::json!({ "version": 1, "padding": padding }).to_string();
+    assert_eq!(
+        put_settings(&coordinator, Some(&session), huge)
+            .await
+            .status(),
+        413
+    );
+
+    // From another origin, or none: a cross-site page cannot change them.
+    for origin in [Some("https://evil.example"), None] {
+        let mut request = client()
+            .put(format!("{}/api/settings", coordinator.base))
+            .header("cookie", format!("rm_session={session}"))
+            .body(serde_json::json!({ "version": 9 }).to_string());
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        assert_eq!(request.send().await.expect("sent").status(), 403);
+    }
+
+    assert_eq!(
+        settings_of(&coordinator, &session).await["settings"],
+        kept,
+        "nothing refused replaced them"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_settings_are_each_persons_own() {
+    let github = github_for_each(&[("code-ivan", "IvanMurzak"), ("code-ann", "ann")]).await;
+    let mut config = auth(&github);
+    config.allowed_logins.push("ann".into());
+    let coordinator = start(Some(config)).await;
+    let (_, ivan) = sign_in_with(&coordinator, "/auth/login", "code-ivan").await;
+    let (_, ann) = sign_in_with(&coordinator, "/auth/login", "code-ann").await;
+    let (ivan, ann) = (ivan.expect("ivan's session"), ann.expect("ann's session"));
+
+    let mine = serde_json::json!({ "version": 1, "general": { "theme": "dark" } });
+    assert_eq!(
+        put_settings(&coordinator, Some(&ivan), mine.to_string())
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        settings_of(&coordinator, &ann).await["settings"],
+        serde_json::Value::Null,
+        "another person sees none of them"
+    );
+    let hers = serde_json::json!({ "version": 1, "general": { "theme": "light" } });
+    assert_eq!(
+        put_settings(&coordinator, Some(&ann), hers.to_string())
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(settings_of(&coordinator, &ivan).await["settings"], mine);
+    assert_eq!(settings_of(&coordinator, &ann).await["settings"], hers);
+
+    // The same person in another browser: the same settings.
+    let (_, again) = sign_in_with(&coordinator, "/auth/login", "code-ivan").await;
+    assert_eq!(
+        settings_of(&coordinator, &again.expect("a second session")).await["settings"],
+        mine
+    );
 }

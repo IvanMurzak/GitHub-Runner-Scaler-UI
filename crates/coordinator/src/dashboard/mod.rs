@@ -35,12 +35,16 @@ use metrics::Range;
 const INDEX_HTML: &str = include_str!("../../assets/index.html");
 const APP_CSS: &str = include_str!("../../assets/app.css");
 const APP_JS: &str = include_str!("../../assets/app.js");
+const SETTINGS_JS: &str = include_str!("../../assets/settings.js");
 const ICON_SVG: &str = include_str!("../../assets/icon.svg");
 
 const SESSION_COOKIE: &str = "rm_session";
 const STATE_COOKIE: &str = "rm_oauth_state";
 /// Where the browser goes after GitHub, when not the dashboard.
 const NEXT_COOKIE: &str = "rm_oauth_next";
+
+/// The most a person's dashboard settings may take, as JSON.
+pub const SETTINGS_MAX_BYTES: usize = 64 * 1024;
 
 /// What every dashboard response carries.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
@@ -85,6 +89,7 @@ impl Dashboard {
 /// The dashboard's routes, merged into the server's router only when the
 /// dashboard exists: without it each of these paths is a plain 404.
 pub fn routes(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
+    use axum::extract::DefaultBodyLimit;
     use axum::middleware::{from_fn_with_state, map_response};
     use axum::routing::{get, post};
     let asset = |body: &'static str, kind: &'static str| {
@@ -107,6 +112,12 @@ pub fn routes(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
         .route("/api/hosts/{id}/config", get(host_config))
         .route("/api/hosts/{id}/command", post(host_command))
         .route("/api/audit", get(audit))
+        .route(
+            "/api/settings",
+            get(settings_get)
+                .put(settings_put)
+                .layer(DefaultBodyLimit::max(SETTINGS_MAX_BYTES)),
+        )
         .route_layer(from_fn_with_state(Arc::clone(state), require_session));
     axum::Router::new()
         .route("/", asset(INDEX_HTML, "text/html; charset=utf-8"))
@@ -114,6 +125,10 @@ pub fn routes(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
         .route(
             "/assets/app.js",
             asset(APP_JS, "text/javascript; charset=utf-8"),
+        )
+        .route(
+            "/assets/settings.js",
+            asset(SETTINGS_JS, "text/javascript; charset=utf-8"),
         )
         .route("/assets/icon.svg", asset(ICON_SVG, "image/svg+xml"))
         .route("/auth/login", get(login))
@@ -838,4 +853,83 @@ async fn audit(State(state): State<Arc<AppState>>) -> Response {
         })
         .collect();
     json(&serde_json::json!({ "commands": records }))
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard settings
+// ---------------------------------------------------------------------------
+
+/// The signed-in person's dashboard settings: `{"settings": {...} | null,
+/// "updated_at": seconds | null}`. The page owns their shape; the coordinator
+/// only keeps them, so they follow the person to another browser.
+async fn settings_get(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<DashboardSession>,
+) -> Response {
+    let saved = match state.store().dashboard_settings(&session.login) {
+        Ok(saved) => saved,
+        Err(error) => {
+            tracing::warn!(%error, "dashboard settings could not be read");
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the settings could not be read",
+            );
+        }
+    };
+    let (settings, updated_at) = saved
+        .and_then(|(at, body)| {
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .map(|value| (value, Some(at)))
+        })
+        .unwrap_or((serde_json::Value::Null, None));
+    json(&serde_json::json!({ "settings": settings, "updated_at": updated_at }))
+}
+
+/// Replaces the signed-in person's dashboard settings with the body, a JSON
+/// object with a positive integer `version` of at most
+/// [`SETTINGS_MAX_BYTES`] (a larger body is answered 413 before it is read).
+async fn settings_put(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<DashboardSession>,
+    Extension(credential): Extension<Credential>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if credential == Credential::Cookie && !same_origin(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let body = match settings_body(&body) {
+        Ok(body) => body,
+        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
+    };
+    let now = Utc::now().timestamp();
+    if let Err(error) = state
+        .store()
+        .save_dashboard_settings(&session.login, &body, now)
+    {
+        tracing::warn!(%error, "dashboard settings were not saved");
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the settings could not be saved",
+        );
+    }
+    json(&serde_json::json!({ "updated_at": now }))
+}
+
+/// The settings to keep, re-serialised compactly, or why they are refused.
+fn settings_body(body: &[u8]) -> Result<String, &'static str> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| "the settings are not JSON")?;
+    let Some(object) = value.as_object() else {
+        return Err("the settings must be a JSON object");
+    };
+    if object
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .is_none_or(|version| version == 0)
+    {
+        return Err("the settings need a positive integer `version`");
+    }
+    serde_json::to_string(&value).map_err(|_| "the settings are not JSON")
 }

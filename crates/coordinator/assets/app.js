@@ -34,14 +34,35 @@
   const isNum = (v) => typeof v === 'number' && isFinite(v);
   const nowSec = () => Date.now() / 1000;
 
+  // --------------------------------------------------------------- settings
+  // The viewer's settings (settings.js has their shape and rules): this
+  // browser's copy at once, then the coordinator's, which follows the
+  // signed-in person to any browser. `cfg` is always normalized.
+  const RS = window.RMSettings;
+  const SETTINGS_KEY = 'rm.settings';
+  let cfg = loadLocalSettings();
+
+  function loadLocalSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (raw) return RS.normalize(JSON.parse(raw));
+      // Before settings: the range and the audit filter were kept on their own.
+      return RS.fromLegacy(localStorage.getItem('rm.range'), localStorage.getItem('rm.audit.all') === '1');
+    } catch (_) { return RS.defaults(); }
+  }
+  function storeLocal() { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(cfg)); } catch (_) { /* storage unavailable */ } }
+
   // ------------------------------------------------------------------ state
-  const RANGES = ['1h', '6h', '24h', '7d'];
+  const RANGES = RS.RANGES;
   const RANGE_LABEL = { '1h': 'last hour', '6h': 'last 6 hours', '24h': 'last 24 hours', '7d': 'last 7 days' };
-  const OVERVIEW_MS = 5000, METRICS_MIN_MS = 60000, STALE_SECS = 20;
+  const METRICS_MIN_MS = 60000;
+  const overviewMs = () => cfg.general.refresh * 1000;
+  // Stale after a few missed refreshes, and never sooner than 20 s.
+  const staleSecs = () => Math.max(20, cfg.general.refresh * 3);
 
   const state = {
     session: null, ov: null, metrics: null,
-    range: loadRange(),
+    range: cfg.charts.range,
     skew: 0,            // server clock minus local clock, seconds
     lastOk: 0,          // local time of the last successful overview fetch
     failed: false,
@@ -50,16 +71,10 @@
     hostColors: new Map(), colorSig: '',
     audit: null, auditErr: null, auditSig: '', showAllAudit: false,
     auditOpen: loadFlag('rm.audit.open', true),
-    auditAll: loadFlag('rm.audit.all', false),
     painted: false,     // the first overview is on screen: changes from here on animate
   };
   const serverNow = () => nowSec() + state.skew;
 
-  function loadRange() {
-    try { const r = localStorage.getItem('rm.range'); if (RANGES.includes(r)) return r; } catch (_) { /* storage unavailable */ }
-    return '6h';
-  }
-  function saveRange(r) { try { localStorage.setItem('rm.range', r); } catch (_) { /* ignore */ } }
   function loadFlag(k, dflt) {
     try { const v = localStorage.getItem(k); if (v === '1' || v === '0') return v === '1'; } catch (_) { /* storage unavailable */ }
     return dflt;
@@ -84,7 +99,9 @@
   const EASE = 'cubic-bezier(.2,.8,.2,1)';
   const DUR = { fast: 160, base: 260, slow: 360 };
   const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
-  const motionOk = () => !reducedMotion.matches && !document.hidden;
+  // The viewer's own choice in the settings, else the system's.
+  const lessMotion = () => (cfg.general.motion === 'system' ? reducedMotion.matches : cfg.general.motion === 'reduce');
+  const motionOk = () => !lessMotion() && !document.hidden;
   // Data updates: full motion once the first overview is on screen.
   const liveMotion = () => state.painted && motionOk();
   const easeOut = (p) => 1 - (1 - p) ** 3;
@@ -303,7 +320,7 @@
     placeThumb(seg, true);
   }
   function placeThumb(seg, animate) {
-    const th = seg._thumb, b = $('.seg-btn[aria-pressed="true"]', seg);
+    const th = seg._thumb, b = $('.seg-btn[aria-pressed="true"], .seg-btn[aria-selected="true"]', seg);
     if (!b || !b.offsetWidth) { th.classList.remove('on'); return; }
     th.classList.toggle('no-anim', !animate || !th.classList.contains('on') || !motionOk());
     th.style.setProperty('--x', `${b.offsetLeft}px`);
@@ -322,8 +339,10 @@
     if (hr < 24) return `${hr}h ${pad2(m % 60)}m`;
     return `${Math.floor(hr / 24)}d ${hr % 24}h`;
   }
+  // `3 min ago`, or with absolute times chosen `14:32`, `Mon 14:32`.
   function fmtAgo(t) {
     if (!isNum(t)) return '—';
+    if (cfg.general.time === 'absolute') return fmtWhen(t);
     const d = serverNow() - t;
     if (d < 10) return 'just now';
     if (d < 60) return `${Math.floor(d)}s ago`;
@@ -331,25 +350,40 @@
     if (d < 86400) return `${Math.floor(d / 3600)} h ago`;
     return `${Math.floor(d / 86400)} d ago`;
   }
+  // GiB (1024³) or, with decimal units chosen, GB (1000³).
   function fmtBytes(b) {
     if (!isNum(b)) return '—';
-    const g = b / 2 ** 30;
-    if (g >= 1024) return `${(g / 1024).toFixed(g >= 10240 ? 0 : 1)} TiB`;
-    if (g >= 100) return `${g.toFixed(0)} GiB`;
-    if (g >= 1) return `${g.toFixed(1)} GiB`;
-    return `${Math.round(b / 2 ** 20)} MiB`;
+    const dec = cfg.general.bytes === 'decimal';
+    const k = dec ? 1000 : 1024, i = dec ? '' : 'i';
+    const g = b / k ** 3;
+    if (g >= k) return `${(g / k).toFixed(g >= 10 * k ? 0 : 1)} T${i}B`;
+    if (g >= 100) return `${g.toFixed(0)} G${i}B`;
+    if (g >= 1) return `${g.toFixed(1)} G${i}B`;
+    return `${Math.round(b / k ** 2)} M${i}B`;
   }
+  const gigabyte = () => (cfg.general.bytes === 'decimal' ? 1e9 : 2 ** 30);
   const fmtPct = (v) => (isNum(v) ? `${Math.round(v)}%` : '—');
   const fmtInt = (v) => (isNum(v) ? String(Math.round(v)) : '—');
   function fmtClock(t) {
     const d = new Date(t * 1000);
-    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    const hr = d.getHours();
+    if (cfg.general.clock === '12') return `${hr % 12 || 12}:${pad2(d.getMinutes())} ${hr < 12 ? 'AM' : 'PM'}`;
+    return `${pad2(hr)}:${pad2(d.getMinutes())}`;
   }
   function fmtDay(t) {
     return new Date(t * 1000).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric' });
   }
   function fmtStamp(t) {
-    return new Date(t * 1000).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    return new Date(t * 1000).toLocaleString(undefined, {
+      weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: cfg.general.clock === '12' ? 'h12' : 'h23',
+    });
+  }
+  // A moment as a time of day: today `14:32`, this week `Mon 14:32`, else `3 Nov 14:32`.
+  function fmtWhen(t) {
+    const d = new Date(t * 1000), now = new Date(serverNow() * 1000);
+    if (d.toDateString() === now.toDateString()) return fmtClock(t);
+    const opts = Math.abs(now - d) < 6 * 86400e3 ? { weekday: 'short' } : { day: 'numeric', month: 'short' };
+    return `${d.toLocaleDateString(undefined, opts)} ${fmtClock(t)}`;
   }
   const repoShort = (r) => (r ? String(r).split('/').pop() : '—');
   const humanize = (v) => (v ? String(v).replace(/_/g, ' ') : '—');
@@ -362,6 +396,9 @@
   // Live-updating text: elements carry data-since (elapsed) or data-ago (relative).
   const since = (t, cls) => h('span', { class: cls || 'num', 'data-since': isNum(t) ? t : null, text: isNum(t) ? fmtDur(serverNow() - t) : '—' });
   const ago = (t, cls) => h('time', { class: cls, 'data-ago': isNum(t) ? t : null, datetime: isNum(t) ? new Date(t * 1000).toISOString() : null, title: isNum(t) ? fmtStamp(t) : null, text: fmtAgo(t) });
+  // What every row and slot that shows a formatted value depends on: a
+  // change rebuilds them.
+  const fmtSig = () => JSON.stringify([cfg.general.time, cfg.general.clock, cfg.general.bytes]);
 
   function tick() {
     for (const el of $$('[data-since]')) el.textContent = fmtDur(serverNow() - Number(el.dataset.since));
@@ -380,12 +417,16 @@
 
   // ------------------------------------------------------------------ boot
   async function boot() {
+    applyGeneral();
+    applyLayout();
     $('#signout').addEventListener('click', signOut);
     $('#recent-toggle').addEventListener('click', () => { state.showAllRecent = !state.showAllRecent; if (state.ov) renderRecent(state.ov); });
     reducedMotion.addEventListener('change', settleMotion);
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyGeneral);
     buildRangeSwitch();
     buildAuditControls();
     setupDrawer();
+    setupSettings();
     document.addEventListener('visibilitychange', onVisibility);
     document.addEventListener('pointerdown', (e) => { if (!e.target.closest('.plot')) hideAllTips(); });
     try {
@@ -428,6 +469,7 @@
     renderSkeletons();
     renderChartFrames();
     startTimers();
+    loadServerSettings();
     const id = hashHost();
     if (id) openDrawer(id, false);
   }
@@ -469,7 +511,7 @@
       state.failed = true;
       renderLive();
     }
-    if (polling()) state.timers.ov = setTimeout(loadOverview, OVERVIEW_MS);
+    if (polling()) state.timers.ov = setTimeout(loadOverview, overviewMs());
   }
 
   async function loadMetrics() {
@@ -494,7 +536,7 @@
     const el = $('#live');
     if (!el || $('#app').hidden) return;
     const age = state.lastOk ? nowSec() - state.lastOk : Infinity;
-    const stale = state.failed || age > STALE_SECS;
+    const stale = state.failed || age > staleSecs();
     el.classList.toggle('is-stale', stale);
     $('#live-text').textContent = stale ? (state.lastOk ? `Stale · ${fmtDur(age)}` : 'Connecting') : 'Live';
     el.title = state.lastOk ? `Last update ${new Date(state.lastOk * 1000).toLocaleTimeString()}${state.failed ? ' · last refresh failed' : ''}` : 'Waiting for first update';
@@ -552,7 +594,7 @@
   function renderSkeletons() {
     if (state.painted) return;
     const line = (w) => h('span', { class: `sk ${w}` });
-    $('#kpis').replaceChildren(...KPIS.map(() => h('div', { class: 'kpi kpi-sk', 'aria-hidden': 'true' }, line('w50'), line('w30 sk-big'), line('w60'))));
+    $('#kpis').replaceChildren(...shownKpis().map(() => h('div', { class: 'kpi kpi-sk', 'aria-hidden': 'true' }, line('w50'), line('w30 sk-big'), line('w60'))));
     $('#hosts').replaceChildren(...[1, 2, 3].map(() => h('div', { class: 'host host-sk', 'aria-hidden': 'true' },
       line('w40 sk-big'), line('w70'), line('w60'), line('w70'), h('span', { class: 'sk sk-spark' }), line('w50'))));
     const rows = (n) => h('div', { class: 'tbl-sk', 'aria-hidden': 'true' }, Array.from({ length: n }, (_, i) => line(['w70', 'w50', 'w60'][i % 3])));
@@ -572,8 +614,9 @@
   }
 
   // ------------------------------------------------------------------ KPIs
-  // The summary tiles, in order. Each fills its own tile: `value` gives the
-  // big number and what it is out of, `sub` the line under it.
+  // The summary tiles. Each fills its own tile: `value` gives the big number
+  // and what it is out of (`single`: nothing), `fmt` formats both, `sub`
+  // fills the line under it. Which show, and in what order, is a setting.
   const KPIS = [
     { key: 'machines', label: 'Machines online', value: (c) => [c.sm.hosts_online, c.sm.hosts_total] },
     {
@@ -588,27 +631,53 @@
       },
     },
     {
-      key: 'wait', label: 'Queue wait p50', value: (c) => [c.sm.p50_queue_wait_secs], fmt: fmtDur,
+      key: 'wait', label: 'Queue wait p50', value: (c) => [c.sm.p50_queue_wait_secs], fmt: fmtDur, single: true,
       sub: (c, el) => {
         if (!el.firstChild) el.append('p90 ', h('b', { class: 'num' }));
         tweenNumber(el.lastChild, c.sm.p90_queue_wait_secs, fmtDur);
       },
     },
+    {
+      key: 'cpu', label: 'Average CPU', value: (c) => [c.cpu.avg], fmt: fmtPct, single: true, bar: (c) => c.cpu.avg,
+      sub: (c, el) => { el.textContent = c.cpu.top ? `busiest ${c.cpu.top.name || c.cpu.top.hostname} · ${fmtPct(c.cpu.top.cpu_load_percent)}` : 'no machine reports CPU'; },
+    },
+    {
+      key: 'memory', label: 'Memory in use', value: (c) => [c.mem.used, c.mem.total], fmt: fmtBytes, bar: (c) => c.mem.pct,
+      sub: (c, el) => { el.textContent = isNum(c.mem.pct) ? `${Math.round(c.mem.pct)}% of the online machines’ memory` : ''; },
+    },
   ];
+  const kpiByKey = new Map(KPIS.map((k) => [k.key, k]));
+  const shownKpis = () => RS.shown(cfg.kpis.order, cfg.kpis.hidden).map((key) => kpiByKey.get(key)).filter(Boolean);
 
   function kpiTile(k) {
     return h('div', { class: 'kpi' },
       h('p', { class: 'kpi-label', text: k.label }),
-      h('p', { class: 'kpi-value' }, h('span', { class: 'num' }, h('span', { class: 'kpi-a' }), k.fmt ? null : h('small', {}, ' / ', h('span', { class: 'kpi-b' })))),
+      h('p', { class: 'kpi-value' }, h('span', { class: 'num' }, h('span', { class: 'kpi-a' }), k.single ? null : h('small', {}, ' / ', h('span', { class: 'kpi-b' })))),
       k.sub ? h('p', { class: 'kpi-sub' }) : null,
       k.bar ? meterBar(null, 'kpi-bar') : null);
   }
   function fillKpi(el, k, c) {
     const [a, b] = k.value(c);
     tweenNumber($('.kpi-a', el), a, k.fmt || fmtInt);
-    if (!k.fmt) tweenNumber($('.kpi-b', el), b, fmtInt);
+    if (!k.single) tweenNumber($('.kpi-b', el), b, k.fmt || fmtInt);
     if (k.sub) k.sub(c, $('.kpi-sub', el));
     if (k.bar) setBar($('.bar', el), k.bar(c));
+  }
+
+  // The fleet's CPU and memory, from the online machines that report them.
+  function fleetLoad(hosts) {
+    const on = hosts.filter((x) => x.online);
+    const cpus = on.filter((x) => isNum(x.cpu_load_percent));
+    const rams = on.filter((x) => isNum(x.ram_bytes) && isNum(x.free_ram_bytes) && x.ram_bytes > 0);
+    const total = rams.reduce((a, x) => a + x.ram_bytes, 0);
+    const used = rams.reduce((a, x) => a + x.ram_bytes - x.free_ram_bytes, 0);
+    return {
+      cpu: {
+        avg: cpus.length ? cpus.reduce((a, x) => a + x.cpu_load_percent, 0) / cpus.length : null,
+        top: cpus.reduce((a, x) => (!a || x.cpu_load_percent > a.cpu_load_percent ? x : a), null),
+      },
+      mem: { used: rams.length ? used : null, total: rams.length ? total : null, pct: total ? (used / total) * 100 : null },
+    };
   }
 
   function renderKpis(ov) {
@@ -618,8 +687,12 @@
       pct: isNum(sm.slots_busy) && sm.slots_total > 0 ? (sm.slots_busy / sm.slots_total) * 100 : null,
       oldest: (ov.queue || [])[0],
       runHosts: new Set((ov.running || []).map((j) => j.host_id).filter(Boolean)).size,
+      ...fleetLoad(ov.hosts || []),
     };
-    reconcile($('#kpis'), KPIS, (k) => k.key, (k) => { const el = kpiTile(k); fillKpi(el, k, c); return el; }, (el, k) => fillKpi(el, k, c));
+    const box = $('#kpis');
+    const n = shownKpis().length;
+    box.style.setProperty('--kpi-cols', String(n > 5 ? 3 : Math.max(1, n)));
+    reconcile(box, shownKpis(), (k) => k.key, (k) => { const el = kpiTile(k); fillKpi(el, k, c); return el; }, (el, k) => fillKpi(el, k, c));
   }
 
   // `on 3 machines · oldest waits 1m 12s`, or `all idle`.
@@ -765,6 +838,7 @@
     const r = {
       dot: hostDot(null),
       link: h('a', { class: 'host-open' }),
+      pin: pinButton('pin-card'),
       sub: document.createComment('sub'),
       status: h('span', { class: 'status' }, h('i', { 'aria-hidden': 'true' }), h('span')),
       reboot: document.createComment('reboot'),
@@ -775,16 +849,37 @@
       disk: document.createComment('disk'),
       up: document.createComment('up'),
     };
+    r.head = h('header', { class: 'host-head' }, r.dot,
+      h('div', { class: 'host-id' }, h('h3', { class: 'host-name' }, r.link), r.sub),
+      r.pin,
+      h('div', { class: 'host-badges' }, r.status, r.reboot, r.access));
     el._r = r;
-    append(el, [
-      h('header', { class: 'host-head' }, r.dot,
-        h('div', { class: 'host-id' }, h('h3', { class: 'host-name' }, r.link), r.sub),
-        h('div', { class: 'host-badges' }, r.status, r.reboot, r.access)),
-      h('div', { class: 'host-meters' }, r.cpu, r.mem, r.slots),
-      r.spark, r.ver,
-      h('footer', { class: 'host-foot' }, r.disk, r.up),
-    ]);
+    layoutCard(el);
     return el;
+  }
+
+  // Lays a card out with the parts the settings show, in their order:
+  // neighbouring meters share a block, disk and uptime sit in the footer.
+  // A part left out keeps updating off the page, ready to come back.
+  function layoutCard(el) {
+    const ms = cfg.machines;
+    const parts = RS.shown(ms.fields, ms.fieldsHidden);
+    const sig = parts.join();
+    if (el._layout === sig) return;
+    const first = el._layout != null;
+    el._layout = sig;
+    const r = el._r;
+    const body = [], foot = [];
+    for (const key of parts) {
+      if (key === 'disk' || key === 'up') foot.push(r[key]);
+      else if (key === 'cpu' || key === 'mem' || key === 'slots') {
+        const last = body[body.length - 1];
+        if (last && last.classList && last.classList.contains('host-meters')) last.append(r[key]);
+        else body.push(h('div', { class: 'host-meters' }, r[key]));
+      } else body.push(r[key]);
+    }
+    el.replaceChildren(r.head, ...body, foot.length ? h('footer', { class: 'host-foot' }, foot) : '');
+    if (first && liveMotion()) for (const n of [...body, el.lastElementChild]) if (n !== r.head) fadeIn(n, DUR.slow);
   }
 
   // Updates a machine card in place: its meters and numbers glide, its status crossfades.
@@ -801,6 +896,8 @@
     r.link.parentNode.title = x.hostname || '';
     r.status.setAttribute('class', `status status-${st.key}`);
     r.status.lastChild.textContent = st.label;
+    setPin(r.pin, x.id, name);
+    layoutCard(el);
     const os = String(x.os || '').toLowerCase();
     slot(el, 'sub', JSON.stringify([os, x.arch, x.cores]), () => h('p', { class: 'host-sub' },
       h('span', { class: `os os-${os || 'unknown'}`, text: OS_NAME[os] || os || 'unknown' }),
@@ -820,7 +917,7 @@
 
     const dt = x.disk_total_bytes, df = x.disk_free_bytes;
     const sized = isNum(dt) && dt > 0 && isNum(df);
-    slot(el, 'disk', String(sized), () => (sized
+    slot(el, 'disk', String(sized) + fmtSig(), () => (sized
       ? h('span', { class: 'disk' }, h('span', {}, 'Disk ', h('b', { class: 'num' })), meterBar(null))
       : h('span', {}, 'Disk free ', h('b', { class: 'num' }))));
     // `Disk 176 GiB / 1.5 TiB` with a meter, from 0.4.66; free space before.
@@ -830,28 +927,70 @@
       tweenNumber($('b', r.disk), usedDisk, (v) => `${fmtBytes(v)} / ${fmtBytes(dt)}`);
       setBar($('.bar', r.disk), (usedDisk / dt) * 100);
     } else tweenNumber($('b', r.disk), df, fmtBytes);
-    slot(el, 'up', JSON.stringify(x.online ? [x.connected_since] : [null, x.last_seen_at]), () => (!x.online ? h('span', {}, 'Last seen ', ago(x.last_seen_at))
+    slot(el, 'up', JSON.stringify(x.online ? [x.connected_since] : [null, x.last_seen_at]) + fmtSig(), () => (!x.online ? h('span', {}, 'Last seen ', ago(x.last_seen_at))
       : isNum(x.connected_since) ? h('span', {}, 'Up ', since(x.connected_since)) : null));
   }
 
-  // The order of the machine cards: online first, then by name.
-  function hostOrder(hosts) {
-    return [...hosts].sort((a, b) => (b.online - a.online) || String(a.name || a.hostname).localeCompare(String(b.name || b.hostname)));
+  // The machine cards in the order the settings give (settings.js
+  // `arrangeHosts`): pinned first, then by the chosen rule, perhaps under
+  // group headings. Each item is a host or a heading `{ head }`.
+  function hostItems(hosts) {
+    const groups = RS.arrangeHosts(hosts, cfg.machines);
+    return groups.flatMap((g) => (g.label ? [{ head: g }, ...g.hosts] : g.hosts));
   }
 
   function renderHosts(ov) {
-    const hosts = hostOrder(ov.hosts || []);
-    const on = hosts.filter((x) => x.online).length;
-    $('#machines-count').textContent = hosts.length ? `${on} of ${hosts.length} online` : '';
+    const all = ov.hosts || [];
+    const items = hostItems(all);
+    const on = all.filter((x) => x.online).length;
+    const away = all.length - items.filter((x) => !x.head).length;
+    $('#machines-count').textContent = all.length ? `${on} of ${all.length} online${away ? ` · ${away} not shown` : ''}` : '';
     const box = $('#hosts');
-    resize(box, () => reconcile(box, hosts.length ? hosts : [null], (x) => (x ? x.id : 'empty'),
+    box.classList.toggle('is-compact', cfg.machines.density === 'compact');
+    const none = !all.length ? 'none' : !items.length ? 'filtered' : null;
+    resize(box, () => reconcile(box, none ? [none] : items, (x) => (typeof x === 'string' ? x : x.head ? `g:${x.head.key}` : x.id),
       (x) => {
-        if (!x) return empty('No machines enrolled yet', 'Machines appear here once their runner-manager agent connects.');
+        if (x === 'none') return empty('No machines enrolled yet', 'Machines appear here once their runner-manager agent connects.');
+        if (x === 'filtered') return empty('Every machine is hidden', 'Settings → Machines chooses which machines show.');
+        if (x.head) return groupHead(x.head);
         const el = hostCard();
         fillHost(el, x);
         return el;
       },
-      (el, x) => { if (x) fillHost(el, x); }));
+      (el, x) => { if (x.head) fillGroupHead(el, x.head); else if (typeof x !== 'string') fillHost(el, x); }));
+  }
+
+  function groupHead(g) {
+    const el = h('h3', { class: 'host-group' }, h('span', { class: 'host-group-name' }), h('span', { class: 'count num' }));
+    fillGroupHead(el, g);
+    return el;
+  }
+  function fillGroupHead(el, g) {
+    el.firstChild.textContent = g.label;
+    tweenNumber(el.lastChild, g.hosts.length, countText);
+  }
+
+  // ----------------------------------------------------------------- pins
+  const isPinned = (id) => cfg.machines.pinned.includes(id);
+  function togglePin(id) {
+    update((c) => {
+      const ms = c.machines;
+      if (ms.pinned.includes(id)) ms.pinned = ms.pinned.filter((x) => x !== id);
+      else { ms.pinned.push(id); ms.hidden = ms.hidden.filter((x) => x !== id); }
+    });
+  }
+  const pinIcon = (n) => icon('M7.5 3.5h5M8.5 3.5v4.2L6 10.5v1.5h8v-1.5l-2.5-2.8V3.5M10 12v4.5', n || 14);
+  function pinButton(cls) {
+    const b = h('button', { type: 'button', class: `pin-btn ${cls}`, 'aria-pressed': 'false' }, pinIcon(15));
+    b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); if (b.dataset.host) togglePin(b.dataset.host); });
+    return b;
+  }
+  function setPin(b, id, name) {
+    const on = isPinned(id);
+    b.dataset.host = id;
+    b.setAttribute('aria-pressed', String(on));
+    b.setAttribute('aria-label', `${on ? 'Unpin' : 'Pin'} ${name}`);
+    b.title = on ? 'Pinned: shown first. Click to unpin.' : 'Pin: show this machine first';
   }
 
   // ---------------------------------------------------------------- tables
@@ -904,7 +1043,7 @@
       const tb = $(':scope > table:not(.is-leaving) > tbody', box);
       if (!tb) return;
       const fill = (tr, it) => {
-        const sig = JSON.stringify([it, spec.sig ? spec.sig(it) : null]) + state.colorSig;
+        const sig = JSON.stringify([it, spec.sig ? spec.sig(it) : null]) + state.colorSig + fmtSig();
         if (tr._sig === sig) return;
         tr._sig = sig;
         tr.replaceChildren(...spec.row(it));
@@ -956,7 +1095,7 @@
 
   function renderRecent(ov) {
     const all = ov.recent || [];
-    const LIMIT = 12;
+    const LIMIT = cfg.general.recentRows;
     const list = state.showAllRecent ? all : all.slice(0, LIMIT);
     const btn = $('#recent-toggle');
     btn.hidden = all.length <= LIMIT;
@@ -1063,6 +1202,20 @@
   // Area under a line down to a fixed baseline, one closed shape per run of values.
   const areaPath = (pts, base, smooth) => runsOf(pts).map((r) =>
     `${curve(r, smooth)}L${f1(r[r.length - 1][0])} ${f1(base)}L${f1(r[0][0])} ${f1(base)}Z`).join('');
+  // A stacked band: along `top` and back along `base` (points or null, by
+  // index), one closed shape per run of values.
+  function bandPath(top, base, smooth) {
+    let d = '', run = [];
+    const flush = () => {
+      if (run.length) d += `${curve(run.map((i) => top[i]), smooth)}${curve(run.map((i) => base[i]).reverse(), smooth).replace(/^M/, 'L')}Z`;
+      run = [];
+    };
+    top.forEach((p, i) => { if (p) run.push(i); else flush(); });
+    flush();
+    return d;
+  }
+  // Kinds drawn from values summed up per step.
+  const stacks = (kind) => kind === 'columns' || kind === 'stacked';
 
   function yScale(maxV, fixed, integer) {
     const top0 = fixed || (maxV > 0 ? maxV : 1);
@@ -1085,9 +1238,11 @@
     return { step, ticks: out };
   }
 
+  let chartSeq = 0;
   function setupChart(fig, id) {
     const plot = $('.plot', fig);
-    const c = { id, fig, plot, cfg: null, idx: null, frame: 0, view: null, sk: null };
+    // Its own clip id: a chart removed in settings fades out beside the one that replaces it.
+    const c = { id: `${id}-${++chartSeq}`, fig, plot, cfg: null, idx: null, frame: 0, view: null, sk: null };
     plot.tabIndex = 0;
     plot.addEventListener('pointermove', (e) => hover(c, e));
     plot.addEventListener('pointerdown', (e) => hover(c, e));
@@ -1115,13 +1270,14 @@
     const t = cfg.t, n = t.length;
     const vals = cfg.series.map((sr) => sr.values);
     let top = cfg.yMax || 100;
-    if (cfg.kind !== 'strips') {
+    // Rows share a fixed top when given one; otherwise every kind fits its data.
+    if (cfg.kind !== 'strips' || !cfg.yMax) {
       let maxV = 0;
       for (let i = 0; i < n; i++) {
         let sum = 0;
         for (const v of vals) {
           if (!isNum(v[i])) continue;
-          if (cfg.kind === 'columns') sum += v[i]; else if (v[i] > maxV) maxV = v[i];
+          if (stacks(cfg.kind)) sum += v[i]; else if (v[i] > maxV) maxV = v[i];
         }
         if (sum > maxV) maxV = sum;
       }
@@ -1154,9 +1310,10 @@
     return c.sk;
   }
 
-  // cfg.kind: 'lines' (smooth, one per series), 'columns' (stacked) or
-  // 'strips' (a row per series, each 0..yMax). `view`: a frame of a morph;
-  // the config's own view when omitted.
+  // cfg.kind: 'lines' (one per series), 'area' (a filled line per series),
+  // 'columns' or 'stacked' (columns or areas, stacked) or 'strips' (a row per
+  // series, each 0..top); `cfg.smooth` curves the lines. `view`: a frame of
+  // a morph; the config's own view when omitted.
   function drawChart(c, view) {
     const { plot, cfg } = c;
     if (!cfg) return;
@@ -1184,10 +1341,11 @@
     apply(sk.svg, { viewBox: `0 0 ${W} ${H}`, width: W, height: H, 'aria-label': cfg.summary });
     apply(sk.clip, { x: P.l, y: 0, width: pw, height: H - P.b + 2 });
 
-    // Columns stack: drawn from cumulative values; tooltips read raw ones.
+    // Stacks are drawn from cumulative values; tooltips read raw ones.
     let tops = vals;
     let bases = null;
-    if (cfg.kind === 'columns') {
+    const smooth = cfg.smooth !== false;
+    if (stacks(cfg.kind)) {
       const acc = new Array(n).fill(0);
       bases = []; tops = [];
       for (const sv of vals) {
@@ -1225,8 +1383,8 @@
         const y0 = P.t + k * (rowH + gap);
         const pts = vals[k].map((val, i) => (isNum(val) ? [xAt(i), rowY(k, val)] : null));
         marks.push(s('rect', { class: 'strip-bg', x: P.l, y: f1(y0), width: pw, height: f1(rowH), rx: 3 }));
-        marks.push(s('path', { class: 'strip-area', d: areaPath(pts, y0 + rowH, true), vars: { '--c': sr.color } }));
-        marks.push(s('path', { class: 'strip-line', d: linePath(pts, true), vars: { '--c': sr.color } }));
+        marks.push(s('path', { class: 'strip-area', d: areaPath(pts, y0 + rowH, smooth), vars: { '--c': sr.color } }));
+        marks.push(s('path', { class: 'strip-line', d: linePath(pts, smooth), vars: { '--c': sr.color } }));
       });
       // Names sit left of the plot, outside its clip.
       cfg.series.forEach((sr, k) => {
@@ -1254,11 +1412,22 @@
         marks.push(g);
       });
       dotY = (k, i) => (isNum(vals[k][i]) ? Y(tops[k][i]) : null);
+    } else if (cfg.kind === 'stacked') {
+      cfg.series.forEach((sr, k) => {
+        // A machine without a value is a band of no height, so the bands
+        // above it stay joined to it.
+        const top = vals[k].map((_, i) => [xAt(i), Y(tops[k][i])]);
+        const base = vals[k].map((_, i) => [xAt(i), Y(bases[k][i])]);
+        marks.push(s('path', { class: 'band', d: bandPath(top, base, smooth), vars: { '--c': sr.color } }));
+        marks.push(s('path', { class: 'line line-thin', d: linePath(top, smooth), vars: { '--c': sr.color } }));
+      });
+      dotY = (k, i) => (isNum(vals[k][i]) ? Y(tops[k][i]) : null);
     } else {
+      const filled = cfg.kind === 'area', one = cfg.series.length === 1;
       cfg.series.forEach((sr, k) => {
         const pts = vals[k].map((val, i) => (isNum(val) ? [xAt(i), Y(val)] : null));
-        if (cfg.series.length === 1) marks.push(s('path', { class: 'area area-soft', d: areaPath(pts, Y(0), true), vars: { '--c': sr.color } }));
-        marks.push(s('path', { class: 'line', d: linePath(pts, true), vars: { '--c': sr.color } }));
+        if (filled || one) marks.push(s('path', { class: `area${filled ? (one ? '' : ' area-many') : ' area-soft'}`, d: areaPath(pts, Y(0), smooth), vars: { '--c': sr.color } }));
+        marks.push(s('path', { class: 'line', d: linePath(pts, smooth), vars: { '--c': sr.color } }));
       });
       dotY = (k, i) => (isNum(vals[k][i]) ? Y(vals[k][i]) : null);
     }
@@ -1341,7 +1510,7 @@
   function setChart(c, cfg) {
     const from = c.view, prev = c.cfg;
     c.cfg = cfg;
-    legend(c, cfg.series, cfg.kind !== 'strips');
+    legend(c, cfg.series, cfg.kind !== 'strips' && cfg.legend !== false);
     const to = viewOf(cfg);
     if (from && prev && prev.kind === cfg.kind && from.keys === to.keys && to.t.length >= 2) {
       frames(c, (p) => drawChart(c, p < 1 ? morphView(from, to, p) : null));
@@ -1358,26 +1527,30 @@
     return `${Number.isInteger(hrs) ? hrs : hrs.toFixed(1)} h`;
   }
 
-  // The Activity charts, in order: `build(x)` gives a chart's config and its
-  // subtitle from the shared context `chartContext()` makes.
-  const CHARTS = [
-    { id: 'jobs', title: 'Jobs', sub: 'Running and queued, stacked', build: jobsChart },
-    { id: 'cpu', title: 'CPU', sub: 'A row per machine', build: cpuChart },
-    { id: 'busy', title: 'Busy slots', sub: 'Stacked per machine', build: busyChart },
-    { id: 'ram', title: 'Memory', sub: 'Used per machine', build: ramChart },
-  ];
+  // The Activity charts (settings.js lists them): `build(x, o)` gives a
+  // chart's config and subtitle from the shared context `chartContext()`
+  // makes and the chart's own settings `o`. Which show, in what order, is a
+  // setting too.
+  const CHART_BUILD = { jobs: jobsChart, cpu: cpuChart, busy: busyChart, ram: ramChart, util: utilChart, disk: diskChart };
+  const CHARTS = RS.CHARTS.map((d) => ({ id: d.key, title: d.label, sub: d.sub, build: CHART_BUILD[d.key] }));
+  const chartDef = new Map(CHARTS.map((d) => [d.id, d]));
+  const shownCharts = () => RS.shown(cfg.charts.order, cfg.charts.hidden).map((k) => chartDef.get(k)).filter(Boolean);
   const chartById = new Map();
 
   // The chart cards, before any data: their plots hold their height.
   function renderChartFrames() {
-    reconcile($('#charts-grid'), CHARTS, (d) => d.id, (d) => {
-      const fig = h('figure', { id: `chart-${d.id}`, class: 'chart card' },
+    const grid = $('#charts-grid');
+    grid.style.setProperty('--chart-cols', String(cfg.charts.columns));
+    grid.style.setProperty('--plot-h', `${RS.HEIGHTS[cfg.charts.height]}px`);
+    grid.dataset.cols = String(cfg.charts.columns);
+    resize(grid, () => reconcile(grid, shownCharts(), (d) => d.id, (d) => {
+      const fig = h('figure', { class: 'chart card' },
         h('figcaption', {}, h('h3', { text: d.title }), h('p', { class: 'chart-sub', text: d.sub })),
         h('ul', { class: 'legend' }),
         h('div', { class: 'plot' }));
       chartById.set(d.id, setupChart(fig, d.id));
       return fig;
-    }, null);
+    }, null));
   }
 
   function chartContext() {
@@ -1396,41 +1569,68 @@
     };
   }
 
-  function jobsChart(x) {
-    const jg = regroup(x.t, x.step, x.kCol, [x.m.running || [], x.m.queued || []]);
+  // What every chart's config carries from its settings.
+  const common = (x, o) => ({ ...x.span, kind: o.style, smooth: o.smooth, legend: cfg.charts.legend });
+  // Columns and stacks average into fewer, wider groups than lines.
+  const groupFor = (x, o) => (stacks(o.style) ? x.kCol : x.kLine);
+  const meanOf = (vals) => { const v = (vals || []).filter(isNum); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
+
+  // The machines a chart shows: all, its top N by `score` over the range, or
+  // the ones picked (a picked machine not in the data is skipped). In name
+  // order, so their colours and rows stay put.
+  function chartHosts(o, hosts, score) {
+    if (o.hosts === 'pick') return hosts.filter((y) => o.pick.includes(y.id));
+    if (o.hosts !== 'top') return hosts;
+    const ranked = hosts.map((y) => [y, score(y)]).filter((p) => isNum(p[1])).sort((a, b) => b[1] - a[1]).slice(0, o.top);
+    const keep = new Set(ranked.map((p) => p[0]));
+    return hosts.filter((y) => keep.has(y));
+  }
+  // `· top 3 by average` and the like, for a subtitle.
+  function hostsNote(o, by) {
+    if (o.hosts === 'top') return ` · top ${o.top} by ${by}`;
+    if (o.hosts === 'pick') return ` · ${o.pick.length} chosen`;
+    return '';
+  }
+  const averaged = (g, x) => (g.step > x.step ? ` · average per ${per(g.step)}` : '');
+  const pctTop = (o) => (o.scale === 'full' ? 100 : undefined);
+
+  function jobsChart(x, o) {
+    const jg = regroup(x.t, x.step, groupFor(x, o), [x.m.running || [], x.m.queued || []]);
     const jobs = [
       { key: 'running', name: 'Running', color: 'var(--s1)', values: jg.series[0] },
       { key: 'queued', name: 'Queued', color: 'var(--s2)', values: jg.series[1] },
     ];
     return {
-      sub: jg.step > x.step ? `Average per ${per(jg.step)}, stacked` : 'Running and queued, stacked',
+      sub: `Running and queued${stacks(o.style) ? ', stacked' : ''}${averaged(jg, x)}`,
       cfg: {
-        ...x.span, kind: 'columns', t: jg.t, step: jg.step, series: jobs, integer: true, fmtVal: x.fmtAvg, fmtTick: x.intTick,
+        ...common(x, o), t: jg.t, step: jg.step, series: jobs, integer: true, fmtVal: x.fmtAvg, fmtTick: x.intTick,
         summary: summarize('Jobs running and queued', jobs, x.fmtAvg),
       },
     };
   }
 
-  function cpuChart(x) {
-    const cg = regroup(x.t, x.step, x.kLine, x.hosts.map((y) => y.cpu || []));
-    const cpu = x.hosts.map((y, k) => ({ ...x.hostSeries(y), values: cg.series[k], raw: y.cpu }));
+  function cpuChart(x, o) {
+    const hosts = chartHosts(o, x.hosts, (y) => meanOf(y.cpu));
+    const cg = regroup(x.t, x.step, groupFor(x, o), hosts.map((y) => y.cpu || []));
+    const cpu = hosts.map((y, k) => ({ ...x.hostSeries(y), values: cg.series[k], raw: y.cpu }));
     return {
-      sub: cg.step > x.step ? `A row per machine · average per ${per(cg.step)}` : 'A row per machine',
-      cfg: { ...x.span, kind: 'strips', t: cg.t, step: cg.step, series: cpu, yMax: 100, fmtVal: fmtPct, fmtTick: x.pctTick, summary: summarize('CPU per machine', cpu, fmtPct) },
+      sub: `${o.style === 'strips' ? 'A row per machine' : 'Per machine'}${hostsNote(o, 'average')}${averaged(cg, x)}`,
+      cfg: { ...common(x, o), t: cg.t, step: cg.step, series: cpu, yMax: pctTop(o), fmtVal: fmtPct, fmtTick: x.pctTick, summary: summarize('CPU per machine', cpu, fmtPct) },
     };
   }
 
-  function busyChart(x) {
-    const n = x.hosts.length;
-    const bg = regroup(x.t, x.step, x.kCol, [...x.hosts.map((y) => y.busy || []), ...x.hosts.map((y) => y.slots || [])]);
-    const busy = x.hosts.map((y, k) => {
+  function busyChart(x, o) {
+    const hosts = chartHosts(o, x.hosts, (y) => meanOf(y.busy));
+    const n = hosts.length;
+    const bg = regroup(x.t, x.step, groupFor(x, o), [...hosts.map((y) => y.busy || []), ...hosts.map((y) => y.slots || [])]);
+    const busy = hosts.map((y, k) => {
       const values = bg.series[k], slots = bg.series[n + k];
       return { ...x.hostSeries(y), values, fmtAt: (i) => (isNum(values[i]) ? `${x.fmtAvg(values[i])}${isNum(slots[i]) ? ` / ${x.fmtAvg(slots[i])}` : ''}` : '—') };
     });
     return {
-      sub: bg.step > x.step ? `Average per ${per(bg.step)}, stacked per machine` : 'Stacked per machine',
+      sub: `${stacks(o.style) ? 'Stacked per machine' : 'Per machine'}${hostsNote(o, 'average')}${averaged(bg, x)}`,
       cfg: {
-        ...x.span, kind: 'columns', t: bg.t, step: bg.step, series: busy, integer: true, fmtVal: x.fmtAvg, fmtTick: x.intTick, summary: summarize('Busy runner slots per machine, stacked', busy, x.fmtAvg),
+        ...common(x, o), t: bg.t, step: bg.step, series: busy, integer: true, fmtVal: x.fmtAvg, fmtTick: x.intTick, summary: summarize('Busy runner slots per machine', busy, x.fmtAvg),
         total: (i) => {
           const sum = busy.reduce((a, sr) => a + (isNum(sr.values[i]) ? sr.values[i] : 0), 0);
           return h('div', { class: 'tip-row tip-total' }, h('span', { class: 'tip-key tip-key-none' }), h('b', { class: 'num', text: x.fmtAvg(sum) }), h('span', { class: 'tip-name', text: 'Total busy' }));
@@ -1439,16 +1639,48 @@
     };
   }
 
-  function ramChart(x) {
-    const n = x.hosts.length;
-    const rg = regroup(x.t, x.step, x.kLine, [...x.hosts.map(ramPct), ...x.hosts.map((y) => y.ram_used || [])]);
-    const ram = x.hosts.map((y, k) => {
+  function ramChart(x, o) {
+    const hosts = chartHosts(o, x.hosts, (y) => meanOf(ramPct(y)));
+    const n = hosts.length;
+    const rg = regroup(x.t, x.step, groupFor(x, o), [...hosts.map(ramPct), ...hosts.map((y) => y.ram_used || [])]);
+    const ram = hosts.map((y, k) => {
       const values = rg.series[k], used = rg.series[n + k];
       return { ...x.hostSeries(y), values, raw: ramPct(y), fmtAt: (i) => (isNum(values[i]) ? `${fmtPct(values[i])} · ${fmtBytes(used[i])}` : '—') };
     });
     return {
-      sub: rg.step > x.step ? `Used per machine · average per ${per(rg.step)}` : 'Used per machine',
-      cfg: { ...x.span, kind: 'lines', t: rg.t, step: rg.step, series: ram, yMax: 100, fmtVal: fmtPct, fmtTick: x.pctTick, summary: summarize('Memory used per machine', ram, fmtPct) },
+      sub: `${o.style === 'strips' ? 'A row per machine' : 'Used per machine'}${hostsNote(o, 'average')}${averaged(rg, x)}`,
+      cfg: { ...common(x, o), t: rg.t, step: rg.step, series: ram, yMax: pctTop(o), fmtVal: fmtPct, fmtTick: x.pctTick, summary: summarize('Memory used per machine', ram, fmtPct) },
+    };
+  }
+
+  // The fleet's busy share of all its slots, per sample.
+  function utilChart(x, o) {
+    const util = x.t.map((_, i) => {
+      let busy = 0, slots = 0;
+      for (const y of x.hosts) {
+        const b = (y.busy || [])[i], n = (y.slots || [])[i];
+        if (isNum(b) && isNum(n)) { busy += b; slots += n; }
+      }
+      return slots > 0 ? (busy / slots) * 100 : null;
+    });
+    const ug = regroup(x.t, x.step, groupFor(x, o), [util]);
+    const series = [{ key: 'util', name: 'Slots busy', color: 'var(--s3)', values: ug.series[0] }];
+    return {
+      sub: `Busy share of every slot${averaged(ug, x)}`,
+      cfg: { ...common(x, o), t: ug.t, step: ug.step, series, yMax: pctTop(o), fmtVal: fmtPct, fmtTick: x.pctTick, summary: summarize('Share of runner slots busy', series, fmtPct) },
+    };
+  }
+
+  // Free disk per machine, in GiB (or GB), the least free first for top N.
+  function diskChart(x, o) {
+    const gb = gigabyte();
+    const hosts = chartHosts(o, x.hosts, (y) => { const m = meanOf(y.disk_free); return isNum(m) ? -m : null; });
+    const dg = regroup(x.t, x.step, groupFor(x, o), hosts.map((y) => (y.disk_free || []).map((v) => (isNum(v) ? v / gb : null))));
+    const fmtGb = (v) => (isNum(v) ? fmtBytes(v * gb) : '—');
+    const disk = hosts.map((y, k) => ({ ...x.hostSeries(y), values: dg.series[k] }));
+    return {
+      sub: `${o.style === 'strips' ? 'A row per machine' : 'Per machine'}${hostsNote(o, 'least free')}${averaged(dg, x)}`,
+      cfg: { ...common(x, o), t: dg.t, step: dg.step, series: disk, fmtVal: fmtGb, fmtTick: fmtGb, summary: summarize('Free disk per machine', disk, fmtGb) },
     };
   }
 
@@ -1456,11 +1688,11 @@
     renderChartFrames();
     assignHostColors();
     const x = chartContext();
-    for (const d of CHARTS) {
+    for (const d of shownCharts()) {
       const c = chartById.get(d.id);
-      const { cfg, sub } = d.build(x);
-      $('.chart-sub', c.fig).textContent = sub;
-      setChart(c, cfg);
+      const built = d.build(x, cfg.charts.per[d.id]);
+      $('.chart-sub', c.fig).textContent = built.sub;
+      setChart(c, built.cfg);
     }
     const m = x.m;
     $('#charts-sub').textContent = m.step_secs ? `${RANGE_LABEL[state.range]} · ${m.step_secs % 60 ? `${m.step_secs}s` : `${m.step_secs / 60} min`} samples` : RANGE_LABEL[state.range];
@@ -1471,16 +1703,20 @@
     box.replaceChildren(...RANGES.map((r) => h('button', {
       type: 'button', class: 'seg-btn', 'aria-pressed': String(r === state.range), 'data-range': r, text: r,
       'aria-label': `Show ${RANGE_LABEL[r]}`,
-      onclick: () => {
-        if (r === state.range) return;
-        state.range = r; saveRange(r);
-        $$('.seg-btn', box).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.range === r)));
-        segThumb(box);
-        $('#charts-sub').textContent = RANGE_LABEL[r];
-        loadMetrics();
-      },
+      onclick: () => { if (r !== state.range) update((c) => { c.charts.range = r; }); },
     })));
     segThumb(box);
+  }
+
+  // The range switch follows the setting, wherever it was changed.
+  function syncRange() {
+    if (cfg.charts.range === state.range) return;
+    const r = state.range = cfg.charts.range;
+    const box = $('#range');
+    $$('.seg-btn', box).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.range === r)));
+    segThumb(box);
+    $('#charts-sub').textContent = RANGE_LABEL[r];
+    if (!$('#app').hidden) loadMetrics();
   }
 
   // ======================================================== remote commands
@@ -1791,8 +2027,8 @@
   // ------------------------------------------------------------ audit log
   function buildAuditControls() {
     $('#audit-filter').replaceChildren(...[['changes', 'Changes'], ['all', 'All']].map(([v, t]) => h('button', {
-      type: 'button', class: 'seg-btn', 'data-v': v, text: t, 'aria-pressed': String((v === 'all') === state.auditAll),
-      onclick: () => { state.auditAll = v === 'all'; saveFlag('rm.audit.all', state.auditAll); renderAudit(true); },
+      type: 'button', class: 'seg-btn', 'data-v': v, text: t, 'aria-pressed': String(v === cfg.general.auditFilter),
+      onclick: () => update((c) => { c.general.auditFilter = v; }),
     })));
     segThumb($('#audit-filter'));
     $('#audit-toggle').addEventListener('click', () => {
@@ -1837,8 +2073,9 @@
 
   function fillAudit(force) {
     const all = state.audit || [];
-    const list = state.auditAll ? all : all.filter((c) => !isRead(c));
-    const sig = JSON.stringify([all, state.auditAll, state.auditOpen, state.showAllAudit, state.auditErr]);
+    const showAll = cfg.general.auditFilter === 'all';
+    const list = showAll ? all : all.filter((c) => !isRead(c));
+    const sig = JSON.stringify([all, showAll, state.auditOpen, state.showAllAudit, state.auditErr, cfg.general.auditRows]);
     if (!force && sig === state.auditSig) return;
     state.auditSig = sig;
     $('#audit-section').classList.toggle('is-collapsed', !state.auditOpen);
@@ -1848,11 +2085,11 @@
     tog.setAttribute('aria-expanded', String(state.auditOpen));
     const filter = $('#audit-filter');
     filter.hidden = !state.auditOpen;
-    $$('.seg-btn', filter).forEach((b) => b.setAttribute('aria-pressed', String((b.dataset.v === 'all') === state.auditAll)));
+    $$('.seg-btn', filter).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.v === cfg.general.auditFilter)));
     segThumb(filter);
     const box = $('#audit');
     if (!state.auditOpen) { collapse(box, false); return; }
-    const LIMIT = 15;
+    const LIMIT = cfg.general.auditRows;
     const shown = state.showAllAudit ? list : list.slice(0, LIMIT);
     const reads = all.length - list.length;
     const errText = state.auditErr ? `The log could not be refreshed. ${state.auditErr}` : null;
@@ -1899,6 +2136,7 @@
 
   function setupDrawer() {
     const dlg = $('#drawer');
+    $('#dw-close').before(pinButton('pin-drawer'));
     $('#dw-close').addEventListener('click', () => closeDrawer());
     dlg.addEventListener('cancel', (e) => { e.preventDefault(); closeDrawer(); });
     dlg.addEventListener('close', () => { if (dw.id) closeDrawer(); });
@@ -1916,7 +2154,7 @@
 
   function trapTab(e) {
     if (e.key !== 'Tab') return;
-    const dlg = $('#drawer');
+    const dlg = e.currentTarget;
     const f = $$('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])', dlg)
       .filter((el) => !el.disabled && !el.closest('fieldset:disabled') && (el.checkVisibility ? el.checkVisibility({ visibilityProperty: true }) : el.getClientRects().length));
     if (!f.length) return;
@@ -1991,6 +2229,7 @@
     const doc = dw.cfg && dw.cfg.config;
     const name = (x && (x.name || x.hostname)) || (doc && doc.host && doc.host.name) || 'Machine';
     const rc = dw.rc != null ? dw.rc : !!(x && x.remote_changes);
+    setPin($('.pin-drawer'), dw.id, name);
     const sig = JSON.stringify([name, !!state.ov, x && [x.hostname, x.os, x.arch, x.online, x.unfit, x.draining, !!x.manageable, !!x.remote_changes], dw.rc]);
     if (sig === dw.sig) return;
     dw.sig = sig;
@@ -2503,6 +2742,766 @@
     refocus(fk, key, !res.ok);
     loadAudit();
     if (res.ok) loadOverview();
+  }
+
+  // ============================================================== settings
+  // Every change goes through update(): normalized, kept in this browser at
+  // once, sent to the coordinator a moment later, and applied to the page
+  // with the usual animations (no reload).
+  const clone = (v) => JSON.parse(JSON.stringify(v));
+  const getPath = (o, path) => path.split('.').reduce((a, k) => (a == null ? a : a[k]), o);
+  function setPath(o, path, v) {
+    const ks = path.split('.'), last = ks.pop();
+    ks.reduce((a, k) => a[k], o)[last] = clone(v);
+  }
+
+  function update(mutate) {
+    const next = clone(cfg);
+    mutate(next);
+    replaceSettings(next);
+  }
+  // `remote`: the settings came from elsewhere (the coordinator, another
+  // tab), so they are not sent back.
+  function replaceSettings(next, remote) {
+    const prev = cfg, n = RS.normalize(next);
+    if (RS.same(n, prev)) return false;
+    cfg = n;
+    if (remote !== 'tab') storeLocal();
+    if (!remote) saveSoon();
+    applyAll(prev);
+    return true;
+  }
+
+  // Brings the page in line with the settings: each render is a diff, so
+  // what did not change stays put and what did moves.
+  function applyAll(prev) {
+    const changed = (k) => !RS.same(prev[k], cfg[k]);
+    if (changed('general')) {
+      applyGeneral();
+      if (prev.general.refresh !== cfg.general.refresh && state.timers.ov) {
+        clearTimeout(state.timers.ov);
+        state.timers.ov = setTimeout(loadOverview, Math.min(overviewMs(), 1000));
+      }
+    }
+    if (changed('layout')) applyLayout();
+    syncRange();
+    if (state.ov) renderOverview(state.ov);
+    else if (changed('kpis')) renderSkeletons();
+    if (state.metrics) renderCharts(); else renderChartFrames();
+    if (changed('general')) { renderAudit(true); tick(); }
+  }
+
+  const darkScheme = matchMedia('(prefers-color-scheme: dark)');
+  // Theme, motion, density and compact tables, as attributes the stylesheet reads.
+  function applyGeneral() {
+    const g = cfg.general, root = document.documentElement;
+    const set = (k, v) => { if (v == null) delete root.dataset[k]; else root.dataset[k] = v; };
+    set('theme', g.theme === 'system' ? null : g.theme);
+    set('motion', g.motion === 'system' ? null : g.motion);
+    set('density', g.density === 'compact' ? 'compact' : null);
+    set('tables', g.compactTables ? 'compact' : null);
+    const dark = g.theme === 'dark' || (g.theme === 'system' && darkScheme.matches);
+    for (const m of $$('meta[name="theme-color"]')) {
+      if (!m.dataset.color) m.dataset.color = m.content;
+      m.content = g.theme === 'system' ? m.dataset.color : dark ? '#0a0b0d' : '#f6f7f9';
+    }
+    if (lessMotion()) settleMotion();
+  }
+
+  // The sections in their order, the hidden ones out, Queue and Running
+  // side by side or stacked; the rest slide to their new places.
+  function applyLayout() {
+    const main = $('#main'), L = cfg.layout;
+    const secs = L.order.map((k) => $(`:scope > [data-section="${k}"]`, main)).filter(Boolean);
+    const split = $('[data-section="queue-running"]', main);
+    const moving = [...secs, ...$$(':scope > .section', split)];
+    const shown = [];
+    flip(moving, () => {
+      for (const el of secs) {
+        main.append(el);
+        const off = L.hidden.includes(el.dataset.section);
+        if (!off && el.hasAttribute('data-off')) shown.push(el);
+        el.toggleAttribute('data-off', off);
+      }
+      split.classList.toggle('is-stacked', L.split === 'stacked');
+    });
+    for (const el of shown) if (liveMotion()) el.animate([{ opacity: 0, transform: 'translateY(8px)' }, { opacity: 1, transform: 'none' }], { duration: DUR.slow, easing: EASE });
+  }
+
+  // ------------------------------------------------------------- syncing
+  const SAVE_DELAY = 700;
+  const sync = { timer: 0, state: 'idle', note: '', dirty: false, inflight: false, again: false };
+
+  function saveSoon() {
+    sync.dirty = true;
+    setSync('pending');
+    clearTimeout(sync.timer);
+    sync.timer = setTimeout(pushSettings, SAVE_DELAY);
+  }
+
+  async function pushSettings(keepalive) {
+    clearTimeout(sync.timer);
+    if (sync.inflight) { sync.again = true; return; }
+    sync.inflight = true;
+    sync.dirty = false;
+    setSync('saving');
+    const r = await call('/api/settings', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg), keepalive: keepalive === true,
+    });
+    sync.inflight = false;
+    if (!r.ok) { sync.dirty = true; setSync('error', r.status === 401 ? '' : r.error || r.hint); }
+    else setSync(sync.dirty ? 'pending' : 'saved');
+    if (sync.again) { sync.again = false; if (sync.dirty) pushSettings(); }
+  }
+
+  // The coordinator's copy wins over this browser's, unless this browser
+  // changed something meanwhile. With none there yet, this browser's
+  // becomes the account's.
+  async function loadServerSettings() {
+    const r = await call('/api/settings');
+    if (!r.ok) { if (r.status !== 401) setSync('error', 'Your saved settings could not be loaded; these are this browser’s.'); return; }
+    if (sync.dirty || sync.inflight) return;
+    const remote = r.body && r.body.settings;
+    if (remote) {
+      replaceSettings(remote, 'server');
+      setSync('saved');
+      if (st.open) renderSettings();
+    } else if (!RS.same(cfg, RS.defaults())) saveSoon();
+  }
+
+  function setSync(kind, note) {
+    sync.state = kind;
+    sync.note = note || '';
+    $('#settings-btn').classList.toggle('has-error', kind === 'error');
+    $('#settings-btn').title = kind === 'error' ? 'Settings · not saved' : 'Settings';
+    renderStatus();
+  }
+
+  function renderStatus() {
+    const box = $('#st-status');
+    if (!box) return;
+    let kids;
+    if (st.undo) {
+      kids = [h('span', { text: st.undo.text }), h('button', { type: 'button', class: 'link-btn', text: 'Undo', 'data-fk': 'undo', onclick: undoSettings })];
+    } else if (st.msg) {
+      kids = [h('span', { class: st.msg.kind === 'err' ? 'text-err' : null, text: st.msg.text })];
+    } else {
+      const text = {
+        idle: 'Saved to your GitHub account as you go',
+        pending: 'Saving…', saving: 'Saving…',
+        saved: 'Saved to your account',
+        error: 'Not saved',
+      }[sync.state];
+      kids = [
+        h('i', { class: `st-dot st-dot-${sync.state}`, 'aria-hidden': 'true' }),
+        h('span', { text }),
+        sync.state === 'error' && sync.note ? h('span', { class: 'muted', text: ` · ${sync.note}` }) : null,
+        sync.state === 'error' ? h('button', { type: 'button', class: 'link-btn', text: 'Retry', onclick: () => pushSettings() }) : null,
+      ];
+    }
+    const sig = JSON.stringify([sync.state, sync.note, st.undo && st.undo.text, st.msg]);
+    if (box.dataset.sig === sig) return;
+    box.dataset.sig = sig;
+    box.replaceChildren(...kids.filter(Boolean));
+    fadeIn(box, DUR.fast);
+  }
+
+  // A message in the footer for a few seconds (an import that failed).
+  function notify(text, kind) {
+    clearTimeout(st.msgTimer);
+    st.msg = { text, kind };
+    renderStatus();
+    st.msgTimer = setTimeout(() => { st.msg = null; renderStatus(); }, 6000);
+  }
+
+  // A reset or an import can be taken back for a while.
+  function offerUndo(before, text) {
+    clearTimeout(st.undoTimer);
+    st.undo = { before, text };
+    renderStatus();
+    st.undoTimer = setTimeout(() => { st.undo = null; renderStatus(); }, 10000);
+  }
+  function undoSettings() {
+    if (!st.undo) return;
+    const before = st.undo.before;
+    st.undo = null;
+    replaceSettings(before);
+    renderSettings();
+    $('#st-close').focus();
+  }
+
+  // ----------------------------------------------------------- the view
+  const TABS = [['general', 'General'], ['layout', 'Layout'], ['machines', 'Machines'], ['charts', 'Charts'], ['kpis', 'Tiles']];
+  const st = { open: false, tab: 'general', closing: null, expanded: new Set(), undo: null, msg: null, confirm: false, seq: 0 };
+
+  function setupSettings() {
+    const dlg = $('#settings');
+    $('#settings-btn').addEventListener('click', openSettings);
+    $('#st-close').addEventListener('click', () => closeSettings());
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); closeSettings(); });
+    dlg.addEventListener('click', (e) => { if (e.target === dlg) closeSettings(); });
+    dlg.addEventListener('keydown', trapTab);
+    const tabs = $('#st-tabs');
+    tabs.replaceChildren(...TABS.map(([k, label]) => h('button', {
+      type: 'button', role: 'tab', class: 'seg-btn', id: `st-tab-${k}`, 'aria-controls': 'st-body', 'data-tab': k, text: label,
+      onclick: () => selectTab(k),
+    })));
+    tabs.addEventListener('keydown', (e) => {
+      const i = TABS.findIndex((t) => t[0] === st.tab);
+      const j = { ArrowLeft: i - 1, ArrowRight: i + 1, Home: 0, End: TABS.length - 1 }[e.key];
+      if (j == null) return;
+      e.preventDefault();
+      const k = TABS[(j + TABS.length) % TABS.length][0];
+      selectTab(k);
+      $(`#st-tab-${k}`).focus();
+    });
+    $('#st-export').addEventListener('click', exportSettings);
+    $('#st-import').addEventListener('click', () => $('#st-file').click());
+    $('#st-file').addEventListener('change', importSettings);
+    $('#st-reset').addEventListener('click', () => setConfirm(true));
+    $('#st-reset-no').addEventListener('click', () => { setConfirm(false); $('#st-reset').focus(); });
+    $('#st-reset-yes').addEventListener('click', () => {
+      const before = cfg;
+      setConfirm(false);
+      if (replaceSettings(RS.defaults())) offerUndo(before, 'Every setting is back to its default.');
+      renderSettings();
+      $('#st-reset').focus();
+    });
+    // Another tab of this dashboard changed them: follow it.
+    window.addEventListener('storage', (e) => {
+      if (e.key !== SETTINGS_KEY || !e.newValue) return;
+      try { if (replaceSettings(JSON.parse(e.newValue), 'tab') && st.open) renderSettings(); } catch (_) { /* not ours to read */ }
+    });
+    // Leaving with a change not yet sent: send it now.
+    window.addEventListener('pagehide', () => { if (sync.dirty) pushSettings(true); });
+    document.addEventListener('visibilitychange', () => { if (document.hidden && sync.dirty) pushSettings(true); });
+  }
+
+  function setConfirm(on) {
+    st.confirm = on;
+    $('#st-actions').hidden = on;
+    $('#st-confirm').hidden = !on;
+    if (on) { $('#st-reset-no').focus(); fadeIn($('#st-confirm'), DUR.fast); }
+  }
+
+  function openSettings() {
+    const dlg = $('#settings');
+    if (dlg.open && !st.closing) return;
+    if (st.closing) { for (const a of st.closing) a.cancel(); st.closing = null; }
+    st.open = true;
+    setConfirm(false);
+    if (!dlg.open) dlg.showModal();
+    renderSettings(true);
+    segThumb($('#st-tabs'));
+    $('#st-close').focus();
+  }
+
+  function closeSettings() {
+    const dlg = $('#settings');
+    if (!st.open) return;
+    st.open = false;
+    const done = () => {
+      const anims = st.closing || [];
+      st.closing = null;
+      if (dlg.open) dlg.close();
+      for (const a of anims) a.cancel();
+      $('#settings-btn').focus();
+    };
+    if (!motionOk()) { done(); return; }
+    const away = matchMedia('(max-width: 720px)').matches ? 'translateY(24px)' : 'translateX(28px)';
+    const out = { duration: 200, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' };
+    const closing = [dlg.animate([{ transform: 'none', opacity: 1 }, { transform: away, opacity: 0 }], out)];
+    st.closing = closing;
+    closing[0].finished.then(() => { if (st.closing === closing) done(); }, () => {});
+    try { closing.push(dlg.animate([{ opacity: 1 }, { opacity: 0 }], { ...out, pseudoElement: '::backdrop' })); } catch (_) { /* the backdrop just goes */ }
+  }
+
+  function selectTab(k) {
+    if (k === st.tab) return;
+    st.tab = k;
+    $('#st-body').scrollTop = 0;
+    renderSettings(true);
+  }
+
+  const TAB_VIEW = { general: generalTab, layout: layoutTab, machines: machinesTab, charts: chartsTab, kpis: kpisTab };
+
+  // Builds the open tab. `fresh`: a new tab, faded in at the top; otherwise
+  // the same tab again (a reset, an import), keeping the scroll and focus.
+  function renderSettings(fresh) {
+    if (!st.open) return;
+    for (const b of $$('[role="tab"]', $('#st-tabs'))) {
+      const on = b.dataset.tab === st.tab;
+      b.setAttribute('aria-selected', String(on));
+      b.tabIndex = on ? 0 : -1;
+    }
+    segThumb($('#st-tabs'));
+    const body = $('#st-body');
+    const fk = document.activeElement && body.contains(document.activeElement) ? document.activeElement.dataset.fk : null;
+    const top = body.scrollTop;
+    st.seq = 0;
+    const view = h('div', { class: 'st-stack' }, TAB_VIEW[st.tab]());
+    body.replaceChildren(view);
+    body.setAttribute('aria-labelledby', `st-tab-${st.tab}`);
+    for (const seg of $$('.seg', view)) segThumb(seg);
+    if (fresh) {
+      if (motionOk()) view.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: DUR.base, easing: EASE });
+      return;
+    }
+    body.scrollTop = top;
+    const again = fk && $(`[data-fk="${CSS.escape(fk)}"]`, body);
+    if (again) again.focus({ preventScroll: true });
+  }
+
+  // ------------------------------------------------------------ controls
+  const uid = (p) => `st-${p}-${++st.seq}`;
+
+  // A card of related settings; `paths` are what its Reset puts back.
+  function group(title, hint, paths, ...kids) {
+    const isDefault = () => paths.every((p) => RS.same(getPath(cfg, p), getPath(RS.defaults(), p)));
+    const reset = paths.length ? h('button', {
+      type: 'button', class: 'link-btn st-reset', 'data-fk': `reset:${title}`, text: 'Reset', 'aria-label': `Reset ${title}`,
+      disabled: isDefault() || null,
+      onclick: () => {
+        const before = cfg, d = RS.defaults();
+        update((c) => { for (const p of paths) setPath(c, p, getPath(d, p)); });
+        offerUndo(before, `${title} reset to defaults.`);
+        renderSettings();
+      },
+    }) : null;
+    const el = h('section', { class: 'card st-group' },
+      h('header', { class: 'st-group-head' },
+        h('div', { class: 'st-group-id' }, h('h3', { class: 'st-group-title', text: title }), hint ? h('p', { class: 'st-hint', text: hint }) : null),
+        reset),
+      ...kids);
+    // A change in the card turns its Reset on or off.
+    el._sync = () => { if (reset) reset.disabled = isDefault(); };
+    el.addEventListener('st-change', () => el._sync());
+    return el;
+  }
+  const changed = (from) => from.dispatchEvent(new Event('st-change', { bubbles: true }));
+
+  // A setting: its name and hint, and its control (made by `make(labelId)`).
+  function row(label, hint, make) {
+    const id = uid('l');
+    const ctl = make(id);
+    // A switch or a stepper stays beside its name on a phone; wider controls go under it.
+    const inline = ctl.classList.contains('switch') || ctl.classList.contains('stepper');
+    return h('div', { class: `st-row${inline ? ' is-inline' : ''}` },
+      h('div', { class: 'st-label' }, h('span', { class: 'st-name', id, text: label }), hint ? h('span', { class: 'st-hint', text: hint }) : null),
+      h('div', { class: 'st-ctl' }, ctl));
+  }
+
+  function segCtl(path, options, labelId, after) {
+    const box = h('div', { class: 'seg seg-sm', role: 'group', 'aria-labelledby': labelId });
+    const press = () => { for (const b of $$('.seg-btn', box)) b.setAttribute('aria-pressed', String(b.dataset.v === String(getPath(cfg, path)))); };
+    box.append(...options.map(([v, text]) => h('button', {
+      type: 'button', class: 'seg-btn', 'data-v': String(v), 'data-fk': `${path}=${v}`, text,
+      onclick: (e) => {
+        update((c) => setPath(c, path, v));
+        press();
+        segThumb(box);
+        changed(e.currentTarget);
+        if (after) after();
+      },
+    })));
+    press();
+    return box;
+  }
+
+  function switchCtl(path, labelId, after, opts = {}) {
+    const get = () => (opts.invert ? !getPath(cfg, path) : !!getPath(cfg, path));
+    const b = h('button', {
+      type: 'button', class: 'switch st-switch', role: 'switch', 'aria-checked': String(get()), 'data-fk': path,
+      'aria-labelledby': labelId || null, 'aria-label': opts.label || null,
+    }, h('span', { class: 'switch-track', 'aria-hidden': 'true' }, h('i')));
+    b.addEventListener('click', () => {
+      const v = !getPath(cfg, path);
+      update((c) => setPath(c, path, v));
+      b.setAttribute('aria-checked', String(get()));
+      changed(b);
+      if (after) after();
+    });
+    return b;
+  }
+
+  function stepperCtl(path, min, max, step, labelId) {
+    const input = h('input', {
+      class: 'num-input', type: 'number', inputmode: 'numeric', min, max, step, value: getPath(cfg, path),
+      'aria-labelledby': labelId, 'data-fk': path,
+    });
+    const set = (v) => {
+      const n = clamp(Math.round(Number(v)), min, max);
+      if (!isFinite(n)) { input.value = getPath(cfg, path); return; }
+      update((c) => setPath(c, path, n));
+      input.value = getPath(cfg, path);
+      dec.disabled = n <= min; inc.disabled = n >= max;
+      changed(input);
+    };
+    const dec = h('button', { type: 'button', class: 'step-btn', 'aria-label': 'Fewer', text: '−', tabindex: -1, onclick: () => set(Number(input.value) - step) });
+    const inc = h('button', { type: 'button', class: 'step-btn', 'aria-label': 'More', text: '+', tabindex: -1, onclick: () => set(Number(input.value) + step) });
+    dec.disabled = getPath(cfg, path) <= min; inc.disabled = getPath(cfg, path) >= max;
+    input.addEventListener('change', () => set(input.value));
+    return h('div', { class: 'stepper' }, dec, input, inc);
+  }
+
+  function selectCtl(path, options, labelId) {
+    const sel = h('select', { class: 'input st-select', 'aria-labelledby': labelId, 'data-fk': path },
+      options.map(([v, text]) => h('option', { value: v, text, selected: v === getPath(cfg, path) || null })));
+    sel.addEventListener('change', () => { update((c) => setPath(c, path, sel.value)); changed(sel); });
+    return sel;
+  }
+
+  const gripIcon = () => s('svg', { viewBox: '0 0 20 20', width: 16, height: 16, 'aria-hidden': 'true' },
+    ...[[7.5, 5], [12.5, 5], [7.5, 10], [12.5, 10], [7.5, 15], [12.5, 15]].map(([cx, cy]) => s('circle', { cx, cy, r: 1.4, fill: 'currentColor' })));
+  const upIcon = () => icon('M6 12.5l4-4 4 4', 14);
+  const downIcon = () => icon('M6 8l4 4 4-4', 14);
+
+  function announce(text) {
+    const live = $('#st-live');
+    live.textContent = '';
+    requestAnimationFrame(() => { live.textContent = text; });
+  }
+
+  // A list to put in order and, with `spec.hidden`, to switch items on and
+  // off. A row moves by dragging its handle (mouse, pen or touch), by the
+  // arrow keys on the handle, or by its up and down buttons; the others
+  // slide out of its way. `spec`: { label, items: [{ key, label, sub, lead }],
+  // order, hidden, onOrder(keys), onShow(key, on), actions(key), detail(key) }.
+  function orderList(spec) {
+    const ul = h('ul', { class: 'olist', 'aria-label': spec.label });
+    const byKey = new Map(spec.items.map((it) => [it.key, it]));
+    const rows = () => $$(':scope > li', ul);
+    const keys = () => rows().map((li) => li.dataset.key);
+    const syncMoves = () => rows().forEach((li, i, all) => { li._up.disabled = i === 0; li._down.disabled = i === all.length - 1; });
+    const commit = () => { spec.onOrder(keys()); syncMoves(); changed(ul); };
+    const labelOf = (li) => byKey.get(li.dataset.key).label;
+
+    function moveBy(li, by, focus) {
+      const all = rows(), i = all.indexOf(li), j = i + by;
+      if (j < 0 || j >= all.length) return;
+      flip(all, () => ul.insertBefore(li, by < 0 ? all[j] : all[j].nextSibling));
+      commit();
+      if (focus) focus.focus({ preventScroll: false });
+      announce(`${labelOf(li)}, position ${j + 1} of ${all.length}`);
+    }
+
+    function drag(e, li, handle) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      // On the window, not the handle: the row moves in the document as it
+      // passes others, which would drop a pointer capture.
+      const id = e.pointerId;
+      const scroller = ul.closest('.dw-body');
+      const before = keys().join('\n');
+      let y0 = e.clientY, dy = 0, moving = false, lastY = e.clientY;
+      const place = () => { li.style.transform = `translateY(${dy}px)`; };
+      const reorder = () => {
+        const r = li.getBoundingClientRect(), mid = r.top + r.height / 2;
+        const others = rows().filter((x) => x !== li);
+        const next = others.find((o) => { const q = o.getBoundingClientRect(); return mid < q.top + q.height / 2; }) || null;
+        if (li.nextElementSibling === next) return;
+        const natural = r.top - dy;
+        flip(others, () => ul.insertBefore(li, next));
+        y0 += li.getBoundingClientRect().top - dy - natural;
+        dy = lastY - y0;
+        place();
+      };
+      const onMove = (ev) => {
+        if (ev.pointerId !== id) return;
+        lastY = ev.clientY;
+        dy = ev.clientY - y0;
+        if (!moving && Math.abs(dy) < 4) return;
+        if (!moving) { moving = true; li.classList.add('is-dragging'); }
+        // Near the panel's edges it scrolls, and the row stays under the pointer.
+        if (scroller) {
+          const b = scroller.getBoundingClientRect();
+          const by = ev.clientY < b.top + 40 ? -12 : ev.clientY > b.bottom - 40 ? 12 : 0;
+          if (by) { const t0 = scroller.scrollTop; scroller.scrollTop += by; y0 -= scroller.scrollTop - t0; dy = ev.clientY - y0; }
+        }
+        place();
+        reorder();
+      };
+      const onUp = (ev) => {
+        if (ev.pointerId !== id) return;
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
+        if (!moving) return;
+        li.classList.remove('is-dragging');
+        li.style.transform = '';
+        handle.focus({ preventScroll: true });
+        if (motionOk() && Math.abs(dy) > 0.5) li.animate([{ transform: `translateY(${dy}px)` }, { transform: 'none' }], { duration: DUR.base, easing: EASE });
+        if (keys().join('\n') !== before) {
+          commit();
+          const all = rows();
+          announce(`${labelOf(li)}, position ${all.indexOf(li) + 1} of ${all.length}`);
+        }
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
+    }
+
+    function item(it) {
+      const off = spec.hidden ? spec.hidden.includes(it.key) : false;
+      const name = uid('o');
+      const handle = h('button', {
+        type: 'button', class: 'ol-handle', 'aria-label': `Move ${it.label}`, 'aria-describedby': 'st-drag-help', 'data-fk': `${spec.fk}:${it.key}:grab`,
+        title: 'Drag to reorder, or use the arrow keys',
+      }, gripIcon());
+      const li = h('li', { class: `ol-item${off ? ' is-off' : ''}`, 'data-key': it.key });
+      li._up = h('button', { type: 'button', class: 'ol-move', 'aria-label': `Move ${it.label} up`, 'data-fk': `${spec.fk}:${it.key}:up`, onclick: () => moveBy(li, -1, li._up.disabled ? li._down : null) }, upIcon());
+      li._down = h('button', { type: 'button', class: 'ol-move', 'aria-label': `Move ${it.label} down`, 'data-fk': `${spec.fk}:${it.key}:down`, onclick: () => moveBy(li, 1, li._down.disabled ? li._up : null) }, downIcon());
+      handle.addEventListener('pointerdown', (e) => drag(e, li, handle));
+      handle.addEventListener('keydown', (e) => {
+        const by = { ArrowUp: -1, ArrowDown: 1 }[e.key];
+        if (!by) return;
+        e.preventDefault();
+        moveBy(li, by, handle);
+      });
+      const open = spec.detail && st.expanded.has(`${spec.fk}:${it.key}`);
+      const more = spec.detail ? h('button', {
+        type: 'button', class: 'ol-more', 'aria-expanded': String(!!open), 'aria-label': `${it.label} options`, 'data-fk': `${spec.fk}:${it.key}:more`,
+      }, h('span', { text: 'Options' }), downIcon()) : null;
+      const show = spec.hidden ? h('button', {
+        type: 'button', class: 'switch st-switch', role: 'switch', 'aria-checked': String(!off), 'aria-label': `Show ${it.label}`, 'data-fk': `${spec.fk}:${it.key}:show`,
+      }, h('span', { class: 'switch-track', 'aria-hidden': 'true' }, h('i'))) : null;
+      if (show) {
+        show.addEventListener('click', () => {
+          const on = show.getAttribute('aria-checked') !== 'true';
+          spec.onShow(it.key, on);
+          show.setAttribute('aria-checked', String(on));
+          li.classList.toggle('is-off', !on);
+          changed(show);
+        });
+      }
+      append(li, [
+        h('div', { class: 'ol-row' },
+          handle,
+          it.lead || null,
+          h('div', { class: 'ol-text' }, h('span', { class: 'ol-name', id: name, text: it.label }), it.sub ? h('span', { class: 'ol-sub', text: it.sub }) : null),
+          spec.actions ? spec.actions(it.key) : null,
+          more, show,
+          h('span', { class: 'ol-moves' }, li._up, li._down)),
+      ]);
+      if (spec.detail) {
+        const box = h('div', { class: 'ol-detail', hidden: !open || null });
+        if (open) box.append(spec.detail(it.key));
+        li.append(box);
+        more.addEventListener('click', () => {
+          const k = `${spec.fk}:${it.key}`, on = !st.expanded.has(k);
+          if (on) st.expanded.add(k); else st.expanded.delete(k);
+          more.setAttribute('aria-expanded', String(on));
+          if (on) { box.replaceChildren(spec.detail(it.key)); for (const seg of $$('.seg', box)) segThumb(seg); }
+          collapse(box, on);
+        });
+      }
+      return li;
+    }
+
+    for (const key of spec.order) if (byKey.has(key)) ul.append(item(byKey.get(key)));
+    syncMoves();
+    return rows().length ? ul : (spec.empty || null);
+  }
+
+  // A list's order and its hidden keys at `path` and `hiddenPath`.
+  function listAt(path, hiddenPath) {
+    return {
+      order: getPath(cfg, path), hidden: hiddenPath ? getPath(cfg, hiddenPath) : null, fk: path,
+      onOrder: (keys) => update((c) => setPath(c, path, keys)),
+      onShow: (key, on) => update((c) => {
+        const now = getPath(c, hiddenPath).filter((k) => k !== key);
+        setPath(c, hiddenPath, on ? now : [...now, key]);
+      }),
+    };
+  }
+
+  // --------------------------------------------------------------- tabs
+  function generalTab() {
+    return [
+      group('Appearance', null, ['general.theme', 'general.density', 'general.motion'],
+        row('Theme', 'System follows your device’s light or dark mode.', (id) => segCtl('general.theme', [['system', 'System'], ['light', 'Light'], ['dark', 'Dark']], id)),
+        row('Density', 'Spacing between and inside the sections.', (id) => segCtl('general.density', [['comfortable', 'Comfortable'], ['compact', 'Compact']], id)),
+        row('Reduce motion', 'Off plays the dashboard’s animations even when your device asks for less motion.', (id) => segCtl('general.motion', [['system', 'System'], ['reduce', 'On'], ['full', 'Off']], id))),
+      group('Data and units', null, ['general.refresh', 'general.time', 'general.clock', 'general.bytes'],
+        row('Refresh every', 'How often the machines, queue and jobs are read again.', (id) => segCtl('general.refresh', RS.REFRESH.map((n) => [n, n < 60 ? `${n} s` : `${n / 60} min`]), id)),
+        row('Times', 'When something happened: “3 min ago”, or the time of day.', (id) => segCtl('general.time', [['relative', 'Relative'], ['absolute', 'Time of day']], id)),
+        row('Clock', null, (id) => segCtl('general.clock', [['24', '24-hour'], ['12', '12-hour']], id)),
+        row('Sizes', 'Memory and disk in GiB (1024³ bytes) or GB (1000³).', (id) => segCtl('general.bytes', [['binary', 'GiB'], ['decimal', 'GB']], id))),
+      group('Tables', null, ['general.compactTables', 'general.recentRows', 'general.auditRows', 'general.auditFilter'],
+        row('Compact rows', 'Tighter rows in every table.', (id) => switchCtl('general.compactTables', id)),
+        row('Recent jobs', 'Rows shown before “Show all”.', (id) => stepperCtl('general.recentRows', 5, 50, 1, id)),
+        row('Remote commands', 'Rows shown before “Show all”.', (id) => stepperCtl('general.auditRows', 5, 100, 5, id)),
+        row('Remote commands show', 'Changes only, or the panel’s reads too.', (id) => segCtl('general.auditFilter', [['changes', 'Changes'], ['all', 'All']], id))),
+    ];
+  }
+
+  function layoutTab() {
+    return [
+      group('Sections', 'Drag a section by its handle, or use its arrows. Switch one off to hide it.', ['layout.order', 'layout.hidden'],
+        orderList({ ...listAt('layout.order', 'layout.hidden'), label: 'Dashboard sections', items: RS.SECTIONS })),
+      group('Queue and Running', null, ['layout.split'],
+        row('Arrangement', 'On narrow screens they always stack.', (id) => segCtl('layout.split', [['side', 'Side by side'], ['stacked', 'Stacked']], id))),
+    ];
+  }
+
+  // Every machine the page knows: the coordinator's list, then any only in
+  // the charts' history, then pins of machines it does not know now.
+  function knownHosts() {
+    const seen = new Map();
+    for (const x of (state.ov && state.ov.hosts) || []) seen.set(x.id, x);
+    for (const x of (state.metrics && state.metrics.hosts) || []) if (!seen.has(x.id)) seen.set(x.id, { id: x.id, name: x.name, online: false, metricsOnly: true });
+    return [...seen.values()].sort((a, b) => String(a.name || a.hostname || a.id).localeCompare(String(b.name || b.hostname || b.id)));
+  }
+  const hostLabel = (id) => { const x = knownHosts().find((y) => y.id === id); return x ? x.name || x.hostname || x.id : id; };
+  function hostSub(x) {
+    if (!x) return 'Not known to the coordinator now: kept for when it returns';
+    const os = String(x.os || '').toLowerCase();
+    return [OS_NAME[os] || null, x.metricsOnly ? 'in the history only' : RS.statusOf(x)].filter(Boolean).join(' · ');
+  }
+
+  function machinesTab() {
+    const ms = cfg.machines;
+    const hosts = knownHosts();
+    const byId = new Map(hosts.map((x) => [x.id, x]));
+    const pinned = orderList({
+      ...listAt('machines.pinned'), label: 'Pinned machines',
+      items: ms.pinned.map((id) => ({ key: id, label: hostLabel(id), sub: hostSub(byId.get(id)), lead: hostDot(id) })),
+      actions: (id) => h('button', {
+        type: 'button', class: 'btn-sm btn-quiet st-unpin', 'data-fk': `unpin:${id}`, 'aria-label': `Unpin ${hostLabel(id)}`,
+        onclick: () => { togglePin(id); renderSettings(); },
+      }, xIcon(12), 'Unpin'),
+      empty: h('p', { class: 'st-empty', text: 'Nothing pinned. Pin a machine with the pin on its card, in its panel, or in the list below.' }),
+    });
+    return [
+      group('Pinned', 'Pinned machines come first, in this order, offline or not.', ['machines.pinned'], pinned),
+      group('Order', 'For the machines not pinned.', ['machines.sort', 'machines.reverse', 'machines.onlineFirst', 'machines.group', 'machines.showOffline'],
+        row('Sort by', 'Loads and slots sort busiest first.', (id) => selectCtl('machines.sort', RS.SORTS, id)),
+        row('Reverse', null, (id) => switchCtl('machines.reverse', id)),
+        row('Online first', 'Offline machines after the connected ones.', (id) => switchCtl('machines.onlineFirst', id)),
+        row('Group by', 'Headings over the cards; pinned ones get their own.', (id) => segCtl('machines.group', RS.GROUPS, id)),
+        row('Show offline machines', 'A pinned machine shows anyway.', (id) => switchCtl('machines.showOffline', id))),
+      group('Cards', 'What a card shows, top to bottom.', ['machines.density', 'machines.fields', 'machines.fieldsHidden'],
+        row('Density', null, (id) => segCtl('machines.density', [['comfortable', 'Comfortable'], ['compact', 'Compact']], id)),
+        orderList({ ...listAt('machines.fields', 'machines.fieldsHidden'), label: 'Card contents', items: RS.FIELDS })),
+      group('All machines', 'Hidden machines leave the Machines section only; their jobs and history stay.', ['machines.hidden'],
+        hosts.length ? h('ul', { class: 'olist st-hosts', 'aria-label': 'All machines' }, hosts.map((x) => hostRow(x))) : h('p', { class: 'st-empty', text: 'No machines yet.' })),
+    ];
+  }
+
+  function hostRow(x) {
+    const name = x.name || x.hostname || x.id;
+    const pin = h('button', {
+      type: 'button', class: 'pin-btn pin-list', 'aria-pressed': String(isPinned(x.id)), 'aria-label': `${isPinned(x.id) ? 'Unpin' : 'Pin'} ${name}`, 'data-fk': `pin:${x.id}`,
+      onclick: () => { togglePin(x.id); renderSettings(); },
+    }, pinIcon(15));
+    const shown = !cfg.machines.hidden.includes(x.id);
+    const show = h('button', {
+      type: 'button', class: 'switch st-switch', role: 'switch', 'aria-checked': String(shown), 'aria-label': `Show ${name}`, 'data-fk': `show:${x.id}`,
+      onclick: () => {
+        update((c) => {
+          const ms = c.machines;
+          if (ms.hidden.includes(x.id)) ms.hidden = ms.hidden.filter((k) => k !== x.id);
+          else { ms.hidden.push(x.id); ms.pinned = ms.pinned.filter((k) => k !== x.id); }
+        });
+        renderSettings();
+      },
+    }, h('span', { class: 'switch-track', 'aria-hidden': 'true' }, h('i')));
+    return h('li', { class: `ol-item${shown ? '' : ' is-off'}` },
+      h('div', { class: 'ol-row' }, hostDot(x.id),
+        h('div', { class: 'ol-text' }, h('span', { class: 'ol-name', text: name }), h('span', { class: 'ol-sub', text: hostSub(x) })),
+        pin, show));
+  }
+
+  function chartsTab() {
+    return [
+      group('All charts', null, ['charts.range', 'charts.legend', 'charts.columns', 'charts.height'],
+        row('Time range', 'The range the charts open with; the switch above them changes it too.', (id) => segCtl('charts.range', RANGES.map((r) => [r, r]), id)),
+        row('Legends', 'The machine names over each chart (rows are named on their left).', (id) => switchCtl('charts.legend', id)),
+        row('Columns', 'Narrow screens show one.', (id) => segCtl('charts.columns', [[1, '1'], [2, '2'], [3, '3']], id)),
+        row('Height', null, (id) => segCtl('charts.height', [['s', 'Small'], ['m', 'Medium'], ['l', 'Large']], id))),
+      group('Charts', 'Drag to reorder, switch off to hide; Options sets how each one draws.', ['charts.order', 'charts.hidden', 'charts.per'],
+        orderList({
+          ...listAt('charts.order', 'charts.hidden'), label: 'Charts', fk: 'charts',
+          items: RS.CHARTS.map((d) => ({ key: d.key, label: d.label, sub: d.sub })),
+          detail: chartOptionsView,
+        })),
+    ];
+  }
+
+  // One chart's options; redrawn when its style changes what applies.
+  function chartOptionsView(key) {
+    const d = RS.CHARTS.find((c) => c.key === key);
+    const base = `charts.per.${key}`;
+    const box = h('div', { class: 'st-sub' });
+    const redo = () => {
+      const o = cfg.charts.per[key];
+      const fk = document.activeElement && box.contains(document.activeElement) ? document.activeElement.dataset.fk : null;
+      box.replaceChildren(...[
+        d.styles.length > 1 ? row('Style', null, (id) => segCtl(`${base}.style`, d.styles.map((x) => [x, RS.STYLE_LABEL[x]]), id, redo)) : null,
+        o.style !== 'columns' ? row('Smooth lines', 'Curves through the points, or straight segments.', (id) => switchCtl(`${base}.smooth`, id)) : null,
+        d.pct ? row('Scale', 'The full 0–100%, or fitted to the values.', (id) => segCtl(`${base}.scale`, [['full', '0–100%'], ['fit', 'Fit']], id)) : null,
+        d.fleet ? null : row('Machines', null, (id) => segCtl(`${base}.hosts`, [['all', 'All'], ['top', 'Top'], ['pick', 'Chosen']], id, redo)),
+        !d.fleet && o.hosts === 'top' ? row('How many', key === 'disk' ? 'The machines with the least free disk.' : 'The busiest machines over the range.', (id) => stepperCtl(`${base}.top`, 1, RS.MAX_TOP, 1, id)) : null,
+        !d.fleet && o.hosts === 'pick' ? pickHosts(key) : null].filter(Boolean));
+      for (const seg of $$('.seg', box)) segThumb(seg);
+      const again = fk && $(`[data-fk="${CSS.escape(fk)}"]`, box);
+      if (again) again.focus({ preventScroll: true });
+    };
+    redo();
+    return box;
+  }
+
+  function pickHosts(key) {
+    const hosts = knownHosts();
+    const path = `charts.per.${key}.pick`;
+    if (!hosts.length) return h('p', { class: 'st-empty', text: 'No machines yet.' });
+    return h('div', { class: 'st-picks', role: 'group', 'aria-label': 'Machines this chart shows' }, hosts.map((x) => {
+      const input = h('input', { type: 'checkbox', checked: cfg.charts.per[key].pick.includes(x.id) || null, 'data-fk': `${path}:${x.id}` });
+      input.addEventListener('change', () => {
+        update((c) => {
+          const now = c.charts.per[key].pick.filter((k) => k !== x.id);
+          c.charts.per[key].pick = input.checked ? [...now, x.id] : now;
+        });
+        changed(input);
+      });
+      return h('label', { class: 'check st-pick' }, input, hostDot(x.id), h('span', { text: x.name || x.hostname || x.id }));
+    }));
+  }
+
+  function kpisTab() {
+    return [
+      group('Summary tiles', 'The tiles at the top of the page: drag to reorder, switch off to hide.', ['kpis.order', 'kpis.hidden'],
+        orderList({ ...listAt('kpis.order', 'kpis.hidden'), label: 'Summary tiles', items: RS.KPIS })),
+    ];
+  }
+
+  // --------------------------------------------------- export and import
+  function exportSettings() {
+    const blob = new Blob([`${JSON.stringify(cfg, null, 2)}\n`], { type: 'application/json' });
+    const a = h('a', { href: URL.createObjectURL(blob), download: 'runner-manager-dashboard-settings.json', hidden: true });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    notify('Exported as runner-manager-dashboard-settings.json');
+  }
+
+  async function importSettings(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > 64 * 1024) { notify('That file is too large to be dashboard settings.', 'err'); return; }
+    let raw;
+    try { raw = JSON.parse(await file.text()); } catch (_) { notify('That file is not JSON.', 'err'); return; }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !Number.isInteger(raw.version) || raw.version < 1) {
+      notify('That file does not hold dashboard settings.', 'err');
+      return;
+    }
+    const before = cfg;
+    if (replaceSettings(raw)) offerUndo(before, `Imported ${file.name}.`);
+    else notify('Those are the settings already in use.');
+    renderSettings();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);

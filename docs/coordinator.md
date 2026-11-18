@@ -807,6 +807,48 @@ A Windows machine's card names the version of the WSL distribution it manages: t
 WSL host runs when exactly one WSL host shares the machine's name, else what `wsl install` last put
 there (which an update inside the distribution leaves behind).
 
+### Dashboard settings
+
+The sliders button in the top bar opens Settings, a panel beside the page; every change shows on
+the dashboard at once and animates into place. From 0.4.73:
+
+- **General**: theme (system, light or dark), density, reduce motion (system, on or off), refresh
+  interval (2 s to 1 min), times as "3 min ago" or the time of day, a 24- or 12-hour clock, sizes
+  in GiB or GB, compact table rows, how many Recent jobs and remote commands show before "Show
+  all", and whether the remote commands list shows changes only or every read too.
+- **Layout**: the order of the sections (drag a section by its handle, or use its arrow buttons or
+  the arrow keys on the handle), which show, and Queue and Running side by side or stacked.
+- **Machines**: pinned machines first, in the order you give them (pin one with the pin on its
+  card, in its panel, or in the list); the rest sorted by name, status, operating system, CPU,
+  memory, busy or free slots or uptime, optionally reversed, online first or not, and optionally
+  grouped by operating system or status; hide machines or offline ones; compact or comfortable
+  cards; and which parts a card shows (each meter, the history sparkline, versions, disk, uptime)
+  in which order.
+- **Charts**: the default range, legends, one to three columns, the chart height; which charts show
+  and their order (besides Jobs, CPU, Busy slots and Memory: Slot use, the fleet's busy share of
+  its slots, and Disk free per machine); for each, how it draws (columns, stacked areas, lines,
+  filled lines or a row per machine, as fits it), smoothing, a 0–100% or fitted scale for the
+  percentages, and all machines, the top N over the range, or the ones you choose.
+- **Tiles**: which summary tiles show (also average CPU and memory in use across the online
+  machines) and their order.
+
+Each group has its own Reset, the footer a Reset all (both can be undone for a few seconds), and
+Export and Import move the settings as a JSON file.
+
+Settings belong to the signed-in GitHub login and follow it to any browser: the page keeps a copy
+in the browser for its first paint, loads the coordinator's (which wins), and saves changes back a
+moment after they are made. They are stored in the `dashboard_settings` table (one row per
+lower-cased login; no schema version change, so a rollback ignores it). A pin of a machine the
+coordinator no longer lists is kept, in case it comes back, and skipped on the page.
+
+| Method and path | Who | Answer |
+| --- | --- | --- |
+| `GET /api/settings` | a session | `{"settings": {...} \| null, "updated_at": seconds \| null}` |
+| `PUT /api/settings` | a session; a cookie also needs this origin | a JSON object with a positive integer `version`, at most 64 KiB: `{"updated_at"}`; `400` not such an object, `413` too large, `403` from another origin |
+
+The coordinator checks only that shape and the size; the page reads any stored value through its
+own rules, so an unknown or out-of-range setting falls back to its default.
+
 Without a proxy in front, forward `/`, `/assets/*`, `/auth/*` and `/api/*` as well as the four
 endpoints in [Deploy](#deploy).
 

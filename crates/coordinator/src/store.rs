@@ -266,6 +266,15 @@ impl Store {
                 body TEXT NOT NULL
             );",
         )?;
+        // 0.4.73: each person's dashboard settings, by lower-cased login.
+        // Without a version of its own, like the job lists.
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS dashboard_settings (
+                login TEXT PRIMARY KEY,
+                updated_at INTEGER NOT NULL,
+                body TEXT NOT NULL
+            );",
+        )?;
         Ok(Self { connection })
     }
 
@@ -795,6 +804,40 @@ impl Store {
             .query_row(
                 "SELECT saved_at, body FROM dashboard_activity WHERE id = 1",
                 [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Keeps `body`, a person's dashboard settings (JSON), in place of their
+    /// last. A GitHub login is the same whatever its case.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn save_dashboard_settings(
+        &self,
+        login: &str,
+        body: &str,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO dashboard_settings (login, updated_at, body) VALUES (?1, ?2, ?3)
+             ON CONFLICT (login) DO UPDATE SET updated_at = excluded.updated_at, body = excluded.body",
+            params![login.to_lowercase(), at, body],
+        )?;
+        Ok(())
+    }
+
+    /// A person's dashboard settings as last saved, and when.
+    ///
+    /// # Errors
+    /// SQLite's.
+    pub fn dashboard_settings(&self, login: &str) -> Result<Option<(i64, String)>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT updated_at, body FROM dashboard_settings WHERE login = ?1",
+                params![login.to_lowercase()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?)
@@ -1358,6 +1401,29 @@ mod tests {
             Err(StoreError::InvalidTtl)
         ));
         assert_eq!(sanitize_hostname("a b\u{1b}[31m"), "ab31m");
+    }
+
+    #[test]
+    fn dashboard_settings_are_kept_per_login_whatever_its_case() {
+        let store = Store::open_in_memory().expect("store");
+        assert_eq!(store.dashboard_settings("Me").expect("read"), None);
+        store
+            .save_dashboard_settings("Me", r#"{"version":1}"#, 5)
+            .expect("saved");
+        store
+            .save_dashboard_settings("other", r#"{"version":2}"#, 6)
+            .expect("saved");
+        store
+            .save_dashboard_settings("ME", r#"{"version":3}"#, 7)
+            .expect("replaced");
+        assert_eq!(
+            store.dashboard_settings("me").expect("read"),
+            Some((7, r#"{"version":3}"#.to_owned()))
+        );
+        assert_eq!(
+            store.dashboard_settings("other").expect("read"),
+            Some((6, r#"{"version":2}"#.to_owned()))
+        );
     }
 
     #[test]
