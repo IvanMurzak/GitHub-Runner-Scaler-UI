@@ -904,10 +904,21 @@ async fn settings_put(
         Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
     };
     let now = Utc::now().timestamp();
-    if let Err(error) = state
-        .store()
-        .save_dashboard_settings(&session.login, &body, now)
-    {
+    // Read and replaced under one lock, so two writes of one page cannot
+    // pass each other between the check and the save.
+    let store = state.store();
+    let kept = store
+        .dashboard_settings(&session.login)
+        .ok()
+        .flatten()
+        .map(|(_, kept)| kept);
+    if kept.is_some_and(|kept| overtaken(&kept, &body)) {
+        return error_json(
+            StatusCode::CONFLICT,
+            "newer settings from the same page are already saved",
+        );
+    }
+    if let Err(error) = store.save_dashboard_settings(&session.login, &body, now) {
         tracing::warn!(%error, "dashboard settings were not saved");
         return error_json(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -915,6 +926,20 @@ async fn settings_put(
         );
     }
     json(&serde_json::json!({ "updated_at": now }))
+}
+
+/// Whether `new` is an older write of the page that wrote `kept`: a page
+/// tags its writes with its own random `client` and a rising `seq`, and a
+/// request sent as the page closes can arrive before an earlier one.
+fn overtaken(kept: &str, new: &str) -> bool {
+    let tag = |body: &str| {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        Some((
+            value.get("client")?.as_str()?.to_owned(),
+            value.get("seq")?.as_u64()?,
+        ))
+    };
+    matches!((tag(kept), tag(new)), (Some((a, kept)), Some((b, new))) if a == b && new < kept)
 }
 
 /// The settings to keep, re-serialised compactly, or why they are refused.

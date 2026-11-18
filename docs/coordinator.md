@@ -847,9 +847,9 @@ coordinator no longer lists is kept, in case it comes back, and skipped on the p
 | Method and path | Who | Answer |
 | --- | --- | --- |
 | `GET /api/settings` | a session | `{"settings": {...} \| null, "updated_at": seconds \| null}` |
-| `PUT /api/settings` | a session; a cookie also needs this origin | a JSON object with a positive integer `version`, at most 64 KiB: `{"updated_at"}`; `400` not such an object, `413` too large, `403` from another origin |
+| `PUT /api/settings` | a session; a cookie also needs this origin | a JSON object with a positive integer `version`, at most 64 KiB: `{"updated_at"}`; `400` not such an object, `413` too large, `403` from another origin, `409` an older write of the same page (its `client` and a lower `seq` than the kept copy's) |
 
-The coordinator checks only that shape and the size; the page reads any stored value through its
+Each page tags its writes with a random `client` and a rising `seq`, so a save sent as the page closes cannot be replaced by an earlier one that arrives after it. The coordinator checks only that shape, that order and the size; the page reads any stored value through its
 own rules, so an unknown or out-of-range setting falls back to its default.
 
 ## Remote management

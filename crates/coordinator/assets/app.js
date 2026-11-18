@@ -55,8 +55,16 @@
   // confirmed: a reload, or another tab, then sends it rather than taking
   // the coordinator's older copy.
   const UNSAVED_KEY = 'rm.settings.unsaved';
-  function markUnsaved(on) { try { if (on) localStorage.setItem(UNSAVED_KEY, '1'); else localStorage.removeItem(UNSAVED_KEY); } catch (_) { /* storage unavailable */ } }
-  function unsaved() { try { return localStorage.getItem(UNSAVED_KEY) === '1'; } catch (_) { return false; } }
+  // Holds the unsaved copy itself, so a save of another copy (another tab's)
+  // does not clear it: `markUnsaved(copy)` sets it, `markUnsaved(null, saved)`
+  // clears it only when `saved` is that copy.
+  function markUnsaved(copy, saved) {
+    try {
+      if (copy != null) localStorage.setItem(UNSAVED_KEY, copy);
+      else if (localStorage.getItem(UNSAVED_KEY) === saved) localStorage.removeItem(UNSAVED_KEY);
+    } catch (_) { /* storage unavailable */ }
+  }
+  function unsaved() { try { return localStorage.getItem(UNSAVED_KEY) != null; } catch (_) { return false; } }
 
   // ------------------------------------------------------------------ state
   const RANGES = RS.RANGES;
@@ -220,14 +228,21 @@
       if (mode === 'full') ghost(box, el, first.get(el), cols.get(el)); else el.remove();
     }
     const entering = [];
+    // A kept element that moves leaves the document for a moment, and its
+    // focus with it, unless the browser can move it in place.
+    const focused = document.activeElement;
+    const keep = focused && focused !== document.body && [...old.values()].some((el) => el.contains(focused)) ? focused : null;
     let ref = box.firstElementChild;
     items.forEach((it, i) => {
       let el = old.get(keys[i]);
       if (el) { if (update) update(el, it); }
       else { el = create(it); el.dataset.key = keys[i]; entering.push(el); }
       while (ref && ref !== el && ref.classList.contains('is-leaving')) ref = ref.nextElementSibling;
-      if (el === ref) ref = ref.nextElementSibling; else box.insertBefore(el, ref);
+      if (el === ref) ref = ref.nextElementSibling;
+      else if (box.moveBefore && el.parentNode === box) box.moveBefore(el, ref);
+      else box.insertBefore(el, ref);
     });
+    if (keep && keep.isConnected && document.activeElement !== keep) keep.focus({ preventScroll: true });
     if (mode === 'none') return;
     if (mode === 'swap') { box.animate([{ opacity: 0.2 }, { opacity: 1 }], { duration: DUR.base, easing: 'ease-out' }); return; }
     if (mode === 'full') { for (const el of leaving) first.delete(el); playFlip(first); }
@@ -993,11 +1008,7 @@
     b.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      if (!b.dataset.host) return;
-      const had = document.activeElement === b;
-      togglePin(b.dataset.host);
-      // Its card moved to its new place, which takes focus away.
-      if (had && b.isConnected) b.focus({ preventScroll: true });
+      if (b.dataset.host) togglePin(b.dataset.host);
     });
     return b;
   }
@@ -2025,8 +2036,15 @@
     if (!dw.id || dw.busy.has('reboot')) return;
     const body = $('#dw-body');
     const old = $('[data-key="reboot"]', body);
-    if (!old) return;
     const x = hostById(dw.id);
+    if (!old) {
+      // The machine said it can reboot after the panel was built: the card
+      // joins it below the versions.
+      const after = $('[data-key="update"]', body);
+      const card = after && rebootCard(x);
+      if (card) { after.after(card); if (liveMotion()) fadeIn(card, DUR.slow); }
+      return;
+    }
     if (!fk && old.dataset.sig === rebootSig(x)) return;
     // Focus stays on the control it was on, never moved onto another one.
     const focused = old.contains(document.activeElement) ? document.activeElement.dataset.fk || '' : null;
@@ -2160,7 +2178,12 @@
     dlg.addEventListener('keydown', trapTab);
     window.addEventListener('hashchange', () => {
       const id = hashHost();
-      if (id) { if (!$('#app').hidden) openDrawer(id, true); } else if (dw.id) closeDrawer(true);
+      if (id) {
+        if ($('#app').hidden) return;
+        // One panel at a time: Back or Forward to a machine closes Settings first.
+        if (st.open) closeSettings(true);
+        openDrawer(id, true);
+      } else if (dw.id) closeDrawer(true);
     });
     // The card's name is a link (Enter); Space opens it too, as on a button.
     $('#hosts').addEventListener('keydown', (e) => {
@@ -2851,11 +2874,17 @@
 
   // ------------------------------------------------------------- syncing
   const SAVE_DELAY = 700;
-  const sync = { timer: 0, state: 'idle', note: '', dirty: false, inflight: false, again: false };
+  // `changes` counts this page's changes; `client` and `seq` order its
+  // writes, so the coordinator keeps the newest of two on their way at once.
+  const sync = {
+    timer: 0, state: 'idle', note: '', dirty: false, inflight: false, again: false,
+    changes: 0, client: Math.random().toString(36).slice(2, 12), seq: 0,
+  };
 
   function saveSoon() {
     sync.dirty = true;
-    markUnsaved(true);
+    sync.changes++;
+    markUnsaved(JSON.stringify(cfg));
     setSync('pending');
     clearTimeout(sync.timer);
     sync.timer = setTimeout(pushSettings, SAVE_DELAY);
@@ -2869,13 +2898,16 @@
     sync.inflight = true;
     sync.dirty = false;
     setSync('saving');
+    const copy = JSON.stringify(cfg);
     const r = await call('/api/settings', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg), keepalive: keepalive === true,
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...cfg, client: sync.client, seq: ++sync.seq }), keepalive: keepalive === true,
     });
     sync.inflight = false;
-    if (!r.ok) { sync.dirty = true; setSync('error', r.status === 401 ? '' : r.error || r.hint); }
+    // 409: a newer write of this page got there first, which carries this change too.
+    if (!r.ok && r.status !== 409) { sync.dirty = true; setSync('error', r.status === 401 ? '' : r.error || r.hint); }
     else {
-      if (!sync.dirty) markUnsaved(false);
+      if (!sync.dirty) markUnsaved(null, copy);
       setSync(sync.dirty ? 'pending' : 'saved');
     }
     if (sync.again) { sync.again = false; if (sync.dirty) pushSettings(); }
@@ -2885,9 +2917,11 @@
   // changed something meanwhile. With none there yet, this browser's
   // becomes the account's.
   async function loadServerSettings() {
+    const changes = sync.changes;
     const r = await call('/api/settings');
     if (!r.ok) { if (r.status !== 401) setSync('error', 'Your saved settings could not be loaded; these are this browser’s.'); return; }
-    if (sync.dirty || sync.inflight) return;
+    // Changed here while the answer was on its way (perhaps saved already): this page's is newer.
+    if (sync.dirty || sync.inflight || sync.changes !== changes) return;
     // A change this browser kept but never got confirmed: it is newer.
     if (unsaved()) { saveSoon(); return; }
     const remote = r.body && r.body.settings;
@@ -2950,6 +2984,12 @@
     renderStatus();
     st.undoTimer = setTimeout(() => { st.undo = null; renderStatus(); }, 10000);
   }
+  // After a reset the keyboard lands on its Undo.
+  function focusUndo() {
+    const b = $('#st-status [data-fk="undo"]');
+    if (b) b.focus();
+    return !!b;
+  }
   function undoSettings() {
     if (!st.undo) return;
     const before = st.undo.before;
@@ -2994,7 +3034,7 @@
       setConfirm(false);
       if (replaceSettings(RS.defaults())) offerUndo(before, 'Every setting is back to its default.');
       renderSettings();
-      $('#st-reset').focus();
+      if (!focusUndo()) $('#st-reset').focus();
     });
     // Another tab of this dashboard changed them: follow it.
     window.addEventListener('storage', (e) => {
@@ -3024,7 +3064,8 @@
     $('#st-close').focus();
   }
 
-  function closeSettings() {
+  // `handOff`: another panel takes over, so focus does not go back to the button.
+  function closeSettings(handOff) {
     const dlg = $('#settings');
     if (!st.open) return;
     st.open = false;
@@ -3033,7 +3074,7 @@
       st.closing = null;
       if (dlg.open) dlg.close();
       for (const a of anims) a.cancel();
-      $('#settings-btn').focus();
+      if (handOff !== true) $('#settings-btn').focus();
     };
     if (!motionOk()) { done(); return; }
     const closing = slideOut(dlg, () => { if (st.closing === closing) done(); });
@@ -3075,7 +3116,7 @@
     if (!fk) return;
     // What had focus may be gone (an unpinned row): the panel keeps it.
     const again = $(`[data-fk="${CSS.escape(fk)}"]`, body);
-    (again || body).focus({ preventScroll: true });
+    (again && !again.disabled ? again : body).focus({ preventScroll: true });
   }
 
   // ------------------------------------------------------------ controls
@@ -3092,6 +3133,7 @@
         update((c) => { for (const p of paths) setPath(c, p, getPath(d, p)); });
         offerUndo(before, `${title} reset to defaults.`);
         renderSettings();
+        focusUndo();
       },
     }) : null;
     const el = h('section', { class: 'card st-group' },
