@@ -53,9 +53,9 @@
     <main id="main" class="main" tabindex="-1">
       <div id="banner" hidden></div>
 
-      <section id="kpis" class="kpis" aria-label="Summary"></section>
+      <section id="kpis" class="kpis" data-section="kpis" aria-label="Summary"></section>
 
-      <section class="section" aria-labelledby="h-machines">
+      <section class="section" data-section="machines" aria-labelledby="h-machines">
         <div class="section-head">
           <h2 id="h-machines">Machines</h2>
           <span id="machines-count" class="section-meta"></span>
@@ -63,7 +63,7 @@
         <div id="hosts" class="hosts"></div>
       </section>
 
-      <div class="split">
+      <div class="split" data-section="queue-running">
         <section class="section card" aria-labelledby="h-queue">
           <div class="section-head">
             <h2 id="h-queue">Queue</h2>
@@ -80,7 +80,7 @@
         </section>
       </div>
 
-      <section id="charts" class="section" aria-labelledby="h-charts">
+      <section id="charts" class="section" data-section="activity" aria-labelledby="h-charts">
         <div class="section-head">
           <div>
             <h2 id="h-charts">Activity</h2>
@@ -88,31 +88,10 @@
           </div>
           <div id="range" class="seg" role="group" aria-label="Time range"></div>
         </div>
-        <div class="charts">
-          <figure id="chart-jobs" class="chart card">
-            <figcaption><h3>Jobs</h3><p id="jobs-sub">Running and queued, stacked</p></figcaption>
-            <ul class="legend"></ul>
-            <div class="plot"></div>
-          </figure>
-          <figure id="chart-cpu" class="chart card">
-            <figcaption><h3>CPU</h3><p id="cpu-sub">A row per machine</p></figcaption>
-            <ul class="legend"></ul>
-            <div class="plot"></div>
-          </figure>
-          <figure id="chart-busy" class="chart card">
-            <figcaption><h3>Busy slots</h3><p id="busy-sub">Stacked per machine</p></figcaption>
-            <ul class="legend"></ul>
-            <div class="plot"></div>
-          </figure>
-          <figure id="chart-ram" class="chart card">
-            <figcaption><h3>Memory</h3><p id="ram-sub">Used per machine</p></figcaption>
-            <ul class="legend"></ul>
-            <div class="plot"></div>
-          </figure>
-        </div>
+        <div id="charts-grid" class="charts"></div>
       </section>
 
-      <section class="section card" aria-labelledby="h-recent">
+      <section class="section card" data-section="recent" aria-labelledby="h-recent">
         <div class="section-head">
           <h2 id="h-recent">Recent</h2>
           <button id="recent-toggle" class="link-btn" type="button" aria-controls="recent" hidden></button>
@@ -120,7 +99,7 @@
         <div id="recent"></div>
       </section>
 
-      <section id="audit-section" class="section card" aria-labelledby="h-audit" hidden>
+      <section id="audit-section" class="section card" data-section="audit" aria-labelledby="h-audit" hidden>
         <div class="section-head">
           <h2 id="h-audit">Remote commands</h2>
           <span id="audit-count" class="count num"></span>
@@ -130,7 +109,7 @@
         <div id="audit"></div>
       </section>
 
-      <section id="pools-section" class="section" aria-labelledby="h-pools" hidden>
+      <section id="pools-section" class="section" data-section="pools" aria-labelledby="h-pools" hidden>
         <div class="section-head"><h2 id="h-pools">Pools &amp; leases</h2></div>
         <div id="pools" class="pools"></div>
       </section>
