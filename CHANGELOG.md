@@ -7,6 +7,26 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.75
+
+### Added
+
+- **Balancing** in the dashboard's top bar shows, live, how the coordinator
+  places pool jobs on machines: each queue, the machines it considered, why a
+  machine was passed over (no matching pool, not ready yet, unfit or
+  draining, no free slot, not enough memory, already refused this round), every
+  candidate's score broken into warm checkout, memory headroom, speed, idle
+  CPU and the big-job penalty, which machines were tried only as a last resort,
+  and what became of the launch (offered, accepted, refused with the reason,
+  unanswered, claimed, finished, cancelled, expired or lost). Two layouts,
+  chosen in Settings → Layout → Balancing screen: a flow map you can pan and
+  zoom with a decision inspector, and a decision theatre that stages each
+  decision step by step, replays past ones and re-ranks a decision with your
+  own weights (in your browser only). The coordinator keeps the last 200
+  decisions and 500 launch events in memory (a restart starts afresh) and
+  serves them at `GET /api/placement`. How machines are chosen is unchanged.
+  Only the coordinator needs 0.4.75.
+
 ## 0.4.74
 
 ### Fixed
