@@ -1131,7 +1131,7 @@ pub struct Load {
 
 impl Load {
     /// Thousandths of a core idle; none known without a CPU load.
-    fn idle_millicores(&self) -> u64 {
+    pub(crate) fn idle_millicores(&self) -> u64 {
         self.cpu_load_percent.map_or(0, |load| {
             u64::from(self.cores) * 10 * u64::from(100u32.saturating_sub(load.min(100)))
         })
@@ -1143,7 +1143,7 @@ impl Contender {
     /// still to come of its launches, and no more than its memory less all of
     /// them. A build's peak can come long after its reservation lapses, with the
     /// host's heartbeat showing that memory free until then.
-    fn available(&self) -> Option<u64> {
+    pub(crate) fn available(&self) -> Option<u64> {
         self.free_ram.map(|free| {
             let unclaimed = free.saturating_sub(self.reserved);
             self.total_ram.map_or(unclaimed, |total| {

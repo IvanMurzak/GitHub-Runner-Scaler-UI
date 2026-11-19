@@ -449,6 +449,7 @@
     buildAuditControls();
     setupDrawer();
     setupSettings();
+    window.addEventListener('hashchange', applyRoute);
     document.addEventListener('visibilitychange', onVisibility);
     document.addEventListener('pointerdown', (e) => { if (!e.target.closest('.plot')) hideAllTips(); });
     try {
@@ -462,8 +463,30 @@
     showApp();
   }
 
+  // ---------------------------------------------------------------- screens
+  // `#balancing` shows the Balancing screen (balancing.js and its two
+  // layouts); any other address the overview.
+  const onBalancing = () => location.hash === '#balancing';
+  const balancingOpts = () => ({ view: cfg.balancing.view, refresh: cfg.general.refresh, clock: cfg.general.clock });
+  function applyRoute() {
+    if ($('#app').hidden) return;
+    const bal = onBalancing();
+    $('#main').hidden = bal;
+    $('.foot').hidden = bal;
+    $('#balancing').hidden = !bal;
+    document.body.classList.toggle('is-balancing', bal);
+    for (const [id, on] of [['#nav-overview', !bal], ['#nav-balancing', bal]]) {
+      if (on) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
+    }
+    document.title = bal ? 'Balancing · Runner Manager' : 'Runner Manager';
+    const screen = window.RMBalancing;
+    if (!screen) return;
+    if (bal) { screen.configure(balancingOpts()); screen.show(); } else screen.hide();
+  }
+
   function showLogin(netMsg) {
     stopTimers();
+    if (window.RMBalancing) window.RMBalancing.hide();
     if (dw.id) closeDrawer(true);
     $('#boot').hidden = true; $('#app').hidden = true; $('#login').hidden = false;
     document.title = 'Sign in · Runner Manager';
@@ -492,6 +515,7 @@
     renderChartFrames();
     startTimers();
     loadServerSettings();
+    applyRoute();
     const id = hashHost();
     if (id) openDrawer(id, false);
   }
@@ -2832,6 +2856,7 @@
       }
     }
     if (changed('layout')) applyLayout();
+    if ((changed('balancing') || changed('general')) && window.RMBalancing) window.RMBalancing.configure(balancingOpts());
     syncRange();
     if (state.ov) renderOverview(state.ov);
     else if (changed('kpis')) renderSkeletons();
@@ -3416,6 +3441,9 @@
         orderList({ ...listAt('layout.order', 'layout.hidden'), label: 'Dashboard sections', items: RS.SECTIONS })),
       group('Queue and Running', null, ['layout.split'],
         row('Arrangement', 'On narrow screens they always stack.', (id) => segCtl('layout.split', [['side', 'Side by side'], ['stacked', 'Stacked']], id))),
+      group('Balancing screen', 'How the Balancing screen shows the coordinator placing jobs.', ['balancing.view'],
+        row('Show as', RS.BALANCING_VIEWS.map((v) => `${v[1]}: ${v[2].charAt(0).toLowerCase()}${v[2].slice(1)}.`).join(' '),
+          (id) => segCtl('balancing.view', RS.BALANCING_VIEWS.map((v) => [v[0], v[1]]), id))),
     ];
   }
 

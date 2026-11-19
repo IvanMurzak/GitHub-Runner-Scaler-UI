@@ -10,7 +10,11 @@
   <title>Runner Manager</title>
   <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/balancing.css">
   <script src="/assets/settings.js" defer></script>
+  <script src="/assets/balancing.js" defer></script>
+  <script src="/assets/balancing-flow.js" defer></script>
+  <script src="/assets/balancing-race.js" defer></script>
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
@@ -42,6 +46,10 @@
         </a>
         <span id="version" class="version num"></span>
         <span id="update-chip" class="update-chip" hidden></span>
+        <nav class="navtabs" aria-label="Screens">
+          <a id="nav-overview" class="navtab" href="#">Overview</a>
+          <a id="nav-balancing" class="navtab" href="#balancing">Balancing</a>
+        </nav>
         <span class="spacer"></span>
         <span id="live" class="live"><i aria-hidden="true"></i><span id="live-text">Connecting</span></span>
         <span id="who" class="who"></span>
@@ -118,6 +126,221 @@
         <div id="pools" class="pools"></div>
       </section>
     </main>
+
+    <section id="balancing" class="bal" aria-label="Balancing: how the coordinator places jobs" hidden>
+      <h1 class="sr-only">Balancing — how the coordinator places each job</h1>
+
+      <!-- Flow map -->
+      <div id="bal-flow" class="bf" hidden>
+        <canvas id="bf-world" class="world" aria-label="Live flow map of job placement. Drag to pan, wheel or pinch to zoom, double-click a node to focus it." tabindex="0"></canvas>
+
+        <div class="hud" aria-live="off">
+          <div class="hud-item"><span class="hud-k">Queued</span><b id="bf-hud-queued" class="num">0</b></div>
+          <div class="hud-item"><span class="hud-k">Running</span><b id="bf-hud-running" class="num">0</b><small id="bf-hud-slots" class="num"></small></div>
+          <div class="hud-item"><span class="hud-k">Decisions</span><b id="bf-hud-decisions" class="num">0</b><small id="bf-hud-rate" class="num"></small></div>
+          <div class="hud-item"><span class="hud-k">Refused</span><b id="bf-hud-refused" class="num">0</b></div>
+          <div class="hud-item"><span class="hud-k">Waiting longest</span><b id="bf-hud-wait" class="num">–</b></div>
+        </div>
+
+        <aside id="bf-details" class="float details" hidden aria-labelledby="bf-details-title">
+          <header class="float-head">
+            <div class="details-kind" id="bf-details-kind"></div>
+            <button id="bf-details-close" class="x-btn" type="button" aria-label="Close details">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            </button>
+          </header>
+          <h2 id="bf-details-title" class="details-title"></h2>
+          <div id="bf-details-body" class="details-body"></div>
+        </aside>
+
+        <aside id="bf-inspector" class="float inspector" aria-labelledby="bf-insp-title">
+          <header class="float-head">
+            <h2 id="bf-insp-title">Decision inspector</h2>
+            <span id="bf-insp-mode" class="mode-chip is-live"><i aria-hidden="true"></i><span>Live</span></span>
+            <button id="bf-insp-toggle" class="x-btn" type="button" aria-label="Collapse inspector" aria-expanded="true">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </header>
+          <div class="insp-body">
+            <div id="bf-insp-empty" class="insp-empty">Waiting for the first decision&hellip; One is recorded when a pool job is queued.</div>
+            <div id="bf-insp-content" hidden>
+              <div class="dec-head">
+                <div class="dec-repo"><i id="bf-dec-dot" class="repo-dot" aria-hidden="true"></i><span id="bf-dec-repo"></span><span id="bf-dec-job" class="muted"></span></div>
+                <div id="bf-dec-labels" class="dec-labels"></div>
+              </div>
+              <div class="dec-facts">
+                <div class="fact"><span class="fact-k">Estimate</span><b id="bf-dec-est" class="num"></b><span id="bf-dec-src" class="src-chip"></span></div>
+                <div class="fact"><span class="fact-k">Method</span><b id="bf-dec-method"></b></div>
+                <div class="fact"><span class="fact-k">Outcome</span><b id="bf-dec-outcome"></b></div>
+              </div>
+              <p id="bf-dec-why" class="dec-why"></p>
+              <div class="rank-head"><span>Candidates, best first</span><span class="muted">score</span></div>
+              <ol id="bf-dec-rank" class="rank"></ol>
+              <div id="bf-dec-filtered-wrap" class="filtered-wrap">
+                <div class="rank-head"><span>Filtered out</span></div>
+                <ul id="bf-dec-filtered" class="filtered"></ul>
+              </div>
+              <div class="rank-head"><span>Launch</span></div>
+              <ol id="bf-dec-attempts" class="attempts"></ol>
+            </div>
+            <div class="history-wrap">
+              <div class="rank-head"><span>Recent decisions</span><button id="bf-insp-live" class="link-btn" type="button" hidden>Back to live</button></div>
+              <ol id="bf-history" class="history"></ol>
+            </div>
+          </div>
+        </aside>
+
+        <aside id="bf-legend" class="float f-legend" aria-labelledby="bf-legend-title">
+          <button id="bf-legend-toggle" class="legend-head" type="button" aria-expanded="true">
+            <span id="bf-legend-title">Legend</span>
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div class="legend-body">
+            <div class="lg-title">Score parts</div>
+            <ul class="lg-list">
+              <li><i class="sw sw-cache"></i>cache <span class="muted">warm checkout</span></li>
+              <li><i class="sw sw-headroom"></i>headroom <span class="muted">RAM left after the job</span></li>
+              <li><i class="sw sw-speed"></i>speed <span class="muted">ran these jobs faster</span></li>
+              <li><i class="sw sw-cpu"></i>cpu <span class="muted">idle cores</span></li>
+              <li><i class="sw sw-bigfit"></i>&minus;bigfit <span class="muted">keep for a heavier job</span></li>
+            </ul>
+            <div class="lg-title">Edges</div>
+            <ul class="lg-list lg-edges">
+              <li><svg viewBox="0 0 34 10" aria-hidden="true"><path class="lg-probe" d="M1 5h32"/></svg>probe: thicker = higher score</li>
+              <li><svg viewBox="0 0 34 10" aria-hidden="true"><path class="lg-win" d="M1 5h32"/></svg>launch offered to the best</li>
+              <li><svg viewBox="0 0 34 10" aria-hidden="true"><path class="lg-filter" d="M1 5h32"/></svg>filtered out (reason chip)</li>
+              <li><svg viewBox="0 0 34 10" aria-hidden="true"><path class="lg-wake" d="M1 5h32"/></svg>not a pool job: a host took it</li>
+            </ul>
+            <div class="lg-title">Jobs &amp; slots</div>
+            <ul class="lg-list">
+              <li><i class="sw sw-dot"></i>a job in flight (colour = repository)</li>
+              <li><i class="sw sw-starting"></i>slot: launch accepted, runner starting</li>
+              <li><i class="sw sw-running"></i>slot: job running, fill = share of its usual time</li>
+            </ul>
+            <div class="lg-keys muted">Drag to pan · wheel/pinch to zoom · double-click to focus · <kbd>F</kbd> fit · <kbd>Space</kbd> pause</div>
+          </div>
+        </aside>
+
+        <div class="float minimap">
+          <canvas id="bf-minimap" class="minimap-canvas" aria-label="Minimap: click or drag to move the camera"></canvas>
+        </div>
+
+        <div class="toolbar" role="toolbar" aria-label="Replay and camera">
+          <button id="bf-btn-pause" class="tb-btn" type="button" aria-pressed="false" aria-label="Pause" title="Pause the replay; what arrives meanwhile plays when you resume (Space)">
+            <svg class="ic-pause" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M5 3.5v9M11 3.5v9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            <svg class="ic-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M5 3.2v9.6L12.6 8z" fill="currentColor"/></svg>
+            <span class="tb-label" id="bf-pause-label">Pause</span>
+          </button>
+          <span class="tb-sep" aria-hidden="true"></span>
+          <button id="bf-btn-zout" class="tb-btn tb-icon" type="button" aria-label="Zoom out" title="Zoom out (-)">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3.5 8h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          </button>
+          <button id="bf-btn-zoom" class="tb-btn tb-zoom num" type="button" title="Zoom to fit (F)">100%</button>
+          <button id="bf-btn-zin" class="tb-btn tb-icon" type="button" aria-label="Zoom in" title="Zoom in (+)">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3.5 8h9M8 3.5v9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          </button>
+          <button id="bf-btn-fit" class="tb-btn tb-icon" type="button" aria-label="Zoom to fit" title="Zoom to fit (F)">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2.5 6V3.5a1 1 0 0 1 1-1H6M10 2.5h2.5a1 1 0 0 1 1 1V6M13.5 10v2.5a1 1 0 0 1-1 1H10M6 13.5H3.5a1 1 0 0 1-1-1V10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+
+        <div id="bf-tip" class="f-tip" role="tooltip" hidden></div>
+      </div>
+
+      <!-- Decision theatre -->
+      <div id="bal-race" class="br" hidden>
+        <section class="conv card" aria-labelledby="br-h-conv">
+          <div class="conv-h">
+            <h2 id="br-h-conv">Incoming jobs</h2>
+            <span class="conv-meta num" id="br-conv-meta"></span>
+            <span class="conv-hint muted">oldest on the left · bar = time waiting</span>
+            <div class="ctl" role="toolbar" aria-label="Replay">
+              <button class="cbtn" id="br-btn-pause" type="button" aria-pressed="false" title="Hold the stage; new decisions wait (Space)">
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path class="i-pause" d="M4.5 3h2.2v10H4.5zM9.3 3h2.2v10H9.3z"/><path class="i-play" d="M4.5 2.8v10.4L13 8z"/></svg>
+                <span id="br-btn-pause-l">Pause</span>
+              </button>
+              <button class="cbtn cbtn-wi" id="br-btn-whatif" type="button" aria-pressed="false" aria-controls="br-whatif" title="Re-rank this decision with weights of your own, in this browser only">What-if weights</button>
+            </div>
+          </div>
+          <div class="conv-track">
+            <div class="conv-gate" aria-hidden="true"><span>to the<br>stage</span></div>
+            <div class="conv-lane" id="br-conv-lane"></div>
+            <p class="conv-empty muted" id="br-conv-empty" hidden>Queue is empty — every job has a runner.</p>
+          </div>
+        </section>
+
+        <div class="mid">
+          <section class="stage card" id="br-stage" tabindex="-1" aria-labelledby="br-st-kicker">
+            <div class="rs-head">
+              <div class="rs-job">
+                <span class="rs-kicker" id="br-st-kicker">Now placing</span>
+                <div class="rs-jobcard" id="br-st-jobcard"></div>
+              </div>
+              <div class="rs-meta" id="br-st-meta"></div>
+              <div class="phases" id="br-phases" aria-label="Decision steps"></div>
+            </div>
+
+            <div class="whatif" id="br-whatif" hidden>
+              <div class="wi-h">
+                <strong>What-if</strong>
+                <span class="muted">Hypothetical: re-ranks this recorded decision in your browser only. The coordinator keeps its own weights.</span>
+                <button class="link-btn" id="br-wi-reset" type="button">Reset to the coordinator’s weights</button>
+              </div>
+              <div class="wi-sliders" id="br-wi-sliders"></div>
+            </div>
+
+            <div class="rs-why" id="br-st-why" aria-live="polite"></div>
+
+            <div class="lanes-h" aria-hidden="true">
+              <span class="lh-rank">#</span><span class="lh-name">Machine</span>
+              <span class="lh-bar"></span>
+              <span class="lh-tot">Total</span>
+            </div>
+            <div class="stage-scroll"><div class="lanes" id="br-lanes" role="list" aria-label="Machines ranked for this job"></div></div>
+
+            <div class="rs-foot">
+              <div class="rlegend" id="br-legend" aria-label="Legend"></div>
+              <div class="scrub">
+                <button class="icon-btn sm" id="br-sc-play" type="button" aria-label="Play or pause this decision">
+                  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path class="i-pause" d="M4.5 3h2.2v10H4.5zM9.3 3h2.2v10H9.3z"/><path class="i-play" d="M4.5 2.8v10.4L13 8z"/></svg>
+                </button>
+                <input type="range" id="br-sc-range" min="0" max="1000" value="0" aria-label="Scrub through this decision">
+                <span class="sc-mode" id="br-sc-mode">Live</span>
+                <button class="cbtn sm" id="br-sc-live" type="button" hidden>Back to live</button>
+              </div>
+            </div>
+          </section>
+
+          <aside class="strip card" aria-labelledby="br-h-strip">
+            <div class="strip-h"><h2 id="br-h-strip">Machines</h2><span class="muted num" id="br-strip-meta"></span></div>
+            <div class="strip-list" id="br-strip-list"></div>
+          </aside>
+        </div>
+
+        <section class="hist card" aria-labelledby="br-h-hist">
+          <div class="hist-h">
+            <h2 id="br-h-hist">Past decisions</h2>
+            <span class="muted">click one to replay it on the stage</span>
+            <span class="spacer"></span>
+            <span class="muted num" id="br-hist-meta"></span>
+          </div>
+          <div class="hist-list" id="br-hist-list" role="list"></div>
+          <p class="muted hist-empty" id="br-hist-empty">No decision recorded since the coordinator started.</p>
+        </section>
+
+        <aside class="rdrawer" id="br-rdrawer" aria-labelledby="br-dr-title" hidden>
+          <div class="dr-h">
+            <h2 id="br-dr-title"></h2>
+            <button class="icon-btn" id="br-dr-close" type="button" aria-label="Close details">
+              <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" fill="none"/></svg>
+            </button>
+          </div>
+          <div class="dr-b" id="br-dr-body"></div>
+        </aside>
+
+        <div class="fly-layer" id="br-fly-layer" aria-hidden="true"></div>
+      </div>
+    </section>
 
     <dialog id="drawer" class="drawer" aria-labelledby="dw-title">
       <header class="dw-head">

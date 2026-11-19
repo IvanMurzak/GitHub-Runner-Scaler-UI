@@ -30,6 +30,7 @@ pub(crate) mod clock {
 pub mod dashboard;
 pub mod github_app;
 pub mod placement;
+pub mod placement_log;
 pub mod registry;
 pub mod remote;
 pub mod server;

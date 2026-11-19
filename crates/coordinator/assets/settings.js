@@ -60,6 +60,12 @@
     { key: 'disk', label: 'Disk free', sub: 'Per machine', styles: ['lines', 'area', 'strips'], off: true },
   ];
 
+  // How the Balancing screen shows placement.
+  const BALANCING_VIEWS = [
+    ['flow', 'Flow map', 'Webhooks, queues, the coordinator and the machines on one map you can pan and zoom'],
+    ['race', 'Decision theatre', 'One decision at a time: the machines race on their score parts'],
+  ];
+
   const RANGES = ['1h', '6h', '24h', '7d'];
   const REFRESH = [2, 5, 10, 30, 60];
   const SORTS = [
@@ -96,6 +102,7 @@
         per: Object.fromEntries(CHARTS.map((c) => [c.key, chartDefaults(c)])),
       },
       kpis: { order: keys(KPIS), hidden: offKeys(KPIS) },
+      balancing: { view: 'flow' },
     };
   }
 
@@ -144,7 +151,7 @@
   // missing or wrong at its default, what is unknown dropped.
   function normalize(raw) {
     const d = defaults(), r = obj(raw);
-    const g = obj(r.general), l = obj(r.layout), m = obj(r.machines), c = obj(r.charts), k = obj(r.kpis);
+    const g = obj(r.general), l = obj(r.layout), m = obj(r.machines), c = obj(r.charts), k = obj(r.kpis), b = obj(r.balancing);
     const dg = d.general, dm = d.machines, dc = d.charts;
     const pinned = ids(m.pinned);
     return {
@@ -190,6 +197,7 @@
         per: Object.fromEntries(CHARTS.map((x) => [x.key, chartOptions(x, obj(c.per)[x.key])])),
       },
       kpis: { order: order(k.order, keys(KPIS)), hidden: subset(k.hidden, keys(KPIS), d.kpis.hidden) },
+      balancing: { view: oneOf(b.view, BALANCING_VIEWS.map((x) => x[0]), d.balancing.view) },
     };
   }
 
@@ -283,7 +291,7 @@
   }
 
   const api = {
-    VERSION, SECTIONS, KPIS, FIELDS, CHARTS, STYLE_LABEL, RANGES, REFRESH, SORTS, GROUPS, HEIGHTS, MAX_TOP,
+    VERSION, SECTIONS, KPIS, FIELDS, CHARTS, STYLE_LABEL, BALANCING_VIEWS, RANGES, REFRESH, SORTS, GROUPS, HEIGHTS, MAX_TOP,
     OS_NAME, STATUS, defaults, normalize, fromLegacy, same, shown, arrangeHosts, statusOf,
   };
   root.RMSettings = api;

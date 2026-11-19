@@ -293,6 +293,114 @@ async fn an_allowed_login_signs_in_and_sees_the_queue() {
     );
 }
 
+/// Delivers a signed `workflow_job` webhook queuing job `id` with `labels`.
+async fn queue_job(coordinator: &Coordinator, id: u64, labels: &[&str]) {
+    let created_at = (chrono::Utc::now() - chrono::TimeDelta::minutes(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let body = serde_json::json!({
+        "action": "queued",
+        "workflow_job": {"id": id, "run_id": 7, "name": "build",
+                         "labels": labels, "created_at": created_at},
+        "repository": {"full_name": "IvanMurzak/app"},
+    })
+    .to_string();
+    let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).expect("key");
+    mac.update(body.as_bytes());
+    let delivered = client()
+        .post(format!("{}/webhook", coordinator.base))
+        .header("x-github-event", "workflow_job")
+        .header("x-github-delivery", format!("delivery-{id}"))
+        .header(
+            "x-hub-signature-256",
+            format!("sha256={}", hex::encode(mac.finalize().into_bytes())),
+        )
+        .body(body)
+        .send()
+        .await
+        .expect("webhook");
+    assert_eq!(delivered.status(), 200);
+}
+
+#[tokio::test]
+async fn the_placement_view_shows_decisions_after_a_cursor() {
+    let github = github_for("ivanmurzak").await;
+    let coordinator = start(Some(auth(&github))).await;
+    for asset in [
+        "/assets/balancing.js",
+        "/assets/balancing-flow.js",
+        "/assets/balancing-race.js",
+        "/assets/balancing.css",
+    ] {
+        assert_eq!(
+            get(&coordinator, asset, None).await.status(),
+            200,
+            "{asset}"
+        );
+    }
+    assert_eq!(
+        get(&coordinator, "/api/placement", None).await.status(),
+        401,
+        "nothing without a session"
+    );
+    let (_, session) = sign_in(&coordinator).await;
+    let session = session.expect("a session cookie");
+
+    // A pool job with no host to take it: placement decides it waits.
+    queue_job(&coordinator, 51, &["rm-pool-linux"]).await;
+    let mut view = serde_json::Value::Null;
+    for _ in 0..50 {
+        view = get(&coordinator, "/api/placement", Some(&session))
+            .await
+            .json()
+            .await
+            .expect("json");
+        if view["decisions"].as_array().is_some_and(|d| !d.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(view["weights"]["cache"], 4.0);
+    assert_eq!(view["weights"]["bigfit"], 1.5);
+    assert!(view["hosts"].as_array().expect("hosts").is_empty());
+    assert_eq!(view["queued"][0]["id"], 51);
+    assert_eq!(view["queued"][0]["labels"], "rm-pool-linux");
+    assert_eq!(view["queued"][0]["pool"], true);
+    let decision = &view["decisions"][0];
+    assert_eq!(decision["repository"], "ivanmurzak/app");
+    assert_eq!(decision["labels"], "rm-pool-linux");
+    assert_eq!(decision["job_id"], 51);
+    assert_eq!(decision["chosen"], serde_json::Value::Null);
+    assert_eq!(decision["reason"], "no_candidate");
+    assert_eq!(view["counters"]["decisions"], 1);
+    let cursor = view["cursor"].as_u64().expect("cursor");
+    assert!(cursor >= 1);
+
+    let after: serde_json::Value = get(
+        &coordinator,
+        &format!("/api/placement?since={cursor}"),
+        Some(&session),
+    )
+    .await
+    .json()
+    .await
+    .expect("json");
+    assert!(after["decisions"].as_array().expect("decisions").is_empty());
+    assert_eq!(after["cursor"], cursor);
+    assert_eq!(after["reset"], false);
+    // A cursor from before a restart is ahead: everything again.
+    let ahead: serde_json::Value = get(
+        &coordinator,
+        &format!("/api/placement?since={}", cursor + 1000),
+        Some(&session),
+    )
+    .await
+    .json()
+    .await
+    .expect("json");
+    assert_eq!(ahead["reset"], true);
+    assert_eq!(ahead["decisions"].as_array().expect("decisions").len(), 1);
+}
+
 #[tokio::test]
 async fn a_login_off_the_allowlist_gets_no_session() {
     let github = github_for("someone-else").await;
