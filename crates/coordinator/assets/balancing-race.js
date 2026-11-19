@@ -52,7 +52,6 @@
     if (labels.length === 1) return labels[0];
     return labels.filter((l) => l !== 'self-hosted').join(' · ');
   }
-  const labelsText = (labels) => poolText(labels);
   function osOfLabels(labels) {
     const l = labels.join(',').toLowerCase();
     return l.includes('macos') || l.includes('-mac') ? 'macos' : l.includes('windows') ? 'windows' : 'linux';
@@ -390,7 +389,7 @@
       const row2 = el('div', 'sm-2');
       const est = el('span', 'sm-kv');
       if (D.scores.length) est.append(el('span', 'muted', 'Needs '), el('b', 'num', gib(D.estimate_bytes)), el('span', 'muted', ' · ' + (SOURCE_TEXT[D.estimate_source] || D.estimate_source)));
-      else est.append(el('span', 'muted', D.queued + ' queued · ' + D.leases + ' on the way · ' + labelsText(D.labelList)));
+      else est.append(el('span', 'muted', D.queued + ' queued · ' + D.leases + ' on the way · ' + poolText(D.labelList)));
       row2.appendChild(est);
       if (D.heavier_bytes && D.scores.some((s) => s.bigfit)) {
         row2.appendChild(el('span', 'sm-kv sm-heavy', 'heavier job waiting: ' + gib(D.heavier_bytes)));

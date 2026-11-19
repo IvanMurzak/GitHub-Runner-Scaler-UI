@@ -35,10 +35,6 @@
       return want.every((l) => have.includes(l));
     });
   }
-  const isWarm = (h, repo) => {
-    const r = String(repo || '').toLowerCase();
-    return (h.warm_repos || []).some((w) => w === r || w === B.ownerOf(r));
-  };
 
   // ================================================================ LiveWorld
   // What the scene draws, in the shapes the prototype's simulator had:
@@ -65,7 +61,6 @@
       this.coordBusy = false;
       this.primed = false;
       this.counters = { webhooks: 0, decisions: 0, launches: 0, accepted: 0, refused: 0, unanswered: 0, wakes: 0, finished: 0 };
-      this.layoutSig = '';
       this.weights = B.DEFAULT_WEIGHTS;
       feed.on((u) => this.ingest(u));
       if (feed.snap) this.ingest({ first: true, decisions: feed.decisions.slice(), events: [] });
@@ -403,18 +398,13 @@
       for (const j of this.jobs.values()) if (j.queue === q.id && j.state === 'queued') list.push(j);
       return list.sort((a, b) => a.queued_t - b.queued_t);
     }
-    pendingQueues() {
-      return this.queues.map((q) => {
-        const p = (this.pending && this.pending.get(q.id)) || {};
-        const jobs = this.queuedJobs(q);
-        const oldest = jobs.length ? Math.round(this.t - jobs[0].queued_t) : null;
-        return { repository: q.repository, labels: q.labels, queued: p.queued != null ? p.queued : jobs.length, leases: p.leases || 0,
-          oldest_wait_secs: p.oldest_wait_secs != null ? p.oldest_wait_secs : oldest, reason: p.reason || null, refusal: p.refusal || null };
-      });
-    }
-    hostSnapshot(h) {
-      return { free_ram_bytes: h.online ? h.free_ram_bytes : null, cpu_load_percent: h.online ? h.cpu_load_percent : null,
-        busy_slots: h.busy_slots || 0, free_slots: h.free_slots || 0 };
+    // A queue as the coordinator reports it, else as the jobs here show it.
+    pendingQueue(q) {
+      const p = (this.pending && this.pending.get(q.id)) || {};
+      const jobs = this.queuedJobs(q);
+      const oldest = jobs.length ? Math.round(this.t - jobs[0].queued_t) : null;
+      return { repository: q.repository, labels: q.labels, queued: p.queued != null ? p.queued : jobs.length, leases: p.leases || 0,
+        oldest_wait_secs: p.oldest_wait_secs != null ? p.oldest_wait_secs : oldest, reason: p.reason || null, refusal: p.refusal || null };
     }
   }
 
@@ -962,11 +952,10 @@
 
     onEvent(ev) {
       const t = ev.t;
-      const qIdx = (qid) => qid;
       switch (ev.type) {
         case 'webhook': {
           const tk = this.token(ev.job);
-          tk.segs.push({ edge: 'gh:' + qIdx(ev.queue), t0: t, dur: PACE.webhook, dir: 1 });
+          tk.segs.push({ edge: 'gh:' + ev.queue, t0: t, dur: PACE.webhook, dir: 1 });
           tk.removeAt = t + PACE.webhook;
           this.ghPulses.push(t);
           if (this.ghPulses.length > 12) this.ghPulses.shift();
@@ -1522,7 +1511,7 @@
       const q = n.q;
       const color = this.color(q.repository);
       const jobs = this.queueJobs(q);
-      const pending = this.sim.pendingQueues().find((x) => x.repository === q.repository && x.labels === q.labels) || {};
+      const pending = this.sim.pendingQueue(q);
       const block = this.blockFx.get(q.id);
       const flash = block ? clamp(1 - (t - block.t0) / 1.6, 0, 1) : 0;
       const active = this.fx.length && this.currentFx().d.queue === q.id && t < this.currentFx().end;
@@ -2472,7 +2461,7 @@
     function queueDetails(id) {
       const q = sim.queue(id);
       if (!q) return null;
-      const pq = sim.pendingQueues().find((x) => x.repository === q.repository && x.labels === q.labels) || {};
+      const pq = sim.pendingQueue(q);
       const jobs = sim.queuedJobs(q);
       const cands = sim.hosts.filter((h) => serves(h, q.labels));
       let html = kv([

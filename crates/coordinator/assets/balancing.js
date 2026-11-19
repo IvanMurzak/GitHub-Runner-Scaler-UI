@@ -103,7 +103,6 @@
   // One recorded decision as the layouts read it: the coordinator's fields,
   // the hosts it names resolved, and its launch's fate from the events.
   function model(raw, snap) {
-    const hosts = new Map((snap.hosts || []).map((h) => [h.id, h]));
     const weights = Object.assign({}, DEFAULT_WEIGHTS, snap.weights || {});
     const mostIdle = (raw.most_idle_millicores || 0) / 1000;
     const scores = (raw.scores || []).map((s) => {
@@ -143,7 +142,6 @@
       reason: raw.reason, refusal: raw.refusal,
       attempts: [], outcome: raw.chosen ? null : raw.reason || 'no_candidate', placed_on: null,
       lease_id: null, claimed_ms: null, finished: null,
-      hostName: (id) => (hosts.get(id) || {}).name || id,
     };
   }
 
@@ -324,6 +322,6 @@
   };
   root.RMBalance = {
     GiB, clamp, isNum, esc, fmtBytes, gShort, pts, secs, fmtWait, fmtClock, shortRepo, ownerOf, labelList,
-    REASON_TEXT, reasonText, SOURCE_TEXT, SEGS, DEFAULT_WEIGHTS, repoVar, statusOf, reduced, onLook, queueId, model, applyEvent, Feed,
+    REASON_TEXT, reasonText, SOURCE_TEXT, SEGS, DEFAULT_WEIGHTS, repoVar, statusOf, reduced, onLook, queueId, applyEvent,
   };
 })(window);

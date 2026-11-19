@@ -724,13 +724,6 @@ async fn placement_route(
                 )
             },
         );
-        let expected_secs = job.name.as_ref().and_then(|name| {
-            let key = format!("{}/{name}", job.repository.to_ascii_lowercase());
-            state
-                .statistics
-                .with_aggregates(|aggregates| aggregates.job(&key))
-                .and_then(|figures| figures.p50_duration_secs)
-        });
         PlacementJob {
             id: job.id,
             host_id: job
@@ -743,11 +736,20 @@ async fn placement_route(
             pool,
             queued_at: job.queued_at,
             started_at: job.started_at,
-            expected_secs,
+            expected_secs: None,
         }
     };
-    let queued: Vec<PlacementJob> = snapshot.queued.into_iter().map(&job).collect();
-    let running: Vec<PlacementJob> = snapshot.running.into_iter().map(&job).collect();
+    let mut queued: Vec<PlacementJob> = snapshot.queued.into_iter().map(&job).collect();
+    let mut running: Vec<PlacementJob> = snapshot.running.into_iter().map(&job).collect();
+    // Their usual run time, under one read of the statistics.
+    state.statistics.with_aggregates(|aggregates| {
+        for job in queued.iter_mut().chain(running.iter_mut()) {
+            job.expected_secs = job.name.as_ref().and_then(|name| {
+                let key = format!("{}/{name}", job.repository.to_ascii_lowercase());
+                aggregates.job(&key)?.p50_duration_secs
+            });
+        }
+    });
     let (pending, leases) = state.placement.snapshot();
     let config = state.statistics.config();
     let weights = config.weights;
