@@ -36,6 +36,10 @@ const INDEX_HTML: &str = include_str!("../../assets/index.html");
 const APP_CSS: &str = include_str!("../../assets/app.css");
 const APP_JS: &str = include_str!("../../assets/app.js");
 const SETTINGS_JS: &str = include_str!("../../assets/settings.js");
+const BALANCING_JS: &str = include_str!("../../assets/balancing.js");
+const BALANCING_FLOW_JS: &str = include_str!("../../assets/balancing-flow.js");
+const BALANCING_RACE_JS: &str = include_str!("../../assets/balancing-race.js");
+const BALANCING_CSS: &str = include_str!("../../assets/balancing.css");
 const ICON_SVG: &str = include_str!("../../assets/icon.svg");
 
 const SESSION_COOKIE: &str = "rm_session";
@@ -109,6 +113,7 @@ pub fn routes(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
         .route("/api/session", get(session))
         .route("/api/overview", get(overview))
         .route("/api/metrics", get(metrics_route))
+        .route("/api/placement", get(placement_route))
         .route("/api/hosts/{id}/config", get(host_config))
         .route("/api/hosts/{id}/command", post(host_command))
         .route("/api/audit", get(audit))
@@ -129,6 +134,22 @@ pub fn routes(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
         .route(
             "/assets/settings.js",
             asset(SETTINGS_JS, "text/javascript; charset=utf-8"),
+        )
+        .route(
+            "/assets/balancing.js",
+            asset(BALANCING_JS, "text/javascript; charset=utf-8"),
+        )
+        .route(
+            "/assets/balancing-flow.js",
+            asset(BALANCING_FLOW_JS, "text/javascript; charset=utf-8"),
+        )
+        .route(
+            "/assets/balancing-race.js",
+            asset(BALANCING_RACE_JS, "text/javascript; charset=utf-8"),
+        )
+        .route(
+            "/assets/balancing.css",
+            asset(BALANCING_CSS, "text/css; charset=utf-8"),
         )
         .route("/assets/icon.svg", asset(ICON_SVG, "image/svg+xml"))
         .route("/auth/login", get(login))
@@ -472,11 +493,8 @@ fn host_names(records: &[HostRecord]) -> BTreeMap<String, String> {
         .collect()
 }
 
-async fn overview(State(state): State<Arc<AppState>>) -> Response {
-    let dashboard = dashboard(&state);
-    let now = Utc::now().timestamp();
-    let records = state.store().hosts().unwrap_or_default();
-    let names = host_names(&records);
+/// Every enrolled host still active, online first, with its last reports.
+fn host_views(state: &AppState, records: &[HostRecord]) -> Vec<HostView> {
     let connected: BTreeMap<String, crate::registry::ConnectedHost> = state
         .registry
         .connected()
@@ -530,6 +548,16 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
         })
         .collect();
     hosts.sort_by(|a, b| b.online.cmp(&a.online).then_with(|| a.name.cmp(&b.name)));
+    hosts
+}
+
+async fn overview(State(state): State<Arc<AppState>>) -> Response {
+    let dashboard = dashboard(&state);
+    let now = Utc::now().timestamp();
+    let records = state.store().hosts().unwrap_or_default();
+    let names = host_names(&records);
+    let hosts = host_views(&state, &records);
+    let stats = state.registry.connected_stats();
     let snapshot = dashboard.activity.snapshot(now);
     let with_host = |runner: Option<&str>| {
         let host_id = runner.and_then(|runner| dashboard.activity.host_of(runner));
@@ -576,8 +604,8 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
     let summary = serde_json::json!({
         "hosts_online": hosts.iter().filter(|host| host.online).count(),
         "hosts_total": hosts.len(),
-        "slots_busy": stats.values().map(|host| host.busy_slots).sum::<u32>(),
-        "slots_total": stats.values().map(|host| host.busy_slots + host.free_slots).sum::<u32>(),
+        "slots_busy": stats.iter().map(|host| host.busy_slots).sum::<u32>(),
+        "slots_total": stats.iter().map(|host| host.busy_slots + host.free_slots).sum::<u32>(),
         "jobs_queued": queue.len(),
         "jobs_running": running.len(),
         "p50_queue_wait_secs": p50,
@@ -596,6 +624,160 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
         "recent": recent,
         "pools": pools,
         "leases": leases,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Balancing: how placement decides, live
+// ---------------------------------------------------------------------------
+
+/// A host as the Balancing screen draws it: its reports, and what it serves.
+#[derive(Debug, Serialize)]
+struct PlacementHost {
+    #[serde(flatten)]
+    host: HostView,
+    /// The labels of each enabled profile, comma-separated.
+    pools: Vec<String>,
+    /// The targets (`owner/repo`, or an organisation) a profile keeps a
+    /// persistent workspace for.
+    warm_repos: Vec<String>,
+}
+
+/// A job in the queue or running, with the pool queue it belongs to.
+#[derive(Debug, Serialize)]
+struct PlacementJob {
+    id: u64,
+    repository: String,
+    name: Option<String>,
+    /// Its required labels as placement keys its queue, comma-separated.
+    labels: String,
+    /// Placement decides where it runs; otherwise hosts are only woken.
+    pool: bool,
+    queued_at: i64,
+    started_at: Option<i64>,
+    host_id: Option<String>,
+    /// Its median run time so far, when measured.
+    expected_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlacementQuery {
+    since: Option<u64>,
+}
+
+fn pools_and_warm(
+    hello: &runner_manager_domain::coordinator_protocol::Hello,
+) -> (Vec<String>, Vec<String>) {
+    let mut pools: Vec<String> = Vec::new();
+    let mut warm: Vec<String> = Vec::new();
+    for target in &hello.targets {
+        for profile in target.profiles.iter().filter(|profile| profile.enabled) {
+            let labels = profile.labels.join(",");
+            if !pools.contains(&labels) {
+                pools.push(labels);
+            }
+            let name = target.name.to_ascii_lowercase();
+            if profile.warm && !warm.contains(&name) {
+                warm.push(name);
+            }
+        }
+    }
+    (pools, warm)
+}
+
+/// `GET /api/placement?since=<cursor>`: the hosts, queues, leases and weights
+/// placement works with now, and the decisions and launch events after
+/// `cursor` (all kept, without one) with the next cursor and the log's
+/// `epoch` (new at each start).
+async fn placement_route(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PlacementQuery>,
+) -> Response {
+    let dashboard = dashboard(&state);
+    let now = Utc::now().timestamp();
+    let records = state.store().hosts().unwrap_or_default();
+    let hellos: BTreeMap<String, runner_manager_domain::coordinator_protocol::Hello> = state
+        .registry
+        .connected()
+        .into_iter()
+        .filter_map(|host| Some((host.host_id, host.hello?)))
+        .collect();
+    let hosts: Vec<PlacementHost> = host_views(&state, &records)
+        .into_iter()
+        .map(|host| {
+            let (pools, warm_repos) = hellos.get(&host.id).map(pools_and_warm).unwrap_or_default();
+            PlacementHost {
+                host,
+                pools,
+                warm_repos,
+            }
+        })
+        .collect();
+    let snapshot = dashboard.activity.snapshot(now);
+    let job = |job: crate::dashboard::activity::ActiveJob| {
+        let required = crate::webhook::required_labels(&job.labels);
+        let (labels, pool) = required.as_ref().map_or_else(
+            || (job.labels.join(","), false),
+            |required| {
+                (
+                    crate::placement::JobKey::new(&job.repository, required).labels_csv(),
+                    state.registry.is_placed(&job.repository, required),
+                )
+            },
+        );
+        PlacementJob {
+            id: job.id,
+            host_id: job
+                .runner_name
+                .as_deref()
+                .and_then(|runner| dashboard.activity.host_of(runner)),
+            repository: job.repository,
+            name: job.name,
+            labels,
+            pool,
+            queued_at: job.queued_at,
+            started_at: job.started_at,
+            expected_secs: None,
+        }
+    };
+    let mut queued: Vec<PlacementJob> = snapshot.queued.into_iter().map(&job).collect();
+    let mut running: Vec<PlacementJob> = snapshot.running.into_iter().map(&job).collect();
+    // Their usual run time, under one read of the statistics.
+    state.statistics.with_aggregates(|aggregates| {
+        for job in queued.iter_mut().chain(running.iter_mut()) {
+            job.expected_secs = job.name.as_ref().and_then(|name| {
+                let key = format!("{}/{name}", job.repository.to_ascii_lowercase());
+                aggregates.job(&key)?.p50_duration_secs
+            });
+        }
+    });
+    let (pending, leases) = state.placement.snapshot();
+    let config = state.statistics.config();
+    let weights = config.weights;
+    let log = state.placement.log_since(query.since.unwrap_or(0));
+    json(&serde_json::json!({
+        "generated_at": now,
+        "weights": {
+            "cache": weights.cache,
+            "headroom": weights.headroom,
+            "speed": weights.speed,
+            "cpu": weights.cpu,
+            "bigfit": weights.bigfit,
+        },
+        "cpu_busy_percent": config.guards.cpu_busy_percent,
+        "min_disk_free_bytes": config.guards.min_disk_free,
+        "ram_margin_bytes": config.ram_margin,
+        "hosts": hosts,
+        "queued": queued,
+        "running": running,
+        "queues": pending,
+        "leases": leases,
+        "epoch": log.epoch,
+        "cursor": log.cursor,
+        "reset": log.reset,
+        "counters": log.counters,
+        "decisions": log.decisions,
+        "events": log.events,
     }))
 }
 

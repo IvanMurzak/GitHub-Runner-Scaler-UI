@@ -395,6 +395,21 @@ impl Registry {
         self.lock().keys().cloned().collect()
     }
 
+    /// Every connected host, and whether it said hello and sent a heartbeat:
+    /// only then can it be a candidate.
+    #[must_use]
+    pub fn readiness(&self) -> Vec<(String, bool)> {
+        self.lock()
+            .iter()
+            .map(|(id, connected)| {
+                (
+                    id.clone(),
+                    connected.hello.is_some() && connected.heartbeat.is_some(),
+                )
+            })
+            .collect()
+    }
+
     /// Every connected host in launch mode for `repository` with an enabled
     /// pool profile whose labels cover `required`, and its last heartbeat. A
     /// host that has not sent a heartbeat yet is not a candidate, nor, for a

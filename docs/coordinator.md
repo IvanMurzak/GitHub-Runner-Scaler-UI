@@ -810,6 +810,44 @@ there (which an update inside the distribution leaves behind).
 Without a proxy in front, forward `/`, `/assets/*`, `/auth/*` and `/api/*` as well as the four
 endpoints in [Deploy](#deploy).
 
+### Balancing screen
+
+**Balancing** in the top bar (`/#balancing`) shows how the coordinator places pool jobs, live, from
+what it actually did: each placement decision with the score parts of every candidate (cache,
+headroom, speed, CPU, bigfit, as the [weights](#weighted-placement) give them), why each other connected host
+was passed over (`no_candidate`: none of its pool profiles serves the queue; `not_ready`: connected
+but no hello or heartbeat yet; `unfit_or_draining`;
+`no_free_slot`; `tried`: it refused or did not answer earlier in the same round; a scored host with
+`fits: false` lacked the memory), the last resorts, the estimate and its source, and what became of
+the launch: offered, accepted, refused (with the host's reason) or unanswered, then claimed and
+finished; `cancelled` (its job left the queue first), `expired`, or `lost` (its host went away or
+reconnected, or stopped listing it). A decision that offers a launch is recorded once the host
+answers. A retry after a refusal is a decision of its own. A queue that stays unplaced, or whose
+launch the same host refuses again for the same reason, is recorded once a minute; the counters
+count every round.
+
+It reads `GET /api/placement` every 2 s (or at the dashboard's refresh interval when that is 10 s or
+longer) and replays what is new in order, each step slow enough to be followed; a backlog of more
+than a few decisions is applied at once. Two layouts, chosen in Settings → Layout → Balancing
+screen:
+
+- **Flow map** (the default): GitHub, the pool queues, the coordinator and the machines on one
+  canvas you can pan, zoom (wheel, pinch, `+`/`-`, `F` to fit) and focus (double-click), with a
+  minimap. Jobs travel from webhook to queue to coordinator to machine; probes to the candidates
+  thicken with their score, filtered hosts get a dashed edge and their reason. The decision
+  inspector explains the current decision, ranks the candidates with their score bars, and pins any
+  of the recent decisions. Click a machine, queue or job for its details.
+- **Decision theatre**: one decision at a time on a stage, the candidates as lanes whose score grows
+  part by part, re-sorted into rank, the launch and the host's answer; the queued jobs above, the
+  machines beside, the past decisions below to replay. The scrubber moves through a decision.
+  **What-if weights** re-ranks the decision on the stage with weights you choose: a hypothetical in
+  your browser only, from the recorded score parts; the coordinator keeps its own weights.
+
+Pause holds the replay (what arrives meanwhile waits). The log of decisions (the last 200) and
+launch events (the last 500) is kept in memory: a restart empties it. Jobs that are not placed
+(no pool label and no host leaving them to placement) only show in the queues, and on the machine
+that takes them.
+
 ### Dashboard settings
 
 The sliders button in the top bar opens Settings, a panel beside the page; every change shows on
@@ -820,7 +858,9 @@ the dashboard at once and animates into place. From 0.4.73:
   in GiB or GB, compact table rows, how many Recent jobs and remote commands show before "Show
   all", and whether the remote commands list shows changes only or every read too.
 - **Layout**: the order of the sections (drag a section by its handle, or use its arrow buttons or
-  the arrow keys on the handle), which show, and Queue and Running side by side or stacked.
+  the arrow keys on the handle), which show, Queue and Running side by side or stacked, and
+  how the [Balancing screen](#balancing-screen) shows placement (flow map or decision
+  theatre; settings saved before default to the flow map).
 - **Machines**: pinned machines first, in the order you give them (pin one with the pin on its
   card, in its panel, or in the list); the rest sorted by name, status, operating system, CPU,
   memory, busy or free slots or uptime, optionally reversed, online first or not, and optionally
@@ -1018,6 +1058,7 @@ old to take commands; the coordinator waits up to a minute for an answer.
 | `POST /api/hosts/{id}/command` | a session; a cookie also needs this origin | `{"argv": [...]}` to `{"request_id", "exit_code", "stdout", "stderr", "truncated"}`; `503` offline, `409` too old, `504` no answer |
 | `GET /api/hosts/{id}/config` | a session | the host's `repo list --json` and `remote_changes` |
 | `GET /api/audit` | a session | the last 100 remote commands |
+| `GET /api/placement?since=<cursor>` | a session | for the [Balancing screen](#balancing-screen): `hosts` (the overview's, with `pools`: each enabled profile's labels, and `warm_repos`), `queued` and `running` jobs (with the queue's `labels`, `pool`, `host_id`, `expected_secs`), `queues` short of runners, open `leases`, the score `weights`, `cpu_busy_percent`, `min_disk_free_bytes`, `ram_margin_bytes`, `counters` since start, and the `decisions` and launch `events` after `since` (all kept without it) with the next `cursor` and the log's `epoch`, new at each start (a page holding another epoch reads everything again); `reset: true` when `since` is ahead of the log or older than what it keeps |
 
 Every `/api/*` route takes the browser's cookie or the CLI's `Authorization: Bearer <token>`. A
 token is only accepted as a bearer token and a cookie only as a cookie; a bearer request needs no
