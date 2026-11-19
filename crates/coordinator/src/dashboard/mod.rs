@@ -687,7 +687,8 @@ fn pools_and_warm(
 
 /// `GET /api/placement?since=<cursor>`: the hosts, queues, leases and weights
 /// placement works with now, and the decisions and launch events after
-/// `cursor` (all kept, without one) with the next cursor.
+/// `cursor` (all kept, without one) with the next cursor and the log's
+/// `epoch` (new at each start).
 async fn placement_route(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PlacementQuery>,
@@ -771,6 +772,7 @@ async fn placement_route(
         "running": running,
         "queues": pending,
         "leases": leases,
+        "epoch": log.epoch,
         "cursor": log.cursor,
         "reset": log.reset,
         "counters": log.counters,

@@ -387,6 +387,15 @@ async fn the_placement_view_shows_decisions_after_a_cursor() {
     assert!(after["decisions"].as_array().expect("decisions").is_empty());
     assert_eq!(after["cursor"], cursor);
     assert_eq!(after["reset"], false);
+    assert!(
+        view["epoch"]
+            .as_str()
+            .is_some_and(|epoch| !epoch.is_empty())
+    );
+    assert_eq!(
+        after["epoch"], view["epoch"],
+        "the same log until a restart"
+    );
     // A cursor from before a restart is ahead: everything again.
     let ahead: serde_json::Value = get(
         &coordinator,

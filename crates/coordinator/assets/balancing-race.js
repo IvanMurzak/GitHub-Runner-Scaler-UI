@@ -307,7 +307,9 @@
         const off = D.not_serving.filter((n) => n.why === 'offline').map((n) => n.host_id);
         const parts = [];
         if (other.length) parts.push(other.map(hostName).join(', ') + ' — serve other labels');
+        const early = D.not_serving.filter((n) => n.why === 'not_ready').map((n) => n.host_id);
         if (off.length) parts.push(off.map(hostName).join(', ') + ' — offline');
+        if (early.length) parts.push(early.map(hostName).join(', ') + ' — connected, not ready yet');
         cur.nsEl.textContent = 'Not candidates: ' + parts.join(' · ');
       }
       lanesEl.appendChild(cur.nsEl);
@@ -748,8 +750,7 @@
     // --------------------------------------------------------------------- live orchestration
     function stageFollowsLive() { return S.mode === 'live' && S.stagePlaying && !S.paused; }
     function pushHistory(D) {
-      if (D._inHistory) return;
-      D._inHistory = true;
+      if (S.history.includes(D)) return;
       S.history.unshift(D);
       if (S.history.length > 80) S.history.length = 80;
       S.histDirty = true;
@@ -757,9 +758,19 @@
     // A launch's answer comes within the coordinator's ack timeout (10 s).
     const settled = (D) => complete(D) || feed.now() - D.at_ms > 15000;
 
+    // Primes the history from what the feed holds.
+    function prime() {
+      S.history = [];
+      S.waiting = [];
+      for (const d of feed.decisions.slice(-40)) pushHistory(settle(staged(d)));
+      S.idleShown = false;
+      S.stale = false;
+    }
     feed.on((u) => {
       if (u.failed) return;
       syncHosts();
+      // Not showing: nothing queues up; the history is primed again on show.
+      if (!S.running) { S.stale = true; return; }
       if (u.first || u.reset) {
         S.history = [];
         S.waiting = [];
@@ -767,6 +778,8 @@
         S.idleShown = false;
       } else {
         S.waiting.push(...u.decisions.map(staged));
+        // Held or paused for long: the oldest go straight to the history.
+        while (S.waiting.length > 40) pushHistory(settle(S.waiting.shift()));
       }
       S.histDirty = true;
       S.lastStrip = 0;
@@ -958,8 +971,13 @@
 
     // --------------------------------------------------------------------- history
     const histList = $('hist-list');
+    let histSig = '';
     function renderHistory() {
       S.histDirty = false;
+      // Rebuilt only when it shows something else: a card under the pointer stays.
+      const sig = S.history.slice(0, 40).map((D) => D.id + ':' + D.outcome).join(',') + '|' + (S.cur ? S.cur.D.id : '');
+      if (sig === histSig) return;
+      histSig = sig;
       histList.textContent = '';
       S.history.slice(0, 40).forEach((D) => {
         const c = el('button', 'hc');
@@ -993,6 +1011,9 @@
         } else if (a && (a.outcome === 'refused' || a.outcome === 'unanswered')) {
           win.append(el('span', 'hc-un', hostName(a.host_id) + ' · ' + (a.outcome === 'refused' ? 'refused' : 'no answer')));
           sub.textContent = a.outcome === 'refused' ? REFUSAL[a.reason] || B.reasonText(a.reason) : 'the next host is asked';
+        } else if (D.outcome == null) {
+          win.append(el('span', 'muted', 'offered…'));
+          sub.textContent = 'waiting for ' + hostName(D.chosen);
         } else {
           win.append(el('span', 'hc-un', 'unplaced · ' + (REASON[D.unplaced] || B.reasonText(D.unplaced))));
           sub.textContent = D.filtered.length + ' filtered · job waits';
@@ -1114,11 +1135,19 @@
       row.append(el('dt', '', k), el('dd', 'num', v));
       dl.appendChild(row);
     }
-    function renderDetails() {
+    // `periodic`: a refresh, skipped while the pointer or focus is in the
+    // drawer, and applied only when it shows something else.
+    function renderDetails(periodic) {
       const sel = S.selected;
       if (!sel) return;
-      const body = $('dr-body');
-      body.textContent = '';
+      const shown = $('dr-body');
+      if (periodic && ($('rdrawer').matches(':hover') || $('rdrawer').contains(document.activeElement))) return;
+      const body = el('div');
+      buildDetails(sel, body);
+      if (periodic && body.innerHTML === shown.innerHTML) return;
+      shown.replaceChildren(...body.childNodes);
+    }
+    function buildDetails(sel, body) {
       const snap = feed.snap || {};
       if (sel.kind === 'host') {
         const h = hostOf(sel.id);
@@ -1286,7 +1315,7 @@
       });
       $('dr-close').addEventListener('click', closeDetails);
       document.addEventListener('keydown', (e) => {
-        if (!S.running || e.defaultPrevented) return;
+        if (!S.running || e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
         if (e.key === 'Escape') { if (S.selected) closeDetails(); else if (S.whatIf) toggleWhatIf(false); }
         if (e.key === ' ' && e.target === document.body) { e.preventDefault(); setPaused(!S.paused); }
       });
@@ -1343,7 +1372,7 @@
         buildLegend();
         renderStrip();
         root.classList.toggle('is-stale', feed.failed);
-        if (S.selected && now - (S.lastDetails || 0) > 1000) { S.lastDetails = now; renderDetails(); }
+        if (S.selected && now - (S.lastDetails || 0) > 1000) { S.lastDetails = now; renderDetails(true); }
       }
       S.raf = requestAnimationFrame(frame);
     }
@@ -1358,6 +1387,7 @@
       start() {
         if (S.running) return;
         S.running = true;
+        if (S.stale) { prime(); S.histDirty = true; }
         if (S.cur) S.cur.barPx = 0;
         last = performance.now();
         S.raf = requestAnimationFrame(frame);

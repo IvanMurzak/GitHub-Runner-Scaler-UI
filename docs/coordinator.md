@@ -815,12 +815,16 @@ endpoints in [Deploy](#deploy).
 **Balancing** in the top bar (`/#balancing`) shows how the coordinator places pool jobs, live, from
 what it actually did: each placement decision with the score parts of every candidate (cache,
 headroom, speed, CPU, bigfit, as the [weights](#weighted-placement) give them), why each other connected host
-was passed over (`no_candidate`: none of its pool profiles serves the queue; `unfit_or_draining`;
+was passed over (`no_candidate`: none of its pool profiles serves the queue; `not_ready`: connected
+but no hello or heartbeat yet; `unfit_or_draining`;
 `no_free_slot`; `tried`: it refused or did not answer earlier in the same round; a scored host with
 `fits: false` lacked the memory), the last resorts, the estimate and its source, and what became of
 the launch: offered, accepted, refused (with the host's reason) or unanswered, then claimed and
-finished. A retry after a refusal is a decision of its own. A queue that stays unplaced for the
-same reasons is recorded once a minute.
+finished; `cancelled` (its job left the queue first), `expired`, or `lost` (its host went away or
+reconnected, or stopped listing it). A decision that offers a launch is recorded once the host
+answers. A retry after a refusal is a decision of its own. A queue that stays unplaced, or whose
+launch the same host refuses again for the same reason, is recorded once a minute; the counters
+count every round.
 
 It reads `GET /api/placement` every 2 s (or at the dashboard's refresh interval when that is 10 s or
 longer) and replays what is new in order, each step slow enough to be followed; a backlog of more
@@ -1054,7 +1058,7 @@ old to take commands; the coordinator waits up to a minute for an answer.
 | `POST /api/hosts/{id}/command` | a session; a cookie also needs this origin | `{"argv": [...]}` to `{"request_id", "exit_code", "stdout", "stderr", "truncated"}`; `503` offline, `409` too old, `504` no answer |
 | `GET /api/hosts/{id}/config` | a session | the host's `repo list --json` and `remote_changes` |
 | `GET /api/audit` | a session | the last 100 remote commands |
-| `GET /api/placement?since=<cursor>` | a session | for the [Balancing screen](#balancing-screen): `hosts` (the overview's, with `pools`: each enabled profile's labels, and `warm_repos`), `queued` and `running` jobs (with the queue's `labels`, `pool`, `host_id`, `expected_secs`), `queues` short of runners, open `leases`, the score `weights`, `cpu_busy_percent`, `min_disk_free_bytes`, `ram_margin_bytes`, `counters` since start, and the `decisions` and launch `events` after `since` (all kept without it) with the next `cursor`; `reset: true` when `since` is ahead of the log (the coordinator restarted) |
+| `GET /api/placement?since=<cursor>` | a session | for the [Balancing screen](#balancing-screen): `hosts` (the overview's, with `pools`: each enabled profile's labels, and `warm_repos`), `queued` and `running` jobs (with the queue's `labels`, `pool`, `host_id`, `expected_secs`), `queues` short of runners, open `leases`, the score `weights`, `cpu_busy_percent`, `min_disk_free_bytes`, `ram_margin_bytes`, `counters` since start, and the `decisions` and launch `events` after `since` (all kept without it) with the next `cursor` and the log's `epoch`, new at each start (a page holding another epoch reads everything again); `reset: true` when `since` is ahead of the log or older than what it keeps |
 
 Every `/api/*` route takes the browser's cookie or the CLI's `Authorization: Bearer <token>`. A
 token is only accepted as a bearer token and a cookie only as a cookie; a bearer request needs no

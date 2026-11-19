@@ -232,8 +232,6 @@ struct Lease {
     expires: Instant,
     /// The memory its queue was expected to need when it was placed.
     estimate: u64,
-    /// The decision that offered it, in the [`PlacementLog`].
-    decision: Option<u64>,
 }
 
 /// Why a pool queue has fewer runners on their way than jobs queued.
@@ -321,8 +319,9 @@ struct State {
     /// Stage 4: the estimates of leases whose runner took its job, by lease,
     /// held for [`RAMP_HOLD`] from the claim or until its attempt ends.
     ramping: Vec<Ramping>,
-    /// The last decisions and launch events, for the dashboard.
-    log: PlacementLog,
+    /// The last decisions and launch events, for the dashboard; its own lock,
+    /// taken after this state's.
+    log: Arc<PlacementLog>,
 }
 
 impl State {
@@ -491,17 +490,16 @@ impl State {
     }
 
     /// Records a launch event of `lease_id` on `host_id`; `lease`, when still
-    /// at hand, names its decision.
-    fn note(&mut self, kind: EventKind, lease_id: &str, host_id: &str, lease: Option<&Lease>) {
+    /// at hand, names its repository.
+    fn note(&self, kind: EventKind, lease_id: &str, host_id: &str, lease: Option<&Lease>) {
         self.note_with(LoggedEvent::new(kind, lease_id, host_id), lease);
     }
 
-    fn note_with(&mut self, mut event: LoggedEvent, lease: Option<&Lease>) {
+    fn note_with(&self, mut event: LoggedEvent, lease: Option<&Lease>) {
         if let Some(lease) = lease {
-            event.decision = lease.decision;
             event.repository = Some(lease.key.repository.clone());
         }
-        self.log.event(event);
+        self.log.event(event, crate::clock::now());
     }
 
     /// What every decision about `key` starts from: the queue as it stands.
@@ -630,6 +628,8 @@ pub struct Placement {
     lease_ttl: Duration,
     /// Stage 4: weighs placement by what jobs used; `None` places as stage 3.
     stats: Option<Arc<Statistics>>,
+    /// The state's [`PlacementLog`], read without the state's lock.
+    log: Arc<PlacementLog>,
 }
 
 impl Placement {
@@ -645,13 +645,18 @@ impl Placement {
         ack_timeout: Duration,
         lease_ttl: Duration,
     ) -> Self {
+        let log = Arc::new(PlacementLog::default());
         Self {
             registry,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                log: Arc::clone(&log),
+                ..State::default()
+            }),
             waiting: Mutex::new(HashMap::new()),
             ack_timeout,
             lease_ttl,
             stats: None,
+            log,
         }
     }
 
@@ -1025,7 +1030,7 @@ impl Placement {
     /// memory for minutes after they finished.
     pub fn attempt_finished(&self, host_id: &str, finished: &AttemptFinished) {
         if let Some(lease_id) = finished.lease_id.as_deref() {
-            let mut state = self.state();
+            let state = self.state();
             let lease = state
                 .leases
                 .get(lease_id)
@@ -1102,7 +1107,8 @@ impl Placement {
             .map(|(id, _)| id.clone())
             .collect();
         for lease_id in &stale {
-            state.leases.remove(lease_id);
+            let lease = state.leases.remove(lease_id);
+            state.note(EventKind::Lost, lease_id, host_id, lease.as_ref());
             tracing::info!(%lease_id, %host_id, "a lease was closed: its host no longer holds it");
         }
         stale.len()
@@ -1126,7 +1132,16 @@ impl Placement {
         for (lease_id, at) in claimed {
             state.release_claimed(&lease_id, at);
         }
-        state.leases.retain(|_, lease| lease.host_id != host_id);
+        let lost: Vec<(String, Lease)> = state
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.host_id == host_id)
+            .map(|(id, lease)| (id.clone(), lease.clone()))
+            .collect();
+        for (lease_id, lease) in &lost {
+            state.leases.remove(lease_id);
+            state.note(EventKind::Lost, lease_id, host_id, Some(lease));
+        }
         drop(state);
         self.waiting().retain(|_, (host, _)| host != host_id);
     }
@@ -1159,7 +1174,10 @@ impl Placement {
             .collect();
         for (lease_id, lease) in &expired {
             state.leases.remove(lease_id);
-            state.note(EventKind::Expired, lease_id, &lease.host_id, Some(lease));
+            // One whose runner took a job is not news: that job runs on.
+            if !matches!(lease.state, LeaseState::Claimed(_)) {
+                state.note(EventKind::Expired, lease_id, &lease.host_id, Some(lease));
+            }
         }
         state
             .ramping
@@ -1201,7 +1219,7 @@ impl Placement {
     /// The decisions and launch events after `cursor`, for the dashboard.
     #[must_use]
     pub fn log_since(&self, cursor: u64) -> LogPage {
-        self.state().log.since(cursor)
+        self.log.since(cursor)
     }
 
     /// The queues short of runners and the open leases, for `stats`.
@@ -1345,11 +1363,12 @@ impl Placement {
                 Ok(Ok(ack)) if ack.accepted => {
                     {
                         let mut state = self.state();
-                        let lease = state.leases.get_mut(&lease_id).map(|lease| {
+                        // Gone meanwhile (its host went away): that was recorded.
+                        if let Some(lease) = state.leases.get_mut(&lease_id) {
                             lease.state = LeaseState::Accepted;
-                            lease.clone()
-                        });
-                        state.note(EventKind::Accepted, &lease_id, &host_id, lease.as_ref());
+                            let lease = lease.clone();
+                            state.note(EventKind::Accepted, &lease_id, &host_id, Some(&lease));
+                        }
                     }
                     report.accepted += 1;
                     if let Some(stats) = &self.stats {
@@ -1402,8 +1421,10 @@ impl Placement {
             };
             {
                 let mut state = self.state();
-                let lease = state.leases.remove(&lease_id);
-                state.note_with(event, lease.as_ref());
+                // Gone meanwhile (its host went away): that was recorded.
+                if let Some(lease) = state.leases.remove(&lease_id) {
+                    state.note_with(event, Some(&lease));
+                }
             }
             report.refused += 1;
             tried.insert(host_id, (still_able, why));
@@ -1425,7 +1446,7 @@ impl Placement {
         let required: Vec<Label> = key.labels.iter().cloned().collect();
         // Read before the placement lock: the registry has its own.
         let candidates = self.registry.launch_candidates(&key.repository, &required);
-        let connected = self.registry.host_ids();
+        let connected = self.registry.readiness();
         let mut state = self.state();
         state.forget_ended(&candidates);
         let queued = state.queues.get(key).map_or(0, Queue::len);
@@ -1447,8 +1468,15 @@ impl Placement {
         // Every connected host not eligible, and why: for the dashboard.
         let filtered: Vec<Filtered> = connected
             .iter()
-            .filter(|id| !candidates.iter().any(|c| &c.host_id == *id))
-            .map(|id| Filtered::new(id, FilterReason::NoCandidate))
+            .filter(|(id, _)| !candidates.iter().any(|c| &c.host_id == id))
+            .map(|(id, ready)| {
+                let reason = if *ready {
+                    FilterReason::NoCandidate
+                } else {
+                    FilterReason::NotReady
+                };
+                Filtered::new(id, reason)
+            })
             .chain(candidates.iter().filter_map(|c| {
                 if let Some((_, why)) = tried.get(&c.host_id) {
                     Some(Filtered::new(&c.host_id, FilterReason::Tried).detail(why))
@@ -1560,9 +1588,9 @@ impl Placement {
             return None;
         };
         logged.chosen = Some(chosen.host_id.clone());
-        let decision = state.log.decided(logged, crate::clock::now());
         let lease_id = uuid::Uuid::new_v4().simple().to_string();
         let now = crate::clock::now();
+        state.log.offering(logged, &lease_id, &chosen.host_id, now);
         let ttl = self.lease_ttl;
         let lease = Lease {
             key: key.clone(),
@@ -1571,9 +1599,7 @@ impl Placement {
             sent: now,
             expires: now + ttl + self.ack_timeout,
             estimate,
-            decision,
         };
-        state.note(EventKind::Offered, &lease_id, &chosen.host_id, Some(&lease));
         state.leases.insert(lease_id.clone(), lease);
         let job_key = state
             .queues
@@ -2211,6 +2237,41 @@ mod tests {
         for host in hosts {
             host.await.expect("host");
         }
+    }
+
+    /// A launch closed with no answer from its runner says so, and a host
+    /// not ready to be a candidate is told apart from one that serves none.
+    #[tokio::test]
+    async fn a_lost_lease_and_a_host_not_ready_are_logged() {
+        use crate::placement_log::FilterReason;
+        let (registry, placement) = setup();
+        let host = connect(&registry, "a", LAUNCH_VERSION, POOL, 2, 8 << 30);
+        let host = answer(&placement, "a", host, Answer::Accept);
+        let (tx, _rx) = mpsc::channel(4);
+        registry.register("bare", LAUNCH_VERSION, tx);
+        let key = placement
+            .queued("octo/app", &required(POOL), 7)
+            .expect("a pool job");
+        assert_eq!(placement.rebalance(&key).await.accepted, 1);
+        placement.host_gone("a");
+        let page = placement.log_since(0);
+        let kinds: Vec<EventKind> = page.events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            [EventKind::Offered, EventKind::Accepted, EventKind::Lost]
+        );
+        assert!(
+            page.events
+                .iter()
+                .all(|e| e.decision == Some(page.decisions[0].id))
+        );
+        assert!(
+            page.decisions[0]
+                .filtered
+                .iter()
+                .any(|f| f.host_id == "bare" && f.reason == FilterReason::NotReady)
+        );
+        host.await.expect("host");
     }
 
     /// A queue nothing can take is logged with each host's reason, once.

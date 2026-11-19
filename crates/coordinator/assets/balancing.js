@@ -53,6 +53,7 @@
     host_capacity: 'host full', max_capacity: 'profile max', memory: 'memory', stale: 'stale lease',
     disabled: 'profile disabled', unknown_profile: 'unknown profile', not_coordinated: 'not coordinated',
     excluded: 'label excluded', other: 'other', cancelled: 'cancelled', expired: 'expired',
+    lost: 'lost', not_ready: 'not ready',
   };
   const reasonText = (r) => REASON_TEXT[r] || String(r || '').replace(/_/g, ' ');
   const SOURCE_TEXT = {
@@ -127,7 +128,7 @@
     const filtered = [], notServing = [];
     for (const f of raw.filtered || []) {
       named.add(f.host_id);
-      if (f.reason === 'no_candidate') notServing.push({ host_id: f.host_id, why: 'other_pool' });
+      if (f.reason === 'no_candidate' || f.reason === 'not_ready') notServing.push({ host_id: f.host_id, why: f.reason === 'not_ready' ? 'not_ready' : 'other_pool' });
       else filtered.push(Object.assign({ capacity: (f.busy_slots || 0) + (f.free_slots || 0) }, f));
     }
     for (const h of snap.hosts || []) if (!h.online && !named.has(h.id)) notServing.push({ host_id: h.id, why: 'offline' });
@@ -169,6 +170,7 @@
       case 'finished': d.finished = { duration: ev.duration_secs, peak: ev.peak_rss_bytes, at_ms: ev.at_ms }; break;
       case 'cancelled':
       case 'expired':
+      case 'lost':
         if (d.outcome == null) { d.outcome = ev.kind; if (last) { last.outcome = ev.kind; last.t_end_ms = ev.at_ms; } }
         break;
       default:
@@ -190,6 +192,7 @@
       this.running = false;
       this.intervalMs = 2000;
       this.timer = 0;
+      this.epoch = null;
       this.skewMs = 0;
       this.lastOk = 0;
       this.failed = false;
@@ -221,9 +224,10 @@
         const res = await fetch('/api/placement?since=' + this.cursor, { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } });
         if (res.status === 401) { location.reload(); return; }
         if (!res.ok) throw new Error('HTTP ' + res.status);
-        this.ingest(await res.json());
+        const again = this.ingest(await res.json());
         this.failed = false;
         this.lastOk = Date.now();
+        if (again) { this.inflight = false; this.poll(); return; }
       } catch (_) {
         this.failed = true;
         for (const fn of this.listeners) fn({ failed: true, decisions: [], events: [] });
@@ -233,7 +237,17 @@
       if (this.running && !document.hidden) this.timer = setTimeout(() => this.poll(), this.intervalMs);
     }
 
+    // Takes one answer in; true when it belongs to another log (the
+    // coordinator restarted) and everything must be read again.
     ingest(data) {
+      if (this.epoch && data.epoch && data.epoch !== this.epoch) {
+        this.epoch = data.epoch;
+        this.cursor = 0;
+        this.snap = null;
+        this.decisions = []; this.byId.clear(); this.events = [];
+        return true;
+      }
+      this.epoch = data.epoch || this.epoch;
       const first = !this.snap;
       if (data.reset && !first) { this.decisions = []; this.byId.clear(); this.events = []; }
       if (isNum(data.generated_at)) this.skewMs = data.generated_at * 1000 - Date.now();
@@ -257,6 +271,7 @@
       this.cursor = isNum(data.cursor) ? data.cursor : this.cursor;
       const update = { first, reset: !!data.reset && !first, decisions: fresh, events: data.events || [] };
       for (const fn of this.listeners) fn(update);
+      return false;
     }
 
     host(id) { return this.hostById.get(id) || null; }

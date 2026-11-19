@@ -3,10 +3,19 @@
 //! host was passed over, and what became of their launches.
 //!
 //! In memory only and bounded ([`KEEP_DECISIONS`], [`KEEP_EVENTS`]): a restart
-//! starts it empty. Decisions and events share one rising sequence, the
-//! cursor a page reads from ([`PlacementLog::since`]).
+//! starts it empty, under a new [`LogPage::epoch`]. Decisions and events share
+//! one rising sequence, the cursor a page reads from ([`PlacementLog::since`]).
+//!
+//! A decision that offers a launch is held until the host answers, then
+//! recorded with its `offered` event and the answer, in that order. A round
+//! that repeats the queue's last refused one (same host, same reason, same
+//! field) within a minute is not recorded again, nor is a queue left unplaced
+//! for the same reasons: placement retries every few seconds.
+//!
+//! It has its own lock, taken after the placement state's when both are.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use runner_manager_domain::coordinator_protocol::HostScore;
@@ -16,9 +25,11 @@ use serde::Serialize;
 pub const KEEP_DECISIONS: usize = 200;
 /// Lease events kept.
 pub const KEEP_EVENTS: usize = 500;
-/// A queue left unplaced for the same reasons is recorded again only after
-/// this: placement retries every few seconds.
+/// A queue left unplaced, or refused by the same host, for the same reasons is
+/// recorded again only after this: placement retries every few seconds.
 const REPEAT_EVERY: Duration = Duration::from_secs(60);
+/// A launch whose answer never came is forgotten after this.
+const HOLD_AT_MOST: Duration = Duration::from_secs(5 * 60);
 
 /// Why a connected host was not scored for a queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -27,6 +38,8 @@ pub enum FilterReason {
     /// No enabled pool profile of its serves the queue (or it is not in
     /// launch mode for that repository).
     NoCandidate,
+    /// Connected, but has not said hello or sent a heartbeat yet.
+    NotReady,
     /// Its doctor says unfit, or it drains (see `detail`).
     UnfitOrDraining,
     /// Its slots are taken, by its last heartbeat and the launches sent since.
@@ -149,6 +162,9 @@ pub enum EventKind {
     Cancelled,
     /// It outlived its lifetime.
     Expired,
+    /// Closed without an answer from its runner: its host went away or
+    /// reconnected, or its heartbeat no longer lists it.
+    Lost,
 }
 
 /// One launch event.
@@ -202,6 +218,7 @@ pub struct Counters {
     pub finished: u64,
     pub cancelled: u64,
     pub expired: u64,
+    pub lost: u64,
 }
 
 impl Counters {
@@ -215,6 +232,7 @@ impl Counters {
             EventKind::Finished => &mut self.finished,
             EventKind::Cancelled => &mut self.cancelled,
             EventKind::Expired => &mut self.expired,
+            EventKind::Lost => &mut self.lost,
         };
         *counter += 1;
     }
@@ -223,33 +241,65 @@ impl Counters {
 /// What a page asked for: everything after its cursor.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LogPage {
+    /// This log's identity: a new one each time the coordinator starts, so a
+    /// page holding a cursor of another knows to read everything again.
+    pub epoch: String,
     /// The newest sequence number: the next page's cursor.
     pub cursor: u64,
-    /// The cursor asked for is ahead of the log (it restarted): everything
-    /// kept is sent again.
+    /// The cursor asked for is ahead of the log (it restarted) or older than
+    /// what it still keeps: everything kept is sent, to replace what the page
+    /// has.
     pub reset: bool,
     pub decisions: Vec<LoggedDecision>,
     pub events: Vec<LoggedEvent>,
     pub counters: Counters,
 }
 
-/// The last decisions and launch events, bounded.
+/// A decision waiting for its launch's answer.
+#[derive(Debug)]
+struct Held {
+    decision: LoggedDecision,
+    offered: LoggedEvent,
+    since: Instant,
+}
+
 #[derive(Debug, Default)]
-pub struct PlacementLog {
+struct Inner {
     last: u64,
     decisions: VecDeque<LoggedDecision>,
     events: VecDeque<LoggedEvent>,
     counters: Counters,
     /// When each queue was last recorded unplaced, and why.
     unplaced: HashMap<(String, String), (Instant, String)>,
+    /// When each queue's launch was last recorded refused or unanswered, and
+    /// what that round looked like.
+    refused: HashMap<(String, String), (Instant, String)>,
+    /// Launches offered and not answered yet, by lease.
+    held: HashMap<String, Held>,
+}
+
+/// The last decisions and launch events, bounded, behind their own lock.
+#[derive(Debug)]
+pub struct PlacementLog {
+    epoch: String,
+    inner: Mutex<Inner>,
+}
+
+impl Default for PlacementLog {
+    fn default() -> Self {
+        Self {
+            epoch: uuid::Uuid::new_v4().simple().to_string(),
+            inner: Mutex::new(Inner::default()),
+        }
+    }
 }
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// What makes two unplaced decisions of a queue the same.
-fn signature(decision: &LoggedDecision) -> String {
+/// What makes two rounds of a queue the same: its outcome and its field.
+fn signature(decision: &LoggedDecision, outcome: &str) -> String {
     let mut parts: Vec<String> = decision
         .filtered
         .iter()
@@ -263,57 +313,44 @@ fn signature(decision: &LoggedDecision) -> String {
         .collect();
     parts.sort();
     format!(
-        "{}|{}|{}",
+        "{outcome}|{}|{}|{}|{}",
+        decision.chosen.as_deref().unwrap_or_default(),
         decision.reason.as_deref().unwrap_or_default(),
         decision.refusal.as_deref().unwrap_or_default(),
         parts.join(",")
     )
 }
 
-impl PlacementLog {
-    /// Records `decision` and returns its id; `None` when it repeats the
-    /// queue's last unplaced decision within a minute.
-    pub fn decided(&mut self, mut decision: LoggedDecision, now: Instant) -> Option<u64> {
-        let queue = (decision.repository.clone(), decision.labels.clone());
-        if decision.chosen.is_none() {
-            let signature = signature(&decision);
-            self.unplaced
-                .retain(|_, (at, _)| now.saturating_duration_since(*at) < REPEAT_EVERY);
-            if self
-                .unplaced
-                .get(&queue)
-                .is_some_and(|(_, last)| *last == signature)
-            {
-                return None;
-            }
-            self.unplaced.insert(queue, (now, signature));
-        } else {
-            self.unplaced.remove(&queue);
-        }
+/// Whether `signature` repeats what `seen` holds for `queue` within a minute;
+/// otherwise it is noted as the queue's last.
+fn repeats(
+    seen: &mut HashMap<(String, String), (Instant, String)>,
+    queue: (String, String),
+    signature: String,
+    now: Instant,
+) -> bool {
+    seen.retain(|_, (at, _)| now.saturating_duration_since(*at) < REPEAT_EVERY);
+    if seen.get(&queue).is_some_and(|(_, last)| *last == signature) {
+        return true;
+    }
+    seen.insert(queue, (now, signature));
+    false
+}
+
+impl Inner {
+    fn push_decision(&mut self, mut decision: LoggedDecision) -> u64 {
         self.last += 1;
         decision.id = self.last;
-        decision.at_ms = now_ms();
         self.decisions.push_back(decision);
         while self.decisions.len() > KEEP_DECISIONS {
             self.decisions.pop_front();
         }
-        self.counters.decisions += 1;
-        Some(self.last)
+        self.last
     }
 
-    /// Records a launch event; its decision is looked up by its lease when
-    /// not given.
-    pub fn event(&mut self, mut event: LoggedEvent) {
-        if (event.decision.is_none() || event.repository.is_none())
-            && let Some(offered) = self.offered(&event.lease_id)
-        {
-            event.decision = event.decision.or(offered.decision);
-            event.repository = event.repository.or_else(|| offered.repository.clone());
-        }
+    fn push_event(&mut self, mut event: LoggedEvent) {
         self.last += 1;
         event.seq = self.last;
-        event.at_ms = now_ms();
-        self.counters.count(event.kind);
         self.events.push_back(event);
         while self.events.len() > KEEP_EVENTS {
             self.events.pop_front();
@@ -328,34 +365,147 @@ impl PlacementLog {
             .find(|event| event.lease_id == lease_id && event.kind == EventKind::Offered)
     }
 
-    /// Whether `lease_id` was offered by a decision still kept.
-    #[must_use]
-    pub fn knows(&self, lease_id: &str) -> bool {
-        self.offered(lease_id).is_some()
+    /// `held`'s launch was answered by `outcome`: the decision, its offer and
+    /// the answer are recorded, unless the round repeats the queue's last
+    /// refused one.
+    fn settle(&mut self, held: Held, mut outcome: LoggedEvent, now: Instant) {
+        let Held {
+            decision,
+            mut offered,
+            ..
+        } = held;
+        let queue = (decision.repository.clone(), decision.labels.clone());
+        if outcome.kind == EventKind::Accepted {
+            self.refused.remove(&queue);
+            self.unplaced.remove(&queue);
+        } else {
+            let answer = format!(
+                "{:?}:{}",
+                outcome.kind,
+                outcome.reason.as_deref().unwrap_or_default()
+            );
+            if repeats(&mut self.refused, queue, signature(&decision, &answer), now) {
+                return;
+            }
+        }
+        let id = self.push_decision(decision);
+        offered.decision = Some(id);
+        outcome.decision = Some(id);
+        outcome.repository.clone_from(&offered.repository);
+        self.push_event(offered);
+        self.push_event(outcome);
+    }
+}
+
+impl PlacementLog {
+    fn inner(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Everything after `cursor`, or everything kept when `cursor` is ahead
-    /// of the log.
+    /// Records a decision that offered nothing and returns its id; `None`
+    /// when it repeats the queue's last unplaced decision within a minute.
+    pub fn decided(&self, mut decision: LoggedDecision, now: Instant) -> Option<u64> {
+        let mut inner = self.inner();
+        inner.counters.decisions += 1;
+        let queue = (decision.repository.clone(), decision.labels.clone());
+        if repeats(
+            &mut inner.unplaced,
+            queue,
+            signature(&decision, "unplaced"),
+            now,
+        ) {
+            return None;
+        }
+        decision.at_ms = now_ms();
+        Some(inner.push_decision(decision))
+    }
+
+    /// Holds a decision that offered `lease_id` to `host_id` until its answer
+    /// ([`Self::event`]).
+    pub fn offering(
+        &self,
+        mut decision: LoggedDecision,
+        lease_id: &str,
+        host_id: &str,
+        now: Instant,
+    ) {
+        let mut inner = self.inner();
+        inner.counters.decisions += 1;
+        inner.counters.count(EventKind::Offered);
+        inner
+            .held
+            .retain(|_, held| now.saturating_duration_since(held.since) < HOLD_AT_MOST);
+        decision.at_ms = now_ms();
+        let mut offered = LoggedEvent::new(EventKind::Offered, lease_id, host_id);
+        offered.repository = Some(decision.repository.clone());
+        offered.at_ms = decision.at_ms;
+        inner.held.insert(
+            lease_id.to_owned(),
+            Held {
+                decision,
+                offered,
+                since: now,
+            },
+        );
+    }
+
+    /// Records a launch event; its decision is looked up by its lease. The
+    /// first answer to a held launch records that launch's decision first.
+    pub fn event(&self, mut event: LoggedEvent, now: Instant) {
+        let mut inner = self.inner();
+        event.at_ms = now_ms();
+        inner.counters.count(event.kind);
+        if let Some(held) = inner.held.remove(&event.lease_id) {
+            inner.settle(held, event, now);
+            return;
+        }
+        if let Some(offered) = inner.offered(&event.lease_id) {
+            event.decision = offered.decision;
+            event.repository = event.repository.or_else(|| offered.repository.clone());
+        }
+        inner.push_event(event);
+    }
+
+    /// Whether `lease_id` was offered by a decision this log holds.
+    #[must_use]
+    pub fn knows(&self, lease_id: &str) -> bool {
+        let inner = self.inner();
+        inner.held.contains_key(lease_id) || inner.offered(lease_id).is_some()
+    }
+
+    /// Everything after `cursor`; everything kept when `cursor` is ahead of
+    /// the log or older than what it keeps.
     #[must_use]
     pub fn since(&self, cursor: u64) -> LogPage {
-        let reset = cursor > self.last;
+        let inner = self.inner();
+        let oldest = inner
+            .decisions
+            .front()
+            .map(|decision| decision.id)
+            .into_iter()
+            .chain(inner.events.front().map(|event| event.seq))
+            .min();
+        // Something after the cursor was dropped already.
+        let gap = cursor > 0 && oldest.is_some_and(|oldest| cursor + 1 < oldest);
+        let reset = cursor > inner.last || gap;
         let after = if reset { 0 } else { cursor };
         LogPage {
-            cursor: self.last,
+            epoch: self.epoch.clone(),
+            cursor: inner.last,
             reset,
-            decisions: self
+            decisions: inner
                 .decisions
                 .iter()
                 .filter(|decision| decision.id > after)
                 .cloned()
                 .collect(),
-            events: self
+            events: inner
                 .events
                 .iter()
                 .filter(|event| event.seq > after)
                 .cloned()
                 .collect(),
-            counters: self.counters,
+            counters: inner.counters,
         }
     }
 }
@@ -375,19 +525,24 @@ mod tests {
         }
     }
 
+    fn refused(lease: &str, host: &str, reason: &str) -> LoggedEvent {
+        let mut event = LoggedEvent::new(EventKind::Refused, lease, host);
+        event.reason = Some(reason.to_owned());
+        event
+    }
+
     #[test]
     fn decisions_and_events_are_bounded_and_keep_the_newest() {
-        let mut log = PlacementLog::default();
+        let log = PlacementLog::default();
         let now = Instant::now();
         for index in 0..KEEP_DECISIONS + 25 {
-            log.decided(decision(&format!("o/r{index}"), Some("a")), now);
+            log.decided(decision(&format!("o/r{index}"), None), now);
         }
         for index in 0..KEEP_EVENTS + 40 {
-            log.event(LoggedEvent::new(
-                EventKind::Offered,
-                &format!("l{index}"),
-                "a",
-            ));
+            log.event(
+                LoggedEvent::new(EventKind::Claimed, &format!("l{index}"), "a"),
+                now,
+            );
         }
         let page = log.since(0);
         assert_eq!(page.decisions.len(), KEEP_DECISIONS);
@@ -401,19 +556,22 @@ mod tests {
             format!("l{}", KEEP_EVENTS + 39)
         );
         assert_eq!(page.counters.decisions, (KEEP_DECISIONS + 25) as u64);
-        assert_eq!(page.counters.offered, (KEEP_EVENTS + 40) as u64);
+        assert_eq!(page.counters.claimed, (KEEP_EVENTS + 40) as u64);
         assert_eq!(page.cursor, (KEEP_DECISIONS + 25 + KEEP_EVENTS + 40) as u64);
+        // A cursor older than what is kept missed something: all again.
+        assert!(log.since(1).reset);
+        assert!(!log.since(page.cursor).reset);
     }
 
     #[test]
     fn a_cursor_returns_only_what_came_after_it() {
-        let mut log = PlacementLog::default();
+        let log = PlacementLog::default();
         let now = Instant::now();
-        let first = log.decided(decision("o/a", Some("a")), now).unwrap();
+        let first = log.decided(decision("o/a", None), now).unwrap();
         let cursor = log.since(0).cursor;
         assert_eq!(cursor, first);
-        log.event(LoggedEvent::new(EventKind::Offered, "l1", "a"));
-        let second = log.decided(decision("o/b", Some("b")), now).unwrap();
+        log.event(LoggedEvent::new(EventKind::Claimed, "l1", "a"), now);
+        let second = log.decided(decision("o/b", None), now).unwrap();
         let page = log.since(cursor);
         assert!(!page.reset);
         assert_eq!(
@@ -426,11 +584,13 @@ mod tests {
         let page = log.since(page.cursor + 100);
         assert!(page.reset);
         assert_eq!(page.decisions.len(), 2);
+        // Each log is told apart from the one before a restart.
+        assert_ne!(log.since(0).epoch, PlacementLog::default().since(0).epoch);
     }
 
     #[test]
     fn a_repeated_unplaced_decision_is_recorded_once_a_minute() {
-        let mut log = PlacementLog::default();
+        let log = PlacementLog::default();
         let now = Instant::now();
         assert!(log.decided(decision("o/a", None), now).is_some());
         assert!(
@@ -452,17 +612,59 @@ mod tests {
     }
 
     #[test]
-    fn events_inherit_the_decision_of_their_offer() {
-        let mut log = PlacementLog::default();
-        let mut offered = LoggedEvent::new(EventKind::Offered, "l1", "a");
-        offered.decision = Some(7);
-        offered.repository = Some("o/a".to_owned());
-        log.event(offered);
-        log.event(LoggedEvent::new(EventKind::Accepted, "l1", "a"));
-        let page = log.since(0);
-        assert_eq!(page.events[1].decision, Some(7));
-        assert_eq!(page.events[1].repository.as_deref(), Some("o/a"));
+    fn a_launch_is_recorded_with_its_answer_and_a_repeated_refusal_once_a_minute() {
+        let log = PlacementLog::default();
+        let now = Instant::now();
+        log.offering(decision("o/a", Some("h")), "l1", "h", now);
         assert!(log.knows("l1"));
-        assert!(!log.knows("l2"));
+        assert!(log.since(0).decisions.is_empty(), "held until answered");
+        log.event(refused("l1", "h", "max_capacity"), now);
+        let page = log.since(0);
+        let id = page.decisions[0].id;
+        let kinds: Vec<(EventKind, Option<u64>)> =
+            page.events.iter().map(|e| (e.kind, e.decision)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (EventKind::Offered, Some(id)),
+                (EventKind::Refused, Some(id))
+            ]
+        );
+        // The same round again: nothing new is recorded, though counted.
+        log.offering(
+            decision("o/a", Some("h")),
+            "l2",
+            "h",
+            now + Duration::from_secs(5),
+        );
+        log.event(
+            refused("l2", "h", "max_capacity"),
+            now + Duration::from_secs(5),
+        );
+        let again = log.since(page.cursor);
+        assert!(again.decisions.is_empty() && again.events.is_empty());
+        assert_eq!(again.counters.refused, 2);
+        // Accepted is always news, and later events find their decision.
+        log.offering(
+            decision("o/a", Some("h")),
+            "l3",
+            "h",
+            now + Duration::from_secs(6),
+        );
+        log.event(
+            LoggedEvent::new(EventKind::Accepted, "l3", "h"),
+            now + Duration::from_secs(6),
+        );
+        log.event(
+            LoggedEvent::new(EventKind::Claimed, "l3", "h"),
+            now + Duration::from_secs(7),
+        );
+        let accepted = log.since(page.cursor);
+        let id = accepted.decisions[0].id;
+        assert!(accepted.events.iter().all(|e| e.decision == Some(id)));
+        assert_eq!(
+            accepted.events.last().unwrap().repository.as_deref(),
+            Some("o/a")
+        );
     }
 }

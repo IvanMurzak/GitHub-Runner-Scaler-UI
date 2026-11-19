@@ -16,8 +16,10 @@
   // How long each step lasts on screen, in seconds.
   const PACE = { webhook: 0.9, pick: 0.7, scan: 0.5, score: 1.0, offer: 0.7, answer: 0.3, bounce: 0.6, stats: 0.9 };
   // While more decisions than this wait, the oldest steps are applied at
-  // once, without animation.
+  // once, without animation; past MAX_BACKLOG the replay starts over from
+  // what the feed holds.
   const SKIP_BACKLOG = 4;
+  const MAX_BACKLOG = 40;
   // Queues not seen for this long leave the map.
   const QUEUE_MEMORY = 10 * 60;
   const MAX_QUEUES = 10;
@@ -57,7 +59,10 @@
       this.decisions = [];
       this.byId = new Map();
       this.backlog = [];
+      // Decisions in the backlog.
+      this.waiting = 0;
       this.busy = false;
+      this.active = false;
       this.coordBusy = false;
       this.primed = false;
       this.counters = { webhooks: 0, decisions: 0, launches: 0, accepted: 0, refused: 0, unanswered: 0, wakes: 0, finished: 0 };
@@ -99,13 +104,20 @@
     // ------------------------------------------------------------ ingest
     ingest(u) {
       if (u.failed || !this.feed.snap) return;
+      // Not showing: nothing queues up; the replay is primed again on show.
+      if (!this.active) { this.primed = false; return; }
       const snap = this.feed.snap;
       this.weights = Object.assign({}, B.DEFAULT_WEIGHTS, snap.weights || {});
       this.cpuBusy = snap.cpu_busy_percent;
       this.minDisk = snap.min_disk_free_bytes;
-      const first = u.first || u.reset || !this.primed;
+      const first = u.first || u.reset || !this.primed || this.waiting + u.decisions.length > MAX_BACKLOG;
       if (first) {
         this.backlog = [];
+        this.waiting = 0;
+        this.timers = [];
+        this.busy = false;
+        this.coordBusy = false;
+        for (const j of this.jobs.values()) if (['webhook', 'picked', 'offering'].includes(j.state)) j.state = 'queued';
         this.decisions = [];
         this.byId.clear();
         const c = snap.counters || {};
@@ -115,6 +127,7 @@
         const items = u.decisions.map((d) => ({ seq: d.id, d })).concat(u.events.map((e) => ({ seq: e.seq, e })));
         items.sort((a, b) => a.seq - b.seq);
         this.backlog.push(...items);
+        this.waiting += u.decisions.length;
       }
       this.sync(snap, first);
       this.primed = true;
@@ -200,18 +213,18 @@
         Object.assign(j, { state: 'running', host: x.host_id, started_at: startT, duration: x.expected_secs || null, queued_t: j.queued_t != null ? j.queued_t : this.t - Math.max(0, serverSecs - x.queued_at) });
         if (j.dock_t == null) j.dock_t = first ? -1 : this.t + (j.pool ? 0 : PACE.pick + PACE.offer);
       }
+      // A job the coordinator no longer lists is gone, whatever the replay
+      // was doing with it; a stand-in for an unnamed job once it settled.
       for (const [id, j] of this.jobs) {
         if (queuedNow.has(id) || runningNow.has(id)) continue;
-        if (j.state === 'running' && id.startsWith('gh:')) {
-          const slot = this.hostById.get(j.host) ? this.hostById.get(j.host).slotJobs.indexOf(id) : -1;
+        if (id.startsWith('gh:')) {
+          const slot = j.state === 'running' && this.hostById.get(j.host) ? this.hostById.get(j.host).slotJobs.indexOf(id) : -1;
           if (!first && slot >= 0) {
             this.counters.finished++;
             this.emit('finished', { job: id, host: j.host, duration: this.t - j.started_at, slot, repository: j.repository });
           }
           this.jobs.delete(id);
-        } else if (['queued', 'webhook', 'placed'].includes(j.state) && id.startsWith('gh:')) {
-          this.jobs.delete(id);
-        } else if (j.phantom && j.state === 'queued') {
+        } else if (j.phantom && j.state !== 'picked' && j.state !== 'offering') {
           this.jobs.delete(id);
         }
       }
@@ -275,11 +288,20 @@
     }
 
     // ----------------------------------------------------------- replay
+    // Starts showing: the replay begins from what the feed holds.
+    show() {
+      this.active = true;
+      this.primed = false;
+      if (this.feed.snap) this.ingest({ first: true, decisions: [], events: [] });
+    }
+    hide() { this.active = false; }
+
     next() {
       const it = this.backlog.shift();
+      if (it.d) this.waiting--;
       // The scene's animations last their own fixed times: a long backlog
       // is caught up by skipping, never by playing faster.
-      const instant = this.backlog.filter((x) => x.d).length >= SKIP_BACKLOG;
+      const instant = this.waiting >= SKIP_BACKLOG;
       this.busy = true;
       const done = () => { this.busy = false; };
       const wait = (secs, fn) => { if (instant) { if (fn) fn(); done(); } else this.at(secs, () => { if (fn) fn(); done(); }); };
@@ -381,9 +403,15 @@
         }
         case 'cancelled':
         case 'expired':
+        case 'lost':
           this.leases.delete(e.lease_id);
+          if (j && (j.state === 'offering' || j.state === 'placed' || j.state === 'picked')) {
+            j.state = 'queued';
+            j.return_t = this.t + PACE.pick;
+          }
+          if (j && e.kind === 'lost') this.coordBusy = false;
           this.slots();
-          if (!quiet) this.emit('host', { host: e.host_id, change: e.kind === 'cancelled' ? 'launch cancelled' : 'lease expired' });
+          if (!quiet) this.emit('host', { host: e.host_id, change: e.kind === 'cancelled' ? 'launch cancelled' : e.kind === 'expired' ? 'lease expired' : 'launch lost' });
           wait(0);
           break;
         default:
@@ -2340,7 +2368,7 @@
     function renderHistory() {
       const list = sim.decisions.slice(-8).reverse();
       const cur = state.shown;
-      $('history').innerHTML = list.map((d) => {
+      const html = list.map((d) => {
         const out = d.outcome === 'accepted' ? '→ ' + esc(hostName(d.placed_on)) : d.outcome ? esc(reasonText(d.outcome === 'refused' ? d.refusal || 'refused' : d.outcome)) : '…';
         const err = d.outcome && d.outcome !== 'accepted';
         return '<li class="hist' + (cur && cur.id === d.id ? ' is-current' : '') + '" data-id="' + d.id + '">' +
@@ -2348,6 +2376,10 @@
           '<span class="hist-main"><b>' + esc(shortRepo(d.repository)) + '</b> ' + esc(d.job_name) + ' <span class="muted">' + esc(d.method === 'stage3' ? 'stage3' : '') + '</span></span>' +
           '<span class="hist-out' + (err ? ' is-err' : '') + '">' + out + '</span></li>';
       }).join('');
+      // Rebuilt only when it shows something else: a row under the pointer stays.
+      if ($('history').dataset.html === html) return;
+      $('history').dataset.html = html;
+      $('history').innerHTML = html;
       $('history').querySelectorAll('.repo-dot').forEach((el) => repoColorStyle(el, el.dataset.repo));
     }
 
@@ -2494,7 +2526,7 @@
       html += '<div class="d-sec">Since the coordinator started</div>' + kv([
         ['Decisions', c.decisions || 0], ['Launches offered', c.offered || 0], ['Accepted', c.accepted || 0],
         ['Refused', c.refused || 0], ['Unanswered', c.unanswered || 0], ['Claimed', c.claimed || 0], ['Finished', c.finished || 0],
-        ['Cancelled', c.cancelled || 0], ['Expired', c.expired || 0],
+        ['Cancelled', c.cancelled || 0], ['Expired', c.expired || 0], ['Lost', c.lost || 0],
       ]);
       return { kind: 'Decision engine', title: 'Coordinator', html };
     }
@@ -2510,9 +2542,12 @@
       return { kind: 'Source', title: 'GitHub webhooks', html };
     }
 
-    function renderDetails() {
+    // `periodic`: a refresh, skipped while the pointer or focus is in the
+    // panel, and applied only when it shows something else.
+    function renderDetails(periodic) {
       const sel = scene.selected;
       const panel = $('details');
+      if (periodic && (panel.matches(':hover') || panel.contains(document.activeElement))) return;
       let out = null;
       if (sel && sel.kind === 'host') { const h = sim.hostById.get(sel.id); if (h) out = hostDetails(h); }
       else if (sel && sel.kind === 'job') { const j = sim.jobs.get(sel.id); if (j) out = jobDetails(j); }
@@ -2521,6 +2556,9 @@
       else if (sel && sel.kind === 'github') out = githubDetails();
       if (!out) { panel.hidden = true; return; }
       panel.hidden = false;
+      const sig = out.kind + '\n' + out.title + '\n' + out.html;
+      if (panel.dataset.sig === sig) return;
+      panel.dataset.sig = sig;
       $('details-kind').textContent = out.kind;
       $('details-title').innerHTML = out.title;
       const body = $('details-body');
@@ -2596,7 +2634,7 @@
       renderInspector();
     }
     function renderPauseLabel() {
-      const waiting = sim.backlog.filter((it) => it.d).length;
+      const waiting = sim.waiting;
       $('pause-label').textContent = state.paused ? (waiting ? 'Play · ' + waiting + ' new' : 'Play') : 'Pause';
     }
     $('btn-pause').addEventListener('click', () => setPaused(!state.paused));
@@ -2612,7 +2650,7 @@
     });
 
     document.addEventListener('keydown', (e) => {
-      if (!state.running || e.defaultPrevented) return;
+      if (!state.running || e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.target.closest && e.target.closest('input, textarea, select, dialog')) return;
       if (e.key === ' ' && e.target.tagName !== 'BUTTON' && e.target.tagName !== 'A') { e.preventDefault(); setPaused(!state.paused); }
       else if (e.key === 'f' || e.key === 'F' || e.key === '0') scene.fit();
@@ -2655,7 +2693,7 @@
       if (acc > 0.25) {
         acc = 0;
         renderHud();
-        if (scene.selected) renderDetails();
+        if (scene.selected) renderDetails(true);
         if (state.tipHit) placeTip();
       }
       state.raf = requestAnimationFrame(frame);
@@ -2666,6 +2704,7 @@
       start() {
         if (state.running) return;
         state.running = true;
+        sim.show();
         if (first) {
           if (root.clientWidth < 1700 || root.clientHeight < 1000) {
             $('legend').classList.add('is-collapsed');
@@ -2688,6 +2727,7 @@
       },
       stop() {
         state.running = false;
+        sim.hide();
         cancelAnimationFrame(state.raf);
         tip.hidden = true;
       },

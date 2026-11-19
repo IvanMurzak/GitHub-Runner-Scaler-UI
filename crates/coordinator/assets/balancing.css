@@ -236,7 +236,7 @@ body.is-balancing .topbar { flex: none; }
   .bf .tb-sep { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .bf .seg-part, .bf .x-btn svg, .bf .legend-head svg { transition: none; }
+  :root:not([data-motion="full"]) .bf .seg-part, :root:not([data-motion="full"]) .bf .x-btn svg, :root:not([data-motion="full"]) .bf .legend-head svg { transition: none; }
 }
 
 /* ----------------------------------------------------------- decision theatre */
@@ -528,8 +528,8 @@ body.is-balancing .topbar { flex: none; }
   .br .rdrawer { top: auto; left: 8px; right: 8px; width: auto; height: 70vh; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .br .lane, .br .lane-group, .br .lane-ns, .br .jc, .br .lanes, .br .rdrawer, .br .mc-gf, .br .sl-p, .br .jc-wb { transition: none !important; }
-  .br .lane.shake, .br .mc.land { animation: none; }
+  :root:not([data-motion="full"]) .br .lane, :root:not([data-motion="full"]) .br .lane-group, :root:not([data-motion="full"]) .br .lane-ns, :root:not([data-motion="full"]) .br .jc, :root:not([data-motion="full"]) .br .lanes, :root:not([data-motion="full"]) .br .rdrawer, :root:not([data-motion="full"]) .br .mc-gf, :root:not([data-motion="full"]) .br .sl-p, :root:not([data-motion="full"]) .br .jc-wb { transition: none !important; }
+  :root:not([data-motion="full"]) .br .lane.shake, :root:not([data-motion="full"]) .br .mc.land { animation: none; }
 }
 .br .lane-group.is-on { transition-delay: 0s, .3s; }
 
